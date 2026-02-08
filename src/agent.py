@@ -139,6 +139,12 @@ def execute_action(page: Page, action: Dict[str, Any], memory: AgentMemory) -> s
         return _do_hover(page, selector)
     elif act == "explore":
         return _do_scroll(page, "down")
+    elif act == "close_modal":
+        return _do_close_modal(page, selector)
+    elif act == "select_option":
+        return _do_select_option(page, selector, value)
+    elif act == "press_key":
+        return _do_press_key(page, selector or value or "Escape")
     elif act == "check_defect":
         return "defect_found"
     else:
@@ -244,11 +250,133 @@ def _do_hover(page: Page, selector: str) -> str:
         try:
             safe_highlight(loc, page, 0.3)
             loc.hover()
-            time.sleep(0.5)
+            time.sleep(1.0)  # Ждём появления тултипа/дропдауна после ховера
             return f"hovered: {selector[:50]}"
         except Exception as e:
             return f"hover_error: {e}"
     return f"not_found: {selector[:50]}"
+
+
+def _do_close_modal(page: Page, selector: str = "") -> str:
+    """
+    Закрыть модалку / оверлей. Стратегии (по приоритету):
+    1) Клик по переданному селектору (крестик закрытия)
+    2) Поиск крестика закрытия по стандартным селекторам
+    3) Нажатие Escape
+    4) Клик по бэкдропу (за пределами модалки)
+    """
+    # Стратегия 1: переданный селектор
+    if selector:
+        loc = _find_element(page, selector)
+        if loc:
+            try:
+                safe_highlight(loc, page, 0.3)
+                highlight_and_click(loc, page, description="Закрываю")
+                time.sleep(0.5)
+                return f"modal_closed_by_selector: {selector[:40]}"
+            except Exception:
+                pass
+
+    # Стратегия 2: стандартные кнопки закрытия
+    close_selectors = [
+        '[aria-label*="close" i]',
+        '[aria-label*="закрыть" i]',
+        '[aria-label*="Close" i]',
+        'button.close',
+        '.modal-close',
+        '[data-dismiss="modal"]',
+        '[data-bs-dismiss="modal"]',
+        '[class*="close"][class*="button"]',
+        '[class*="close"][class*="btn"]',
+        '[class*="dialog"] [class*="close"]',
+        '[class*="modal"] [class*="close"]',
+        '[role="dialog"] button:has-text("×")',
+        '[role="dialog"] button:has-text("✕")',
+        '[role="dialog"] button:has-text("✖")',
+        '[role="dialog"] button:has-text("Закрыть")',
+        '[role="dialog"] button:has-text("Close")',
+        '[role="dialog"] button:has-text("Отмена")',
+        '[role="dialog"] button:has-text("Cancel")',
+    ]
+    for cs in close_selectors:
+        try:
+            loc = page.locator(cs).first
+            if loc.count() > 0 and loc.is_visible():
+                safe_highlight(loc, page, 0.3)
+                highlight_and_click(loc, page, description="Закрываю")
+                time.sleep(0.5)
+                return f"modal_closed_by_standard: {cs[:40]}"
+        except Exception:
+            continue
+
+    # Стратегия 3: Escape
+    try:
+        page.keyboard.press("Escape")
+        time.sleep(0.5)
+        return "modal_closed_by_escape"
+    except Exception:
+        pass
+
+    # Стратегия 4: клик за пределами модалки (по backdrop)
+    try:
+        page.mouse.click(5, 5)
+        time.sleep(0.5)
+        return "modal_closed_by_backdrop_click"
+    except Exception as e:
+        return f"modal_close_failed: {e}"
+
+
+def _do_select_option(page: Page, selector: str, value: str) -> str:
+    """Выбрать опцию в дропдауне / select / listbox."""
+    if not selector or not value:
+        return "no_selector_or_value"
+
+    # Стратегия 1: нативный <select>
+    loc = _find_element(page, selector)
+    if loc:
+        try:
+            tag = loc.evaluate("el => el.tagName.toLowerCase()")
+            if tag == "select":
+                loc.select_option(label=value)
+                time.sleep(0.5)
+                return f"selected_native: {value[:30]} in {selector[:30]}"
+        except Exception:
+            pass
+
+    # Стратегия 2: кастомный дропдаун — кликнуть по пункту с текстом value
+    try:
+        option_selectors = [
+            f'[role="option"]:has-text("{value}")',
+            f'[role="menuitem"]:has-text("{value}")',
+            f'li:has-text("{value}")',
+            f'.dropdown-item:has-text("{value}")',
+            f'[class*="option"]:has-text("{value}")',
+            f'[class*="item"]:has-text("{value}")',
+        ]
+        for os_sel in option_selectors:
+            try:
+                opt = page.locator(os_sel).first
+                if opt.count() > 0 and opt.is_visible():
+                    safe_highlight(opt, page, 0.3)
+                    highlight_and_click(opt, page, description=f"Выбираю: {value[:20]}")
+                    time.sleep(0.5)
+                    return f"selected_custom: {value[:30]}"
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return f"select_not_found: {selector[:30]} / {value[:30]}"
+
+
+def _do_press_key(page: Page, key: str) -> str:
+    """Нажать клавишу (Escape, Enter, Tab и т.д.)."""
+    try:
+        page.keyboard.press(key)
+        time.sleep(0.5)
+        return f"key_pressed: {key}"
+    except Exception as e:
+        return f"key_error: {e}"
 
 
 # --- Инициализация страницы ---
@@ -496,17 +624,47 @@ def run_agent(start_url: str = None):
                     update_llm_overlay(page, prompt=f"Чеклист: {step_id}", response=f"{st} {detail[:120]}", loading=False)
                 checklist_results = run_checklist(page, console_log, network_failures, step_delay_ms=CHECKLIST_STEP_DELAY_MS, on_step=on_step)
 
-            # ========== PHASE 2: Скриншот + контекст → GigaChat ==========
-            update_demo_banner(page, step_text=f"#{step} Скриншот для GigaChat…", progress_pct=30)
+            # ========== PHASE 2: Обнаружение оверлеев + Скриншот + контекст → GigaChat ==========
+            update_demo_banner(page, step_text=f"#{step} Анализ страницы…", progress_pct=25)
+
+            # Детекция модалок, тултипов, дропдаунов
+            overlay_info = detect_active_overlays(page)
+            overlay_context = format_overlays_context(overlay_info)
+            has_overlay = overlay_info.get("has_overlay", False)
+
+            if has_overlay:
+                overlay_types = [o.get("type", "?") for o in overlay_info.get("overlays", [])]
+                print(f"[Agent] #{step} Обнаружены оверлеи: {', '.join(overlay_types)}")
+                update_demo_banner(page, step_text=f"#{step} Оверлей: {', '.join(overlay_types)}!", progress_pct=30)
+
+            update_demo_banner(page, step_text=f"#{step} Скриншот для GigaChat…", progress_pct=35)
             screenshot_b64 = take_screenshot_b64(page)
 
             context_str = build_context(page, current_url, console_log, network_failures)
             if checklist_results:
                 context_str = checklist_results_to_context(checklist_results) + "\n\n" + context_str
+            if overlay_context:
+                context_str = overlay_context + "\n\n" + context_str
             dom_summary = get_dom_summary(page, max_length=4000)
             history_text = memory.get_history_text(last_n=10)
 
-            question = f"""Вот скриншот и контекст страницы.
+            if has_overlay:
+                question = f"""Вот скриншот. На странице есть АКТИВНЫЙ ОВЕРЛЕЙ (модалка/дропдаун/тултип/попап).
+
+{overlay_context}
+
+DOM (все элементы):
+{dom_summary[:3000]}
+
+{history_text}
+
+ВАЖНО: Сейчас на экране оверлей! Действуй так:
+1) Если ещё НЕ протестировал содержимое оверлея — тестируй его (кликай кнопки внутри, заполняй поля, проверяй ссылки)
+2) Если уже протестировал — закрой оверлей (action=close_modal) и переходи к другим элементам
+3) Если видишь баг в оверлее — action=check_defect
+Выбери ОДНО действие."""
+            else:
+                question = f"""Вот скриншот и контекст страницы.
 
 DOM (кнопки, ссылки, формы):
 {dom_summary[:3000]}
@@ -514,6 +672,7 @@ DOM (кнопки, ссылки, формы):
 {history_text}
 
 Выбери ОДНО следующее действие. Не повторяй те элементы, на которые уже кликнул. Ищи новые кнопки, формы, ссылки. Будь активным тестировщиком!
+Попробуй hover на элементы с подменю/тултипами. Открывай дропдауны и выбирай опции.
 Если видишь реальный баг — укажи action=check_defect."""
 
             update_demo_banner(page, step_text=f"#{step} Консультация с GigaChat…", progress_pct=60)
@@ -565,6 +724,23 @@ DOM (кнопки, ссылки, формы):
             )
 
             # ========== PHASE 4: Пост-анализ после действия ==========
+            update_demo_banner(page, step_text=f"#{step} Анализ результата…", progress_pct=90)
+
+            # Проверяем: появился ли оверлей после действия?
+            post_overlay = detect_active_overlays(page)
+            if post_overlay.get("has_overlay") and not has_overlay:
+                # Оверлей появился! Следующая итерация займётся им
+                overlay_types = [o.get("type", "?") for o in post_overlay.get("overlays", [])]
+                print(f"[Agent] #{step} После действия появился оверлей: {', '.join(overlay_types)}")
+                update_demo_banner(page, step_text=f"#{step} Появился оверлей! Тестирую…", progress_pct=95)
+                memory.add_action(
+                    {"action": "overlay_detected", "selector": ", ".join(overlay_types)},
+                    result="new_overlay_appeared"
+                )
+                # Не ждём — сразу к следующей итерации, чтобы протестировать оверлей
+                time.sleep(0.5)
+                continue
+
             update_demo_banner(page, step_text=f"#{step} Анализ результата…", progress_pct=95)
             post_screenshot_b64 = take_screenshot_b64(page)
 
