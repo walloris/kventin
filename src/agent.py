@@ -40,6 +40,15 @@ from config import (
     NETWORK_LOG_LIMIT,
     POST_ACTION_DELAY,
     PHASE_STEPS_TO_ADVANCE,
+    A11Y_CHECK_EVERY_N,
+    PERF_CHECK_EVERY_N,
+    ENABLE_RESPONSIVE_TEST,
+    RESPONSIVE_VIEWPORTS,
+    SESSION_PERSIST_CHECK_EVERY_N,
+    SELF_HEAL_AFTER_FAILURES,
+    ENABLE_SCENARIO_CHAINS,
+    SCENARIO_CHAIN_LENGTH,
+    ENABLE_IFRAME_TESTING,
 )
 from src.gigachat_client import (
     consult_agent_with_screenshot,
@@ -49,6 +58,10 @@ from src.gigachat_client import (
     init_gigachat_connection,
     validate_llm_action,
 )
+from src.form_strategies import detect_field_type, get_test_value, get_form_fill_strategy
+from src.accessibility import check_accessibility, format_a11y_issues
+from src.visual_diff import compute_screenshot_diff
+from src.performance import check_performance, format_performance_issues
 
 import hashlib
 import logging
@@ -130,6 +143,22 @@ class AgentMemory:
         # Фаза тестирования (как у реального тестировщика): orient → smoke → critical_path → exploratory
         self.tester_phase: str = "orient"
         self.steps_in_phase: int = 0
+        # Корреляция: длина console_log до действия (для детекции новых ошибок именно от действия)
+        self.console_len_before_action: int = 0
+        self.network_len_before_action: int = 0
+        # Tracking тест-плана: какие пункты закрыты
+        self.test_plan_completed: List[bool] = []
+        # Consecutive failures (для self-healing)
+        self.consecutive_failures: int = 0
+        # Стратегия заполнения форм
+        self.form_strategy_iteration: int = 0
+        # Accessibility и performance дефекты (чтобы не дублировать)
+        self.reported_a11y_rules: set = set()
+        self.reported_perf_rules: set = set()
+        # Responsive: уже протестированные viewports
+        self.responsive_done: set = set()
+        # Скриншот до действия (для visual diff)
+        self.screenshot_before_action: Optional[str] = None
 
     def add_action(self, action: Dict[str, Any], result: str = ""):
         act = (action.get("action") or "").lower()
@@ -320,6 +349,50 @@ class AgentMemory:
         lines.append("=== Конец отчёта ===")
         return "\n".join(lines)
 
+    def set_test_plan_tracking(self):
+        """Инициализировать отслеживание тест-плана."""
+        self.test_plan_completed = [False] * len(self.test_plan)
+
+    def mark_test_plan_step(self, step_index: int):
+        """Отметить пункт тест-плана как выполненный."""
+        if 0 <= step_index < len(self.test_plan_completed):
+            self.test_plan_completed[step_index] = True
+
+    def get_test_plan_progress(self) -> str:
+        """Прогресс выполнения тест-плана."""
+        if not self.test_plan:
+            return ""
+        done = sum(self.test_plan_completed)
+        total = len(self.test_plan)
+        lines = [f"Тест-план: {done}/{total} выполнено"]
+        for i, (step, completed) in enumerate(zip(self.test_plan, self.test_plan_completed)):
+            mark = "[x]" if completed else "[ ]"
+            lines.append(f"  {mark} {i+1}. {step[:60]}")
+        return "\n".join(lines)
+
+    def record_action_success(self):
+        """Сбросить счётчик последовательных неудач."""
+        self.consecutive_failures = 0
+
+    def record_action_failure(self):
+        """Увеличить счётчик последовательных неудач."""
+        self.consecutive_failures += 1
+
+    def needs_self_healing(self) -> bool:
+        """Нужна ли мета-рефлексия из-за серии неудач?"""
+        return self.consecutive_failures >= SELF_HEAL_AFTER_FAILURES
+
+    def snapshot_logs_before_action(self, console_log: list, network_failures: list):
+        """Запомнить длину логов до действия для корреляции."""
+        self.console_len_before_action = len(console_log)
+        self.network_len_before_action = len(network_failures)
+
+    def get_new_errors_after_action(self, console_log: list, network_failures: list) -> Dict[str, Any]:
+        """Получить ошибки, появившиеся именно после последнего действия."""
+        new_console = [c for c in console_log[self.console_len_before_action:] if c.get("type") == "error"]
+        new_network = [n for n in network_failures[self.network_len_before_action:] if n.get("status") and n.get("status") >= 400]
+        return {"console_errors": new_console, "network_errors": new_network}
+
     def is_screenshot_changed(self, screenshot_b64: str) -> bool:
         """Проверить, изменился ли скриншот по сравнению с предыдущим (по хешу). Обновляет хеш."""
         if not screenshot_b64:
@@ -378,7 +451,8 @@ def execute_action(page: Page, action: Dict[str, Any], memory: AgentMemory) -> s
     if act == "click":
         return _do_click(page, selector, reason)
     elif act == "type":
-        return _do_type(page, selector, value)
+        form_strat = action.get("_form_strategy", "happy")
+        return _do_type(page, selector, value, form_strategy=form_strat)
     elif act == "scroll":
         return _do_scroll(page, selector)
     elif act == "hover":
@@ -462,7 +536,11 @@ def _do_click(page: Page, selector: str, reason: str = "") -> str:
     return f"not_found: {selector[:50]}"
 
 
-def _do_type(page: Page, selector: str, value: str) -> str:
+def _do_type(page: Page, selector: str, value: str, form_strategy: str = "happy") -> str:
+    # Smart value: если value пустой — подобрать по типу поля и стратегии
+    if not value and selector:
+        field_type = detect_field_type(placeholder=selector, name=selector, aria_label=selector)
+        value = get_test_value(field_type, form_strategy)
     if not selector or not value:
         return "no_selector_or_value"
     loc = _find_element(page, selector)
@@ -912,6 +990,7 @@ def run_agent(start_url: str = None):
             test_plan_steps = get_test_plan_from_screenshot(plan_screenshot, start_url)
             if test_plan_steps:
                 memory.set_test_plan(test_plan_steps)
+                memory.set_test_plan_tracking()
                 print(f"[Agent] Тест-план ({len(test_plan_steps)} шагов): " + "; ".join(test_plan_steps[:3]) + "…")
                 update_llm_overlay(page, prompt="Тест-план", response="; ".join(test_plan_steps[:4]), loading=False)
 
@@ -980,7 +1059,41 @@ def run_agent(start_url: str = None):
                     _step_handle_defect(page, action, possible_bug, current_url, checklist_results, console_log, network_failures, memory)
                     continue
 
+                # Self-healing: серия неудач → мета-рефлексия
+                if memory.needs_self_healing():
+                    _self_heal(page, memory, console_log, network_failures)
+                    continue
+
+                # Запомнить скриншот до действия (для visual diff)
+                memory.screenshot_before_action = screenshot_b64
+
+                # Запомнить длину логов до действия (для корреляции)
+                memory.snapshot_logs_before_action(console_log, network_failures)
+
                 result = _step_execute(page, action, step, memory, context)
+
+                # Корреляция: отслеживаем ошибки именно от этого действия
+                action_errors = memory.get_new_errors_after_action(console_log, network_failures)
+                if action_errors["console_errors"]:
+                    err_texts = "; ".join(e.get("text", "")[:60] for e in action_errors["console_errors"][:3])
+                    LOG.info("#{step} Console ошибки после действия: %s", err_texts)
+                if action_errors["network_errors"]:
+                    net_texts = "; ".join(f"{n.get('status')} {n.get('url', '')[:40]}" for n in action_errors["network_errors"][:3])
+                    LOG.info("#{step} Network ошибки после действия: %s", net_texts)
+
+                # Трекинг success/failure для self-healing
+                if "error" in (result or "").lower() or "not_found" in (result or "").lower():
+                    memory.record_action_failure()
+                else:
+                    memory.record_action_success()
+
+                # Отслеживание тест-плана
+                _track_test_plan(memory, action)
+
+                # Network verification после submit-подобных кликов
+                net_issue = _check_network_after_action(page, memory, action, network_failures)
+                if net_issue:
+                    print(f"[Agent] #{step} Network issue: {net_issue[:80]}")
 
                 # ========== STEP 4: Пост-анализ ==========
                 _step_post_analysis(
@@ -988,10 +1101,35 @@ def run_agent(start_url: str = None):
                     has_overlay, current_url, checklist_results, console_log, network_failures, memory,
                 )
 
+                # ========== STEP 5: Периодические продвинутые проверки ==========
+                # Accessibility
+                if A11Y_CHECK_EVERY_N > 0 and step % A11Y_CHECK_EVERY_N == 0:
+                    _run_a11y_check(page, memory, current_url, console_log, network_failures)
+
+                # Performance
+                if PERF_CHECK_EVERY_N > 0 and step % PERF_CHECK_EVERY_N == 0:
+                    _run_perf_check(page, memory, current_url, console_log, network_failures)
+
+                # iframe проверки
+                if ENABLE_IFRAME_TESTING and step % 10 == 0:
+                    _run_iframe_check(page, memory, current_url, console_log, network_failures)
+
+                # Session persistence
+                if SESSION_PERSIST_CHECK_EVERY_N > 0 and step % SESSION_PERSIST_CHECK_EVERY_N == 0:
+                    _run_session_persistence_check(page, memory, current_url, console_log, network_failures)
+
+                # Responsive (один раз за всю сессию, ближе к концу smoke-фазы)
+                if ENABLE_RESPONSIVE_TEST and memory.tester_phase == "critical_path" and not memory.responsive_done:
+                    _run_responsive_check(page, memory, current_url, console_log, network_failures)
+
                 update_demo_banner(page, step_text=f"#{step} Готово. Следующий шаг…", progress_pct=100)
 
                 if SESSION_REPORT_EVERY_N > 0 and step % SESSION_REPORT_EVERY_N == 0:
-                    print(memory.get_session_report_text())
+                    report = memory.get_session_report_text()
+                    plan_progress = memory.get_test_plan_progress()
+                    if plan_progress:
+                        report += "\n" + plan_progress
+                    print(report)
 
                 time.sleep(1)
 
@@ -999,7 +1137,17 @@ def run_agent(start_url: str = None):
             print("\n[Agent] Остановлен по Ctrl+C.")
         finally:
             # Финальный отчёт
-            print(memory.get_session_report_text())
+            report = memory.get_session_report_text()
+            plan_progress = memory.get_test_plan_progress()
+            if plan_progress:
+                report += "\n" + plan_progress
+            if memory.reported_a11y_rules:
+                report += f"\nA11y: проверено {len(memory.reported_a11y_rules)} правил"
+            if memory.reported_perf_rules:
+                report += f"\nPerf: обнаружено {len(memory.reported_perf_rules)} проблем"
+            if memory.responsive_done:
+                report += f"\nResponsive: проверены viewports {', '.join(memory.responsive_done)}"
+            print(report)
             if browser:
                 browser.close()
             else:
@@ -1059,13 +1207,18 @@ DOM: {dom_summary[:3000]}
     else:
         plan_hint = ""
         if memory.test_plan:
-            plan_hint = f"\nТест-план: " + "; ".join(memory.test_plan[:6]) + "\n"
+            plan_progress = memory.get_test_plan_progress()
+            plan_hint = f"\n{plan_progress}\n"
         if CRITICAL_FLOW_STEPS:
             plan_hint += "\nКритический сценарий: " + ", ".join(CRITICAL_FLOW_STEPS[:5]) + "\n"
+        form_strategy = get_form_fill_strategy(memory.tester_phase, memory.form_strategy_iteration)
+        form_hint = ""
+        if form_strategy != "happy":
+            form_hint = f"\nСтратегия заполнения форм: {form_strategy} (негативные/граничные/security значения).\n"
         question = f"""Вот скриншот и контекст страницы.
 DOM (кнопки, ссылки, формы): {dom_summary[:3000]}
 {history_text}
-{plan_hint}
+{plan_hint}{form_hint}
 Выбери ОДНО действие. Укажи test_goal и expected_outcome. Не повторяй уже сделанное.
 Оцени верстку. Если реальный баг — action=check_defect."""
 
@@ -1075,6 +1228,24 @@ DOM (кнопки, ссылки, формы): {dom_summary[:3000]}
 
     # Скриншот для GigaChat: если не изменился — можно не отправлять (экономия токенов)
     send_screenshot = screenshot_b64 if screenshot_changed else None
+
+    # Scenario chains: в critical_path каждый 3-й шаг запрашиваем цепочку
+    if ENABLE_SCENARIO_CHAINS and memory.tester_phase == "critical_path" and step % 3 == 0 and not has_overlay:
+        chain = _request_scenario_chain(page, memory, context_str, send_screenshot)
+        if chain and len(chain) > 1:
+            # Выполнить все действия из цепочки кроме первого (первый вернём как основной)
+            print(f"[Agent] #{step} Scenario chain: {len(chain)} действий")
+            # Первое действие вернём, остальные сохраним в memory для последующих шагов
+            if not hasattr(memory, '_scenario_queue'):
+                memory._scenario_queue = []
+            memory._scenario_queue = chain[1:]
+            return chain[0], has_overlay, screenshot_b64
+
+    # Проверить, есть ли действия из scenario chain в очереди
+    if hasattr(memory, '_scenario_queue') and memory._scenario_queue:
+        action = memory._scenario_queue.pop(0)
+        print(f"[Agent] #{step} Scenario chain (из очереди): {action.get('action')} -> {action.get('selector', '')[:40]}")
+        return action, has_overlay, screenshot_b64
 
     raw_answer = consult_agent_with_screenshot(
         context_str, question, screenshot_b64=send_screenshot,
@@ -1144,6 +1315,11 @@ def _step_execute(page, action, step, memory, context):
     """STEP 3: Выполнение действия с retry."""
     act_type = (action.get("action") or "").lower()
     sel = (action.get("selector") or "").strip()
+    # Передаём стратегию заполнения формы
+    if act_type == "type":
+        strategy = get_form_fill_strategy(memory.tester_phase, memory.form_strategy_iteration)
+        action["_form_strategy"] = strategy
+        memory.form_strategy_iteration += 1
     update_demo_banner(page, step_text=f"#{step} {act_type.upper()}: {sel[:30]}…", progress_pct=80)
 
     result = ""
@@ -1204,6 +1380,14 @@ def _step_post_analysis(
     update_demo_banner(page, step_text=f"#{step} Анализ результата…", progress_pct=95)
     post_screenshot_b64 = take_screenshot_b64(page)
 
+    # Visual diff: сравнение скриншотов до и после действия
+    visual_diff_info = compute_screenshot_diff(memory.screenshot_before_action, post_screenshot_b64)
+    if visual_diff_info.get("changed"):
+        diff_pct = visual_diff_info.get("change_percent", 0)
+        diff_zone = visual_diff_info.get("diff_zone", "?")
+        if diff_pct > 0:
+            LOG.info("#{step} Visual diff: %s (%.1f%%)", diff_zone, diff_pct)
+
     new_errors = [c for c in console_log[-10:] if c.get("type") == "error"]
     new_network_fails = [n for n in network_failures[-5:] if n.get("status") and n.get("status") >= 500]
 
@@ -1226,7 +1410,10 @@ def _step_post_analysis(
     if ENABLE_ORACLE_AFTER_ACTION and act_type in ("type", "click") and post_screenshot_b64 and memory.defects_on_current_step == 0:
         update_llm_overlay(page, prompt=f"#{step} Оракул", loading=True)
         expected_text = f"Ожидалось: {expected_outcome[:200]}" if expected_outcome else "Ожидался успешный результат."
-        oracle_context = f"Действие: {act_type} -> {sel[:60]}. Результат: {result}. {expected_text}"
+        vdiff_text = ""
+        if visual_diff_info.get("changed"):
+            vdiff_text = f" Visual diff: {visual_diff_info.get('detail', '')}."
+        oracle_context = f"Действие: {act_type} -> {sel[:60]}. Результат: {result}. {expected_text}{vdiff_text}"
         oracle_ans = consult_agent_with_screenshot(
             oracle_context,
             "Произошло ли ожидаемое? Ответь: успех / ошибка / неясно.",
@@ -1291,3 +1478,227 @@ def _create_defect(
                 shutil.rmtree(d, ignore_errors=True)
         except Exception:
             pass
+
+
+# ===== Продвинутые проверки (a11y, perf, responsive, session, iframe, self-healing, scenario chains) =====
+
+def _run_a11y_check(page: Page, memory: AgentMemory, current_url: str, console_log, network_failures):
+    """Запустить accessibility проверки и завести дефекты на новые проблемы."""
+    issues = check_accessibility(page)
+    new_issues = [i for i in issues if i.get("rule") not in memory.reported_a11y_rules]
+    if new_issues:
+        text = format_a11y_issues(new_issues)
+        print(f"[Agent] A11y: {len(new_issues)} новых проблем")
+        for i in new_issues:
+            memory.reported_a11y_rules.add(i.get("rule"))
+        if any(i.get("severity") == "error" for i in new_issues):
+            _create_defect(page, f"Accessibility (a11y): {text}", current_url, [], console_log, network_failures, memory)
+
+
+def _run_perf_check(page: Page, memory: AgentMemory, current_url: str, console_log, network_failures):
+    """Запустить performance проверки и завести дефекты."""
+    issues = check_performance(page)
+    new_issues = [i for i in issues if i.get("rule") not in memory.reported_perf_rules]
+    if new_issues:
+        text = format_performance_issues(new_issues)
+        print(f"[Agent] Perf: {len(new_issues)} проблем")
+        for i in new_issues:
+            memory.reported_perf_rules.add(i.get("rule"))
+        if any(i.get("severity") == "warning" for i in new_issues):
+            _create_defect(page, f"Performance: {text}", current_url, [], console_log, network_failures, memory)
+
+
+def _run_responsive_check(page: Page, memory: AgentMemory, current_url: str, console_log, network_failures):
+    """Переключить viewport на мобильный/планшетный, сделать скриншот и проверить верстку через GigaChat."""
+    if not ENABLE_RESPONSIVE_TEST:
+        return
+    for vp in RESPONSIVE_VIEWPORTS:
+        name = vp["name"]
+        if name in memory.responsive_done:
+            continue
+        memory.responsive_done.add(name)
+        print(f"[Agent] Responsive: проверка viewport {name} ({vp['width']}x{vp['height']})")
+        try:
+            page.set_viewport_size({"width": vp["width"], "height": vp["height"]})
+            time.sleep(2)
+            screenshot_b64 = take_screenshot_b64(page)
+            if screenshot_b64:
+                answer = consult_agent_with_screenshot(
+                    f"Viewport: {name} ({vp['width']}x{vp['height']}). URL: {current_url}",
+                    "На скриншоте страница в мобильном/планшетном viewport. Есть ли проблемы верстки: наложения, обрезки, горизонтальная прокрутка, элементы вне экрана? Если есть — ответь JSON с action=check_defect и possible_bug. Если нет — ответь JSON с action=explore.",
+                    screenshot_b64=screenshot_b64,
+                )
+                if answer:
+                    action = parse_llm_action(answer)
+                    if action and action.get("action") == "check_defect" and action.get("possible_bug"):
+                        bug = f"[Responsive {name}] {action['possible_bug']}"
+                        _create_defect(page, bug, current_url, [], console_log, network_failures, memory)
+        except Exception as e:
+            LOG.debug("responsive check %s: %s", name, e)
+        finally:
+            # Вернуть оригинальный viewport
+            page.set_viewport_size({"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT})
+            time.sleep(1)
+
+
+def _run_session_persistence_check(page: Page, memory: AgentMemory, current_url: str, console_log, network_failures):
+    """Перезагрузить страницу и проверить: состояние сохранилось?"""
+    if not SESSION_PERSIST_CHECK_EVERY_N:
+        return
+    print("[Agent] Session persistence: перезагрузка страницы…")
+    try:
+        before_b64 = take_screenshot_b64(page)
+        page.reload(wait_until="domcontentloaded", timeout=15000)
+        smart_wait_after_goto(page, timeout=5000)
+        after_b64 = take_screenshot_b64(page)
+        diff = compute_screenshot_diff(before_b64, after_b64)
+        if diff.get("change_percent", 0) > 40:
+            answer = consult_agent_with_screenshot(
+                f"URL: {current_url}. После перезагрузки (F5) экран изменился на {diff.get('change_percent')}%. {diff.get('detail', '')}",
+                "Страница сильно изменилась после перезагрузки. Это ожидаемо или потеря состояния (сброс формы, разлогин, потеря данных)? Если баг — JSON с check_defect.",
+                screenshot_b64=after_b64,
+            )
+            if answer:
+                action = parse_llm_action(answer)
+                if action and action.get("action") == "check_defect" and action.get("possible_bug"):
+                    _create_defect(page, f"[Session] {action['possible_bug']}", current_url, [], console_log, network_failures, memory)
+        _inject_all(page)
+    except Exception as e:
+        LOG.debug("session persistence: %s", e)
+
+
+def _run_iframe_check(page: Page, memory: AgentMemory, current_url: str, console_log, network_failures):
+    """Проверить содержимое iframe на странице."""
+    if not ENABLE_IFRAME_TESTING:
+        return
+    try:
+        iframes = page.evaluate("""() => {
+            return Array.from(document.querySelectorAll('iframe'))
+                .filter(f => f.src && !f.src.startsWith('about:') && f.width > 50 && f.height > 50)
+                .map(f => ({ src: f.src.slice(0, 200), name: f.name || '', id: f.id || '' }))
+                .slice(0, 3);
+        }""")
+        for iframe_info in (iframes or []):
+            src = iframe_info.get("src", "")
+            name = iframe_info.get("name", "") or iframe_info.get("id", "")
+            print(f"[Agent] iframe: проверяю {name or src[:40]}")
+            try:
+                frame = page.frame(url=src) if src else (page.frame(name=name) if name else None)
+                if not frame:
+                    continue
+                # Проверяем что внутри iframe загружено
+                body_text = frame.evaluate("() => (document.body && document.body.innerText || '').trim().slice(0, 200)")
+                if not body_text or len(body_text) < 10:
+                    _create_defect(
+                        page,
+                        f"iframe пустой или не загрузился: src={src[:80]}, name={name[:30]}",
+                        current_url, [], console_log, network_failures, memory,
+                    )
+            except Exception as e:
+                LOG.debug("iframe check %s: %s", src[:40], e)
+    except Exception as e:
+        LOG.debug("iframe scan: %s", e)
+
+
+def _self_heal(page: Page, memory: AgentMemory, console_log, network_failures):
+    """
+    Self-healing: после серии неудач — мета-рефлексия.
+    Спрашиваем GigaChat «что пошло не так и что делать?».
+    """
+    print(f"[Agent] Self-healing: {memory.consecutive_failures} неудач подряд")
+    screenshot_b64 = take_screenshot_b64(page)
+    recent_actions = "\n".join(
+        f"  #{a['step']} {a['action']} -> {a['selector'][:40]} => {a['result'][:40]}"
+        for a in memory.actions[-6:]
+    )
+    answer = consult_agent_with_screenshot(
+        f"Последние действия (все неудачные):\n{recent_actions}\n\nЧто идёт не так? Какую стратегию выбрать?",
+        "Агент зациклился: несколько действий подряд не удались. Предложи одно действие, которое точно сработает (прокрутка, клик по видимому элементу, Escape). JSON.",
+        screenshot_b64=screenshot_b64,
+    )
+    memory.consecutive_failures = 0
+    if answer:
+        action = parse_llm_action(answer)
+        if action:
+            action = validate_llm_action(action)
+            execute_action(page, action, memory)
+            memory.add_action(action, result="self_heal")
+    # Принудительная смена фазы
+    memory.advance_tester_phase(force=True)
+
+
+def _request_scenario_chain(page: Page, memory: AgentMemory, context_str: str, screenshot_b64: Optional[str]) -> List[Dict]:
+    """
+    Попросить GigaChat сгенерировать цепочку из N связанных действий (сценарий).
+    Возвращает список action-dicts.
+    """
+    if not ENABLE_SCENARIO_CHAINS:
+        return []
+    n = SCENARIO_CHAIN_LENGTH
+    answer = consult_agent_with_screenshot(
+        context_str,
+        f"Сгенерируй цепочку из {n} связанных действий (сценарий). Каждое действие — отдельный JSON-объект. "
+        f"Ответь МАССИВОМ JSON: [{n} объектов с action/selector/value/reason/test_goal/expected_outcome]. "
+        f"Пример: [{{'action':'click','selector':'Войти','value':'','reason':'открыть форму','test_goal':'проверка входа','expected_outcome':'форма логина'}}, ...]",
+        screenshot_b64=screenshot_b64,
+    )
+    if not answer:
+        return []
+    # Попробуем распарсить массив
+    try:
+        cleaned = re.sub(r'^```(?:json)?\s*', '', answer.strip(), flags=re.MULTILINE)
+        cleaned = re.sub(r'```\s*$', '', cleaned.strip(), flags=re.MULTILINE)
+        arr = json.loads(cleaned)
+        if isinstance(arr, list):
+            return [validate_llm_action(a) for a in arr if isinstance(a, dict) and a.get("action")][:n]
+    except Exception:
+        pass
+    # Fallback: одно действие
+    single = parse_llm_action(answer)
+    return [validate_llm_action(single)] if single else []
+
+
+def _check_network_after_action(page: Page, memory: AgentMemory, action: Dict, network_failures: list) -> Optional[str]:
+    """
+    После click по кнопке формы — проверить, что ушёл сетевой запрос.
+    Возвращает описание проблемы или None.
+    """
+    act = (action.get("action") or "").lower()
+    sel = (action.get("selector") or "").lower()
+    # Проверяем только после клика по «отправить/сохранить/submit»
+    submit_keywords = ["submit", "отправ", "сохран", "save", "send", "войти", "login", "sign", "register", "зарегистр"]
+    if act != "click" or not any(kw in sel for kw in submit_keywords):
+        return None
+    new_after = network_failures[memory.network_len_before_action:]
+    # Ищем POST/PUT
+    post_put = [n for n in new_after if n.get("method", "").upper() in ("POST", "PUT", "PATCH")]
+    if not new_after and not post_put:
+        # Вообще нет новых запросов — возможно кнопка не работает
+        return f"После нажатия '{sel[:40]}' не обнаружено сетевых запросов. Кнопка может не работать."
+    # Есть 4xx/5xx
+    errors = [n for n in new_after if n.get("status") and n.get("status") >= 400]
+    if errors:
+        detail = "; ".join(f"{n.get('status')} {n.get('url', '')[:50]}" for n in errors[:3])
+        return f"После нажатия '{sel[:40]}' получены ошибки: {detail}"
+    return None
+
+
+def _track_test_plan(memory: AgentMemory, action: Dict):
+    """Отследить, какой пункт тест-плана закрыт текущим действием."""
+    if not memory.test_plan or not memory.test_plan_completed:
+        return
+    reason = (action.get("reason") or "").lower()
+    test_goal = (action.get("test_goal") or "").lower()
+    sel = (action.get("selector") or "").lower()
+    combined = f"{reason} {test_goal} {sel}"
+    for i, step in enumerate(memory.test_plan):
+        if memory.test_plan_completed[i]:
+            continue
+        step_lower = step.lower()
+        # Простая эвристика: если 2+ слова из пункта плана встречаются в действии
+        words = [w for w in step_lower.split() if len(w) > 3]
+        matches = sum(1 for w in words if w in combined)
+        if matches >= 2 or (len(words) <= 2 and matches >= 1):
+            memory.mark_test_plan_step(i)
+            print(f"[Agent] Тест-план: закрыт пункт {i+1}: {step[:50]}")
+            break

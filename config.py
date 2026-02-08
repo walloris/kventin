@@ -146,6 +146,27 @@ NETWORK_LOG_LIMIT = int(os.getenv("NETWORK_LOG_LIMIT", "80"))     # обрезк
 POST_ACTION_DELAY = float(os.getenv("POST_ACTION_DELAY", "1.5"))  # пауза после действия (сек)
 PHASE_STEPS_TO_ADVANCE = int(os.getenv("PHASE_STEPS_TO_ADVANCE", "5"))  # шагов в фазе до перехода
 
+# --- Продвинутые проверки ---
+# Accessibility (a11y) проверки каждые N шагов (0 = отключены)
+A11Y_CHECK_EVERY_N = int(os.getenv("A11Y_CHECK_EVERY_N", "10"))
+# Performance-мониторинг каждые N шагов (0 = отключён)
+PERF_CHECK_EVERY_N = int(os.getenv("PERF_CHECK_EVERY_N", "15"))
+# Responsive тестирование: после основного прохода переключить на мобильный viewport
+ENABLE_RESPONSIVE_TEST = os.getenv("ENABLE_RESPONSIVE_TEST", "true").lower() in ("1", "true", "yes")
+RESPONSIVE_VIEWPORTS = [
+    {"name": "mobile", "width": 375, "height": 812},
+    {"name": "tablet", "width": 768, "height": 1024},
+]
+# Session persistence: проверять сохранение состояния после reload каждые N шагов (0 = отключено)
+SESSION_PERSIST_CHECK_EVERY_N = int(os.getenv("SESSION_PERSIST_CHECK_EVERY_N", "20"))
+# Self-healing: после N неудачных действий подряд — мета-рефлексия
+SELF_HEAL_AFTER_FAILURES = int(os.getenv("SELF_HEAL_AFTER_FAILURES", "4"))
+# Сценарные цепочки: запрашивать у GigaChat цепочку из N действий
+ENABLE_SCENARIO_CHAINS = os.getenv("ENABLE_SCENARIO_CHAINS", "true").lower() in ("1", "true", "yes")
+SCENARIO_CHAIN_LENGTH = int(os.getenv("SCENARIO_CHAIN_LENGTH", "4"))
+# iframe: тестировать содержимое iframe
+ENABLE_IFRAME_TESTING = os.getenv("ENABLE_IFRAME_TESTING", "true").lower() in ("1", "true", "yes")
+
 # Критические сценарии: список шагов, которые агент должен выполнить в первую очередь
 # Формат: через запятую текстовые подсказки, например "Открыть меню, Клик Контакты, Заполнить форму"
 CRITICAL_FLOW_STEPS = [s.strip() for s in os.getenv("CRITICAL_FLOW_STEPS", "").split(",") if s.strip()]
