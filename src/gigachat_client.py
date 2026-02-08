@@ -4,6 +4,7 @@
 OAuth (authorization_key или client_id+client_secret), password grant (username, password, client_id).
 """
 import base64
+import logging
 import os
 import time
 import uuid
@@ -16,6 +17,20 @@ try:
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 except Exception:
     pass
+
+LOG = logging.getLogger("GigaChat")
+LOG.setLevel(logging.DEBUG)
+if not LOG.handlers:
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter("[GigaChat] %(levelname)s %(message)s"))
+    LOG.addHandler(h)
+
+
+def _mask(s: str, show_tail: int = 8) -> str:
+    """Скрыть середину строки для логов (первые 4 + ... + последние show_tail)."""
+    if not s or len(s) <= 12:
+        return "***" if s else "(пусто)"
+    return s[:4] + "…" + s[-show_tail:] if len(s) > 12 else "***"
 
 # Публичный API (если не заданы свои URL)
 DEFAULT_TOKEN_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
@@ -101,6 +116,22 @@ class GigaChatClient:
         self.token_expires_at: float = 0
         self.scope = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
 
+        # Лог конфига для дебага кредов (без вывода секретов целиком)
+        auth_type = "token_header" if self.token_header else ("oauth" if self._basic_key() else ("password_grant" if (self.username and self.password and self.client_id) else "none"))
+        LOG.debug(
+            "config: api_url=%s token_url=%s model=%s env=%s auth=%s verify_ssl=%s",
+            self.api_url[:60] + "..." if len(self.api_url) > 60 else self.api_url,
+            self.token_url[:60] + "..." if len(self.token_url) > 60 else self.token_url,
+            self.model,
+            self.env,
+            auth_type,
+            self.verify_ssl,
+        )
+        if self.token_header:
+            LOG.debug("token_header: %s", _mask(self.token_header.strip()[:80], show_tail=6))
+        if self._basic_key() and not self.token_header:
+            LOG.debug("basic_key (oauth): %s", _mask(self._basic_key(), show_tail=4))
+
     def _normalize_model(self, model: str) -> str:
         if not model:
             return self.model or "GigaChat-2-Max:latest"
@@ -120,14 +151,17 @@ class GigaChatClient:
     def _get_token_oauth(self) -> Optional[str]:
         basic_key = self._basic_key()
         if not basic_key:
+            LOG.debug("oauth: пропуск — нет basic_key (authorization_key / client_id+secret / credentials)")
             return None
+        rq_uid = str(uuid.uuid4())
         headers = {
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json",
-            "RqUID": str(uuid.uuid4()),
+            "RqUID": rq_uid,
             "Authorization": f"Basic {basic_key}",
         }
         data = f"scope={self.scope}"
+        LOG.info("oauth: POST %s scope=%s RqUID=%s Authorization=Basic %s", self.token_url, self.scope, rq_uid, _mask(basic_key, show_tail=4))
         try:
             r = requests.post(
                 self.token_url,
@@ -137,26 +171,32 @@ class GigaChatClient:
                 timeout=30,
             )
         except Exception as e:
-            print(f"[GigaChat] Ошибка подключения OAuth: {e}")
+            LOG.exception("oauth: ошибка подключения к token_url: %s", e)
             return None
+        LOG.info("oauth: ответ %s body_len=%s", r.status_code, len(r.text))
         if r.status_code != 200:
-            print(f"[GigaChat] Ошибка токена OAuth {r.status_code}: {r.text[:500]}")
+            LOG.error("oauth: ответ %s %s", r.status_code, r.text[:800])
             return None
         try:
             payload = r.json()
-        except Exception:
+        except Exception as ex:
+            LOG.error("oauth: ответ не JSON: %s", ex)
             return None
         token = payload.get("access_token")
         expires_in = int(payload.get("expires_in", 1800) or 1800)
         if token:
             self.access_token = token
             self.token_expires_at = time.time() + expires_in
+            LOG.info("oauth: токен получен, expires_in=%s, token=%s", expires_in, _mask(token, show_tail=6))
             return token
+        LOG.warning("oauth: в ответе нет access_token: %s", str(payload)[:400])
         return None
 
     def _get_token_password_grant(self) -> Optional[str]:
         if not (self.username and self.password and self.client_id):
+            LOG.debug("password_grant: пропуск — нет username/password/client_id")
             return None
+        LOG.info("password_grant: POST %s username=%s client_id=%s", self.token_url, self.username, self.client_id)
         try:
             payload = {
                 "grant_type": "password",
@@ -172,36 +212,43 @@ class GigaChatClient:
                 verify=self.verify_ssl,
                 timeout=30,
             )
+            LOG.info("password_grant: ответ %s body_len=%s", r.status_code, len(r.text))
             if r.status_code != 200:
-                print(f"[GigaChat] Ошибка password-grant {r.status_code}: {r.text[:500]}")
+                LOG.error("password_grant: ответ %s %s", r.status_code, r.text[:500])
                 return None
             data = r.json()
             self.access_token = data.get("access_token")
             expires_in = int(data.get("expires_in", 1800) or 1800)
             self.token_expires_at = time.time() + expires_in
+            LOG.info("password_grant: токен получен, expires_in=%s token=%s", expires_in, _mask(self.access_token or "", show_tail=6))
             return self.access_token
         except Exception as e:
-            print(f"[GigaChat] Ошибка password-grant: {e}")
+            LOG.exception("password_grant: ошибка: %s", e)
             return None
 
     def _get_token(self) -> Optional[str]:
         if self.token_header:
             s = self.token_header.strip()
-            if s.lower().startswith("bearer "):
-                return s[7:].strip()
-            return s
+            tok = s[7:].strip() if s.lower().startswith("bearer ") else s
+            LOG.debug("get_token: используем token_header, token=%s", _mask(tok, show_tail=6))
+            return tok
         if self.access_token and time.time() < self.token_expires_at - 60:
+            LOG.debug("get_token: кэшированный токен до %s", time.strftime("%H:%M:%S", time.localtime(self.token_expires_at)))
             return self.access_token
+        LOG.debug("get_token: запрос oauth...")
         token = self._get_token_oauth()
         if token:
             return token
+        LOG.debug("get_token: запрос password_grant...")
         token = self._get_token_password_grant()
+        if not token:
+            LOG.error("get_token: не удалось получить токен (token_header/oauth/password_grant)")
         return token
 
     def chat(self, messages: List[Dict[str, str]]) -> str:
         token = self._get_token()
         if not token:
-            print("[GigaChat] Не удалось получить токен (нет token_header, authorization_key или password).")
+            LOG.error("chat: нет токена, запрос отменён")
             return ""
 
         model = self._normalize_model(self.model)
@@ -219,6 +266,10 @@ class GigaChatClient:
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
         }
+        user_content = (messages[-1].get("content") or "") if messages else ""
+        LOG.info("chat: POST %s model=%s messages=%s user_len=%s Authorization=Bearer %s",
+                 self.api_url, model, len(messages), len(user_content), _mask(token, show_tail=6))
+        LOG.debug("chat: user prompt (tail 400): %s", user_content[-400:] if len(user_content) > 400 else user_content)
         try:
             r = requests.post(
                 self.api_url,
@@ -227,17 +278,22 @@ class GigaChatClient:
                 verify=self.verify_ssl,
                 timeout=60,
             )
+            LOG.info("chat: ответ %s body_len=%s", r.status_code, len(r.text))
             if r.status_code != 200:
-                print(f"[GigaChat] Ошибка API {r.status_code}: {r.text[:800]}")
+                LOG.error("chat: ответ %s %s", r.status_code, r.text[:1200])
                 return ""
             data = r.json()
             choices = data.get("choices") or []
             if not choices:
+                LOG.warning("chat: в ответе нет choices: %s", str(data)[:500])
                 return ""
             msg = choices[0].get("message") or {}
-            return (msg.get("content") or "").strip()
+            content = (msg.get("content") or "").strip()
+            LOG.info("chat: content_len=%s", len(content))
+            LOG.debug("chat: content (head 500): %s", content[:500] if content else "(пусто)")
+            return content
         except Exception as e:
-            print(f"[GigaChat] Ошибка запроса: {e}")
+            LOG.exception("chat: ошибка запроса: %s", e)
             return ""
 
     def query(self, prompt: str, system: Optional[str] = None) -> str:

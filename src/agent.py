@@ -17,7 +17,7 @@ from config import (
 from src.gigachat_client import consult_agent
 from src.jira_client import create_jira_issue
 from src.page_analyzer import build_context, get_dom_summary
-from src.visible_actions import inject_cursor, move_cursor_to, highlight_and_click, safe_highlight
+from src.visible_actions import inject_cursor, move_cursor_to, highlight_and_click, safe_highlight, inject_llm_overlay, update_llm_overlay
 
 
 def _same_page(start_url: str, current_url: str) -> bool:
@@ -86,6 +86,7 @@ def run_agent(start_url: str = None):
             page.goto(start_url, wait_until="domcontentloaded", timeout=30000)
             time.sleep(1)
             inject_cursor(page)
+            inject_llm_overlay(page)
         except Exception as e:
             print(f"[Agent] Ошибка загрузки {start_url}: {e}")
             browser.close()
@@ -103,6 +104,7 @@ def run_agent(start_url: str = None):
                     page.goto(start_url, wait_until="domcontentloaded", timeout=20000)
                     time.sleep(0.5)
                     inject_cursor(page)
+                    inject_llm_overlay(page)
                 except Exception as e:
                     print(f"[Agent] Ошибка возврата: {e}")
                 continue
@@ -123,7 +125,10 @@ def run_agent(start_url: str = None):
                 "(не 404, не флак). Если дефект — напиши кратко: summary и description для тикета. "
                 "Если ничего делать не нужно — напиши: СТОП."
             )
+            short_prompt = f"URL: {current_url[:60]}... | Вопрос: {question[:120]}..."
+            update_llm_overlay(page, prompt=short_prompt, loading=True)
             answer = consult_agent(context_str, question)
+            update_llm_overlay(page, prompt=short_prompt, response=answer or "", loading=False, error="Нет ответа" if not answer else None)
 
             if not answer:
                 print("[Agent] GigaChat недоступен — пауза 10 сек и повтор.")
