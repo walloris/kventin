@@ -783,7 +783,7 @@ def run_agent(start_url: str = None):
         # Параметры в localStorage на каждой загружаемой странице
         context.add_init_script("""
             localStorage.setItem('onboarding_is_passed', 'true');
-            localStorage.setItem('hrp-core-app/app-mode', 'neuro');
+            localStorage.setItem('hrp-core-app/app-mode', '"neuro"');
         """)
 
         # --- Обработка новых вкладок (target="_blank" и т.п.) ---

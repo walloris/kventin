@@ -494,21 +494,11 @@ _client: Optional[Any] = None
 
 
 def _get_client():
-    """Вернуть клиент LLM: GigaChat или Jan (по конфигу LLM_PROVIDER)."""
+    """Вернуть клиент LLM: всегда GigaChat."""
     global _client
     if _client is None:
-        try:
-            from config import LLM_PROVIDER
-            if (LLM_PROVIDER or "").strip().lower() == "jan":
-                from src.jan_client import JanClient
-                _client = JanClient()
-                LOG.info("Using LLM: Jan (local)")
-            else:
-                _client = GigaChatClient()
-                LOG.info("Using LLM: GigaChat")
-        except ImportError:
-            _client = GigaChatClient()
-            LOG.info("Using LLM: GigaChat (default)")
+        _client = GigaChatClient()
+        LOG.info("Using LLM: GigaChat")
     return _client
 
 
