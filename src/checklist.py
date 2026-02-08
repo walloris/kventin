@@ -127,17 +127,18 @@ def run_checklist(
     network_failures: List[Dict[str, Any]],
     *,
     step_delay_ms: Optional[int] = None,
-    on_step: Optional[Callable[[str, bool, str], None]] = None,
+    on_step: Optional[Callable[..., None]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Выполнить чеклист по порядку, с паузой между шагами.
     Возвращает список результатов: [{ "id", "title", "ok", "detail" }, ...].
-    on_step(id, ok, detail) вызывается после каждого шага (для лога/оверлея).
+    on_step(step_id, ok, detail, step_index, total) вызывается после каждого шага.
     """
     step_delay_ms = step_delay_ms or CHECKLIST_STEP_DELAY_MS
     checklist = build_checklist()
+    total = len(checklist)
     results = []
-    for item in checklist:
+    for i, item in enumerate(checklist):
         try:
             ok, detail = item["check"](page, console_log, network_failures)
         except Exception as e:
@@ -149,7 +150,7 @@ def run_checklist(
             "detail": detail,
         })
         if on_step:
-            on_step(item["id"], ok, detail)
+            on_step(item["id"], ok, detail, i + 1, total)
         time.sleep(step_delay_ms / 1000.0)
     return results
 

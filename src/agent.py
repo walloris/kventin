@@ -20,7 +20,16 @@ from config import (
 from src.gigachat_client import consult_agent
 from src.jira_client import create_jira_issue
 from src.page_analyzer import build_context, get_dom_summary
-from src.visible_actions import inject_cursor, move_cursor_to, highlight_and_click, safe_highlight, inject_llm_overlay, update_llm_overlay
+from src.visible_actions import (
+    inject_cursor,
+    move_cursor_to,
+    highlight_and_click,
+    safe_highlight,
+    inject_llm_overlay,
+    update_llm_overlay,
+    inject_demo_banner,
+    update_demo_banner,
+)
 from src.wait_utils import smart_wait_after_goto
 from src.checklist import run_checklist, checklist_results_to_context
 
@@ -92,6 +101,7 @@ def run_agent(start_url: str = None):
             smart_wait_after_goto(page, timeout=15000)
             inject_cursor(page)
             inject_llm_overlay(page)
+            inject_demo_banner(page)
         except Exception as e:
             print(f"[Agent] Ошибка загрузки {start_url}: {e}")
             browser.close()
@@ -110,6 +120,7 @@ def run_agent(start_url: str = None):
                     smart_wait_after_goto(page, timeout=10000)
                     inject_cursor(page)
                     inject_llm_overlay(page)
+                    inject_demo_banner(page)
                 except Exception as e:
                     print(f"[Agent] Ошибка возврата: {e}")
                 continue
@@ -124,9 +135,11 @@ def run_agent(start_url: str = None):
                 del network_failures[:-50]
 
             # Чеклист: идём строго по пунктам, с паузой между шагами
-            def on_step(step_id: str, ok: bool, detail: str):
+            def on_step(step_id: str, ok: bool, detail: str, step_index: int, total: int):
                 status = "✅" if ok else "❌"
                 print(f"[Agent] Чеклист {status} {step_id}: {detail[:80]}")
+                pct = round(100 * step_index / total) if total else 0
+                update_demo_banner(page, step_text=f"Чеклист {step_index}/{total}: {step_id} — {detail[:35]}…", progress_pct=pct)
                 update_llm_overlay(page, prompt=f"Чеклист: {step_id}", response=detail[:200], loading=False)
 
             checklist_results = run_checklist(
@@ -147,6 +160,7 @@ def run_agent(start_url: str = None):
                 "Если ничего делать не нужно — напиши: СТОП."
             )
             short_prompt = f"URL: {current_url[:60]}... | Вопрос: {question[:120]}..."
+            update_demo_banner(page, step_text="Консультация с GigaChat…", progress_pct=100)
             update_llm_overlay(page, prompt=short_prompt, loading=True)
             answer = consult_agent(context_str, question)
             update_llm_overlay(page, prompt=short_prompt, response=answer or "", loading=False, error="Нет ответа" if not answer else None)
