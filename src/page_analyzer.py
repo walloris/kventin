@@ -8,6 +8,7 @@ from playwright.sync_api import Page
 from config import (
     IGNORE_CONSOLE_PATTERNS,
     IGNORE_NETWORK_STATUSES,
+    IGNORE_NETWORK_URL_PATTERNS,
     COOKIE_BANNER_BUTTON_TEXTS,
     OVERLAY_IGNORE_PATTERNS,
 )
@@ -25,7 +26,7 @@ def _should_ignore_network(url: str, status: Optional[int]) -> bool:
     if status in IGNORE_NETWORK_STATUSES:
         return True
     url_lower = url.lower()
-    for pattern in IGNORE_CONSOLE_PATTERNS:
+    for pattern in IGNORE_NETWORK_URL_PATTERNS:
         if pattern in url_lower:
             return True
     return False

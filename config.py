@@ -78,6 +78,21 @@ IGNORE_CONSOLE_PATTERNS = [
 ]
 IGNORE_NETWORK_STATUSES = {404}  # можно расширить: 502, 503 для тестовой среды
 
+# Отдельные паттерны игнора сетевых запросов (URL). Не путать с IGNORE_CONSOLE_PATTERNS.
+IGNORE_NETWORK_URL_PATTERNS = [
+    "favicon",
+    "analytics",
+    "gtm",
+    "google-analytics",
+    "hotjar",
+    "sentry",
+    "ads.",
+    "adservice",
+    "chrome-extension",
+    "localhost",
+    "127.0.0.1",
+]
+
 # Исключения для дефектов: если в summary/description есть эти фразы — тикет не создаём (404 в консоли и т.д.)
 DEFECT_IGNORE_PATTERNS = [
     "404",
@@ -114,6 +129,22 @@ ENABLE_SECOND_PASS_BUG = os.getenv("ENABLE_SECOND_PASS_BUG", "true").lower() in 
 ACTION_RETRY_COUNT = int(os.getenv("ACTION_RETRY_COUNT", "2"))
 # Печатать отчёт сессии каждые N шагов (0 = только в конце при создании дефекта)
 SESSION_REPORT_EVERY_N = int(os.getenv("SESSION_REPORT_EVERY_N", "0"))
+
+# Максимальное число шагов агента (0 = бесконечный цикл). При достижении — печатает отчёт и останавливается.
+MAX_STEPS = int(os.getenv("MAX_STEPS", "0"))
+
+# Retry при сбое GigaChat (пустой ответ / не JSON): экспоненциальный backoff
+LLM_RETRY_COUNT = int(os.getenv("LLM_RETRY_COUNT", "3"))
+LLM_RETRY_BASE_DELAY = float(os.getenv("LLM_RETRY_BASE_DELAY", "2.0"))  # секунды
+
+# --- Константы агента (бывшие магические числа) ---
+SCROLL_PIXELS = int(os.getenv("SCROLL_PIXELS", "600"))           # пикселей за одну прокрутку
+MAX_ACTIONS_IN_MEMORY = int(os.getenv("MAX_ACTIONS_IN_MEMORY", "80"))  # размер истории
+MAX_SCROLLS_IN_ROW = int(os.getenv("MAX_SCROLLS_IN_ROW", "5"))   # лимит прокруток подряд
+CONSOLE_LOG_LIMIT = int(os.getenv("CONSOLE_LOG_LIMIT", "150"))    # обрезка логов консоли
+NETWORK_LOG_LIMIT = int(os.getenv("NETWORK_LOG_LIMIT", "80"))     # обрезка сетевых ошибок
+POST_ACTION_DELAY = float(os.getenv("POST_ACTION_DELAY", "1.5"))  # пауза после действия (сек)
+PHASE_STEPS_TO_ADVANCE = int(os.getenv("PHASE_STEPS_TO_ADVANCE", "5"))  # шагов в фазе до перехода
 
 # Критические сценарии: список шагов, которые агент должен выполнить в первую очередь
 # Формат: через запятую текстовые подсказки, например "Открыть меню, Клик Контакты, Заполнить форму"

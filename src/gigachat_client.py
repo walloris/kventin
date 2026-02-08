@@ -540,64 +540,135 @@ def consult_agent(context: str, question: str) -> Optional[str]:
     return ask_gigachat(full_prompt)
 
 
+def _llm_call_with_retry(prompt: str, screenshot_b64: Optional[str] = None, system: Optional[str] = None) -> Optional[str]:
+    """Вызов GigaChat с retry и экспоненциальным backoff при пустом ответе."""
+    try:
+        from config import LLM_RETRY_COUNT, LLM_RETRY_BASE_DELAY
+    except ImportError:
+        LLM_RETRY_COUNT, LLM_RETRY_BASE_DELAY = 3, 2.0
+
+    last_result = None
+    for attempt in range(max(1, LLM_RETRY_COUNT)):
+        result = _get_client().chat_with_screenshot(prompt, screenshot_b64=screenshot_b64, system=system)
+        if result and result.strip():
+            return result
+        last_result = result
+        if attempt < LLM_RETRY_COUNT - 1:
+            delay = LLM_RETRY_BASE_DELAY * (2 ** attempt)
+            LOG.warning("LLM retry %d/%d — пустой ответ, пауза %.1fс", attempt + 1, LLM_RETRY_COUNT, delay)
+            time.sleep(delay)
+    return last_result
+
+
+# Белый список допустимых действий (для валидации ответа GigaChat)
+VALID_ACTIONS = {"click", "type", "scroll", "hover", "close_modal", "select_option", "press_key", "check_defect", "explore"}
+
+
+def validate_llm_action(action: dict) -> dict:
+    """
+    Валидация и нормализация JSON-ответа GigaChat.
+    - Приводит action к нижнему регистру
+    - Исправляет русские синонимы (кликнуть → click и т.д.)
+    - Проверяет, что selector не пуст для действий, где он обязателен
+    """
+    act = (action.get("action") or "").strip().lower()
+    # Русские синонимы
+    rus_map = {
+        "кликнуть": "click", "клик": "click", "нажать": "click",
+        "ввести": "type", "ввод": "type", "набрать": "type",
+        "прокрутить": "scroll", "прокрутка": "scroll",
+        "навести": "hover", "наведение": "hover",
+        "закрыть": "close_modal", "закрыть модалку": "close_modal",
+        "выбрать": "select_option", "выбрать опцию": "select_option",
+        "клавиша": "press_key",
+        "дефект": "check_defect", "баг": "check_defect",
+        "исследовать": "explore", "обзор": "explore",
+    }
+    act = rus_map.get(act, act)
+    if act not in VALID_ACTIONS:
+        LOG.warning("validate_llm_action: неизвестное действие '%s', fallback на explore", act)
+        act = "explore"
+    action["action"] = act
+
+    sel = (action.get("selector") or "").strip()
+    val = (action.get("value") or "").strip()
+    # selector обязателен для click, type, hover
+    if act in ("click", "hover") and not sel:
+        LOG.warning("validate_llm_action: пустой selector для %s", act)
+    if act == "type" and (not sel or not val):
+        LOG.warning("validate_llm_action: пустой selector или value для type")
+
+    return action
+
+
+def _build_system_prompt(
+    phase_instruction: Optional[str] = None,
+    tester_phase: Optional[str] = None,
+    has_overlay: bool = False,
+) -> str:
+    """
+    Динамический системный промпт: базовая роль + блоки по ситуации.
+    Вместо одного огромного промпта — компактное ядро и контекстные блоки.
+    """
+    base = """Ты — опытный ручной тестировщик веб-приложений. Ты выполняешь ОДНО действие за шаг, проверяешь результат, затем решаешь следующий шаг.
+
+Принципы:
+1) Один шаг — одна цель: test_goal (что проверяю) и expected_outcome (что должно произойти).
+2) Стабильные селекторы: текст кнопки, aria-label, id, data-testid, role. Не хрупкие CSS.
+3) Не повторяй одно и то же. Если уже проверял элемент — переходи к другому.
+4) Дефекты: только воспроизводимые баги приложения. Не 404, не флак, не сбой среды.
+5) Служебный оверлей (Kventin, GigaChat, AI-тестировщик) — НЕ часть приложения. Игнорируй его.
+6) Верстка: оценивай расположение (наложения, обрезки, сломанная сетка, кнопки вне экрана).
+
+СТРОГО JSON (без markdown):
+{
+  "action": "click|type|scroll|hover|close_modal|select_option|press_key|check_defect|explore",
+  "selector": "CSS-селектор, текст, aria-label, data-testid или id элемента",
+  "value": "текст (type) / опция (select_option) / клавиша (press_key)",
+  "reason": "зачем",
+  "test_goal": "что проверяю",
+  "expected_outcome": "что должно произойти",
+  "observation": "что вижу (кратко)",
+  "possible_bug": "описание бага или null",
+  "layout_issue": "проблема верстки или null"
+}
+
+Приоритет элементов: CTA (главные кнопки) → формы → навигация → меню → футер → мелочи.
+В формах — реалистичные тестовые данные (test@test.com, Иван Тестов, +79991234567).
+НЕ предлагай СТОП."""
+
+    blocks = []
+
+    # Блок по фазе
+    if phase_instruction:
+        blocks.append(f"\n{phase_instruction}")
+    if tester_phase:
+        blocks.append(f"(текущая фаза: {tester_phase})")
+
+    # Блок по оверлею
+    if has_overlay:
+        blocks.append("""
+Модалки/оверлеи: сначала протестируй содержимое (кнопки, поля), потом закрой (close_modal).
+Дропдауны: открыть → выбрать опцию → проверить. Тултипы: hover → проверить текст.""")
+
+    return base + "\n".join(blocks)
+
+
 def consult_agent_with_screenshot(
     context: str,
     question: str,
     screenshot_b64: Optional[str] = None,
     phase_instruction: Optional[str] = None,
     tester_phase: Optional[str] = None,
+    has_overlay: bool = False,
 ) -> Optional[str]:
     """
-    Задать GigaChat вопрос со скриншотом. Режим «реальный тестировщик»:
-    фазы (orient → smoke → critical_path → exploratory), цель шага и ожидаемый результат.
+    Задать GigaChat вопрос со скриншотом. Режим «реальный тестировщик».
+    Retry при пустом ответе.
     """
-    phase_block = ""
-    if phase_instruction:
-        phase_block = f"\n\nТекущая фаза тестирования:\n{phase_instruction}\n"
-    if tester_phase:
-        phase_block += f"(фаза в сессии: {tester_phase})\n"
-
-    system = """Ты — опытный ручной тестировщик веб-приложений. Ты работаешь как человек: у тебя есть цель проверки, ты выполняешь ОДНО действие, затем проверяешь результат — и только потом решаешь следующий шаг.
-
-Принципы работы:
-1) Один шаг — одна цель: формулируй, ЧТО именно проверяешь (test_goal) и ЧТО должно произойти (expected_outcome).
-2) Не «кликать всё подряд»: каждое действие осмысленно (smoke → основной сценарий → исследование).
-3) Учитывай ограничения авто-агента: после клика DOM может обновиться, элементы подгружаются с задержкой — предлагай стабильные селекторы (текст кнопки, роль, id). Не полагайся на один хрупкий селектор.
-4) Зацикливание: не повторяй одно и то же (прокрутка вниз-вверх без новой информации, один и тот же клик). Если уже проверял элемент — переходи к другому.
-5) Дефекты: только воспроизводимые баги приложения. Не 404 в консоли, не сбой сети, не флак. Отделяй баг приложения от проблемы окружения.
-6) На скриншоте может быть служебный оверлей агента (блок «Диалог с LLM», «GigaChat», «Kventin», «AI-тестировщик») — это НЕ часть тестируемого приложения. Не выбирай элементы внутри него, не кликай по нему, не используй в selector.
-7) Верстка и UI: оценивай расположение элементов — логично ли размещены блоки, соответствуют ли структуре DOM, нет ли наложений, обрезаний, сломанной сетки, кнопок вне видимой области. Если видишь проблему верстки — укажи в observation или possible_bug (layout_issue).
-
-ВСЕГДА отвечай СТРОГО в формате JSON (без markdown, без ```, без пояснений):
-{
-  "action": "click|type|scroll|hover|close_modal|select_option|press_key|check_defect|explore",
-  "selector": "CSS-селектор или текст элемента",
-  "value": "текст для ввода (type) / опция (select_option) / клавиша (press_key)",
-  "reason": "зачем это действие",
-  "test_goal": "что именно проверяю в этом шаге (одна фраза)",
-  "expected_outcome": "что должно произойти после действия (одна фраза)",
-  "observation": "что вижу на скриншоте (кратко); при проверке верстки — логичность размещения, соответствие DOM",
-  "possible_bug": "описание бага или null (в т.ч. проблемы верстки: наложение, обрезка, сломанная сетка)",
-  "layout_issue": "описание проблемы верстки или null"
-}
-
-Действия: click, type, scroll, hover, close_modal, select_option, press_key, check_defect, explore — как раньше.
-
-Модалки/оверлеи: сначала протестируй содержимое (кнопки, поля), потом закрой (close_modal). Дропдауны: открыть → выбрать опцию → проверить применение. Тултипы: hover → проверить текст.
-
-НЕ предлагай СТОП. Дефект — только реальный. В формах — реалистичные тестовые данные (test@test.com, Иван Тестов).
-Проверка верстки: при осмотре страницы оцени, логично ли расположены элементы (хедер, контент, футер), нет ли наложений текста/блоков, обрезаний по краям, кнопок вне зоны видимости. Соответствует ли визуал структуре DOM (порядок блоков, вложенность). Если есть — укажи layout_issue или possible_bug.
-""" + phase_block + """
-
-Пример ответа (только JSON):
-{"action": "click", "selector": "Войти", "value": "", "reason": "Проверяю кнопку входа", "test_goal": "Проверяю переход на форму логина", "expected_outcome": "Откроется форма логина или переход на страницу входа", "observation": "Вижу кнопку Войти, верстка без наложений", "possible_bug": null, "layout_issue": null}"""
-
-    full_prompt = f"""{context}
-
-{question}"""
-
-    result = _get_client().chat_with_screenshot(full_prompt, screenshot_b64=screenshot_b64, system=system)
-    return result if result else None
+    system = _build_system_prompt(phase_instruction, tester_phase, has_overlay)
+    full_prompt = f"{context}\n\n{question}"
+    return _llm_call_with_retry(full_prompt, screenshot_b64=screenshot_b64, system=system)
 
 
 def get_test_plan_from_screenshot(screenshot_b64: Optional[str], url: str) -> List[str]:
