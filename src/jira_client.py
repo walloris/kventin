@@ -1,11 +1,18 @@
 """
 Клиент Jira REST API для создания дефектов.
 Создаёт только реальные баги; флаки и проблемы тестовой среды не заводим.
+Поддержка как в твоём проекте: Bearer-токен (если длинный) или Basic (username, token), X-Atlassian-Token, verify=False.
 """
 import os
 from typing import Optional
 
 import requests
+
+try:
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+except Exception:
+    pass
 
 from config import IGNORE_CONSOLE_PATTERNS, IGNORE_NETWORK_STATUSES, DEFECT_IGNORE_PATTERNS
 
@@ -44,16 +51,27 @@ def create_jira_issue(
     api_token = api_token or os.getenv("JIRA_API_TOKEN", "")
     project_key = project_key or os.getenv("JIRA_PROJECT_KEY", "")
 
-    if not all([jira_url, login, api_token, project_key]):
-        print("[Jira] Не заданы JIRA_URL, (JIRA_USERNAME или JIRA_EMAIL), JIRA_API_TOKEN или JIRA_PROJECT_KEY — пропуск создания тикета.")
+    if not jira_url or not api_token or not project_key:
+        print("[Jira] Не заданы JIRA_URL, JIRA_API_TOKEN или JIRA_PROJECT_KEY — пропуск создания тикета.")
+        return None
+    # Bearer: только токен. Basic: нужен ещё логин (username/email)
+    use_bearer = len(api_token) > 20
+    if not use_bearer and not login:
+        print("[Jira] Для короткого токена нужен JIRA_USERNAME или JIRA_EMAIL — пропуск.")
         return None
 
     if is_ignorable_issue(summary, description):
         print("[Jira] Пропуск: похоже на флак/тестовую среду:", summary[:80])
         return None
 
-    url = f"{jira_url}/rest/api/2/issue/"
-    auth = (login, api_token)
+    url = f"{jira_url}/rest/api/2/issue"
+    headers = {"Content-Type": "application/json", "X-Atlassian-Token": "no-check"}
+    if use_bearer:
+        headers["Authorization"] = f"Bearer {api_token}"
+        auth = None
+    else:
+        auth = (login, api_token)
+
     payload = {
         "fields": {
             "project": {"key": project_key},
@@ -64,7 +82,7 @@ def create_jira_issue(
     }
 
     try:
-        r = requests.post(url, json=payload, auth=auth, timeout=30)
+        r = requests.post(url, json=payload, headers=headers, auth=auth, verify=False, timeout=30)
         r.raise_for_status()
         key = r.json().get("key")
         print(f"[Jira] Создан дефект: {key}")
