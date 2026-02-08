@@ -2,9 +2,12 @@
 Клиент Jira REST API для создания дефектов.
 Создаёт только реальные баги; флаки и проблемы тестовой среды не заводим.
 Поддержка вложений (скриншоты, логи). Bearer или Basic, X-Atlassian-Token, verify=False.
+Многоуровневая дедупликация: локальная (память сессии) → Jira (JQL) → GigaChat (семантика).
 """
 import os
-from typing import Optional, List, Union
+import re
+import logging
+from typing import Optional, List, Union, Set
 
 import requests
 
@@ -16,8 +19,78 @@ except Exception:
 
 from config import IGNORE_CONSOLE_PATTERNS, IGNORE_NETWORK_STATUSES, DEFECT_IGNORE_PATTERNS, JIRA_ISSUE_TYPE
 
+LOG = logging.getLogger("Jira")
+
 # Лейбл всех дефектов, заведённых агентом
 JIRA_DEFECT_LABEL = "kventin"
+
+# =============================================
+# Локальная дедупликация (в памяти процесса)
+# =============================================
+_session_defect_keys: Set[str] = set()  # нормализованные ключи дефектов за сессию
+
+
+def _normalize_defect_key(text: str) -> str:
+    """Нормализовать текст бага для сравнения: без пунктуации, lowercase, без стоп-слов."""
+    if not text:
+        return ""
+    t = text.lower().strip()
+    # Убрать [Kventin] префикс
+    t = re.sub(r'\[kventin\]\s*', '', t)
+    # Убрать URL-ы
+    t = re.sub(r'https?://\S+', '', t)
+    # Убрать пунктуацию
+    t = re.sub(r'[^\w\sа-яёА-ЯЁ]', ' ', t)
+    # Схлопнуть пробелы
+    t = re.sub(r'\s+', ' ', t).strip()
+    # Обрезать до 120 символов
+    return t[:120]
+
+
+def _similarity(a: str, b: str) -> float:
+    """Простая метрика схожести: Jaccard по словам (bigrams для коротких текстов)."""
+    if not a or not b:
+        return 0.0
+    words_a = set(a.split())
+    words_b = set(b.split())
+    if not words_a or not words_b:
+        return 0.0
+    intersection = words_a & words_b
+    union = words_a | words_b
+    return len(intersection) / len(union) if union else 0.0
+
+
+def is_local_duplicate(summary: str, description: str = "") -> bool:
+    """
+    Проверить дедупликацию внутри текущей сессии.
+    Если summary/description похожи на уже созданный дефект — дубль.
+    """
+    key = _normalize_defect_key(summary)
+    if not key:
+        return False
+    # Точное совпадение ключа
+    if key in _session_defect_keys:
+        LOG.info("Локальный дубль (точный): %s", summary[:60])
+        return True
+    # Нечёткое: Jaccard > 0.6
+    for existing in _session_defect_keys:
+        sim = _similarity(key, existing)
+        if sim > 0.6:
+            LOG.info("Локальный дубль (sim=%.2f): '%s' ~ '%s'", sim, key[:40], existing[:40])
+            return True
+    return False
+
+
+def register_local_defect(summary: str):
+    """Запомнить дефект в памяти сессии для дедупликации."""
+    key = _normalize_defect_key(summary)
+    if key:
+        _session_defect_keys.add(key)
+
+
+def reset_session_defects():
+    """Сбросить локальный кеш (при перезапуске агента)."""
+    _session_defect_keys.clear()
 
 
 def _jira_request(
@@ -49,6 +122,27 @@ def _jira_request(
         return None
 
 
+def _extract_search_keywords(text: str, max_words: int = 6) -> str:
+    """Извлечь ключевые слова из summary для JQL-поиска (убрать стоп-слова, оставить суть)."""
+    stop_words = {
+        "на", "в", "и", "с", "не", "по", "к", "от", "за", "из", "для", "при", "что", "это",
+        "the", "is", "at", "on", "in", "to", "for", "a", "an", "of", "with",
+        "kventin", "ошибка", "error", "проблема", "баг", "bug", "http", "после", "страниц",
+    }
+    text = re.sub(r'\[kventin\]\s*', '', text.lower())
+    text = re.sub(r'https?://\S+', '', text)
+    text = re.sub(r'[^\w\sа-яёА-ЯЁ]', ' ', text)
+    words = [w for w in text.split() if len(w) > 2 and w not in stop_words]
+    # Берём уникальные слова, не больше max_words
+    seen = []
+    for w in words:
+        if w not in seen:
+            seen.append(w)
+        if len(seen) >= max_words:
+            break
+    return " ".join(seen)
+
+
 def search_duplicates(
     summary_part: str,
     *,
@@ -59,7 +153,8 @@ def search_duplicates(
     project_key: Optional[str] = None,
 ) -> Optional[str]:
     """
-    Поиск дубля по summary: открытые задачи с лейблом kventin и похожим summary.
+    Поиск дубля в Jira: открытые задачи с лейблом kventin и похожим summary.
+    Двухуровневый: сначала точный поиск, потом по ключевым словам.
     Возвращает ключ найденной задачи (PROJ-123) или None.
     """
     jira_url = (jira_url or os.getenv("JIRA_URL", "")).rstrip("/")
@@ -80,25 +175,55 @@ def search_duplicates(
     else:
         auth = (login, api_token)
 
-    safe = (summary_part or "").replace('"', "").replace("\\", "")[:50].strip()
-    if not safe:
-        return None
-    jql = (
-        f'project = {project_key} AND labels = {JIRA_DEFECT_LABEL} '
-        f'AND status not in (Closed, Done) AND summary ~ "{safe}"'
-    )
-    res = _jira_request(
-        "GET",
-        jira_url,
-        "search",
-        params={"jql": jql, "fields": "key", "maxResults": 1},
-        headers=headers,
-        auth=auth,
-        use_bearer=use_bearer,
-    )
-    if not res or "issues" not in res or not res["issues"]:
-        return None
-    return res["issues"][0].get("key")
+    # --- Поиск 1: по подстроке summary (точный) ---
+    safe = (summary_part or "").replace('"', "").replace("\\", "")[:80].strip()
+    if safe:
+        jql = (
+            f'project = {project_key} AND labels = {JIRA_DEFECT_LABEL} '
+            f'AND status not in (Closed, Done, Resolved) AND summary ~ "{safe[:50]}"'
+        )
+        res = _jira_request(
+            "GET", jira_url, "search",
+            params={"jql": jql, "fields": "key,summary", "maxResults": 5},
+            headers=headers, auth=auth, use_bearer=use_bearer,
+        )
+        if res and res.get("issues"):
+            # Проверяем similarity с каждым результатом
+            norm_input = _normalize_defect_key(summary_part)
+            for issue in res["issues"]:
+                existing_summary = issue.get("fields", {}).get("summary", "")
+                norm_existing = _normalize_defect_key(existing_summary)
+                sim = _similarity(norm_input, norm_existing)
+                if sim > 0.5:
+                    key = issue.get("key", "?")
+                    LOG.info("Jira дубль (sim=%.2f): %s — '%s'", sim, key, existing_summary[:60])
+                    return key
+
+    # --- Поиск 2: по ключевым словам (широкий) ---
+    keywords = _extract_search_keywords(summary_part)
+    if keywords and len(keywords.split()) >= 2:
+        kw_safe = keywords.replace('"', '').replace('\\', '')[:60]
+        jql2 = (
+            f'project = {project_key} AND labels = {JIRA_DEFECT_LABEL} '
+            f'AND status not in (Closed, Done, Resolved) AND text ~ "{kw_safe}"'
+        )
+        res2 = _jira_request(
+            "GET", jira_url, "search",
+            params={"jql": jql2, "fields": "key,summary", "maxResults": 5},
+            headers=headers, auth=auth, use_bearer=use_bearer,
+        )
+        if res2 and res2.get("issues"):
+            norm_input = _normalize_defect_key(summary_part)
+            for issue in res2["issues"]:
+                existing_summary = issue.get("fields", {}).get("summary", "")
+                norm_existing = _normalize_defect_key(existing_summary)
+                sim = _similarity(norm_input, norm_existing)
+                if sim > 0.5:
+                    key = issue.get("key", "?")
+                    LOG.info("Jira дубль по keywords (sim=%.2f): %s — '%s'", sim, key, existing_summary[:60])
+                    return key
+
+    return None
 
 
 def is_ignorable_issue(summary: str, description: str) -> bool:
@@ -193,9 +318,15 @@ def create_jira_issue(
         return None
 
     if is_ignorable_issue(summary, description):
-        print("[Jira] Пропуск: похоже на флак/тестовую среду:", summary[:80])
+        LOG.info("Пропуск: похоже на флак/тестовую среду: %s", summary[:80])
         return None
 
+    # Уровень 1: локальная дедупликация (в памяти сессии)
+    if is_local_duplicate(summary, description):
+        LOG.info("Пропуск (локальный дубль): %s", summary[:80])
+        return None
+
+    # Уровень 2: дедупликация через Jira (JQL поиск)
     dup = search_duplicates(
         summary,
         jira_url=jira_url,
@@ -204,7 +335,8 @@ def create_jira_issue(
         project_key=project_key,
     )
     if dup:
-        print(f"[Jira] Дубль: не создаём, найден {dup}")
+        LOG.info("Дубль в Jira: не создаём, найден %s", dup)
+        register_local_defect(summary)  # запомнить чтобы не искать повторно
         return dup
 
     url = f"{jira_url}/rest/api/2/issue"
@@ -229,7 +361,8 @@ def create_jira_issue(
         r = requests.post(url, json=payload, headers=headers, auth=auth, verify=False, timeout=30)
         r.raise_for_status()
         key = r.json().get("key")
-        print(f"[Jira] Создан дефект: {key}")
+        LOG.info("Создан дефект: %s", key)
+        register_local_defect(summary)  # запомнить для дедупликации
 
         if key and attachment_paths:
             paths = [os.fspath(p) for p in attachment_paths]

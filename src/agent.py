@@ -71,7 +71,7 @@ if not LOG.handlers:
     h = logging.StreamHandler()
     h.setFormatter(logging.Formatter("[Agent] %(levelname)s %(message)s"))
     LOG.addHandler(h)
-from src.jira_client import create_jira_issue
+from src.jira_client import create_jira_issue, reset_session_defects
 from src.page_analyzer import (
     build_context,
     get_dom_summary,
@@ -933,6 +933,7 @@ def run_agent(start_url: str = None):
     console_log: List[Dict[str, Any]] = []
     network_failures: List[Dict[str, Any]] = []
     memory = AgentMemory()
+    reset_session_defects()  # сбросить локальный кеш дефектов
 
     # Инициализация соединения с GigaChat до запуска браузера
     if not init_gigachat_connection():
@@ -1474,6 +1475,32 @@ def _step_post_analysis(
                 memory.defects_on_current_step += 1
 
 
+def _is_semantic_duplicate(bug_description: str, memory: AgentMemory) -> bool:
+    """
+    Уровень 3: семантическая проверка через GigaChat.
+    Спросить: «это тот же баг, что уже заведённые?»
+    """
+    if not memory or not memory.defects_created:
+        return False
+    # Сравниваем только если есть 1+ дефектов за сессию
+    existing = "\n".join(
+        f"- {d['key']}: {d['summary'][:80]}"
+        for d in memory.defects_created[-10:]
+    )
+    try:
+        answer = consult_agent(
+            f"Уже заведённые дефекты:\n{existing}\n\n"
+            f"Новый дефект: {bug_description[:300]}\n\n"
+            f"Это ДУБЛЬ одного из уже заведённых? Ответь ОДНИМ словом: ДА или НЕТ."
+        )
+        if answer and "да" in answer.strip().lower()[:10]:
+            LOG.info("Семантический дубль (GigaChat): %s", bug_description[:60])
+            return True
+    except Exception as e:
+        LOG.debug("semantic dedup error: %s", e)
+    return False
+
+
 def _create_defect(
     page: Page,
     bug_description: str,
@@ -1483,9 +1510,25 @@ def _create_defect(
     network_failures: List[Dict[str, Any]],
     memory: Optional[AgentMemory] = None,
 ):
-    """Создать дефект в Jira с полной фактурой и путём воспроизведения."""
-    steps_to_reproduce = memory.get_steps_to_reproduce() if memory else None
+    """Создать дефект в Jira с полной фактурой, 3-уровневой дедупликацией."""
+    from src.jira_client import is_local_duplicate, register_local_defect
+
     summary = build_defect_summary(bug_description, current_url)
+
+    # Уровень 1: локальная дедупликация (ещё до сбора evidence — экономим ресурсы)
+    if is_local_duplicate(summary, bug_description):
+        LOG.info("Пропуск дефекта (локальный дубль): %s", summary[:60])
+        update_llm_overlay(page, prompt="Дубль", response=f"Уже заведён: {summary[:60]}", loading=False)
+        return
+
+    # Уровень 3: семантическая проверка через GigaChat (до Jira — экономим API-запросы)
+    if _is_semantic_duplicate(bug_description, memory):
+        LOG.info("Пропуск дефекта (семантический дубль): %s", summary[:60])
+        register_local_defect(summary)
+        update_llm_overlay(page, prompt="Дубль (GigaChat)", response=f"Похож на уже заведённый", loading=False)
+        return
+
+    steps_to_reproduce = memory.get_steps_to_reproduce() if memory else None
     description = build_defect_description(
         bug_description, current_url,
         checklist_results=checklist_results,
@@ -1494,6 +1537,7 @@ def _create_defect(
         steps_to_reproduce=steps_to_reproduce,
     )
     attachment_paths = collect_evidence(page, console_log, network_failures)
+    # Уровень 2: дедупликация через Jira внутри create_jira_issue
     key = create_jira_issue(summary=summary, description=description, attachment_paths=attachment_paths or None)
     if key:
         print(f"[Agent] Дефект создан: {key}")
