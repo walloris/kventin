@@ -9,12 +9,13 @@ load_dotenv()
 START_URL = os.getenv("START_URL", "https://example.com")
 
 # --- Провайдер LLM: gigachat | jan ---
+# Рекомендуется gigachat для режима «реальный тестировщик» (фазы, оракул, GigaChat лучше держит контекст).
 # jan — локальная модель в Jan (OpenAI-совместимый API на http://127.0.0.1:1337)
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gigachat").strip().lower()
 JAN_API_URL = os.getenv("JAN_API_URL", "http://127.0.0.1:1337").rstrip("/")
 JAN_API_KEY = os.getenv("JAN_API_KEY", "jan-api-key")
-# ID модели в Jan (как в интерфейсе Jan). Для русского: Vikhr-7B, Qwen2.5-7B, Saiga, Llama-3.2 и т.д.
-JAN_MODEL = os.getenv("JAN_MODEL", "vikhr-7b-instruct")
+# ID модели в Jan (как в интерфейсе Jan). Для скриншотов нужна vision-модель: Llama-3.2-11B-Vision, Qwen2-VL
+JAN_MODEL = os.getenv("JAN_MODEL", "llama-3.2-11b-vision-instruct")
 
 # GigaChat (как в твоём проекте: token_header, gateway URL, OAuth или password grant)
 GIGACHAT_TOKEN_HEADER = os.getenv("GIGACHAT_TOKEN_HEADER", "")  # "Bearer eyJ..." — готовый токен
@@ -52,6 +53,11 @@ HEADLESS = os.getenv("HEADLESS", "false").lower() in ("1", "true", "yes")
 # Размер окна браузера (по умолчанию Full HD — на весь экран)
 VIEWPORT_WIDTH = int(os.getenv("VIEWPORT_WIDTH", "1920"))
 VIEWPORT_HEIGHT = int(os.getenv("VIEWPORT_HEIGHT", "1080"))
+
+# Профиль браузера: если задан — запуск с persistent context (сохраняется сертификат, куки, логин)
+BROWSER_USER_DATA_DIR = os.getenv("BROWSER_USER_DATA_DIR", "").strip()
+if BROWSER_USER_DATA_DIR and not os.path.isabs(BROWSER_USER_DATA_DIR):
+    BROWSER_USER_DATA_DIR = str(Path.cwd() / BROWSER_USER_DATA_DIR)
 
 # Игнорируемые паттерны (флаки, тестовая среда, 404 в консоли и т.д.)
 IGNORE_CONSOLE_PATTERNS = [

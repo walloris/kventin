@@ -69,12 +69,14 @@ cp .env.example .env
 
 Вместо GigaChat можно использовать **локальную модель** в [Jan](https://jan.ai/) (OpenAI-совместимый API).
 
+**Важно:** чтобы агент «видел» скриншоты страницы, в Jan должна быть загружена **vision-модель** (multimodal). Обычные текстовые модели (Vikhr, Qwen2.5-7B без VL) скриншоты не обрабатывают.
+
 1. Установи [Jan](https://github.com/janhq/jan/releases) и запусти приложение.
-2. Скачай модель с хорошей поддержкой русского (рекомендуется для Mac Mini M4 32GB):
-   - **Vikhr-7B-instruct** — сильная русскоязычная модель (GGUF, Q4_K_M или Q5_K_M).
-   - **Qwen2.5-7B-Instruct** — отличный мультиязычный вариант.
-   - **Saiga** (7B/13B) — русский инструктивный модель.
-3. В Jan: **Settings → Local API Server** → задай API Key (например `jan-api-key`) → **Start Server**. В логах должно быть: `JAN API listening at http://127.0.0.1:1337`.
+2. Скачай **vision-модель** (для Mac Mini M4 32GB):
+   - **Llama 3.2 11B Vision Instruct** (GGUF, квант Q4_K_M ~6 GB) — мультиязычная, хорошо работает с экранами. В Jan/Hugging Face ищи `Llama-3.2-11B-Vision-Instruct-GGUF`.
+   - **Qwen2-VL-7B** (именно VL — vision, не Qwen2.5 7B текстовый) — мультиязычная, понимает изображения.
+   - Альтернативы: **LLaVA**, **Pixtral** (если есть в каталоге Jan).
+3. В Jan: **Settings → Local API Server** → задай API Key (например `jan-api-key`) → **Start Server**. В логах: `JAN API listening at http://127.0.0.1:1337`.
 4. В `.env` задай:
    ```
    LLM_PROVIDER=jan
@@ -82,9 +84,9 @@ cp .env.example .env
    JAN_API_KEY=jan-api-key
    JAN_MODEL=<ID модели в Jan>
    ```
-   `JAN_MODEL` — точный ID модели, как он отображается в Jan (например `vikhr-7b-instruct-q4_k_m` или как в списке моделей).
+   `JAN_MODEL` — точный ID модели, как в Jan (например `llama-3.2-11b-vision-instruct-q4_k_m` или как в списке после загрузки).
 
-Текстовые модели (Vikhr, Qwen без VL) не получают скриншот — агент опирается на DOM и контекст. Для анализа скриншота нужна vision-модель (например Qwen2-VL, Llama 3.2 11B Vision в Jan, если хватает памяти).
+Только vision-модели получают скриншот. Текстовые (Vikhr, Qwen2.5 без VL) работают без картинки — агент опирается на DOM и контекст.
 
 Получить GigaChat API: [developers.sber.ru — GigaChat](https://developers.sber.ru/portal/products/gigachat-api).
 

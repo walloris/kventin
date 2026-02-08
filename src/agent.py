@@ -22,6 +22,7 @@ from config import (
     START_URL,
     BROWSER_SLOW_MO,
     HEADLESS,
+    BROWSER_USER_DATA_DIR,
     CHECKLIST_STEP_DELAY_MS,
     VIEWPORT_WIDTH,
     VIEWPORT_HEIGHT,
@@ -103,6 +104,9 @@ class AgentMemory:
         self.defects_created: List[Dict[str, Any]] = []
         # Время старта сессии
         self.session_start: Optional[datetime] = None
+        # Фаза тестирования (как у реального тестировщика): orient → smoke → critical_path → exploratory
+        self.tester_phase: str = "orient"
+        self.steps_in_phase: int = 0
 
     def add_action(self, action: Dict[str, Any], result: str = ""):
         act = (action.get("action") or "").lower()
@@ -234,6 +238,34 @@ class AgentMemory:
 
     def record_defect_created(self, key: str, summary: str):
         self.defects_created.append({"key": key, "summary": summary[:200]})
+
+    def advance_tester_phase(self) -> str:
+        """
+        Переход к следующей фазе тестирования (как у реального тестировщика).
+        orient → smoke → critical_path → exploratory (далее остаётся exploratory).
+        """
+        next_phase = {
+            "orient": "smoke",
+            "smoke": "critical_path",
+            "critical_path": "exploratory",
+            "exploratory": "exploratory",
+        }
+        self.tester_phase = next_phase.get(self.tester_phase, "exploratory")
+        self.steps_in_phase = 0
+        return self.tester_phase
+
+    def tick_phase_step(self) -> None:
+        self.steps_in_phase += 1
+
+    def get_phase_instruction(self) -> str:
+        """Краткая инструкция для GigaChat по текущей фазе."""
+        d = {
+            "orient": "Фаза: ОРИЕНТАЦИЯ. Определи тип страницы (лендинг, каталог, форма, ЛК). Выбери ОДНО действие для понимания контекста (например осмотр ключевых элементов или лёгкий клик по главному CTA).",
+            "smoke": "Фаза: SMOKE. Проверь, что страница живая: ключевые кнопки/ссылки есть и кликабельны. Выбери один важный элемент и проверь его (клик или hover).",
+            "critical_path": "Фаза: ОСНОВНОЙ СЦЕНАРИЙ. Тестируй главный пользовательский сценарий: основная кнопка, форма, навигация. Одно целенаправленное действие с ясной целью проверки.",
+            "exploratory": "Фаза: ИССЛЕДОВАТЕЛЬСКОЕ ТЕСТИРОВАНИЕ. Проверь меню, футер, формы, краевые случаи. Не повторяй уже сделанное. Цель каждого действия — осмысленная проверка, не случайный клик.",
+        }
+        return d.get(self.tester_phase, d["exploratory"])
 
     def get_session_report_text(self) -> str:
         """Краткий отчёт сессии: шаги, покрытие, дефекты."""
@@ -730,12 +762,29 @@ def run_agent(start_url: str = None):
     memory = AgentMemory()
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=HEADLESS, slow_mo=BROWSER_SLOW_MO)
-        context = browser.new_context(
-            viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
-            ignore_https_errors=True,
-        )
+        browser = None
+        if BROWSER_USER_DATA_DIR:
+            # Профиль на диске — сохраняется выбранный сертификат, куки, логин
+            context = p.chromium.launch_persistent_context(
+                BROWSER_USER_DATA_DIR,
+                headless=HEADLESS,
+                slow_mo=BROWSER_SLOW_MO,
+                viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
+                ignore_https_errors=True,
+            )
+        else:
+            browser = p.chromium.launch(headless=HEADLESS, slow_mo=BROWSER_SLOW_MO)
+            context = browser.new_context(
+                viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
+                ignore_https_errors=True,
+            )
         page = context.new_page()
+
+        # Параметры в localStorage на каждой загружаемой странице
+        context.add_init_script("""
+            localStorage.setItem('onboarding_is_passed', 'true');
+            localStorage.setItem('hrp-core-app/app-mode', 'neuro');
+        """)
 
         # --- Обработка новых вкладок (target="_blank" и т.п.) ---
         new_tabs_queue: List[Any] = []   # очередь вкладок для обработки
@@ -772,7 +821,10 @@ def run_agent(start_url: str = None):
             _inject_all(page)
         except Exception as e:
             print(f"[Agent] Ошибка загрузки {start_url}: {e}")
-            browser.close()
+            if browser:
+                browser.close()
+            else:
+                context.close()
             return
 
         memory.session_start = datetime.now()
@@ -824,6 +876,11 @@ def run_agent(start_url: str = None):
                 del network_failures[:-50]
 
             # ========== PHASE 1: Чеклист (каждые 5 итераций) ==========
+            # Переход к следующей фазе тестирования каждые 6 шагов (как у реального тестировщика)
+            if step > 1 and step % 6 == 1 and memory.steps_in_phase >= 5:
+                memory.advance_tester_phase()
+                print(f"[Agent] Переход в фазу: {memory.tester_phase}")
+
             checklist_results = []
             if step % 5 == 1:
                 smart_wait_after_goto(page, timeout=5000)
@@ -887,14 +944,17 @@ DOM (кнопки, ссылки, формы):
 {history_text}
 {plan_hint}
 
-Выбери ОДНО следующее действие. Не повторяй те элементы, на которые уже кликнул. Ищи новые кнопки, формы, ссылки. Будь активным тестировщиком!
-Попробуй hover на элементы с подменю/тултипами. Открывай дропдауны и выбирай опции.
+Выбери ОДНО следующее действие. Укажи test_goal и expected_outcome. Не повторяй уже сделанное. Ищи новые кнопки, формы, ссылки.
 Если видишь реальный баг — укажи action=check_defect."""
 
+            phase_instruction = memory.get_phase_instruction()
             update_demo_banner(page, step_text=f"#{step} Консультация с GigaChat…", progress_pct=60)
-            update_llm_overlay(page, prompt=f"#{step} Что делать дальше?", loading=True)
+            update_llm_overlay(page, prompt=f"#{step} Что делать дальше? [{memory.tester_phase}]", loading=True)
 
-            raw_answer = consult_agent_with_screenshot(context_str, question, screenshot_b64=screenshot_b64)
+            raw_answer = consult_agent_with_screenshot(
+                context_str, question, screenshot_b64=screenshot_b64,
+                phase_instruction=phase_instruction, tester_phase=memory.tester_phase,
+            )
             update_llm_overlay(page, prompt=f"#{step} Что делать дальше?", response=raw_answer or "Нет ответа", loading=False, error="Нет ответа" if not raw_answer else None)
 
             if not raw_answer:
@@ -928,6 +988,12 @@ DOM (кнопки, ссылки, формы):
             observation = action.get("observation", "")
             reason = action.get("reason", "")
             possible_bug = action.get("possible_bug")
+            test_goal = action.get("test_goal", "")
+            expected_outcome = action.get("expected_outcome", "")
+            if test_goal:
+                print(f"[Agent] #{step} Цель: {test_goal[:80]}")
+            if expected_outcome:
+                print(f"[Agent] #{step} Ожидаемый результат: {expected_outcome[:80]}")
             print(f"[Agent] #{step} Наблюдение: {observation[:80]}")
             print(f"[Agent] #{step} Действие: {act_type} -> {sel[:40]} | {reason[:50]}")
 
@@ -963,6 +1029,7 @@ DOM (кнопки, ссылки, формы):
                     time.sleep(1.0)
 
             memory.add_action(action, result=result)
+            memory.tick_phase_step()
             print(f"[Agent] #{step} Результат: {result}")
 
             # Карта покрытия: запомнить зону после прокрутки
@@ -1016,13 +1083,15 @@ DOM (кнопки, ссылки, формы):
             new_errors = [c for c in console_log[-10:] if c.get("type") == "error"]
             new_network_fails = [n for n in network_failures[-5:] if n.get("status") and n.get("status") >= 500]
 
-            # Оракул: после ввода или клика — достигнут ли ожидаемый результат?
+            # Оракул: после ввода или клика — достигнут ли ожидаемый результат? (логика реального тестировщика)
             oracle_says_error = False
             if ENABLE_ORACLE_AFTER_ACTION and act_type in ("type", "click") and post_screenshot_b64:
-                update_llm_overlay(page, prompt=f"#{step} Оракул: успех или ошибка?", loading=True)
+                update_llm_overlay(page, prompt=f"#{step} Оракул: достигнут ли ожидаемый результат?", loading=True)
+                expected_text = f"Ожидалось: {expected_outcome[:200]}" if expected_outcome else "Ожидался успешный результат действия."
+                oracle_context = f"Действие: {act_type} -> {sel[:60]}. Результат выполнения: {result}. {expected_text}"
                 oracle_ans = consult_agent_with_screenshot(
-                    f"Последнее действие: {act_type} -> {sel[:60]}. Результат: {result}",
-                    "На скриншоте после этого действия виден успех (всё ок, форма отправилась, данные отобразились) или ошибка (сообщение об ошибке, пустая страница, что-то сломалось)? Ответь одним словом: успех / ошибка / неясно.",
+                    oracle_context,
+                    "На скриншоте после действия: произошло ли ожидаемое (успех), или видна ошибка? Ответь одним словом: успех / ошибка / неясно.",
                     screenshot_b64=post_screenshot_b64,
                 )
                 update_llm_overlay(page, prompt=f"#{step} Оракул", response=oracle_ans or "—", loading=False)
@@ -1058,7 +1127,10 @@ DOM (кнопки, ссылки, формы):
 
             time.sleep(1)
 
-        browser.close()
+        if browser:
+            browser.close()
+        else:
+            context.close()
 
 
 def _create_defect(
