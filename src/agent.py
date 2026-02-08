@@ -28,7 +28,7 @@ from config import (
 )
 from src.gigachat_client import consult_agent_with_screenshot, consult_agent
 from src.jira_client import create_jira_issue
-from src.page_analyzer import build_context, get_dom_summary
+from src.page_analyzer import build_context, get_dom_summary, detect_active_overlays, format_overlays_context
 from src.visible_actions import (
     inject_cursor,
     move_cursor_to,
@@ -265,6 +265,131 @@ def _same_page(start_url: str, current_url: str) -> bool:
     return norm(current_url) == norm(start_url)
 
 
+# --- Обработка новых вкладок ---
+def _handle_new_tabs(
+    new_tabs_queue: List[Any],
+    main_page: Page,
+    start_url: str,
+    step: int,
+    console_log: List[Dict[str, Any]],
+    network_failures: List[Dict[str, Any]],
+    memory: AgentMemory,
+):
+    """
+    Обработать все новые вкладки из очереди:
+    - Дождаться загрузки (domcontentloaded, таймаут 15с)
+    - Если загрузка успешна → лог, скриншот для визуала, закрыть вкладку
+    - Если загрузка неуспешна (таймаут, краш, ошибка) → завести дефект, закрыть вкладку
+    """
+    while new_tabs_queue:
+        new_tab = new_tabs_queue.pop(0)
+        tab_url = "(пустая)"
+        load_ok = False
+
+        try:
+            # Ждём, пока вкладка начнёт загружаться
+            new_tab.wait_for_load_state("domcontentloaded", timeout=15000)
+            tab_url = new_tab.url or "(пустая)"
+            print(f"[Agent] #{step} Новая вкладка загрузилась: {tab_url[:80]}")
+            update_demo_banner(main_page, step_text=f"Новая вкладка: {tab_url[:40]}…", progress_pct=50)
+
+            # Проверяем, что страница не пустая/ошибочная
+            title = ""
+            try:
+                title = new_tab.title() or ""
+            except Exception:
+                pass
+
+            # Попробуем дождаться networkidle (но не больше 5 сек)
+            try:
+                new_tab.wait_for_load_state("networkidle", timeout=5000)
+            except Exception:
+                pass
+
+            # Скриншот новой вкладки для лога
+            try:
+                _inject_all(new_tab)
+                time.sleep(0.5)
+                screenshot_b64 = take_screenshot_b64(new_tab)
+            except Exception:
+                screenshot_b64 = None
+
+            # Проверяем на ошибки: пустая страница, about:blank, chrome-error://
+            is_error_page = (
+                not tab_url
+                or tab_url in ("about:blank", "about:blank#blocked")
+                or "chrome-error://" in tab_url
+                or "err_" in tab_url.lower()
+            )
+
+            # Проверяем: есть ли ошибки JS в новой вкладке
+            tab_errors = []
+            try:
+                tab_errors_raw = new_tab.evaluate("""
+                    () => {
+                        const errs = [];
+                        if (window.__pageErrors) errs.push(...window.__pageErrors);
+                        return errs.map(e => String(e)).slice(0, 5);
+                    }
+                """)
+                if tab_errors_raw:
+                    tab_errors = tab_errors_raw
+            except Exception:
+                pass
+
+            # Проверяем HTTP-статус (если страница отдала ошибку)
+            is_http_error = False
+            try:
+                body_text = new_tab.text_content("body") or ""
+                for err_pattern in ["404", "500", "502", "503", "This page isn", "не найдена", "Server Error", "Bad Gateway"]:
+                    if err_pattern.lower() in body_text[:500].lower() and len(body_text.strip()) < 2000:
+                        is_http_error = True
+                        break
+            except Exception:
+                pass
+
+            if is_error_page or is_http_error:
+                # Загрузка неуспешна → дефект
+                bug_desc = f"Ссылка открыла новую вкладку с ошибкой.\nURL: {tab_url}\nTitle: {title}\nОшибки JS: {', '.join(tab_errors[:3])}"
+                print(f"[Agent] #{step} Новая вкладка: ОШИБКА → дефект. URL: {tab_url[:60]}")
+                update_llm_overlay(main_page, prompt=f"Новая вкладка: ошибка!", response=bug_desc[:200], loading=False)
+                _create_defect(main_page, bug_desc, tab_url, [], console_log, network_failures)
+                memory.add_action({"action": "new_tab_error", "selector": tab_url}, result="defect_reported")
+            else:
+                # Загрузка успешна
+                load_ok = True
+                print(f"[Agent] #{step} Новая вкладка OK: {tab_url[:60]} → закрываю")
+                update_demo_banner(main_page, step_text=f"Вкладка OK: {tab_url[:30]}. Закрываю.", progress_pct=70)
+                memory.add_action({"action": "new_tab_ok", "selector": tab_url}, result=f"tab_loaded: {title[:40]}")
+
+        except Exception as e:
+            # Таймаут загрузки или краш → дефект
+            try:
+                tab_url = new_tab.url or tab_url
+            except Exception:
+                pass
+            bug_desc = f"Новая вкладка не загрузилась (таймаут/ошибка).\nURL: {tab_url}\nОшибка: {str(e)[:200]}"
+            print(f"[Agent] #{step} Новая вкладка: ТАЙМАУТ/КРАШ → дефект. URL: {tab_url[:60]}")
+            update_llm_overlay(main_page, prompt="Новая вкладка: не загрузилась!", response=bug_desc[:200], loading=False)
+            _create_defect(main_page, bug_desc, tab_url, [], console_log, network_failures)
+            memory.add_action({"action": "new_tab_timeout", "selector": tab_url}, result=f"error: {str(e)[:60]}")
+
+        finally:
+            # Всегда закрываем новую вкладку
+            try:
+                if not new_tab.is_closed():
+                    new_tab.close()
+                    print(f"[Agent] #{step} Вкладка закрыта: {tab_url[:60]}")
+            except Exception as close_err:
+                print(f"[Agent] #{step} Ошибка закрытия вкладки: {close_err}")
+
+    # Убедиться, что фокус на основной вкладке
+    try:
+        main_page.bring_to_front()
+    except Exception:
+        pass
+
+
 # --- Основной цикл ---
 def run_agent(start_url: str = None):
     """
@@ -289,6 +414,16 @@ def run_agent(start_url: str = None):
             ignore_https_errors=True,
         )
         page = context.new_page()
+
+        # --- Обработка новых вкладок (target="_blank" и т.п.) ---
+        new_tabs_queue: List[Any] = []   # очередь вкладок для обработки
+
+        def _on_new_page(new_page):
+            """Перехватываем открытие новой вкладки."""
+            print(f"[Agent] Новая вкладка обнаружена")
+            new_tabs_queue.append(new_page)
+
+        context.on("page", _on_new_page)
 
         def on_console(msg):
             console_log.append({"type": msg.type, "text": msg.text})
@@ -326,9 +461,15 @@ def run_agent(start_url: str = None):
             step = memory.iteration
             current_url = page.url
 
-            # Проверка: ушли на другую страницу → вернуться
-            if not _same_page(start_url, current_url):
-                print(f"[Agent] #{step} Переход: {current_url[:60]}. Возврат на {start_url}")
+            # ========== Обработка новых вкладок ==========
+            _handle_new_tabs(
+                new_tabs_queue, page, start_url, step,
+                console_log, network_failures, memory,
+            )
+
+            # Проверка: ушли на другую страницу (навигация в той же вкладке) → вернуться
+            if not _same_page(start_url, page.url):
+                print(f"[Agent] #{step} Навигация: {page.url[:60]}. Возврат на {start_url}")
                 update_demo_banner(page, step_text="Возврат на основную страницу…", progress_pct=0)
                 try:
                     page.goto(start_url, wait_until="domcontentloaded", timeout=20000)
@@ -388,7 +529,6 @@ DOM (кнопки, ссылки, формы):
 
             action = parse_llm_action(raw_answer)
             if not action:
-                # Попробовать грубый парсинг
                 print(f"[Agent] #{step} Не удалось распарсить JSON. Ответ: {raw_answer[:120]}")
                 action = {"action": "scroll", "selector": "down", "reason": "GigaChat не дал JSON, прокрутка"}
 
@@ -402,11 +542,13 @@ DOM (кнопки, ссылки, формы):
             update_demo_banner(page, step_text=f"#{step} {action.get('action', '').upper()}: {action.get('selector', '')[:30]}…", progress_pct=80)
 
             if action.get("action") == "check_defect" and possible_bug:
-                # Сразу создаём дефект
                 _create_defect(page, possible_bug, current_url, checklist_results, console_log, network_failures)
                 memory.add_action(action, result="defect_reported")
                 time.sleep(3)
                 continue
+
+            # Запомним кол-во вкладок ДО действия
+            pages_before = len(context.pages)
 
             result = execute_action(page, action, memory)
             memory.add_action(action, result=result)
@@ -416,11 +558,16 @@ DOM (кнопки, ссылки, формы):
             time.sleep(1.5)
             smart_wait_after_goto(page, timeout=3000)
 
+            # Обработать вкладки, которые могли открыться из-за этого действия
+            _handle_new_tabs(
+                new_tabs_queue, page, start_url, step,
+                console_log, network_failures, memory,
+            )
+
             # ========== PHASE 4: Пост-анализ после действия ==========
             update_demo_banner(page, step_text=f"#{step} Анализ результата…", progress_pct=95)
             post_screenshot_b64 = take_screenshot_b64(page)
 
-            # Проверяем: новые ошибки в консоли?
             new_errors = [c for c in console_log[-10:] if c.get("type") == "error"]
             new_network_fails = [n for n in network_failures[-5:] if n.get("status") and n.get("status") >= 500]
 

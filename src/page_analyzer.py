@@ -151,6 +151,203 @@ def get_dom_summary(page: Page, max_length: int = 8000) -> str:
         return f"[Ошибка DOM: {e}]"
 
 
+def detect_active_overlays(page: Page) -> Dict[str, Any]:
+    """
+    Обнаружить все активные оверлеи на странице:
+    модалки, тултипы, дропдауны, поповеры, уведомления, контекстные меню.
+    Возвращает dict: { has_overlay, overlays: [{type, text, buttons, inputs, close_selector}] }
+    """
+    try:
+        result = page.evaluate("""
+            () => {
+                const overlays = [];
+                const vis = (el) => {
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 10 || r.height < 10) return false;
+                    const s = getComputedStyle(el);
+                    return s.display !== 'none' && s.visibility !== 'hidden' && parseFloat(s.opacity) > 0.1;
+                };
+                const zOf = (el) => {
+                    let z = 0;
+                    let cur = el;
+                    while (cur && cur !== document.body) {
+                        const zi = parseInt(getComputedStyle(cur).zIndex);
+                        if (!isNaN(zi) && zi > z) z = zi;
+                        cur = cur.parentElement;
+                    }
+                    return z;
+                };
+                const textOf = (el, max) => (el.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, max || 150);
+
+                // --- Модалки / Диалоги ---
+                const modalSels = [
+                    '[role="dialog"]', '[role="alertdialog"]', 'dialog[open]',
+                    '.modal.show', '.modal.active', '.modal.open', '.modal.visible',
+                    '.modal-dialog', '.modal-content',
+                    '[class*="modal"][class*="open"]', '[class*="modal"][class*="show"]',
+                    '[class*="modal"][class*="active"]', '[class*="modal"][class*="visible"]',
+                    '[class*="popup"][class*="open"]', '[class*="popup"][class*="show"]',
+                    '[class*="popup"][class*="active"]', '[class*="popup"][class*="visible"]',
+                    '[class*="drawer"][class*="open"]', '[class*="drawer"][class*="show"]',
+                    '[class*="overlay"][class*="open"]', '[class*="overlay"][class*="show"]',
+                    '[class*="lightbox"]',
+                    '[aria-modal="true"]'
+                ];
+                const modalEls = new Set();
+                for (const sel of modalSels) {
+                    try {
+                        document.querySelectorAll(sel).forEach(el => {
+                            if (vis(el) && zOf(el) > 10) modalEls.add(el);
+                        });
+                    } catch(e) {}
+                }
+                // Ещё: элементы с position:fixed/absolute и высоким z-index
+                document.querySelectorAll('*').forEach(el => {
+                    if (modalEls.has(el)) return;
+                    const s = getComputedStyle(el);
+                    const pos = s.position;
+                    if ((pos === 'fixed' || pos === 'absolute') && vis(el)) {
+                        const z = parseInt(s.zIndex);
+                        const r = el.getBoundingClientRect();
+                        // Большой оверлей (не наш агентский UI)
+                        if (z > 100 && r.width > 200 && r.height > 100
+                            && !el.id?.startsWith('agent-') && !el.className?.toString().includes('agent-')) {
+                            modalEls.add(el);
+                        }
+                    }
+                });
+
+                modalEls.forEach(el => {
+                    const o = { type: 'modal', text: textOf(el, 200), buttons: [], inputs: [], links: [], close_selector: null };
+                    // Кнопки внутри модалки
+                    el.querySelectorAll('button, [role="button"], input[type="submit"]').forEach(btn => {
+                        if (vis(btn)) o.buttons.push(textOf(btn, 50) || btn.getAttribute('aria-label') || '(кнопка)');
+                    });
+                    // Инпуты внутри
+                    el.querySelectorAll('input:not([type="hidden"]), textarea, select').forEach(inp => {
+                        if (vis(inp)) o.inputs.push({ type: inp.type || 'text', placeholder: (inp.placeholder || '').slice(0, 40), name: inp.name || '' });
+                    });
+                    // Ссылки внутри
+                    el.querySelectorAll('a[href]').forEach(a => {
+                        if (vis(a)) o.links.push(textOf(a, 40));
+                    });
+                    // Крестик закрытия
+                    const closeBtn = el.querySelector('[aria-label*="close" i], [aria-label*="закрыть" i], [class*="close"], [class*="dismiss"], button.close, .modal-close, [data-dismiss="modal"], [data-bs-dismiss="modal"]');
+                    if (closeBtn && vis(closeBtn)) {
+                        o.close_selector = closeBtn.id ? '#' + closeBtn.id
+                            : closeBtn.getAttribute('aria-label') ? '[aria-label="' + closeBtn.getAttribute('aria-label') + '"]'
+                            : closeBtn.className ? '.' + closeBtn.className.toString().split(' ').filter(c=>c).join('.')
+                            : null;
+                    }
+                    if (o.text.length > 5 || o.buttons.length || o.inputs.length) overlays.push(o);
+                });
+
+                // --- Тултипы ---
+                const tooltipSels = [
+                    '[role="tooltip"]', '.tooltip.show', '.tooltip.active',
+                    '[class*="tooltip"][class*="show"]', '[class*="tooltip"][class*="visible"]',
+                    '.tippy-box', '.tippy-content', '[data-tippy-root]'
+                ];
+                for (const sel of tooltipSels) {
+                    try {
+                        document.querySelectorAll(sel).forEach(el => {
+                            if (vis(el)) overlays.push({ type: 'tooltip', text: textOf(el, 120) });
+                        });
+                    } catch(e) {}
+                }
+
+                // --- Дропдауны ---
+                const ddSels = [
+                    '[role="listbox"]', '[role="menu"]:not(nav [role="menu"])',
+                    '.dropdown-menu.show', '.dropdown-menu.active', '.dropdown-menu.open',
+                    '[class*="dropdown"][class*="open"]', '[class*="dropdown"][class*="show"]',
+                    '[class*="select"][class*="open"]', '[class*="select"][class*="show"]',
+                    '[class*="listbox"]', '.autocomplete-results', '[class*="autocomplete"][class*="open"]',
+                    'ul[class*="menu"][class*="open"]', 'ul[class*="menu"][class*="show"]'
+                ];
+                for (const sel of ddSels) {
+                    try {
+                        document.querySelectorAll(sel).forEach(el => {
+                            if (vis(el) && zOf(el) > 5) {
+                                const items = [];
+                                el.querySelectorAll('[role="option"], [role="menuitem"], li, a').forEach(li => {
+                                    if (vis(li)) items.push(textOf(li, 40));
+                                });
+                                overlays.push({ type: 'dropdown', text: textOf(el, 100), items: items.slice(0, 10) });
+                            }
+                        });
+                    } catch(e) {}
+                }
+
+                // --- Поповеры ---
+                const popSels = [
+                    '[role="dialog"][class*="popover"]', '.popover.show', '.popover.active',
+                    '[class*="popover"][class*="show"]', '[class*="popover"][class*="visible"]'
+                ];
+                for (const sel of popSels) {
+                    try {
+                        document.querySelectorAll(sel).forEach(el => {
+                            if (vis(el)) overlays.push({ type: 'popover', text: textOf(el, 150) });
+                        });
+                    } catch(e) {}
+                }
+
+                // --- Уведомления / Тосты ---
+                const toastSels = [
+                    '[role="alert"]', '[role="status"]', '.toast.show',
+                    '[class*="toast"][class*="show"]', '[class*="notification"][class*="show"]',
+                    '[class*="snackbar"][class*="show"]', '[class*="alert"][class*="show"]',
+                    '.Toastify__toast', '.notistack-SnackbarContainer'
+                ];
+                for (const sel of toastSels) {
+                    try {
+                        document.querySelectorAll(sel).forEach(el => {
+                            if (vis(el)) overlays.push({ type: 'notification', text: textOf(el, 120) });
+                        });
+                    } catch(e) {}
+                }
+
+                // Дедупликация
+                const seen = new Set();
+                const unique = [];
+                for (const o of overlays) {
+                    const k = o.type + '|' + (o.text || '').slice(0, 50);
+                    if (!seen.has(k)) { seen.add(k); unique.push(o); }
+                }
+
+                return { has_overlay: unique.length > 0, overlays: unique.slice(0, 8) };
+            }
+        """)
+        return result or {"has_overlay": False, "overlays": []}
+    except Exception as e:
+        return {"has_overlay": False, "overlays": [], "error": str(e)}
+
+
+def format_overlays_context(overlay_info: Dict[str, Any]) -> str:
+    """Форматировать информацию об оверлеях в текст для GigaChat."""
+    if not overlay_info.get("has_overlay"):
+        return ""
+    lines = ["⚠️ АКТИВНЫЕ ОВЕРЛЕИ НА СТРАНИЦЕ (тестируй их в первую очередь!):"]
+    for i, ov in enumerate(overlay_info.get("overlays", []), 1):
+        ov_type = ov.get("type", "unknown")
+        text = ov.get("text", "")[:120]
+        lines.append(f"  [{i}] Тип: {ov_type} | Текст: {text}")
+        if ov.get("buttons"):
+            lines.append(f"      Кнопки: {', '.join(ov['buttons'][:5])}")
+        if ov.get("inputs"):
+            inp_desc = [f"{inp.get('type','text')}({inp.get('placeholder','') or inp.get('name','')})" for inp in ov["inputs"][:5]]
+            lines.append(f"      Поля ввода: {', '.join(inp_desc)}")
+        if ov.get("links"):
+            lines.append(f"      Ссылки: {', '.join(ov['links'][:5])}")
+        if ov.get("items"):
+            lines.append(f"      Пункты: {', '.join(ov['items'][:8])}")
+        if ov.get("close_selector"):
+            lines.append(f"      Закрыть: selector={ov['close_selector']}")
+    lines.append("  → Сначала протестируй содержимое оверлея, потом закрой его (action=close_modal).")
+    return "\n".join(lines)
+
+
 def build_context(
     page: Page,
     current_url: str,
