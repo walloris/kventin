@@ -256,8 +256,23 @@ def detect_active_overlays(page: Page) -> Dict[str, Any]:
             """
             (ignorePatterns) => {
                 const overlays = [];
+                // Фильтр: UI агента (чат с LLM, баннер Kventin) — не часть тестируемого приложения
+                const isAgentUI = (el) => {
+                    if (!el) return false;
+                    let cur = el;
+                    while (cur && cur !== document.body) {
+                        const id = (cur.id || '').toString();
+                        if (id.startsWith('agent-') || id === 'agent-banner' || id === 'agent-llm-overlay') return true;
+                        const cls = (cur.className || '').toString().toLowerCase();
+                        if (cls.includes('agent-llm') || cls.includes('agent-banner') || cls.includes('kventin')) return true;
+                        cur = cur.parentElement;
+                    }
+                    return false;
+                };
                 const isChatOrSupport = (el) => {
                     if (!el || !ignorePatterns || !ignorePatterns.length) return false;
+                    // Сначала проверяем: это UI агента?
+                    if (isAgentUI(el)) return true;
                     const check = (s) => {
                         if (!s || typeof s !== 'string') return false;
                         const low = s.toLowerCase();
@@ -363,7 +378,7 @@ def detect_active_overlays(page: Page) -> Dict[str, Any]:
                 for (const sel of tooltipSels) {
                     try {
                         document.querySelectorAll(sel).forEach(el => {
-                            if (vis(el)) overlays.push({ type: 'tooltip', text: textOf(el, 120) });
+                            if (vis(el) && !isAgentUI(el) && !isChatOrSupport(el)) overlays.push({ type: 'tooltip', text: textOf(el, 120) });
                         });
                     } catch(e) {}
                 }
@@ -380,7 +395,7 @@ def detect_active_overlays(page: Page) -> Dict[str, Any]:
                 for (const sel of ddSels) {
                     try {
                         document.querySelectorAll(sel).forEach(el => {
-                            if (vis(el) && zOf(el) > 5) {
+                            if (vis(el) && zOf(el) > 5 && !isAgentUI(el) && !isChatOrSupport(el)) {
                                 const items = [];
                                 el.querySelectorAll('[role="option"], [role="menuitem"], li, a').forEach(li => {
                                     if (vis(li)) items.push(textOf(li, 40));
@@ -399,7 +414,7 @@ def detect_active_overlays(page: Page) -> Dict[str, Any]:
                 for (const sel of popSels) {
                     try {
                         document.querySelectorAll(sel).forEach(el => {
-                            if (vis(el)) overlays.push({ type: 'popover', text: textOf(el, 150) });
+                            if (vis(el) && !isAgentUI(el) && !isChatOrSupport(el)) overlays.push({ type: 'popover', text: textOf(el, 150) });
                         });
                     } catch(e) {}
                 }
@@ -414,7 +429,7 @@ def detect_active_overlays(page: Page) -> Dict[str, Any]:
                 for (const sel of toastSels) {
                     try {
                         document.querySelectorAll(sel).forEach(el => {
-                            if (vis(el)) overlays.push({ type: 'notification', text: textOf(el, 120) });
+                            if (vis(el) && !isAgentUI(el) && !isChatOrSupport(el)) overlays.push({ type: 'notification', text: textOf(el, 120) });
                         });
                     } catch(e) {}
                 }

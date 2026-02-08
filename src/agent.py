@@ -404,14 +404,43 @@ class AgentMemory:
 
 
 # --- Скриншот в base64 ---
-def take_screenshot_b64(page: Page) -> Optional[str]:
-    """Сделать скриншот и вернуть base64-строку."""
+def _hide_agent_ui(page: Page):
+    """Скрыть UI агента перед скриншотом (чтобы GigaChat не видел оверлей)."""
     try:
+        page.evaluate("""() => {
+            ['agent-llm-overlay', 'agent-banner'].forEach(id => {
+                const el = document.getElementById(id);
+                if (el) el.style.display = 'none';
+            });
+        }""")
+    except Exception:
+        pass
+
+
+def _show_agent_ui(page: Page):
+    """Вернуть UI агента после скриншота."""
+    try:
+        page.evaluate("""() => {
+            const llm = document.getElementById('agent-llm-overlay');
+            if (llm) llm.style.display = '';
+            const banner = document.getElementById('agent-banner');
+            if (banner) banner.style.display = 'flex';
+        }""")
+    except Exception:
+        pass
+
+
+def take_screenshot_b64(page: Page) -> Optional[str]:
+    """Сделать скриншот (без UI агента) и вернуть base64-строку."""
+    try:
+        _hide_agent_ui(page)
         raw = page.screenshot(type="png")
         return base64.b64encode(raw).decode("ascii")
     except Exception as e:
         print(f"[Agent] Ошибка скриншота: {e}")
         return None
+    finally:
+        _show_agent_ui(page)
 
 
 # --- Парсинг JSON-ответа от GigaChat ---
