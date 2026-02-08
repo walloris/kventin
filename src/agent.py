@@ -45,23 +45,48 @@ from src.checklist import run_checklist, checklist_results_to_context
 from src.defect_builder import build_defect_summary, build_defect_description, collect_evidence
 
 
+# --- Нормализация ключа для дедупликации ---
+def _norm_key(s: str, max_len: int = 80) -> str:
+    """Единый ключ для сравнения: без повторов из-за пробелов/регистра."""
+    if not s:
+        return ""
+    return s.strip().lower().replace("\n", " ").replace("\r", " ")[:max_len]
+
+
 # --- Память агента ---
 class AgentMemory:
-    """Хранит историю действий, чтобы не повторяться и давать GigaChat контекст."""
+    """
+    Хранит всё, что агент уже делал, чтобы не ходить по циклу.
+    Учитываются: клики, ховеры, ввод в поля, закрытие модалок, выбор опций, прокрутки.
+    """
 
-    def __init__(self, max_actions: int = 50):
+    def __init__(self, max_actions: int = 80):
         self.actions: List[Dict[str, Any]] = []
         self.max_actions = max_actions
         self.defects_reported: List[str] = []
-        self.elements_clicked: set = set()
         self.iteration = 0
+        # Ключи (normalized) уже выполненных действий — НЕ ПОВТОРЯТЬ
+        self.done_click: set = set()       # selector/text по которому кликали
+        self.done_hover: set = set()      # selector/text по которому наводили
+        self.done_type: set = set()       # placeholder/name поля или "selector" куда вводили
+        self.done_close_modal: int = 0    # сколько раз закрывали модалку (не дублируем бесконечно)
+        self.done_select_option: set = set()  # ("selector", "value") или просто value
+        self.done_scroll_down: int = 0
+        self.done_scroll_up: int = 0
+        # Лимиты, чтобы не зациклиться на одном типе действия
+        self.max_scrolls_in_row = 5
+        self.last_actions_sequence: List[str] = []  # последние 5 типов действий (click, scroll, ...)
 
     def add_action(self, action: Dict[str, Any], result: str = ""):
+        act = (action.get("action") or "").lower()
+        sel = _norm_key(action.get("selector", ""))
+        val = _norm_key(action.get("value", ""))
+
         self.iteration += 1
         entry = {
             "step": self.iteration,
             "time": datetime.now().strftime("%H:%M:%S"),
-            "action": action.get("action", ""),
+            "action": act,
             "selector": action.get("selector", ""),
             "reason": action.get("reason", ""),
             "result": result[:200],
@@ -69,18 +94,85 @@ class AgentMemory:
         self.actions.append(entry)
         if len(self.actions) > self.max_actions:
             self.actions = self.actions[-self.max_actions:]
-        sel = action.get("selector", "")
-        if sel and action.get("action") == "click":
-            self.elements_clicked.add(sel[:100])
 
-    def get_history_text(self, last_n: int = 15) -> str:
-        if not self.actions:
-            return "История пуста — это первое действие."
-        lines = ["Последние действия агента:"]
+        # Запоминаем для дедупликации
+        if act == "click" and sel:
+            self.done_click.add(sel)
+        elif act == "hover" and sel:
+            self.done_hover.add(sel)
+        elif act == "type" and (sel or val):
+            self.done_type.add(sel or val)
+        elif act == "close_modal":
+            self.done_close_modal += 1
+        elif act == "select_option" and (sel or val):
+            self.done_select_option.add((sel, val) if sel and val else (sel or val,))
+        elif act == "scroll":
+            if sel in ("down", "вниз", ""):
+                self.done_scroll_down += 1
+            elif sel in ("up", "вверх"):
+                self.done_scroll_up += 1
+
+        self.last_actions_sequence.append(act)
+        if len(self.last_actions_sequence) > 10:
+            self.last_actions_sequence = self.last_actions_sequence[-10:]
+
+    def is_already_done(self, action: str, selector: str = "", value: str = "") -> bool:
+        """Проверить, не делали ли мы уже это действие (чтобы не повторять)."""
+        act = (action or "").lower()
+        sel = _norm_key(selector)
+        val = _norm_key(value)
+        if act == "click" and sel and sel in self.done_click:
+            return True
+        if act == "hover" and sel and sel in self.done_hover:
+            return True
+        if act == "type" and (sel or val) and (sel in self.done_type or val in self.done_type):
+            return True
+        if act == "select_option" and (sel or val):
+            if (sel, val) in self.done_select_option:
+                return True
+            if val and (val,) in self.done_select_option:
+                return True
+            if sel and (sel,) in self.done_select_option:
+                return True
+        if act == "close_modal" and self.done_close_modal > 0:
+            # Не считаем повторным, если модалка появилась снова — но можно ограничить подряд
+            pass
+        return False
+
+    def should_avoid_scroll(self) -> bool:
+        """Не прокручивать бесконечно: если недавно много scroll — предложить другое действие."""
+        recent = self.last_actions_sequence[-5:] if self.last_actions_sequence else []
+        scroll_count = sum(1 for a in recent if a == "scroll")
+        return scroll_count >= self.max_scrolls_in_row
+
+    def get_history_text(self, last_n: int = 20) -> str:
+        """Текст для GigaChat: что уже сделано. НЕ ПОВТОРЯТЬ эти действия."""
+        lines = [
+            "——— УЖЕ СДЕЛАНО (НЕ ПОВТОРЯТЬ, выбирай другое действие!) ———",
+        ]
+        if self.done_click:
+            items = sorted(self.done_click)[-25:]
+            lines.append(f"Кликнуто ({len(self.done_click)}): " + ", ".join(f'"{x[:40]}"' for x in items))
+        if self.done_hover:
+            items = sorted(self.done_hover)[-15:]
+            lines.append(f"Наведено (hover) ({len(self.done_hover)}): " + ", ".join(f'"{x[:40]}"' for x in items))
+        if self.done_type:
+            items = sorted(self.done_type)[-15:]
+            lines.append(f"Ввод в поля ({len(self.done_type)}): " + ", ".join(f'"{x[:40]}"' for x in items))
+        if self.done_close_modal:
+            lines.append(f"Закрыто модалок: {self.done_close_modal}")
+        if self.done_select_option:
+            items = list(self.done_select_option)[:15]
+            lines.append(f"Выбрано опций: " + ", ".join(str(x)[:50] for x in items))
+        if self.done_scroll_down or self.done_scroll_up:
+            lines.append(f"Прокручено: вниз {self.done_scroll_down}, вверх {self.done_scroll_up}")
+        if self.should_avoid_scroll():
+            lines.append("Внимание: недавно много прокруток — выбери клик/hover/type/close_modal, а не scroll.")
+        lines.append("——— Конец списка. Выбери действие, которого ещё НЕТ в списке выше. ———")
+        lines.append("")
+        lines.append("Последние шаги:")
         for a in self.actions[-last_n:]:
-            lines.append(f"  #{a['step']} [{a['time']}] {a['action']} -> {a['selector'][:50]} | {a['result'][:60]}")
-        if self.elements_clicked:
-            lines.append(f"Уже кликнуто ({len(self.elements_clicked)}): {', '.join(list(self.elements_clicked)[-10:])}")
+            lines.append(f"  #{a['step']} {a['action']} -> {a['selector'][:45]} | {a['result'][:50]}")
         return "\n".join(lines)
 
 
@@ -646,7 +738,7 @@ def run_agent(start_url: str = None):
             if overlay_context:
                 context_str = overlay_context + "\n\n" + context_str
             dom_summary = get_dom_summary(page, max_length=4000)
-            history_text = memory.get_history_text(last_n=10)
+            history_text = memory.get_history_text(last_n=15)
 
             if has_overlay:
                 question = f"""Вот скриншот. На странице есть АКТИВНЫЙ ОВЕРЛЕЙ (модалка/дропдаун/тултип/попап).
@@ -691,16 +783,34 @@ DOM (кнопки, ссылки, формы):
                 print(f"[Agent] #{step} Не удалось распарсить JSON. Ответ: {raw_answer[:120]}")
                 action = {"action": "scroll", "selector": "down", "reason": "GigaChat не дал JSON, прокрутка"}
 
+            act_type = (action.get("action") or "").lower()
+            sel = (action.get("selector") or "").strip()
+            val = (action.get("value") or "").strip()
+
+            # Проверка: это действие уже делали? Не ходим по циклу.
+            if act_type != "check_defect" and memory.is_already_done(act_type, sel, val):
+                print(f"[Agent] #{step} Повтор действия (уже делали): {act_type} -> {sel[:40]}")
+                update_llm_overlay(page, prompt=f"#{step} Повтор!", response=f"Уже делали: {act_type} {sel[:30]}. Запасное действие.", loading=False)
+                if has_overlay:
+                    action = {"action": "close_modal", "selector": "", "reason": "Повтор — закрываю оверлей"}
+                elif not memory.should_avoid_scroll():
+                    action = {"action": "scroll", "selector": "down", "reason": "Повтор — прокручиваю вниз"}
+                else:
+                    action = {"action": "scroll", "selector": "up", "reason": "Повтор — прокручиваю вверх"}
+                act_type = action.get("action", "").lower()
+                sel = action.get("selector", "")
+                val = action.get("value", "")
+
             observation = action.get("observation", "")
             reason = action.get("reason", "")
             possible_bug = action.get("possible_bug")
             print(f"[Agent] #{step} Наблюдение: {observation[:80]}")
-            print(f"[Agent] #{step} Действие: {action.get('action')} -> {action.get('selector', '')[:40]} | {reason[:50]}")
+            print(f"[Agent] #{step} Действие: {act_type} -> {sel[:40]} | {reason[:50]}")
 
             # ========== PHASE 3: Выполнение действия ==========
-            update_demo_banner(page, step_text=f"#{step} {action.get('action', '').upper()}: {action.get('selector', '')[:30]}…", progress_pct=80)
+            update_demo_banner(page, step_text=f"#{step} {act_type.upper()}: {sel[:30]}…", progress_pct=80)
 
-            if action.get("action") == "check_defect" and possible_bug:
+            if act_type == "check_defect" and possible_bug:
                 _create_defect(page, possible_bug, current_url, checklist_results, console_log, network_failures)
                 memory.add_action(action, result="defect_reported")
                 time.sleep(3)
