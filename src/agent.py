@@ -5,6 +5,7 @@
 держится в пределах переданной страницы (при переходе по ссылке — проверка и возврат).
 Все действия видимы: курсор, подсветка элементов.
 """
+import os
 import re
 import time
 from playwright.sync_api import sync_playwright, Page
@@ -32,6 +33,7 @@ from src.visible_actions import (
 )
 from src.wait_utils import smart_wait_after_goto
 from src.checklist import run_checklist, checklist_results_to_context
+from src.defect_builder import build_defect_summary, build_defect_description, collect_evidence
 
 
 def _same_page(start_url: str, current_url: str) -> bool:
@@ -178,11 +180,27 @@ def run_agent(start_url: str = None):
 
             # Попытка распознать: дефект или клик
             if "дефект" in answer.lower() or "тикет" in answer.lower() or "jira" in answer.lower():
-                # Парсим summary/description из ответа (упрощённо)
-                lines = [s.strip() for s in answer.split("\n") if s.strip()]
-                summary = lines[0][:255] if lines else "Дефект (автотест)"
-                description = answer[:3000]
-                create_jira_issue(summary=summary, description=description)
+                summary = build_defect_summary(answer, current_url)
+                description = build_defect_description(
+                    answer, current_url,
+                    checklist_results=checklist_results,
+                    console_log=console_log,
+                    network_failures=network_failures,
+                )
+                attachment_paths = collect_evidence(page, console_log, network_failures)
+                key = create_jira_issue(
+                    summary=summary,
+                    description=description,
+                    attachment_paths=attachment_paths if attachment_paths else None,
+                )
+                if key and attachment_paths:
+                    try:
+                        import shutil
+                        d = os.path.dirname(attachment_paths[0])
+                        if d and os.path.isdir(d) and "kventin_defect_" in d:
+                            shutil.rmtree(d, ignore_errors=True)
+                    except Exception:
+                        pass
                 time.sleep(5)
                 continue
 

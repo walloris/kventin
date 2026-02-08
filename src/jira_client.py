@@ -1,10 +1,10 @@
 """
 Клиент Jira REST API для создания дефектов.
 Создаёт только реальные баги; флаки и проблемы тестовой среды не заводим.
-Поддержка как в твоём проекте: Bearer-токен (если длинный) или Basic (username, token), X-Atlassian-Token, verify=False.
+Поддержка вложений (скриншоты, логи). Bearer или Basic, X-Atlassian-Token, verify=False.
 """
 import os
-from typing import Optional
+from typing import Optional, List, Union
 
 import requests
 
@@ -32,6 +32,41 @@ def is_ignorable_issue(summary: str, description: str) -> bool:
     return False
 
 
+def _attach_files(
+    jira_url: str,
+    issue_key: str,
+    file_paths: List[str],
+    *,
+    headers_base: dict,
+    auth: Optional[tuple],
+    use_bearer: bool,
+    api_token: str,
+) -> None:
+    """Приложить файлы к созданной задаче."""
+    url = f"{jira_url}/rest/api/2/issue/{issue_key}/attachments"
+    headers = {k: v for k, v in headers_base.items() if k.lower() != "content-type"}
+    for path in file_paths:
+        if not path or not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "rb") as f:
+                files = {"file": (os.path.basename(path), f)}
+                r = requests.post(
+                    url,
+                    files=files,
+                    headers=headers,
+                    auth=auth if not use_bearer else None,
+                    verify=False,
+                    timeout=60,
+                )
+            if r.status_code in (200, 201):
+                print(f"[Jira] Вложение: {issue_key} <- {os.path.basename(path)}")
+            else:
+                print(f"[Jira] Ошибка вложения {r.status_code}: {os.path.basename(path)}")
+        except Exception as e:
+            print(f"[Jira] Ошибка вложения {path}: {e}")
+
+
 def create_jira_issue(
     summary: str,
     description: str,
@@ -41,10 +76,12 @@ def create_jira_issue(
     email: Optional[str] = None,
     api_token: Optional[str] = None,
     project_key: Optional[str] = None,
+    attachment_paths: Optional[List[Union[str, os.PathLike]]] = None,
 ) -> Optional[str]:
     """
-    Создать дефект в Jira. Возвращает ключ задачи (например PROJ-123) или None.
-    Логин: JIRA_USERNAME или JIRA_EMAIL (в зависимости от типа Jira).
+    Создать дефект в Jira с описанием и вложениями (фактура).
+    Возвращает ключ задачи (PROJ-123) или None.
+    attachment_paths: список путей к файлам (скриншот, console.log, network.log и т.д.).
     """
     jira_url = (jira_url or os.getenv("JIRA_URL", "")).rstrip("/")
     login = username or os.getenv("JIRA_USERNAME", "") or email or os.getenv("JIRA_EMAIL", "")
@@ -86,6 +123,16 @@ def create_jira_issue(
         r.raise_for_status()
         key = r.json().get("key")
         print(f"[Jira] Создан дефект: {key}")
+
+        if key and attachment_paths:
+            paths = [os.fspath(p) for p in attachment_paths]
+            _attach_files(
+                jira_url, key, paths,
+                headers_base=headers,
+                auth=auth,
+                use_bearer=use_bearer,
+                api_token=api_token,
+            )
         return key
     except requests.exceptions.HTTPError as e:
         print(f"[Jira] Ошибка API: {e.response.status_code} — {e.response.text[:200]}")
