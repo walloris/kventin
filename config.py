@@ -57,3 +57,28 @@ IGNORE_CONSOLE_PATTERNS = [
     "adservice",
 ]
 IGNORE_NETWORK_STATUSES = {404}  # можно расширить: 502, 503 для тестовой среды
+
+# Исключения для дефектов: если в summary/description есть эти фразы — тикет не создаём (404 в консоли и т.д.)
+DEFECT_IGNORE_PATTERNS = [
+    "404",
+    "404 ошибк",
+    "ошибк 404",
+    "404 в консоли",
+    "в консоли 404",
+    "консоль",
+    "console",
+    "failed to load resource",
+    "net::err_",
+    "favicon",
+    "chrome-extension",
+    "аналитик",
+    "analytics",
+    "тестовой сред",
+    "флак",
+    "flaky",
+]
+
+# Чеклист: пауза между шагами (мс), чтобы агент шёл медленнее и по порядку
+CHECKLIST_STEP_DELAY_MS = int(os.getenv("CHECKLIST_STEP_DELAY_MS", "2000"))
+# Ожидание загрузки: таймаут networkidle (мс)
+WAIT_NETWORK_IDLE_MS = int(os.getenv("WAIT_NETWORK_IDLE_MS", "5000"))

@@ -13,11 +13,14 @@ from config import (
     START_URL,
     BROWSER_SLOW_MO,
     HEADLESS,
+    CHECKLIST_STEP_DELAY_MS,
 )
 from src.gigachat_client import consult_agent
 from src.jira_client import create_jira_issue
 from src.page_analyzer import build_context, get_dom_summary
 from src.visible_actions import inject_cursor, move_cursor_to, highlight_and_click, safe_highlight, inject_llm_overlay, update_llm_overlay
+from src.wait_utils import smart_wait_after_goto
+from src.checklist import run_checklist, checklist_results_to_context
 
 
 def _same_page(start_url: str, current_url: str) -> bool:
@@ -84,7 +87,7 @@ def run_agent(start_url: str = None):
 
         try:
             page.goto(start_url, wait_until="domcontentloaded", timeout=30000)
-            time.sleep(1)
+            smart_wait_after_goto(page, timeout=15000)
             inject_cursor(page)
             inject_llm_overlay(page)
         except Exception as e:
@@ -102,12 +105,15 @@ def run_agent(start_url: str = None):
                 print(f"[Agent] Переход по ссылке: {current_url}. Проверка загрузки и возврат на {start_url}")
                 try:
                     page.goto(start_url, wait_until="domcontentloaded", timeout=20000)
-                    time.sleep(0.5)
+                    smart_wait_after_goto(page, timeout=10000)
                     inject_cursor(page)
                     inject_llm_overlay(page)
                 except Exception as e:
                     print(f"[Agent] Ошибка возврата: {e}")
                 continue
+
+            # Умное ожидание: дождаться стабилизации страницы
+            smart_wait_after_goto(page, timeout=5000)
 
             # Очистка старых записей (оставляем последние)
             if len(console_log) > 100:
@@ -115,7 +121,20 @@ def run_agent(start_url: str = None):
             if len(network_failures) > 50:
                 del network_failures[:-50]
 
+            # Чеклист: идём строго по пунктам, с паузой между шагами
+            def on_step(step_id: str, ok: bool, detail: str):
+                status = "✅" if ok else "❌"
+                print(f"[Agent] Чеклист {status} {step_id}: {detail[:80]}")
+                update_llm_overlay(page, prompt=f"Чеклист: {step_id}", response=detail[:200], loading=False)
+
+            checklist_results = run_checklist(
+                page, console_log, network_failures,
+                step_delay_ms=CHECKLIST_STEP_DELAY_MS,
+                on_step=on_step,
+            )
+            checklist_ctx = checklist_results_to_context(checklist_results)
             context_str = build_context(page, current_url, console_log, network_failures)
+            context_str = checklist_ctx + "\n\n" + context_str
             dom_summary = get_dom_summary(page)
 
             # Вопрос к GigaChat: что делать дальше?

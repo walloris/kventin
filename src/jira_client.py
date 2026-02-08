@@ -7,15 +7,18 @@ from typing import Optional
 
 import requests
 
-from config import IGNORE_CONSOLE_PATTERNS, IGNORE_NETWORK_STATUSES
+from config import IGNORE_CONSOLE_PATTERNS, IGNORE_NETWORK_STATUSES, DEFECT_IGNORE_PATTERNS
 
 
 def is_ignorable_issue(summary: str, description: str) -> bool:
     """
     Решение: не создавать тикет, если это типичный флак/тестовая среда.
-    Игнорируем: 404 в консоли, сетевые ошибки к сторонним сервисам и т.д.
+    Игнорируем: 404 в консоли, ошибки консоли, сетевые ошибки к сторонним сервисам и т.д.
     """
     text = (summary + " " + description).lower()
+    for pattern in DEFECT_IGNORE_PATTERNS:
+        if pattern.lower() in text:
+            return True
     for pattern in IGNORE_CONSOLE_PATTERNS:
         if pattern.lower() in text:
             return True
