@@ -38,6 +38,9 @@ JIRA_PROJECT_KEY = os.getenv("JIRA_PROJECT_KEY", "")
 BROWSER_SLOW_MO = int(os.getenv("BROWSER_SLOW_MO", "300"))
 HIGHLIGHT_DURATION_MS = int(os.getenv("HIGHLIGHT_DURATION_MS", "800"))
 HEADLESS = os.getenv("HEADLESS", "false").lower() in ("1", "true", "yes")
+# Размер окна браузера (по умолчанию Full HD — на весь экран)
+VIEWPORT_WIDTH = int(os.getenv("VIEWPORT_WIDTH", "1920"))
+VIEWPORT_HEIGHT = int(os.getenv("VIEWPORT_HEIGHT", "1080"))
 
 # Игнорируемые паттерны (флаки, тестовая среда, 404 в консоли и т.д.)
 IGNORE_CONSOLE_PATTERNS = [

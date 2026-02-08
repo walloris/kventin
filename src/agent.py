@@ -14,6 +14,8 @@ from config import (
     BROWSER_SLOW_MO,
     HEADLESS,
     CHECKLIST_STEP_DELAY_MS,
+    VIEWPORT_WIDTH,
+    VIEWPORT_HEIGHT,
 )
 from src.gigachat_client import consult_agent
 from src.jira_client import create_jira_issue
@@ -54,7 +56,7 @@ def run_agent(start_url: str = None):
             slow_mo=BROWSER_SLOW_MO,
         )
         context = browser.new_context(
-            viewport={"width": 1280, "height": 720},
+            viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
             ignore_https_errors=True,
         )
         page = context.new_page()
