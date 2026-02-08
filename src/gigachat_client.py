@@ -311,6 +311,50 @@ class GigaChatClient:
             LOG.error("get_token: не удалось получить токен (token_header/get_gigachat_token/oauth/password_grant)")
         return token
 
+    def _files_url(self) -> str:
+        """Вычислить URL для загрузки файлов из api_url (/chat/completions → /files)."""
+        base = self.api_url
+        if "/chat/completions" in base:
+            return base.replace("/chat/completions", "/files")
+        # Fallback: добавить /files к базовому URL
+        return base.rstrip("/").rsplit("/", 1)[0] + "/files"
+
+    def _upload_screenshot(self, screenshot_bytes: bytes) -> Optional[str]:
+        """
+        Загрузить скриншот через GigaChat /files API.
+        Возвращает file_id или None.
+        """
+        token = self._get_token()
+        if not token:
+            return None
+        files_url = self._files_url()
+        headers = {
+            "Authorization": f"Bearer {token}",
+        }
+        LOG.info("upload_screenshot: POST %s (%d bytes)", files_url, len(screenshot_bytes))
+        try:
+            r = requests.post(
+                files_url,
+                headers=headers,
+                files={"file": ("screenshot.jpg", screenshot_bytes, "image/jpeg")},
+                data={"purpose": "general"},
+                verify=self.verify_ssl,
+                timeout=60,
+            )
+            LOG.info("upload_screenshot: ответ %s body_len=%s", r.status_code, len(r.text))
+            if r.status_code in (200, 201):
+                data = r.json()
+                file_id = data.get("id") or data.get("file_id")
+                if file_id:
+                    LOG.info("upload_screenshot: file_id=%s", file_id)
+                    return file_id
+                LOG.warning("upload_screenshot: нет id в ответе: %s", str(data)[:300])
+            else:
+                LOG.warning("upload_screenshot: ошибка %s %s", r.status_code, r.text[:300])
+        except Exception as e:
+            LOG.warning("upload_screenshot: ошибка: %s", e)
+        return None
+
     def chat(self, messages: List[Dict[str, Any]]) -> str:
         token = self._get_token()
         if not token:
@@ -332,19 +376,9 @@ class GigaChatClient:
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
         }
-        # Вычислить длину user-промпта для лога
         last_msg = messages[-1] if messages else {}
-        if isinstance(last_msg.get("content"), str):
-            user_len = len(last_msg["content"])
-        elif isinstance(last_msg.get("content"), list):
-            user_len = sum(len(p.get("text", "")) for p in last_msg["content"] if isinstance(p, dict))
-        else:
-            user_len = 0
-        has_image = any(
-            isinstance(p, dict) and p.get("type") == "image_url"
-            for p in (last_msg.get("content") or [])
-            if isinstance(last_msg.get("content"), list)
-        )
+        user_len = len(last_msg.get("content", "")) if isinstance(last_msg.get("content"), str) else 0
+        has_image = "<img" in (last_msg.get("content", "") if isinstance(last_msg.get("content"), str) else "")
         LOG.info("chat: POST %s model=%s msgs=%s user_len=%s has_image=%s", self.api_url, model, len(messages), user_len, has_image)
         try:
             r = requests.post(
@@ -374,22 +408,76 @@ class GigaChatClient:
 
     def chat_with_screenshot(self, text_prompt: str, screenshot_b64: Optional[str] = None, system: Optional[str] = None) -> str:
         """
-        Отправить промпт со скриншотом (base64 PNG).
-        Если модель не поддерживает изображения, отправится только текст.
+        Отправить промпт со скриншотом в GigaChat.
+        Стратегия:
+          1) Загрузить скриншот через /files → получить file_id → <img src="file_id"> в тексте
+          2) Если /files не работает → inline <img src="data:image/jpeg;base64,..."> в тексте
+          3) Если и это 400 → текст без картинки (fallback)
         """
         system = system or "Ты — AI-тестировщик. Отвечай на русском. Кратко, структурированно."
-        if screenshot_b64:
-            user_content = [
-                {"type": "text", "text": text_prompt},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{screenshot_b64}"}},
+
+        if not screenshot_b64:
+            return self.query(text_prompt, system=system)
+
+        # Сжать скриншот (JPEG, уменьшить размер) для снижения payload
+        screenshot_bytes = self._compress_screenshot(screenshot_b64)
+
+        # --- Стратегия 1: загрузить через /files ---
+        file_id = self._upload_screenshot(screenshot_bytes)
+        if file_id:
+            LOG.info("chat_with_screenshot: используем file_id=%s", file_id)
+            user_content = f"{text_prompt}\n<img src=\"{file_id}\">"
+            messages = [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_content},
             ]
-        else:
-            user_content = text_prompt
-        messages = [
+            result = self.chat(messages)
+            if result:
+                return result
+            LOG.warning("chat_with_screenshot: file_id не сработал, пробуем inline base64")
+
+        # --- Стратегия 2: inline base64 <img> тег в тексте ---
+        img_b64 = base64.b64encode(screenshot_bytes).decode("ascii")
+        user_content_inline = f"{text_prompt}\n<img src=\"data:image/jpeg;base64,{img_b64}\">"
+        messages_inline = [
             {"role": "system", "content": system},
-            {"role": "user", "content": user_content},
+            {"role": "user", "content": user_content_inline},
         ]
-        return self.chat(messages)
+        LOG.info("chat_with_screenshot: пробуем inline base64 (img_len=%d)", len(img_b64))
+        result = self.chat(messages_inline)
+        if result:
+            return result
+
+        # --- Стратегия 3: fallback — только текст ---
+        LOG.warning("chat_with_screenshot: изображение не поддерживается, fallback на текст")
+        return self.query(text_prompt, system=system)
+
+    @staticmethod
+    def _compress_screenshot(screenshot_b64: str) -> bytes:
+        """Сжать скриншот: PNG base64 → JPEG bytes, уменьшить до 1280px по ширине."""
+        raw_png = base64.b64decode(screenshot_b64)
+        try:
+            from io import BytesIO
+            from PIL import Image
+            img = Image.open(BytesIO(raw_png))
+            # Уменьшить до 1280px по ширине
+            if img.width > 1280:
+                ratio = 1280 / img.width
+                new_size = (1280, int(img.height * ratio))
+                img = img.resize(new_size, Image.LANCZOS)
+            # Конвертировать в RGB (JPEG не поддерживает alpha)
+            if img.mode in ("RGBA", "P"):
+                img = img.convert("RGB")
+            buf = BytesIO()
+            img.save(buf, format="JPEG", quality=70, optimize=True)
+            LOG.info("compress_screenshot: %d bytes PNG → %d bytes JPEG", len(raw_png), buf.tell())
+            return buf.getvalue()
+        except ImportError:
+            LOG.warning("compress_screenshot: Pillow не установлен, отправляем PNG как есть")
+            return raw_png
+        except Exception as e:
+            LOG.warning("compress_screenshot: ошибка сжатия: %s, отправляем PNG", e)
+            return raw_png
 
     def query(self, prompt: str, system: Optional[str] = None) -> str:
         system = system or "Отвечай на русском. Кратко и по делу."
