@@ -14,7 +14,7 @@ try:
 except Exception:
     pass
 
-from config import IGNORE_CONSOLE_PATTERNS, IGNORE_NETWORK_STATUSES, DEFECT_IGNORE_PATTERNS
+from config import IGNORE_CONSOLE_PATTERNS, IGNORE_NETWORK_STATUSES, DEFECT_IGNORE_PATTERNS, JIRA_ISSUE_TYPE
 
 
 def is_ignorable_issue(summary: str, description: str) -> bool:
@@ -77,7 +77,7 @@ def create_jira_issue(
             "project": {"key": project_key},
             "summary": summary[:255],
             "description": description,
-            "issuetype": {"name": "Bug"},
+            "issuetype": {"name": JIRA_ISSUE_TYPE},
         }
     }
 
