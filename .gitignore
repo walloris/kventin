@@ -1,0 +1,30 @@
+# Секреты и окружение
+.env
+.env.local
+*.pem
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Playwright
+playwright-report/
+test-results/
+.blob*
+trace.zip
+
+# Прочее
+.DS_Store
+*.log
