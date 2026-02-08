@@ -37,6 +37,64 @@ DEFAULT_TOKEN_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
 DEFAULT_API_URL = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
 
 
+def get_gigachat_token(env: str) -> Optional[str]:
+    """
+    Получение токена методом из твоего проекта: grant_type=password, username, client_id (без пароля).
+    URL берётся из config: token_url_dev / token_url_ift по env.
+    """
+    try:
+        from config import (
+            GIGACHAT_USERNAME,
+            GIGACHAT_CLIENT_ID,
+            GIGACHAT_TOKEN_URL,
+            GIGACHAT_TOKEN_URL_DEV,
+            GIGACHAT_TOKEN_URL_IFT,
+        )
+    except ImportError:
+        GIGACHAT_USERNAME = os.getenv("GIGACHAT_USERNAME", "")
+        GIGACHAT_CLIENT_ID = os.getenv("GIGACHAT_CLIENT_ID", "")
+        GIGACHAT_TOKEN_URL = os.getenv("GIGACHAT_TOKEN_URL", "")
+        GIGACHAT_TOKEN_URL_DEV = os.getenv("GIGACHAT_TOKEN_URL_DEV", "")
+        GIGACHAT_TOKEN_URL_IFT = os.getenv("GIGACHAT_TOKEN_URL_IFT", "")
+
+    url = (GIGACHAT_TOKEN_URL_IFT if env == "ift" else GIGACHAT_TOKEN_URL_DEV) or GIGACHAT_TOKEN_URL or _config("TOKEN_URL") or DEFAULT_TOKEN_URL
+    if not GIGACHAT_USERNAME or not GIGACHAT_CLIENT_ID:
+        LOG.warning("get_gigachat_token: не заданы username или client_id")
+        return None
+
+    LOG.info("🔗 Попытка подключения к: %s", url)
+    payload = {
+        "grant_type": "password",
+        "username": GIGACHAT_USERNAME,
+        "client_id": GIGACHAT_CLIENT_ID,
+    }
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+
+    try:
+        response = requests.post(
+            url,
+            data=payload,
+            headers=headers,
+            verify=False,
+            timeout=30,
+        )
+        if response.status_code == 200:
+            LOG.info("✅ Токен получен успешно")
+            return response.json().get("access_token")
+        LOG.error("❌ HTTP ошибка: %s - %s", response.status_code, response.text)
+        return None
+    except requests.exceptions.ConnectionError as e:
+        LOG.error("❌ Ошибка подключения: %s", e)
+        LOG.error("💡 Возможные причины: сервер недоступен, проблемы с сетью, блокировка файрволом")
+        return None
+    except requests.exceptions.Timeout as e:
+        LOG.error("❌ Таймаут подключения: %s", e)
+        return None
+    except Exception as e:
+        LOG.error("❌ Неожиданная ошибка: %s", e)
+        return None
+
+
 def _config(key: str, default: str = "") -> str:
     try:
         from config import (
@@ -117,7 +175,7 @@ class GigaChatClient:
         self.scope = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
 
         # Лог конфига для дебага кредов (без вывода секретов целиком)
-        auth_type = "token_header" if self.token_header else ("oauth" if self._basic_key() else ("password_grant" if (self.username and self.password and self.client_id) else "none"))
+        auth_type = "token_header" if self.token_header else ("get_gigachat_token" if (self.username and self.client_id) else ("oauth" if self._basic_key() else ("password_grant" if (self.username and self.password and self.client_id) else "none")))
         LOG.debug(
             "config: api_url=%s token_url=%s model=%s env=%s auth=%s verify_ssl=%s",
             self.api_url[:60] + "..." if len(self.api_url) > 60 else self.api_url,
@@ -235,14 +293,22 @@ class GigaChatClient:
         if self.access_token and time.time() < self.token_expires_at - 60:
             LOG.debug("get_token: кэшированный токен до %s", time.strftime("%H:%M:%S", time.localtime(self.token_expires_at)))
             return self.access_token
+        # Твой метод: username + client_id (без пароля)
+        if self.username and self.client_id:
+            LOG.debug("get_token: get_gigachat_token(env=%s)...", self.env)
+            token = get_gigachat_token(self.env)
+            if token:
+                self.access_token = token
+                self.token_expires_at = time.time() + 1800  # 30 мин по умолчанию
+                return token
         LOG.debug("get_token: запрос oauth...")
         token = self._get_token_oauth()
         if token:
             return token
-        LOG.debug("get_token: запрос password_grant...")
+        LOG.debug("get_token: запрос password_grant (username+password+client_id)...")
         token = self._get_token_password_grant()
         if not token:
-            LOG.error("get_token: не удалось получить токен (token_header/oauth/password_grant)")
+            LOG.error("get_token: не удалось получить токен (token_header/get_gigachat_token/oauth/password_grant)")
         return token
 
     def chat(self, messages: List[Dict[str, str]]) -> str:
