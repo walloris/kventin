@@ -38,6 +38,7 @@ from src.gigachat_client import (
     consult_agent,
     get_test_plan_from_screenshot,
     ask_is_this_really_bug,
+    init_gigachat_connection,
 )
 from src.jira_client import create_jira_issue
 from src.page_analyzer import (
@@ -760,6 +761,12 @@ def run_agent(start_url: str = None):
     console_log: List[Dict[str, Any]] = []
     network_failures: List[Dict[str, Any]] = []
     memory = AgentMemory()
+
+    # Инициализация соединения с GigaChat до запуска браузера
+    if not init_gigachat_connection():
+        print("[Agent] GigaChat недоступен. Проверьте настройки (токен, URL). Браузер не запускается.")
+        return
+    print("[Agent] GigaChat готов. Запуск браузера…")
 
     with sync_playwright() as p:
         browser = None

@@ -502,6 +502,29 @@ def _get_client():
     return _client
 
 
+def init_gigachat_connection() -> bool:
+    """
+    Инициализировать соединение с GigaChat до запуска браузера: получить клиент и токен,
+    при необходимости отправить минимальный запрос для проверки доступности API.
+    Возвращает True, если соединение установлено (токен получен), иначе False.
+    """
+    try:
+        client = _get_client()
+        token = client._get_token()
+        if not token:
+            LOG.warning("init_gigachat_connection: не удалось получить токен")
+            return False
+        LOG.info("GigaChat: соединение инициализировано (токен получен)")
+        # Минимальный запрос для проверки доступности API
+        out = client.query("Ответь одним словом: ок", system="Ты отвечаешь только одним словом.")
+        if out and len(out.strip()) > 0:
+            LOG.info("GigaChat: API доступен")
+        return True
+    except Exception as e:
+        LOG.exception("init_gigachat_connection: %s", e)
+        return False
+
+
 def ask_gigachat(prompt: str, **kwargs: Any) -> Optional[str]:
     """Один запрос к GigaChat. Поддерживаются все способы авторизации из конфига."""
     result = _get_client().query(prompt, system=kwargs.get("system"))
