@@ -30,20 +30,22 @@ def create_jira_issue(
     description: str,
     *,
     jira_url: Optional[str] = None,
+    username: Optional[str] = None,
     email: Optional[str] = None,
     api_token: Optional[str] = None,
     project_key: Optional[str] = None,
 ) -> Optional[str]:
     """
     Создать дефект в Jira. Возвращает ключ задачи (например PROJ-123) или None.
+    Логин: JIRA_USERNAME или JIRA_EMAIL (в зависимости от типа Jira).
     """
     jira_url = (jira_url or os.getenv("JIRA_URL", "")).rstrip("/")
-    email = email or os.getenv("JIRA_EMAIL", "")
+    login = username or os.getenv("JIRA_USERNAME", "") or email or os.getenv("JIRA_EMAIL", "")
     api_token = api_token or os.getenv("JIRA_API_TOKEN", "")
     project_key = project_key or os.getenv("JIRA_PROJECT_KEY", "")
 
-    if not all([jira_url, email, api_token, project_key]):
-        print("[Jira] Не заданы JIRA_URL, JIRA_EMAIL, JIRA_API_TOKEN или JIRA_PROJECT_KEY — пропуск создания тикета.")
+    if not all([jira_url, login, api_token, project_key]):
+        print("[Jira] Не заданы JIRA_URL, (JIRA_USERNAME или JIRA_EMAIL), JIRA_API_TOKEN или JIRA_PROJECT_KEY — пропуск создания тикета.")
         return None
 
     if is_ignorable_issue(summary, description):
@@ -51,7 +53,7 @@ def create_jira_issue(
         return None
 
     url = f"{jira_url}/rest/api/2/issue/"
-    auth = (email, api_token)
+    auth = (login, api_token)
     payload = {
         "fields": {
             "project": {"key": project_key},

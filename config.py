@@ -28,9 +28,10 @@ GIGACHAT_API_URL_IFT = os.getenv("GIGACHAT_API_URL_IFT", "")
 # Совместимость со старым способом (публичный API)
 GIGACHAT_CREDENTIALS = os.getenv("GIGACHAT_CREDENTIALS", "")
 
-# Jira
+# Jira (логин: username или email — в зависимости от типа Jira)
 JIRA_URL = os.getenv("JIRA_URL", "").rstrip("/")
-JIRA_EMAIL = os.getenv("JIRA_EMAIL", "")
+JIRA_USERNAME = os.getenv("JIRA_USERNAME", "")
+JIRA_EMAIL = os.getenv("JIRA_EMAIL", "")  # для Atlassian Cloud часто используют email
 JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN", "")
 JIRA_PROJECT_KEY = os.getenv("JIRA_PROJECT_KEY", "")
 

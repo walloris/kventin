@@ -57,7 +57,8 @@ cp .env.example .env
 | `START_URL` | **Обязательно.** URL страницы для тестирования (например `https://example.com`). |
 | `GIGACHAT_CREDENTIALS` | Строка авторизации GigaChat (Base64 от `client_id:client_secret`) или используйте `GIGACHAT_CLIENT_ID` и `GIGACHAT_CLIENT_SECRET`. |
 | `JIRA_URL` | URL вашего Jira (например `https://your-company.atlassian.net`). |
-| `JIRA_EMAIL` | Email учётной записи Jira. |
+| `JIRA_USERNAME` | Логин (username) в Jira. |
+| `JIRA_EMAIL` | Email в Jira (если у вас логин по email, например Atlassian Cloud). |
 | `JIRA_API_TOKEN` | API-токен (или пароль) для Jira. |
 | `JIRA_PROJECT_KEY` | Ключ проекта для создания дефектов (например `PROJ`). |
 | `BROWSER_SLOW_MO` | Замедление операций браузера в мс (по умолчанию 300), чтобы было видно действия. |
