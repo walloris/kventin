@@ -16,6 +16,90 @@ except Exception:
 
 from config import IGNORE_CONSOLE_PATTERNS, IGNORE_NETWORK_STATUSES, DEFECT_IGNORE_PATTERNS, JIRA_ISSUE_TYPE
 
+# Лейбл всех дефектов, заведённых агентом
+JIRA_DEFECT_LABEL = "kventin"
+
+
+def _jira_request(
+    method: str,
+    jira_url: str,
+    path: str,
+    *,
+    headers: dict,
+    auth: Optional[tuple],
+    use_bearer: bool,
+    **kwargs: object,
+) -> Optional[dict]:
+    """Выполнить запрос к Jira API. Возвращает JSON или None."""
+    url = f"{jira_url}/rest/api/2/{path.lstrip('/')}"
+    kwargs.setdefault("verify", False)
+    kwargs.setdefault("timeout", 30)
+    if use_bearer:
+        kwargs["auth"] = None
+    else:
+        kwargs["auth"] = auth
+    kwargs["headers"] = {**headers, **kwargs.get("headers", {})}
+    try:
+        r = requests.request(method, url, **kwargs)
+        if r.status_code in (200, 201):
+            return r.json() if r.text else {}
+        return None
+    except Exception as e:
+        print(f"[Jira] Ошибка запроса: {e}")
+        return None
+
+
+def search_duplicates(
+    summary_part: str,
+    *,
+    jira_url: Optional[str] = None,
+    username: Optional[str] = None,
+    email: Optional[str] = None,
+    api_token: Optional[str] = None,
+    project_key: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Поиск дубля по summary: открытые задачи с лейблом kventin и похожим summary.
+    Возвращает ключ найденной задачи (PROJ-123) или None.
+    """
+    jira_url = (jira_url or os.getenv("JIRA_URL", "")).rstrip("/")
+    login = username or os.getenv("JIRA_USERNAME", "") or email or os.getenv("JIRA_EMAIL", "")
+    api_token = api_token or os.getenv("JIRA_API_TOKEN", "")
+    project_key = project_key or os.getenv("JIRA_PROJECT_KEY", "")
+
+    if not jira_url or not api_token or not project_key:
+        return None
+    use_bearer = len(api_token) > 20
+    if not use_bearer and not login:
+        return None
+
+    headers = {"Content-Type": "application/json", "X-Atlassian-Token": "no-check"}
+    if use_bearer:
+        headers["Authorization"] = f"Bearer {api_token}"
+        auth = None
+    else:
+        auth = (login, api_token)
+
+    safe = (summary_part or "").replace('"', "").replace("\\", "")[:50].strip()
+    if not safe:
+        return None
+    jql = (
+        f'project = {project_key} AND labels = {JIRA_DEFECT_LABEL} '
+        f'AND status not in (Closed, Done) AND summary ~ "{safe}"'
+    )
+    res = _jira_request(
+        "GET",
+        jira_url,
+        "search",
+        params={"jql": jql, "fields": "key", "maxResults": 1},
+        headers=headers,
+        auth=auth,
+        use_bearer=use_bearer,
+    )
+    if not res or "issues" not in res or not res["issues"]:
+        return None
+    return res["issues"][0].get("key")
+
 
 def is_ignorable_issue(summary: str, description: str) -> bool:
     """
@@ -101,6 +185,17 @@ def create_jira_issue(
         print("[Jira] Пропуск: похоже на флак/тестовую среду:", summary[:80])
         return None
 
+    dup = search_duplicates(
+        summary,
+        jira_url=jira_url,
+        username=login,
+        api_token=api_token,
+        project_key=project_key,
+    )
+    if dup:
+        print(f"[Jira] Дубль: не создаём, найден {dup}")
+        return dup
+
     url = f"{jira_url}/rest/api/2/issue"
     headers = {"Content-Type": "application/json", "X-Atlassian-Token": "no-check"}
     if use_bearer:
@@ -115,6 +210,7 @@ def create_jira_issue(
             "summary": summary[:255],
             "description": description,
             "issuetype": {"name": JIRA_ISSUE_TYPE},
+            "labels": [JIRA_DEFECT_LABEL],
         }
     }
 

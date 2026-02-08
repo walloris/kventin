@@ -311,7 +311,7 @@ class GigaChatClient:
             LOG.error("get_token: не удалось получить токен (token_header/get_gigachat_token/oauth/password_grant)")
         return token
 
-    def chat(self, messages: List[Dict[str, str]]) -> str:
+    def chat(self, messages: List[Dict[str, Any]]) -> str:
         token = self._get_token()
         if not token:
             LOG.error("chat: нет токена, запрос отменён")
@@ -332,17 +332,27 @@ class GigaChatClient:
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
         }
-        user_content = (messages[-1].get("content") or "") if messages else ""
-        LOG.info("chat: POST %s model=%s messages=%s user_len=%s Authorization=Bearer %s",
-                 self.api_url, model, len(messages), len(user_content), _mask(token, show_tail=6))
-        LOG.debug("chat: user prompt (tail 400): %s", user_content[-400:] if len(user_content) > 400 else user_content)
+        # Вычислить длину user-промпта для лога
+        last_msg = messages[-1] if messages else {}
+        if isinstance(last_msg.get("content"), str):
+            user_len = len(last_msg["content"])
+        elif isinstance(last_msg.get("content"), list):
+            user_len = sum(len(p.get("text", "")) for p in last_msg["content"] if isinstance(p, dict))
+        else:
+            user_len = 0
+        has_image = any(
+            isinstance(p, dict) and p.get("type") == "image_url"
+            for p in (last_msg.get("content") or [])
+            if isinstance(last_msg.get("content"), list)
+        )
+        LOG.info("chat: POST %s model=%s msgs=%s user_len=%s has_image=%s", self.api_url, model, len(messages), user_len, has_image)
         try:
             r = requests.post(
                 self.api_url,
                 json=payload,
                 headers=headers,
                 verify=self.verify_ssl,
-                timeout=60,
+                timeout=120,
             )
             LOG.info("chat: ответ %s body_len=%s", r.status_code, len(r.text))
             if r.status_code != 200:
@@ -361,6 +371,25 @@ class GigaChatClient:
         except Exception as e:
             LOG.exception("chat: ошибка запроса: %s", e)
             return ""
+
+    def chat_with_screenshot(self, text_prompt: str, screenshot_b64: Optional[str] = None, system: Optional[str] = None) -> str:
+        """
+        Отправить промпт со скриншотом (base64 PNG).
+        Если модель не поддерживает изображения, отправится только текст.
+        """
+        system = system or "Ты — AI-тестировщик. Отвечай на русском. Кратко, структурированно."
+        if screenshot_b64:
+            user_content = [
+                {"type": "text", "text": text_prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{screenshot_b64}"}},
+            ]
+        else:
+            user_content = text_prompt
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_content},
+        ]
+        return self.chat(messages)
 
     def query(self, prompt: str, system: Optional[str] = None) -> str:
         system = system or "Отвечай на русском. Кратко и по делу."
@@ -389,15 +418,50 @@ def ask_gigachat(prompt: str, **kwargs: Any) -> Optional[str]:
 
 
 def consult_agent(context: str, question: str) -> Optional[str]:
-    """
-    Задать GigaChat вопрос в контексте тестирования.
-    context: сводка по консоли, сети, DOM, текущему URL.
-    question: что спросить.
-    """
-    full_prompt = f"""Ты — помощник автотеста. Контекст страницы и наблюдения:
+    """Задать GigaChat вопрос в контексте тестирования (без скриншота)."""
+    full_prompt = f"""Контекст:
 {context}
 
-Вопрос: {question}
-
-Отвечай кратко и по делу. Для выбора действия: укажи один конкретный совет (например: "Кликни по кнопке с текстом X" или "Создай дефект: описание"). Для дефектов: пиши только если это явный баг приложения, не флак и не проблема тестовой среды (не 404, не внешние скрипты)."""
+Вопрос: {question}"""
     return ask_gigachat(full_prompt)
+
+
+def consult_agent_with_screenshot(
+    context: str,
+    question: str,
+    screenshot_b64: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Задать GigaChat вопрос со скриншотом экрана.
+    Агент видит скриншот + текстовый контекст (DOM, консоль, сеть).
+    """
+    system = """Ты — экспертный AI-тестировщик веб-приложений. Тебе прислали скриншот экрана и контекст страницы.
+Твоя задача — активно тестировать приложение: кликать, заполнять формы, прокручивать, проверять модалки.
+
+ВСЕГДА отвечай СТРОГО в формате JSON (без markdown, без ```):
+{
+  "action": "click|type|scroll|hover|check_defect|explore",
+  "selector": "CSS-селектор или текст элемента",
+  "value": "текст для ввода (только для type)",
+  "reason": "зачем это действие",
+  "observation": "что ты видишь на скриншоте (кратко)",
+  "possible_bug": "описание бага или null"
+}
+
+Правила:
+- action=click: кликнуть по элементу (укажи selector — текст кнопки/ссылки или CSS-селектор)
+- action=type: ввести текст в поле (selector — поле, value — текст)
+- action=scroll: прокрутить страницу (selector — "down", "up", или CSS-селектор элемента)
+- action=hover: навести мышку на элемент (selector — элемент)
+- action=check_defect: ты нашёл дефект (possible_bug — описание)
+- action=explore: нужна прокрутка/обзор другой части страницы
+- НЕ предлагай СТОП, ВСЕГДА ищи что сделать: кликнуть, ввести данные, прокрутить
+- Будь активным: тестируй все кнопки, формы, ссылки, модалки, дропдауны
+- Дефект — только реальный баг (не 404 в консоли, не флак)"""
+
+    full_prompt = f"""{context}
+
+{question}"""
+
+    result = _get_client().chat_with_screenshot(full_prompt, screenshot_b64=screenshot_b64, system=system)
+    return result if result else None
