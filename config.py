@@ -123,6 +123,6 @@ CRITICAL_FLOW_STEPS = [s.strip() for s in os.getenv("CRITICAL_FLOW_STEPS", "").s
 # Через запятую, например "Принять,Accept,Согласен,ОК,Понятно,cookie,Cookies"
 COOKIE_BANNER_BUTTON_TEXTS = [s.strip() for s in os.getenv("COOKIE_BANNER_BUTTON_TEXTS", "Принять,Accept,Согласен,ОК,Понятно,Все cookies,cookie,Cookies,Разрешить,Соглашаюсь").split(",") if s.strip()]
 
-# Оверлеи, которые НЕ часть приложения: чат, поддержка, виджеты. Не тестируем их.
-# Паттерны в id/class/aria-label (нижний регистр). Через запятую.
-OVERLAY_IGNORE_PATTERNS = [s.strip().lower() for s in os.getenv("OVERLAY_IGNORE_PATTERNS", "chat,чат,support,поддержк,help,консультант,jivo,intercom,crisp,drift,tawk,livechat,live-chat,widget-chat,chat-widget,feedback,обратн,звонок,callback").split(",") if s.strip()]
+# Оверлеи, которые НЕ часть приложения: чат, поддержка, виджеты + служебный UI агента (чат с LLM, Kventin).
+# Паттерны в id/class/aria-label/тексте (нижний регистр). Через запятую.
+OVERLAY_IGNORE_PATTERNS = [s.strip().lower() for s in os.getenv("OVERLAY_IGNORE_PATTERNS", "chat,чат,support,поддержк,help,консультант,jivo,intercom,crisp,drift,tawk,livechat,live-chat,widget-chat,chat-widget,feedback,обратн,звонок,callback,kventin,agent-llm,agent-banner,диалог с llm,ai-тестировщик,gigachat").split(",") if s.strip()]

@@ -106,6 +106,17 @@ def get_dom_summary(page: Page, max_length: int = 8000) -> str:
         summary = page.evaluate("""
             () => {
                 const result = [];
+                // Служебный UI агента (чат с LLM, баннер Kventin) — не часть тестируемого приложения
+                const isAgentUI = (el) => {
+                    if (!el) return true;
+                    let cur = el;
+                    while (cur && cur !== document.body) {
+                        const id = (cur.id || '').toString();
+                        if (id.startsWith('agent-') || id === 'agent-banner' || id === 'agent-llm-overlay') return true;
+                        cur = cur.parentElement;
+                    }
+                    return false;
+                };
                 const vis = (el) => {
                     if (!el) return false;
                     const r = el.getBoundingClientRect();
@@ -130,7 +141,7 @@ def get_dom_summary(page: Page, max_length: int = 8000) -> str:
 
                 // Кнопки
                 document.querySelectorAll('button, [role="button"], input[type="submit"], input[type="button"]').forEach(el => {
-                    if (!vis(el)) return;
+                    if (!vis(el) || isAgentUI(el)) return;
                     const o = desc(el);
                     o._type = 'button';
                     if (el.type) o.type = el.type;
@@ -139,7 +150,7 @@ def get_dom_summary(page: Page, max_length: int = 8000) -> str:
 
                 // Ссылки
                 document.querySelectorAll('a[href]').forEach(el => {
-                    if (!vis(el)) return;
+                    if (!vis(el) || isAgentUI(el)) return;
                     const href = el.getAttribute('href') || '';
                     if (href.startsWith('javascript:')) return;
                     const o = desc(el);
@@ -150,7 +161,7 @@ def get_dom_summary(page: Page, max_length: int = 8000) -> str:
 
                 // Формы и инпуты
                 document.querySelectorAll('input, textarea, select').forEach(el => {
-                    if (!vis(el)) return;
+                    if (!vis(el) || isAgentUI(el)) return;
                     const o = desc(el);
                     o._type = 'input';
                     o.inputType = el.type || 'text';
@@ -169,7 +180,7 @@ def get_dom_summary(page: Page, max_length: int = 8000) -> str:
 
                 // Табы
                 document.querySelectorAll('[role="tab"], [role="tablist"] > *').forEach(el => {
-                    if (!vis(el)) return;
+                    if (!vis(el) || isAgentUI(el)) return;
                     const o = desc(el);
                     o._type = 'tab';
                     o.selected = el.getAttribute('aria-selected') === 'true';
@@ -178,7 +189,7 @@ def get_dom_summary(page: Page, max_length: int = 8000) -> str:
 
                 // Модалки / диалоги
                 document.querySelectorAll('[role="dialog"], [role="alertdialog"], dialog, .modal, .popup, [class*="modal"], [class*="dialog"]').forEach(el => {
-                    if (!vis(el)) return;
+                    if (!vis(el) || isAgentUI(el)) return;
                     const o = desc(el);
                     o._type = 'modal';
                     o.open = true;
@@ -187,7 +198,7 @@ def get_dom_summary(page: Page, max_length: int = 8000) -> str:
 
                 // Меню
                 document.querySelectorAll('[role="menu"], [role="menuitem"], nav a, .nav-link, .menu-item').forEach(el => {
-                    if (!vis(el)) return;
+                    if (!vis(el) || isAgentUI(el)) return;
                     const o = desc(el);
                     o._type = 'menu';
                     result.push(o);
@@ -198,7 +209,7 @@ def get_dom_summary(page: Page, max_length: int = 8000) -> str:
                     if (!root) return;
                     try {
                         root.querySelectorAll('button, [role="button"], a[href], input:not([type="hidden"]), select, textarea').forEach(el => {
-                            if (!vis(el)) return;
+                            if (!vis(el) || isAgentUI(el)) return;
                             const o = desc(el);
                             o._type = o._type || 'shadow';
                             o._shadow = true;

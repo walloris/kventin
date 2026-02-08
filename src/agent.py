@@ -945,6 +945,7 @@ DOM (кнопки, ссылки, формы):
 {plan_hint}
 
 Выбери ОДНО следующее действие. Укажи test_goal и expected_outcome. Не повторяй уже сделанное. Ищи новые кнопки, формы, ссылки.
+Оцени верстку: логично ли размещены элементы, соответствие DOM; при проблемах (наложение, обрезка, сломанная сетка) — layout_issue или possible_bug.
 Если видишь реальный баг — укажи action=check_defect."""
 
             phase_instruction = memory.get_phase_instruction()
@@ -966,6 +967,9 @@ DOM (кнопки, ссылки, формы):
             if not action:
                 print(f"[Agent] #{step} Не удалось распарсить JSON. Ответ: {raw_answer[:120]}")
                 action = {"action": "scroll", "selector": "down", "reason": "GigaChat не дал JSON, прокрутка"}
+            # Проблемы верстки (layout_issue) учитываем как possible_bug для заведения дефекта
+            if action.get("layout_issue") and not action.get("possible_bug"):
+                action["possible_bug"] = action.get("layout_issue")
 
             act_type = (action.get("action") or "").lower()
             sel = (action.get("selector") or "").strip()
@@ -1082,6 +1086,22 @@ DOM (кнопки, ссылки, формы):
 
             new_errors = [c for c in console_log[-10:] if c.get("type") == "error"]
             new_network_fails = [n for n in network_failures[-5:] if n.get("status") and n.get("status") >= 500]
+
+            # Ошибки 5xx после действия агента — не флак, заводим дефект
+            if new_network_fails:
+                five_xx_detail = "\n".join(
+                    f"- {n.get('status')} {n.get('method', 'GET')} {n.get('url', '')[:120]}"
+                    for n in new_network_fails[-10:]
+                )
+                bug_5xx = (
+                    f"HTTP 5xx после действия агента.\n\n"
+                    f"Действие: {act_type} | selector: {sel[:100]} | value: {val[:50]}\n\n"
+                    f"Неуспешные запросы:\n{five_xx_detail}"
+                )
+                _create_defect(
+                    page, bug_5xx, current_url,
+                    checklist_results, console_log, network_failures, memory,
+                )
 
             # Оракул: после ввода или клика — достигнут ли ожидаемый результат? (логика реального тестировщика)
             oracle_says_error = False

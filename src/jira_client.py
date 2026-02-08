@@ -105,8 +105,19 @@ def is_ignorable_issue(summary: str, description: str) -> bool:
     """
     Решение: не создавать тикет, если это типичный флак/тестовая среда.
     Игнорируем: 404 в консоли, ошибки консоли, сетевые ошибки к сторонним сервисам и т.д.
+    Ошибки 5xx после действий агента не считаем флаком — тикет всегда создаём.
     """
     text = (summary + " " + description).lower()
+    # Ошибки сервера (5xx) после действий агента — не флак, всегда заводим дефект
+    if any(
+        x in text
+        for x in (
+            "500", "502", "503", "5xx",
+            "ошибка сервера", "server error", "internal server error",
+            "http 5xx", "http 500",
+        )
+    ):
+        return False
     for pattern in DEFECT_IGNORE_PATTERNS:
         if pattern.lower() in text:
             return True
