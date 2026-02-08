@@ -6,6 +6,7 @@ OAuth (authorization_key или client_id+client_secret), password grant (userna
 import base64
 import logging
 import os
+import re
 import time
 import uuid
 from typing import Optional, List, Dict, Any
@@ -488,14 +489,26 @@ class GigaChatClient:
         return self.chat(messages)
 
 
-# Глобальный клиент (ленивая инициализация)
-_client: Optional[GigaChatClient] = None
+# Глобальный клиент (ленивая инициализация): GigaChat или Jan (локальная модель)
+_client: Optional[Any] = None
 
 
-def _get_client() -> GigaChatClient:
+def _get_client():
+    """Вернуть клиент LLM: GigaChat или Jan (по конфигу LLM_PROVIDER)."""
     global _client
     if _client is None:
-        _client = GigaChatClient()
+        try:
+            from config import LLM_PROVIDER
+            if (LLM_PROVIDER or "").strip().lower() == "jan":
+                from src.jan_client import JanClient
+                _client = JanClient()
+                LOG.info("Using LLM: Jan (local)")
+            else:
+                _client = GigaChatClient()
+                LOG.info("Using LLM: GigaChat")
+        except ImportError:
+            _client = GigaChatClient()
+            LOG.info("Using LLM: GigaChat (default)")
     return _client
 
 
@@ -567,7 +580,10 @@ def consult_agent_with_screenshot(
 - Будь активным: тестируй ВСЕ интерактивные элементы
 - После ховера жди 1 секунду — может появиться тултип или подменю
 - Дефект — только реальный баг (не 404 в консоли, не флак)
-- В формах используй реалистичные тестовые данные (test@test.com, Иван Тестов, +79991234567)"""
+- В формах используй реалистичные тестовые данные (test@test.com, Иван Тестов, +79991234567)
+
+Пример правильного ответа (только JSON, без markdown):
+{"action": "click", "selector": "Войти", "value": "", "reason": "Проверяю кнопку входа", "observation": "Вижу форму логина", "possible_bug": null}"""
 
     full_prompt = f"""{context}
 
@@ -575,3 +591,41 @@ def consult_agent_with_screenshot(
 
     result = _get_client().chat_with_screenshot(full_prompt, screenshot_b64=screenshot_b64, system=system)
     return result if result else None
+
+
+def get_test_plan_from_screenshot(screenshot_b64: Optional[str], url: str) -> List[str]:
+    """
+    По скриншоту главной страницы получить от GigaChat короткий тест-план (5–7 шагов).
+    Возвращает список строк — шагов для тестирования.
+    """
+    system = "Ты — тест-аналитик. По скриншоту главной страницы составь краткий тест-план. Отвечай ТОЛЬКО нумерованным списком из 5–7 шагов на русском, по одному шагу на строку. Без вступления и выводов. Пример: 1. Кликнуть по меню. 2. Проверить форму поиска."
+    prompt = f"URL: {url}\n\nСоставь тест-план из 5–7 конкретных шагов для тестирования этой страницы."
+    raw = _get_client().chat_with_screenshot(prompt, screenshot_b64=screenshot_b64, system=system)
+    if not raw:
+        return []
+    steps = []
+    for line in raw.strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        # Убрать нумерацию "1. " или "1) "
+        line = re.sub(r"^\d+[\.\)]\s*", "", line)
+        if len(line) > 10:
+            steps.append(line[:200])
+    return steps[:10]
+
+
+def ask_is_this_really_bug(bug_description: str, screenshot_b64: Optional[str]) -> bool:
+    """
+    Второй проход: GigaChat смотрит описание и скриншот и решает — это точно баг приложения?
+    Возвращает True если да (создаём тикет), False если нет (пропускаем).
+    """
+    system = "Ты — ревьюер дефектов. Тебе прислали описание возможного бага и скриншот. Ответь СТРОГО одним словом: ДА — если это реальный баг приложения (не ожидаемое поведение, не проблема окружения, не флак). НЕТ — если это не баг (нормальное поведение, 404 в консоли, аналитика, тестовая среда)."
+    prompt = f"Описание от тестировщика:\n{bug_description[:1500]}\n\nЭто точно баг приложения? Ответь одним словом: ДА или НЕТ."
+    raw = _get_client().chat_with_screenshot(prompt, screenshot_b64=screenshot_b64, system=system)
+    if not raw:
+        return True  # при сбое LLM — создаём тикет
+    low = raw.strip().lower()
+    if "нет" in low or "не баг" in low or "не дефект" in low:
+        return False
+    return "да" in low

@@ -8,6 +8,14 @@ load_dotenv()
 # Страница для тестирования
 START_URL = os.getenv("START_URL", "https://example.com")
 
+# --- Провайдер LLM: gigachat | jan ---
+# jan — локальная модель в Jan (OpenAI-совместимый API на http://127.0.0.1:1337)
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gigachat").strip().lower()
+JAN_API_URL = os.getenv("JAN_API_URL", "http://127.0.0.1:1337").rstrip("/")
+JAN_API_KEY = os.getenv("JAN_API_KEY", "jan-api-key")
+# ID модели в Jan (как в интерфейсе Jan). Для русского: Vikhr-7B, Qwen2.5-7B, Saiga, Llama-3.2 и т.д.
+JAN_MODEL = os.getenv("JAN_MODEL", "vikhr-7b-instruct")
+
 # GigaChat (как в твоём проекте: token_header, gateway URL, OAuth или password grant)
 GIGACHAT_TOKEN_HEADER = os.getenv("GIGACHAT_TOKEN_HEADER", "")  # "Bearer eyJ..." — готовый токен
 GIGACHAT_API_URL = os.getenv("GIGACHAT_API_URL", "")  # URL чата (например внутренний gateway)
@@ -88,3 +96,27 @@ DEFECT_IGNORE_PATTERNS = [
 CHECKLIST_STEP_DELAY_MS = int(os.getenv("CHECKLIST_STEP_DELAY_MS", "2000"))
 # Ожидание загрузки: таймаут networkidle (мс)
 WAIT_NETWORK_IDLE_MS = int(os.getenv("WAIT_NETWORK_IDLE_MS", "5000"))
+
+# --- Улучшение качества тестирования ---
+# В начале сессии запросить у GigaChat тест-план по скриншоту (5–7 шагов)
+ENABLE_TEST_PLAN_START = os.getenv("ENABLE_TEST_PLAN_START", "true").lower() in ("1", "true", "yes")
+# После важных действий спрашивать GigaChat: достигнут ли ожидаемый результат (оракул)
+ENABLE_ORACLE_AFTER_ACTION = os.getenv("ENABLE_ORACLE_AFTER_ACTION", "true").lower() in ("1", "true", "yes")
+# Перед созданием дефекта — второй проход: «это точно баг?» (снижает ложные тикеты)
+ENABLE_SECOND_PASS_BUG = os.getenv("ENABLE_SECOND_PASS_BUG", "true").lower() in ("1", "true", "yes")
+# Повторы при сбое: сколько раз повторять клик/действие при таймауте или not_found
+ACTION_RETRY_COUNT = int(os.getenv("ACTION_RETRY_COUNT", "2"))
+# Печатать отчёт сессии каждые N шагов (0 = только в конце при создании дефекта)
+SESSION_REPORT_EVERY_N = int(os.getenv("SESSION_REPORT_EVERY_N", "0"))
+
+# Критические сценарии: список шагов, которые агент должен выполнить в первую очередь
+# Формат: через запятую текстовые подсказки, например "Открыть меню, Клик Контакты, Заполнить форму"
+CRITICAL_FLOW_STEPS = [s.strip() for s in os.getenv("CRITICAL_FLOW_STEPS", "").split(",") if s.strip()]
+
+# Cookie/баннер: селекторы или текст кнопок для закрытия (принять cookies, согласен и т.д.)
+# Через запятую, например "Принять,Accept,Согласен,ОК,Понятно,cookie,Cookies"
+COOKIE_BANNER_BUTTON_TEXTS = [s.strip() for s in os.getenv("COOKIE_BANNER_BUTTON_TEXTS", "Принять,Accept,Согласен,ОК,Понятно,Все cookies,cookie,Cookies,Разрешить,Соглашаюсь").split(",") if s.strip()]
+
+# Оверлеи, которые НЕ часть приложения: чат, поддержка, виджеты. Не тестируем их.
+# Паттерны в id/class/aria-label (нижний регистр). Через запятую.
+OVERLAY_IGNORE_PATTERNS = [s.strip().lower() for s in os.getenv("OVERLAY_IGNORE_PATTERNS", "chat,чат,support,поддержк,help,консультант,jivo,intercom,crisp,drift,tawk,livechat,live-chat,widget-chat,chat-widget,feedback,обратн,звонок,callback").split(",") if s.strip()]

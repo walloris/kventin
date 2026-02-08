@@ -42,15 +42,21 @@ def build_defect_description(
     checklist_results: Optional[List[Dict[str, Any]]] = None,
     console_log: Optional[List[Dict[str, Any]]] = None,
     network_failures: Optional[List[Dict[str, Any]]] = None,
+    steps_to_reproduce: Optional[List[str]] = None,
 ) -> str:
     """
     Описание по канонам: шаги воспроизведения, ожидаемый/фактический результат, окружение, фактура.
+    steps_to_reproduce: список шагов от агента (путь к багу) для точного воспроизведения.
     """
     sections = []
 
     sections.append("h3. Описание проблемы\n{quote}\n" + (llm_answer[:4000] if llm_answer else "Обнаружена проблема при автотестировании.") + "\n{quote}")
 
-    sections.append("h3. Шаги воспроизведения\n# Открыть страницу: " + url + "\n# Выполнить действия на странице (или дождаться загрузки)\n# Наблюдать консоль/сеть (см. вложения)")
+    if steps_to_reproduce:
+        steps_str = "\n".join(f"# {s}" for s in steps_to_reproduce[:20])
+        sections.append("h3. Шаги воспроизведения\n# Открыть страницу: " + url + "\n" + steps_str)
+    else:
+        sections.append("h3. Шаги воспроизведения\n# Открыть страницу: " + url + "\n# Выполнить действия на странице (или дождаться загрузки)\n# Наблюдать консоль/сеть (см. вложения)")
 
     sections.append("h3. Ожидаемый результат\nОшибок в консоли и сетевых запросах нет (или только ожидаемые). Контент отображается корректно.")
 

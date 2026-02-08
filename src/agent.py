@@ -25,10 +25,27 @@ from config import (
     CHECKLIST_STEP_DELAY_MS,
     VIEWPORT_WIDTH,
     VIEWPORT_HEIGHT,
+    ENABLE_TEST_PLAN_START,
+    ENABLE_ORACLE_AFTER_ACTION,
+    ENABLE_SECOND_PASS_BUG,
+    ACTION_RETRY_COUNT,
+    SESSION_REPORT_EVERY_N,
+    CRITICAL_FLOW_STEPS,
 )
-from src.gigachat_client import consult_agent_with_screenshot, consult_agent
+from src.gigachat_client import (
+    consult_agent_with_screenshot,
+    consult_agent,
+    get_test_plan_from_screenshot,
+    ask_is_this_really_bug,
+)
 from src.jira_client import create_jira_issue
-from src.page_analyzer import build_context, get_dom_summary, detect_active_overlays, format_overlays_context
+from src.page_analyzer import (
+    build_context,
+    get_dom_summary,
+    detect_active_overlays,
+    format_overlays_context,
+    detect_cookie_banner,
+)
 from src.visible_actions import (
     inject_cursor,
     move_cursor_to,
@@ -75,7 +92,17 @@ class AgentMemory:
         self.done_scroll_up: int = 0
         # Лимиты, чтобы не зациклиться на одном типе действия
         self.max_scrolls_in_row = 5
-        self.last_actions_sequence: List[str] = []  # последние 5 типов действий (click, scroll, ...)
+        self.last_actions_sequence: List[str] = []
+        # Карта покрытия: какие зоны страницы уже обходили (top/middle/bottom)
+        self.coverage_zones: List[str] = []
+        # Тест-план от GigaChat в начале сессии (список шагов)
+        self.test_plan: List[str] = []
+        # Критические шаги: индексы выполненных (из config CRITICAL_FLOW_STEPS)
+        self.critical_flow_done: set = set()
+        # Созданные дефекты за сессию (для отчёта)
+        self.defects_created: List[Dict[str, Any]] = []
+        # Время старта сессии
+        self.session_start: Optional[datetime] = None
 
     def add_action(self, action: Dict[str, Any], result: str = ""):
         act = (action.get("action") or "").lower()
@@ -173,6 +200,59 @@ class AgentMemory:
         lines.append("Последние шаги:")
         for a in self.actions[-last_n:]:
             lines.append(f"  #{a['step']} {a['action']} -> {a['selector'][:45]} | {a['result'][:50]}")
+        return "\n".join(lines)
+
+    def record_coverage_zone(self, zone: str):
+        """Учесть, что эту зону страницы уже обходили (top/middle/bottom)."""
+        if zone and zone not in self.coverage_zones:
+            self.coverage_zones.append(zone)
+            if len(self.coverage_zones) > 20:
+                self.coverage_zones = self.coverage_zones[-20:]
+
+    def set_test_plan(self, steps: List[str]):
+        self.test_plan = list(steps)[:15]
+
+    def get_steps_to_reproduce(self, max_steps: int = 15) -> List[str]:
+        """Шаги для воспроизведения дефекта (последние действия до бага)."""
+        steps = []
+        for a in self.actions[-max_steps:]:
+            act = a.get("action", "")
+            sel = (a.get("selector") or "").strip()
+            if act == "click" and sel:
+                steps.append(f"Клик по элементу: {sel[:60]}")
+            elif act == "type" and sel:
+                steps.append(f"Ввод в поле: {sel[:60]}")
+            elif act == "hover" and sel:
+                steps.append(f"Наведение на: {sel[:60]}")
+            elif act == "close_modal":
+                steps.append("Закрыть модальное окно")
+            elif act == "select_option" and sel:
+                steps.append(f"Выбрать опцию: {sel[:60]}")
+            elif act == "scroll":
+                steps.append("Прокрутка страницы")
+        return steps
+
+    def record_defect_created(self, key: str, summary: str):
+        self.defects_created.append({"key": key, "summary": summary[:200]})
+
+    def get_session_report_text(self) -> str:
+        """Краткий отчёт сессии: шаги, покрытие, дефекты."""
+        if not self.session_start:
+            self.session_start = datetime.now()
+        duration = (datetime.now() - self.session_start).total_seconds() if self.session_start else 0
+        lines = [
+            "=== Отчёт сессии AI-тестировщика Kventin ===",
+            f"Шагов выполнено: {len(self.actions)}",
+            f"Время: {duration:.0f} с",
+            f"Зоны покрытия: {', '.join(self.coverage_zones) if self.coverage_zones else '—'}",
+        ]
+        if self.test_plan:
+            lines.append("Тест-план: " + "; ".join(self.test_plan[:5]))
+        if self.defects_created:
+            lines.append(f"Создано дефектов: {len(self.defects_created)}")
+            for d in self.defects_created[-10:]:
+                lines.append(f"  - {d.get('key', '')}: {d.get('summary', '')[:60]}")
+        lines.append("=== Конец отчёта ===")
         return "\n".join(lines)
 
 
@@ -471,6 +551,28 @@ def _do_press_key(page: Page, key: str) -> str:
         return f"key_error: {e}"
 
 
+# --- Cookie/баннер согласия ---
+def try_accept_cookie_banner(page: Page) -> bool:
+    """Если на странице баннер cookies/согласия — кликнуть по кнопке принять. Возвращает True если кликнули."""
+    try:
+        info = detect_cookie_banner(page)
+        if not info or not info.get("text"):
+            return False
+        text = info.get("text", "").strip()
+        if not text:
+            return False
+        loc = _find_element(page, text)
+        if loc:
+            safe_highlight(loc, page, 0.3)
+            highlight_and_click(loc, page, description="Принять")
+            time.sleep(1.0)
+            print(f"[Agent] Закрыт баннер: {text[:50]}")
+            return True
+    except Exception as e:
+        print(f"[Agent] Ошибка закрытия баннера: {e}")
+    return False
+
+
 # --- Инициализация страницы ---
 def _inject_all(page: Page):
     """Инжектировать все визуальные элементы."""
@@ -573,7 +675,7 @@ def _handle_new_tabs(
                 bug_desc = f"Ссылка открыла новую вкладку с ошибкой.\nURL: {tab_url}\nTitle: {title}\nОшибки JS: {', '.join(tab_errors[:3])}"
                 print(f"[Agent] #{step} Новая вкладка: ОШИБКА → дефект. URL: {tab_url[:60]}")
                 update_llm_overlay(main_page, prompt=f"Новая вкладка: ошибка!", response=bug_desc[:200], loading=False)
-                _create_defect(main_page, bug_desc, tab_url, [], console_log, network_failures)
+                _create_defect(main_page, bug_desc, tab_url, [], console_log, network_failures, memory)
                 memory.add_action({"action": "new_tab_error", "selector": tab_url}, result="defect_reported")
             else:
                 # Загрузка успешна
@@ -591,7 +693,7 @@ def _handle_new_tabs(
             bug_desc = f"Новая вкладка не загрузилась (таймаут/ошибка).\nURL: {tab_url}\nОшибка: {str(e)[:200]}"
             print(f"[Agent] #{step} Новая вкладка: ТАЙМАУТ/КРАШ → дефект. URL: {tab_url[:60]}")
             update_llm_overlay(main_page, prompt="Новая вкладка: не загрузилась!", response=bug_desc[:200], loading=False)
-            _create_defect(main_page, bug_desc, tab_url, [], console_log, network_failures)
+            _create_defect(main_page, bug_desc, tab_url, [], console_log, network_failures, memory)
             memory.add_action({"action": "new_tab_timeout", "selector": tab_url}, result=f"error: {str(e)[:60]}")
 
         finally:
@@ -672,6 +774,22 @@ def run_agent(start_url: str = None):
             print(f"[Agent] Ошибка загрузки {start_url}: {e}")
             browser.close()
             return
+
+        memory.session_start = datetime.now()
+        # Закрыть баннер cookies/согласия, если есть
+        if try_accept_cookie_banner(page):
+            time.sleep(1.5)
+            smart_wait_after_goto(page, timeout=3000)
+
+        # Тест-план в начале сессии (GigaChat по скриншоту предлагает 5–7 шагов)
+        if ENABLE_TEST_PLAN_START:
+            update_demo_banner(page, step_text="Получение тест-плана от GigaChat…", progress_pct=10)
+            plan_screenshot = take_screenshot_b64(page)
+            test_plan_steps = get_test_plan_from_screenshot(plan_screenshot, start_url)
+            if test_plan_steps:
+                memory.set_test_plan(test_plan_steps)
+                print(f"[Agent] Тест-план ({len(test_plan_steps)} шагов): " + "; ".join(test_plan_steps[:3]) + "…")
+                update_llm_overlay(page, prompt="Тест-план", response="; ".join(test_plan_steps[:4]), loading=False)
 
         print(f"[Agent] Старт тестирования: {start_url}")
         print(f"[Agent] Бесконечный цикл. Ctrl+C для остановки.")
@@ -756,12 +874,18 @@ DOM (все элементы):
 3) Если видишь баг в оверлее — action=check_defect
 Выбери ОДНО действие."""
             else:
+                plan_hint = ""
+                if memory.test_plan:
+                    plan_hint = f"\nТест-план сессии: " + "; ".join(memory.test_plan[:6]) + "\nПо возможности выполняй шаги из плана по порядку.\n"
+                if CRITICAL_FLOW_STEPS:
+                    plan_hint += "\nКритический сценарий (приоритет): " + ", ".join(CRITICAL_FLOW_STEPS[:5]) + "\n"
                 question = f"""Вот скриншот и контекст страницы.
 
 DOM (кнопки, ссылки, формы):
 {dom_summary[:3000]}
 
 {history_text}
+{plan_hint}
 
 Выбери ОДНО следующее действие. Не повторяй те элементы, на которые уже кликнул. Ищи новые кнопки, формы, ссылки. Будь активным тестировщиком!
 Попробуй hover на элементы с подменю/тултипами. Открывай дропдауны и выбирай опции.
@@ -811,7 +935,16 @@ DOM (кнопки, ссылки, формы):
             update_demo_banner(page, step_text=f"#{step} {act_type.upper()}: {sel[:30]}…", progress_pct=80)
 
             if act_type == "check_defect" and possible_bug:
-                _create_defect(page, possible_bug, current_url, checklist_results, console_log, network_failures)
+                # Второй проход: это точно баг?
+                if ENABLE_SECOND_PASS_BUG:
+                    post_b64 = take_screenshot_b64(page)
+                    if not ask_is_this_really_bug(possible_bug, post_b64):
+                        print(f"[Agent] #{step} Второй проход: не баг, пропускаем тикет.")
+                        update_llm_overlay(page, prompt="Ревью дефекта", response="Не баг (ожидаемое поведение)", loading=False)
+                        memory.add_action(action, result="defect_skipped_second_pass")
+                        time.sleep(1)
+                        continue
+                _create_defect(page, possible_bug, current_url, checklist_results, console_log, network_failures, memory)
                 memory.add_action(action, result="defect_reported")
                 time.sleep(3)
                 continue
@@ -819,9 +952,35 @@ DOM (кнопки, ссылки, формы):
             # Запомним кол-во вкладок ДО действия
             pages_before = len(context.pages)
 
-            result = execute_action(page, action, memory)
+            # Выполнение с повтором при сбое (таймаут, not_found)
+            result = ""
+            for attempt in range(1 + max(0, ACTION_RETRY_COUNT)):
+                result = execute_action(page, action, memory)
+                if "error" not in result.lower() and "not_found" not in result.lower() and "no_selector" not in result.lower():
+                    break
+                if attempt < max(0, ACTION_RETRY_COUNT):
+                    print(f"[Agent] #{step} Повтор попытки {attempt + 1}…")
+                    time.sleep(1.0)
+
             memory.add_action(action, result=result)
             print(f"[Agent] #{step} Результат: {result}")
+
+            # Карта покрытия: запомнить зону после прокрутки
+            if act_type == "scroll":
+                try:
+                    y = page.evaluate("() => window.scrollY")
+                    h = page.evaluate("() => Math.max(0, document.documentElement.scrollHeight - window.innerHeight)")
+                    if h <= 0:
+                        zone = "top"
+                    elif y < h * 0.3:
+                        zone = "top"
+                    elif y < h * 0.7:
+                        zone = "middle"
+                    else:
+                        zone = "bottom"
+                    memory.record_coverage_zone(zone)
+                except Exception:
+                    pass
 
             # Пауза после действия для загрузки
             time.sleep(1.5)
@@ -857,11 +1016,25 @@ DOM (кнопки, ссылки, формы):
             new_errors = [c for c in console_log[-10:] if c.get("type") == "error"]
             new_network_fails = [n for n in network_failures[-5:] if n.get("status") and n.get("status") >= 500]
 
-            if new_errors or new_network_fails or possible_bug:
+            # Оракул: после ввода или клика — достигнут ли ожидаемый результат?
+            oracle_says_error = False
+            if ENABLE_ORACLE_AFTER_ACTION and act_type in ("type", "click") and post_screenshot_b64:
+                update_llm_overlay(page, prompt=f"#{step} Оракул: успех или ошибка?", loading=True)
+                oracle_ans = consult_agent_with_screenshot(
+                    f"Последнее действие: {act_type} -> {sel[:60]}. Результат: {result}",
+                    "На скриншоте после этого действия виден успех (всё ок, форма отправилась, данные отобразились) или ошибка (сообщение об ошибке, пустая страница, что-то сломалось)? Ответь одним словом: успех / ошибка / неясно.",
+                    screenshot_b64=post_screenshot_b64,
+                )
+                update_llm_overlay(page, prompt=f"#{step} Оракул", response=oracle_ans or "—", loading=False)
+                if oracle_ans and "ошибка" in oracle_ans.lower():
+                    oracle_says_error = True
+
+            if new_errors or new_network_fails or possible_bug or oracle_says_error:
                 post_context = f"""Я выполнил действие: {action.get('action')} -> {action.get('selector', '')}.
 Результат: {result}
 Новые ошибки консоли: {', '.join(e.get('text', '')[:60] for e in new_errors[-3:])} 
 Новые 5xx ответы: {', '.join(f"{n.get('status')} {n.get('url', '')[:40]}" for n in new_network_fails[-3:])}
+{"Оракул: на скриншоте после действия видна ошибка (не успех)." if oracle_says_error else ""}
 
 Это баг приложения или нормальное поведение? Если баг — ответь JSON с action=check_defect и possible_bug."""
                 update_llm_overlay(page, prompt=f"#{step} Есть ошибки: анализ…", loading=True)
@@ -871,9 +1044,18 @@ DOM (кнопки, ссылки, формы):
                 if post_answer:
                     post_action = parse_llm_action(post_answer)
                     if post_action and post_action.get("action") == "check_defect" and post_action.get("possible_bug"):
-                        _create_defect(page, post_action["possible_bug"], current_url, checklist_results, console_log, network_failures)
+                        pbug = post_action["possible_bug"]
+                        if ENABLE_SECOND_PASS_BUG and not ask_is_this_really_bug(pbug, post_screenshot_b64):
+                            print(f"[Agent] #{step} Второй проход: не баг, пропускаем.")
+                            continue
+                        _create_defect(page, pbug, current_url, checklist_results, console_log, network_failures, memory)
 
             update_demo_banner(page, step_text=f"#{step} Готово. Следующий шаг…", progress_pct=100)
+
+            # Отчёт сессии каждые N шагов
+            if SESSION_REPORT_EVERY_N > 0 and step % SESSION_REPORT_EVERY_N == 0:
+                print(memory.get_session_report_text())
+
             time.sleep(1)
 
         browser.close()
@@ -886,19 +1068,24 @@ def _create_defect(
     checklist_results: List[Dict[str, Any]],
     console_log: List[Dict[str, Any]],
     network_failures: List[Dict[str, Any]],
+    memory: Optional[AgentMemory] = None,
 ):
-    """Создать дефект в Jira с полной фактурой."""
+    """Создать дефект в Jira с полной фактурой и путём воспроизведения."""
+    steps_to_reproduce = memory.get_steps_to_reproduce() if memory else None
     summary = build_defect_summary(bug_description, current_url)
     description = build_defect_description(
         bug_description, current_url,
         checklist_results=checklist_results,
         console_log=console_log,
         network_failures=network_failures,
+        steps_to_reproduce=steps_to_reproduce,
     )
     attachment_paths = collect_evidence(page, console_log, network_failures)
     key = create_jira_issue(summary=summary, description=description, attachment_paths=attachment_paths or None)
     if key:
         print(f"[Agent] Дефект создан: {key}")
+        if memory:
+            memory.record_defect_created(key, summary)
         update_llm_overlay(page, prompt="Дефект создан!", response=f"{key}: {summary[:80]}", loading=False)
     if attachment_paths:
         try:

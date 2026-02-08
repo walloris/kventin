@@ -5,7 +5,12 @@ from typing import List, Dict, Any, Optional
 
 from playwright.sync_api import Page
 
-from config import IGNORE_CONSOLE_PATTERNS, IGNORE_NETWORK_STATUSES
+from config import (
+    IGNORE_CONSOLE_PATTERNS,
+    IGNORE_NETWORK_STATUSES,
+    COOKIE_BANNER_BUTTON_TEXTS,
+    OVERLAY_IGNORE_PATTERNS,
+)
 
 
 def _should_ignore_console(text: str) -> bool:
@@ -35,6 +40,61 @@ def collect_console_messages(page: Page) -> List[Dict[str, Any]]:
 def collect_network_failures(page: Page) -> List[Dict[str, Any]]:
     """Собрать неуспешные сетевые запросы (перехватываются в agent)."""
     return getattr(page, "_agent_network_failures", [])
+
+
+def detect_cookie_banner(page: Page) -> Optional[Dict[str, Any]]:
+    """
+    Найти баннер cookies/согласия и кнопку для закрытия.
+    Возвращает { "text": "текст кнопки", "selector": "селектор" } или None.
+    """
+    if not COOKIE_BANNER_BUTTON_TEXTS:
+        return None
+    try:
+        found = page.evaluate(
+            """(buttonTexts) => {
+                const vis = (el) => {
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect();
+                    const s = getComputedStyle(el);
+                    return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
+                };
+                const texts = buttonTexts.map(t => t.toLowerCase());
+                const all = document.querySelectorAll('button, [role="button"], a, input[type="submit"], input[type="button"], [class*="cookie"], [class*="consent"], [class*="accept"], [id*="cookie"], [id*="accept"]');
+                for (const el of all) {
+                    if (!vis(el)) continue;
+                    const t = (el.textContent || el.value || el.getAttribute('aria-label') || '').trim().toLowerCase();
+                    if (!t || t.length > 80) continue;
+                    for (const need of texts) {
+                        if (need.length < 2) continue;
+                        if (t.includes(need) || need.includes(t)) {
+                            return { text: (el.textContent || el.value || '').trim().slice(0, 50), selector: el.id ? '#' + el.id : null };
+                        }
+                    }
+                }
+                return null;
+            }""",
+            COOKIE_BANNER_BUTTON_TEXTS,
+        )
+        if found and found.get("text"):
+            return found
+    except Exception:
+        pass
+    return None
+
+
+def get_iframes_info(page: Page) -> List[Dict[str, Any]]:
+    """Список iframe на странице (src, name) для контекста."""
+    try:
+        frames = page.evaluate("""() => {
+            return Array.from(document.querySelectorAll('iframe')).map(f => ({
+                src: (f.src || '').slice(0, 200),
+                name: (f.name || '').slice(0, 80),
+                id: (f.id || '').slice(0, 80)
+            })).filter(x => x.src || x.name);
+        }""")
+        return frames or []
+    except Exception:
+        return []
 
 
 def get_dom_summary(page: Page, max_length: int = 8000) -> str:
@@ -133,6 +193,26 @@ def get_dom_summary(page: Page, max_length: int = 8000) -> str:
                     result.push(o);
                 });
 
+                // Элементы внутри Shadow DOM
+                const walkShadow = (root) => {
+                    if (!root) return;
+                    try {
+                        root.querySelectorAll('button, [role="button"], a[href], input:not([type="hidden"]), select, textarea').forEach(el => {
+                            if (!vis(el)) return;
+                            const o = desc(el);
+                            o._type = o._type || 'shadow';
+                            o._shadow = true;
+                            result.push(o);
+                        });
+                        root.querySelectorAll('*').forEach(el => {
+                            if (el.shadowRoot) walkShadow(el.shadowRoot);
+                        });
+                    } catch(e) {}
+                };
+                document.querySelectorAll('*').forEach(el => {
+                    if (el.shadowRoot) walkShadow(el.shadowRoot);
+                });
+
                 // Дедупликация по text+tag
                 const seen = new Set();
                 const unique = [];
@@ -156,11 +236,29 @@ def detect_active_overlays(page: Page) -> Dict[str, Any]:
     Обнаружить все активные оверлеи на странице:
     модалки, тултипы, дропдауны, поповеры, уведомления, контекстные меню.
     Возвращает dict: { has_overlay, overlays: [{type, text, buttons, inputs, close_selector}] }
+    Чат/виджеты поддержки (jivo, intercom, crisp и т.д.) исключаются — не часть приложения.
     """
     try:
-        result = page.evaluate("""
-            () => {
+        ignore_patterns = list(OVERLAY_IGNORE_PATTERNS) if OVERLAY_IGNORE_PATTERNS else []
+        result = page.evaluate(
+            """
+            (ignorePatterns) => {
                 const overlays = [];
+                const isChatOrSupport = (el) => {
+                    if (!el || !ignorePatterns || !ignorePatterns.length) return false;
+                    const check = (s) => {
+                        if (!s || typeof s !== 'string') return false;
+                        const low = s.toLowerCase();
+                        return ignorePatterns.some(p => low.indexOf(p) !== -1);
+                    };
+                    let cur = el;
+                    for (let i = 0; i < 10 && cur; i++) {
+                        if (check(cur.id) || check(cur.className && cur.className.toString()) || check(cur.getAttribute('aria-label') || '')) return true;
+                        cur = cur.parentElement;
+                    }
+                    const text = (el.textContent || '').trim().toLowerCase().slice(0, 500);
+                    return ignorePatterns.some(p => text.indexOf(p) !== -1);
+                };
                 const vis = (el) => {
                     if (!el) return false;
                     const r = el.getBoundingClientRect();
@@ -219,6 +317,7 @@ def detect_active_overlays(page: Page) -> Dict[str, Any]:
                 });
 
                 modalEls.forEach(el => {
+                    if (isChatOrSupport(el)) return;
                     const o = { type: 'modal', text: textOf(el, 200), buttons: [], inputs: [], links: [], close_selector: null };
                     // Кнопки внутри модалки
                     el.querySelectorAll('button, [role="button"], input[type="submit"]').forEach(btn => {
@@ -318,7 +417,9 @@ def detect_active_overlays(page: Page) -> Dict[str, Any]:
 
                 return { has_overlay: unique.length > 0, overlays: unique.slice(0, 8) };
             }
-        """)
+        """,
+            ignore_patterns,
+        )
         return result or {"has_overlay": False, "overlays": []}
     except Exception as e:
         return {"has_overlay": False, "overlays": [], "error": str(e)}

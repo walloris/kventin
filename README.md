@@ -65,6 +65,27 @@ cp .env.example .env
 | `HIGHLIGHT_DURATION_MS` | Пауза после подсветки элемента в мс (по умолчанию 800). |
 | `HEADLESS` | `true` — без окна браузера; по умолчанию `false` (окно видно). |
 
+### Локальная модель в Jan (Mac M4 32GB и др.)
+
+Вместо GigaChat можно использовать **локальную модель** в [Jan](https://jan.ai/) (OpenAI-совместимый API).
+
+1. Установи [Jan](https://github.com/janhq/jan/releases) и запусти приложение.
+2. Скачай модель с хорошей поддержкой русского (рекомендуется для Mac Mini M4 32GB):
+   - **Vikhr-7B-instruct** — сильная русскоязычная модель (GGUF, Q4_K_M или Q5_K_M).
+   - **Qwen2.5-7B-Instruct** — отличный мультиязычный вариант.
+   - **Saiga** (7B/13B) — русский инструктивный модель.
+3. В Jan: **Settings → Local API Server** → задай API Key (например `jan-api-key`) → **Start Server**. В логах должно быть: `JAN API listening at http://127.0.0.1:1337`.
+4. В `.env` задай:
+   ```
+   LLM_PROVIDER=jan
+   JAN_API_URL=http://127.0.0.1:1337
+   JAN_API_KEY=jan-api-key
+   JAN_MODEL=<ID модели в Jan>
+   ```
+   `JAN_MODEL` — точный ID модели, как он отображается в Jan (например `vikhr-7b-instruct-q4_k_m` или как в списке моделей).
+
+Текстовые модели (Vikhr, Qwen без VL) не получают скриншот — агент опирается на DOM и контекст. Для анализа скриншота нужна vision-модель (например Qwen2-VL, Llama 3.2 11B Vision в Jan, если хватает памяти).
+
 Получить GigaChat API: [developers.sber.ru — GigaChat](https://developers.sber.ru/portal/products/gigachat-api).
 
 ## Запуск
