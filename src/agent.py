@@ -110,6 +110,7 @@ from src.jira_client import create_jira_issue, reset_session_defects
 from src.page_analyzer import (
     build_context,
     get_dom_summary,
+    get_page_modules,
     detect_active_overlays,
     format_overlays_context,
     detect_cookie_banner,
@@ -214,6 +215,51 @@ class AgentMemory:
         self._page_coverage: Dict[str, set] = {}  # URL -> set of element keys
         # Чеклисты по страницам: URL -> (checklist_items, current_index, completed)
         self._page_checklists: Dict[str, Dict[str, Any]] = {}  # URL -> {"items": [...], "index": 0, "completed": False}
+        # Модули страницы (шапка, навигация, основной контент и т.д.) — тестируем по очереди
+        self.page_modules: List[Dict[str, Any]] = []
+        self.current_module_index: int = 0
+        self.steps_in_current_module: int = 0
+        self._modules_page_url: str = ""
+
+    def set_page_modules(self, modules: List[Dict[str, Any]], page_url: str) -> None:
+        """Задать список модулей для текущей страницы (при смене URL или первой загрузке)."""
+        self.page_modules = list(modules) if modules else []
+        self.current_module_index = 0
+        self.steps_in_current_module = 0
+        self._modules_page_url = page_url or ""
+
+    def get_current_module(self) -> Optional[Dict[str, Any]]:
+        """Текущий модуль для тестирования (или None если модулей нет)."""
+        if not self.page_modules or self.current_module_index >= len(self.page_modules):
+            return None
+        return self.page_modules[self.current_module_index]
+
+    def advance_module(self) -> bool:
+        """Перейти к следующему модулю. Возвращает True если перешли."""
+        if not self.page_modules or self.current_module_index >= len(self.page_modules) - 1:
+            return False
+        self.current_module_index += 1
+        self.steps_in_current_module = 0
+        return True
+
+    def tick_module_step(self) -> None:
+        """Увеличить счётчик шагов в текущем модуле (для перехода после N шагов)."""
+        self.steps_in_current_module += 1
+
+    def get_module_context_text(self) -> str:
+        """Текст для промпта GigaChat: какие модули есть и какой тестируем сейчас."""
+        if not self.page_modules:
+            return ""
+        lines = ["МОДУЛИ СТРАНИЦЫ (тестируй по очереди):"]
+        for i, m in enumerate(self.page_modules):
+            name = m.get("name", "Модуль")
+            mark = " ← ТЕКУЩИЙ" if i == self.current_module_index else ""
+            lines.append(f"  {i + 1}) {name}{mark}")
+        cur = self.get_current_module()
+        if cur:
+            lines.append("")
+            lines.append(f"Сейчас тестируй только модуль: «{cur.get('name', '')}». Выбери действие внутри этого модуля (selector ref:N из элементов этого блока).")
+        return "\n".join(lines)
 
     def add_action(self, action: Dict[str, Any], result: str = ""):
         act = (action.get("action") or "").lower()
@@ -1453,9 +1499,12 @@ def run_agent(start_url: str = None):
             }
             ptype_hint = f"\nТип: {page_type}. {type_strategies.get(page_type, '')}\n" if page_type != "unknown" else ""
 
+            module_ctx = memory_.get_module_context_text()
+
             if has_overlay:
                 question = f"""Скриншот. АКТИВНЫЙ ОВЕРЛЕЙ.
 {overlay_context}
+{module_ctx}
 ЭЛЕМЕНТЫ: {dom_summary[:2500]}
 {history_text}
 Используй selector="ref:N". Тестируй оверлей или закрой (close_modal)."""
@@ -1465,11 +1514,13 @@ def run_agent(start_url: str = None):
                     plan_hint = memory_.get_test_plan_progress() + "\n"
                 stuck_w = "\n🚨 ЗАЦИКЛИВАНИЕ! Выбери НОВЫЙ элемент!\n" if memory_.is_stuck() else ""
                 question = f"""Скриншот и контекст.
+{module_ctx}
 {ptype_hint}{coverage_hint}
-ЭЛЕМЕНТЫ: {dom_summary[:2500]}
+ЭЛЕМЕНТЫ СТРАНИЦЫ (только видимые на экране, формат: [N] тип "текст" атрибуты):
+{dom_summary[:2500]}
 {history_text}
 {plan_hint}{stuck_w}
-Используй selector="ref:N". Выбери КОНКРЕТНОЕ действие."""
+Используй selector="ref:N". Выбери КОНКРЕТНОЕ действие в рамках текущего модуля."""
 
             phase_instruction = memory_.get_phase_instruction()
             send_screenshot = screenshot_b64 if screenshot_changed else None
@@ -1564,19 +1615,29 @@ def run_agent(start_url: str = None):
                     overlay_info_fast = detect_active_overlays(page)
                     has_overlay = overlay_info_fast.get("has_overlay", False)
                 except Exception as e:
-                    # Страница закрылась во время детекции оверлея
                     LOG.debug("detect_active_overlays: страница закрыта: %s", e)
                     break
 
-                # В демо ref-id не присваиваются (GigaChat не запускается) — присваиваем здесь
-                if DEMO_MODE and not page.is_closed():
+                # Обновить модули страницы при смене URL (шапка, нав, main, секции)
+                if not page.is_closed() and memory._modules_page_url != current_url:
+                    try:
+                        modules = get_page_modules(page)
+                        if not modules:
+                            modules = [{"id": "page", "name": "Страница", "selector": "body", "in_viewport": True}]
+                        memory.set_page_modules(modules, current_url)
+                        print(f"[Agent] Модули страницы: {len(modules)} — {[m.get('name', '')[:20] for m in modules]}")
+                    except Exception:
+                        pass
+
+                # Ref-id для быстрого выбора (и для GigaChat)
+                if not page.is_closed():
                     try:
                         get_dom_summary(page, max_length=4000)
                     except Exception:
                         pass
 
-                # Проверяем: GigaChat уже ответил? (в DEMO_MODE — отключён)
-                gc_action = None if DEMO_MODE else _poll_gigachat()
+                # GigaChat (в т.ч. в демо — советуется по модулям)
+                gc_action = _poll_gigachat()
 
                 if gc_action is not None:
                     action = gc_action
@@ -1585,13 +1646,13 @@ def run_agent(start_url: str = None):
                     screenshot_b64 = _gigachat_meta.get("screenshot_b64")
                     source = "GigaChat"
                 else:
-                    # GigaChat ещё думает (или демо) → быстрое локальное действие по ref-id
+                    # GigaChat ещё не ответил → быстрое локальное действие по ref-id
                     action = _get_fast_action(page, memory, has_overlay, demo_mode=DEMO_MODE)
                     screenshot_b64 = None
                     source = "Fast"
 
-                # Запустить GigaChat для СЛЕДУЮЩЕГО шага (параллельно с выполнением текущего)
-                if not DEMO_MODE and _gigachat_future is None and not page.is_closed():
+                # Запустить GigaChat для СЛЕДУЮЩЕГО шага (в т.ч. в демо — тестируем по модулям с подсказками)
+                if _gigachat_future is None and not page.is_closed():
                     try:
                         _start_gigachat_async(page, step, memory, console_log, network_failures, checklist_results, context)
                     except Exception:
@@ -1641,6 +1702,14 @@ def run_agent(start_url: str = None):
                     memory.record_action_failure()
                 else:
                     memory.record_action_success()
+
+                # Шаги по модулю: после N шагов переключаемся на следующий модуль
+                memory.tick_module_step()
+                if memory.get_current_module() and memory.steps_in_current_module >= PHASE_STEPS_TO_ADVANCE:
+                    if memory.advance_module():
+                        next_mod = memory.get_current_module()
+                        if next_mod:
+                            print(f"[Agent] Переход к модулю: {next_mod.get('name', '')[:50]}")
 
                 _track_test_plan(memory, action)
 
@@ -1857,11 +1926,9 @@ def _get_fast_action(
 ) -> Dict[str, Any]:
     """
     Мгновенный выбор действия БЕЗ LLM — по ref-id из DOM.
-    Агент ВСЕГДА получает что-то для выполнения (< 50 мс).
-    Приоритет: кнопки CTA → inputs → ссылки навигации → scroll.
+    Учитывает текущий модуль (если задан): только элементы внутри модуля.
     """
     try:
-        # Проверка: страница закрыта
         if page.is_closed():
             return {"action": "scroll", "selector": "down", "reason": "Страница закрыта"}
         
@@ -1869,8 +1936,111 @@ def _get_fast_action(
             return {"action": "close_modal", "selector": "", "reason": "Закрываю оверлей"}
 
         current_url = page.url
-        # Собираем ВСЕ кликабельные элементы с ref-id за один evaluate
-        elements = page.evaluate("""() => {
+        cur_module = memory.get_current_module()
+        scope_selector = (cur_module.get("selector") or "").strip() if cur_module else ""
+
+        def _collect_js(scope_sel: str) -> str:
+            scope_check = ""
+            if scope_sel:
+                scope_check = """
+                const scopeEl = document.querySelector(scopeSel);
+                if (scopeEl && !scopeEl.contains(el)) return;"""
+            return """
+            (scopeSel) => {
+            const scopeEl = scopeSel ? document.querySelector(scopeSel) : null;
+            if (scopeSel && !scopeEl) return [];
+            const result = [];
+            const isAgent = (el) => {
+                let c = el;
+                while (c && c !== document.body) {
+                    if (c.hasAttribute && c.hasAttribute('data-agent-host')) return true;
+                    c = c.parentElement;
+                }
+                return false;
+            };
+            const inViewport = (el) => {
+                const r = el.getBoundingClientRect();
+                const vw = window.innerWidth, vh = window.innerHeight;
+                return r.top < vh && r.bottom > 0 && r.left < vw && r.right > 0;
+            };
+            const ancestorsVisible = (el) => {
+                let cur = el.parentElement;
+                while (cur && cur !== document.body) {
+                    const s = getComputedStyle(cur);
+                    if (s.display === 'none' || s.visibility === 'hidden' || parseFloat(s.opacity) === 0) return false;
+                    cur = cur.parentElement;
+                }
+                return true;
+            };
+            const vis = (el) => {
+                const r = el.getBoundingClientRect();
+                if (r.width < 5 || r.height < 5) return false;
+                const s = getComputedStyle(el);
+                if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return false;
+                if (!inViewport(el) || !ancestorsVisible(el)) return false;
+                return true;
+            };
+            // Кнопки (приоритет 1)
+            document.querySelectorAll('button:not([disabled]), [role="button"]:not([disabled]), input[type="submit"]').forEach(el => {
+                if (!vis(el) || isAgent(el)) return;
+                """ + ("if (scopeEl && !scopeEl.contains(el)) return;" if scope_sel else "") + """
+                let ref = el.getAttribute('data-agent-ref');
+                if (!ref) return;
+                const text = (el.textContent || el.getAttribute('aria-label') || '').trim().slice(0, 50);
+                result.push({ref: 'ref:' + ref, type: 'click', text, priority: 1});
+            });
+            // Инпуты (приоритет 2)
+            document.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([disabled]), textarea:not([disabled])').forEach(el => {
+                if (!vis(el) || isAgent(el)) return;
+                """ + ("if (scopeEl && !scopeEl.contains(el)) return;" if scope_sel else "") + """
+                let ref = el.getAttribute('data-agent-ref');
+                if (!ref) return;
+                const text = (el.placeholder || el.name || el.getAttribute('aria-label') || '').trim().slice(0, 50);
+                result.push({ref: 'ref:' + ref, type: 'input', text, priority: 2});
+            });
+            // Ссылки (приоритет 3)
+            document.querySelectorAll('a[href]:not([disabled])').forEach(el => {
+                if (!vis(el) || isAgent(el)) return;
+                """ + ("if (scopeEl && !scopeEl.contains(el)) return;" if scope_sel else "") + """
+                let ref = el.getAttribute('data-agent-ref');
+                if (!ref) return;
+                const text = (el.textContent || el.getAttribute('aria-label') || '').trim().slice(0, 50);
+                const href = (el.getAttribute('href') || '');
+                if (href.startsWith('javascript:') || href === '#') return;
+                if (href.startsWith('http')) {
+                    try {
+                        const url = new URL(href, window.location.href);
+                        if (url.hostname !== window.location.hostname && url.hostname !== '') return;
+                    } catch(e) { return; }
+                }
+                result.push({ref: 'ref:' + ref, type: 'link', text, priority: 3});
+            });
+            // Select, табы
+            document.querySelectorAll('select:not([disabled])').forEach(el => {
+                if (!vis(el) || isAgent(el)) return;
+                """ + ("if (scopeEl && !scopeEl.contains(el)) return;" if scope_sel else "") + """
+                let ref = el.getAttribute('data-agent-ref');
+                if (!ref) return;
+                const opts = Array.from(el.options).slice(0,3).map(o => o.text.trim()).join(',');
+                result.push({ref: 'ref:' + ref, type: 'select', text: opts, priority: 2});
+            });
+            document.querySelectorAll('[role="tab"]').forEach(el => {
+                if (!vis(el) || isAgent(el)) return;
+                """ + ("if (scopeEl && !scopeEl.contains(el)) return;" if scope_sel else "") + """
+                let ref = el.getAttribute('data-agent-ref');
+                if (!ref) return;
+                const text = (el.textContent || '').trim().slice(0, 50);
+                result.push({ref: 'ref:' + ref, type: 'tab', text, priority: 2});
+            });
+            return result;
+            }
+            """
+
+        elements = page.evaluate(_collect_js(scope_selector), scope_selector) or []
+
+        # Старая логика без scope — один большой evaluate (оставляем запасной вариант)
+        if scope_selector and not elements:
+            elements = page.evaluate("""() => {
             const result = [];
             const isAgent = (el) => {
                 let c = el;

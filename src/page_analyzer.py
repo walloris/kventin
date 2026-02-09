@@ -406,6 +406,107 @@ def get_dom_summary(page: Page, max_length: int = 8000) -> str:
         return f"[Ошибка DOM: {e}]"
 
 
+def get_page_modules(page: Page) -> List[Dict[str, Any]]:
+    """
+    Разбить страницу на модули по DOM-дереву: header, nav, main, footer, section с id/aria-label.
+    Возвращает список { "id", "name", "selector", "in_viewport" } для поочерёдного тестирования.
+    """
+    try:
+        modules = page.evaluate("""() => {
+            const vw = window.innerWidth, vh = window.innerHeight;
+            const inViewport = (el) => {
+                if (!el) return false;
+                const r = el.getBoundingClientRect();
+                return r.top < vh && r.bottom > 0 && r.left < vw && r.right > 0;
+            };
+            const vis = (el) => {
+                if (!el) return false;
+                const s = getComputedStyle(el);
+                return s.display !== 'none' && s.visibility !== 'hidden' && parseFloat(s.opacity) > 0;
+            };
+            const result = [];
+            const names = {
+                'header': 'Шапка',
+                'nav': 'Навигация',
+                'main': 'Основной контент',
+                'footer': 'Футер',
+                '[role="banner"]': 'Баннер',
+                '[role="navigation"]': 'Навигация',
+                '[role="main"]': 'Основной контент',
+                '[role="contentinfo"]': 'Подвал',
+                '[role="complementary"]': 'Боковая панель',
+                '[role="search"]': 'Поиск',
+                'form': 'Форма'
+            };
+            // Семантические теги и роли (порядок важен: сверху вниз по типичному layout)
+            const selectors = [
+                'header', '[role="banner"]',
+                'nav', '[role="navigation"]',
+                '[role="search"]',
+                'main', '[role="main"]',
+                'form',
+                '[role="complementary"]',
+                'footer', '[role="contentinfo"]'
+            ];
+            const seen = new Set();
+            for (const sel of selectors) {
+                document.querySelectorAll(sel).forEach((el, i) => {
+                    if (!vis(el)) return;
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width < 20 || rect.height < 20) return;
+                    const key = sel + ':' + i;
+                    if (seen.has(key)) return;
+                    seen.add(key);
+                    const name = names[sel] || sel;
+                    const label = el.getAttribute('aria-label') || el.getAttribute('title') || '';
+                    const idAttr = el.id ? '#' + el.id : '';
+                    const nameStr = (label || names[sel] || el.tagName.toLowerCase()) + (idAttr ? ' ' + idAttr : '');
+                    result.push({
+                        id: key.replace(/[^a-z0-9_-]/gi, '_'),
+                        name: nameStr.slice(0, 60),
+                        selector: el.id ? '#' + el.id : sel + ':nth-of-type(' + (i+1) + ')',
+                        in_viewport: inViewport(el)
+                    });
+                });
+            }
+            // Секции с id или aria-label (не дублируем уже попавшие)
+            document.querySelectorAll('section[id], section[aria-label], div[role="region"][id], div[role="region"][aria-label]').forEach((el, i) => {
+                if (!vis(el)) return;
+                const rect = el.getBoundingClientRect();
+                if (rect.width < 50 || rect.height < 30) return;
+                const id = el.id || ('region_' + i);
+                if (seen.has(id)) return;
+                seen.add(id);
+                const name = (el.getAttribute('aria-label') || el.id || el.className || 'Блок').slice(0, 50);
+                let sel = el.id ? ('#' + el.id) : (el.tagName.toLowerCase() + '[aria-label="' + (el.getAttribute('aria-label') || '') + '"]');
+                result.push({
+                    id: id.replace(/[^a-z0-9_-]/gi, '_'),
+                    name: name,
+                    selector: sel,
+                    in_viewport: inViewport(el)
+                });
+            });
+            return result;
+        }""")
+        if not modules:
+            return []
+        # Нормализуем selector для секций без id
+        out = []
+        for m in modules:
+            sel = m.get("selector") or ""
+            if isinstance(sel, bool):  # JS undefined -> True в JSON не приходит; на всякий случай
+                continue
+            out.append({
+                "id": m.get("id", ""),
+                "name": m.get("name", "Модуль"),
+                "selector": sel,
+                "in_viewport": m.get("in_viewport", True),
+            })
+        return out
+    except Exception:
+        return []
+
+
 def detect_active_overlays(page: Page) -> Dict[str, Any]:
     """
     Обнаружить все активные оверлеи на странице:
