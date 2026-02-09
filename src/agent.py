@@ -718,10 +718,10 @@ def _find_element(page: Page, selector: str):
         except Exception:
             continue
 
-    # --- 3) Playwright getBy* методы ---
+    # --- 3) Playwright getBy* методы (ССЫЛКИ ИСКЛЮЧЕНЫ) ---
     getby_strategies = [
         ("getByRole:button", lambda: page.get_by_role("button", name=safe_text, exact=False).first),
-        ("getByRole:link", lambda: page.get_by_role("link", name=safe_text, exact=False).first),
+        # getByRole:link исключён — может перезагрузить страницу
         ("getByRole:tab", lambda: page.get_by_role("tab", name=safe_text, exact=False).first),
         ("getByRole:menuitem", lambda: page.get_by_role("menuitem", name=safe_text, exact=False).first),
         ("getByLabel", lambda: page.get_by_label(safe_text, exact=False).first),
@@ -736,11 +736,11 @@ def _find_element(page: Page, selector: str):
         except Exception:
             continue
 
-    # --- 4) Текстовый has-text fallback ---
+    # --- 4) Текстовый has-text fallback (ССЫЛКИ ИСКЛЮЧЕНЫ) ---
     text_strategies = [
         f'button:has-text("{safe_text}")',
-        f'a:has-text("{safe_text}")',
         f'[role="button"]:has-text("{safe_text}")',
+        # Ссылки исключены — могут перезагрузить страницу
     ]
     for css in text_strategies:
         try:
@@ -759,6 +759,17 @@ def _do_click(page: Page, selector: str, reason: str = "") -> str:
     loc = _find_element(page, selector)
     if loc:
         try:
+            # ПРОВЕРКА: не кликаем по ссылкам (могут перезагрузить страницу)
+            try:
+                tag = loc.evaluate("el => el.tagName.toLowerCase()")
+                if tag == "a":
+                    href = loc.evaluate("el => el.getAttribute('href') || ''")
+                    if href and not href.startswith("javascript:") and href != "#":
+                        print(f"[Agent] ⚠️ Пропускаю ссылку (может перезагрузить страницу): {selector[:50]}")
+                        return f"skipped_link: {selector[:50]}"
+            except Exception:
+                pass
+            
             print(f"[Agent] 🔴 КЛИК: {selector[:50]} ({reason[:30]})")
             # Показываем курсор и подсказку ДО highlight
             box = loc.bounding_box()
@@ -1481,19 +1492,9 @@ def run_agent(start_url: str = None):
 
                 current_url = page.url
 
-                # Новые вкладки
-                _handle_new_tabs(new_tabs_queue, page, start_url, step, console_log, network_failures, memory)
-
-                # Навигация на другой домен → вернуться
-                if not _same_page(start_url, page.url):
-                    print(f"[Agent] #{step} Навигация на {page.url[:60]}. Возврат.")
-                    try:
-                        page.goto(start_url, wait_until="domcontentloaded", timeout=20000)
-                        smart_wait_after_goto(page, timeout=5000)
-                        _inject_all(page)
-                    except Exception as e:
-                        LOG.warning("Ошибка возврата: %s", e)
-                    continue
+                # НАВИГАЦИЯ ОТКЛЮЧЕНА — агент остаётся на одной странице
+                # Новые вкладки — игнорируем
+                # Возврат на start_url — отключен
 
                 # Фоновый анализ предыдущего шага (не блокируем)
                 try:
@@ -1850,16 +1851,8 @@ def _get_fast_action(page: Page, memory: AgentMemory, has_overlay: bool = False)
                 const text = (el.placeholder || el.name || el.getAttribute('aria-label') || '').trim().slice(0, 50);
                 result.push({ref: 'ref:' + ref, type: 'input', text, priority: 2});
             });
-            // Ссылки (приоритет 3)
-            document.querySelectorAll('a[href]:not([disabled])').forEach(el => {
-                if (!vis(el) || isAgent(el)) return;
-                let ref = el.getAttribute('data-agent-ref');
-                if (!ref) return;
-                const text = (el.textContent || el.getAttribute('aria-label') || '').trim().slice(0, 50);
-                const href = (el.getAttribute('href') || '');
-                if (href.startsWith('javascript:') || href === '#') return;
-                result.push({ref: 'ref:' + ref, type: 'link', text, priority: 3});
-            });
+            // ССЫЛКИ ИСКЛЮЧЕНЫ — могут перезагрузить страницу
+            // Не добавляем ссылки в список действий
             // Select (приоритет 2)
             document.querySelectorAll('select:not([disabled])').forEach(el => {
                 if (!vis(el) || isAgent(el)) return;
@@ -1883,7 +1876,8 @@ def _get_fast_action(page: Page, memory: AgentMemory, has_overlay: bool = False)
         for elem in elements:
             ref = elem.get("ref", "")
             etype = elem.get("type", "")
-            act = "click" if etype in ("click", "link", "tab") else ("type" if etype == "input" else "select_option")
+            # Ссылки исключены из действий — могут перезагрузить страницу
+            act = "click" if etype in ("click", "tab") else ("type" if etype == "input" else "select_option")
             key = f"{act}:{ref}"
             if not memory.is_element_tested(current_url, key):
                 text = elem.get("text", "?")[:30]
@@ -2666,28 +2660,8 @@ def _run_responsive_check(page: Page, memory: AgentMemory, current_url: str, con
 
 def _run_session_persistence_check(page: Page, memory: AgentMemory, current_url: str, console_log, network_failures):
     """Перезагрузить страницу и проверить: состояние сохранилось?"""
-    if not SESSION_PERSIST_CHECK_EVERY_N:
-        return
-    print("[Agent] Session persistence: перезагрузка страницы…")
-    try:
-        before_b64 = take_screenshot_b64(page)
-        page.reload(wait_until="domcontentloaded", timeout=15000)
-        smart_wait_after_goto(page, timeout=5000)
-        after_b64 = take_screenshot_b64(page)
-        diff = compute_screenshot_diff(before_b64, after_b64)
-        if diff.get("change_percent", 0) > 40:
-            answer = consult_agent_with_screenshot(
-                f"URL: {current_url}. После перезагрузки (F5) экран изменился на {diff.get('change_percent')}%. {diff.get('detail', '')}",
-                "Страница сильно изменилась после перезагрузки. Это ожидаемо или потеря состояния (сброс формы, разлогин, потеря данных)? Если баг — JSON с check_defect.",
-                screenshot_b64=after_b64,
-            )
-            if answer:
-                action = parse_llm_action(answer)
-                if action and action.get("action") == "check_defect" and action.get("possible_bug"):
-                    _create_defect(page, f"[Session] {action['possible_bug']}", current_url, [], console_log, network_failures, memory)
-        _inject_all(page)
-    except Exception as e:
-        LOG.debug("session persistence: %s", e)
+    # ОТКЛЮЧЕНО — перезагрузка страницы не нужна
+    return
 
 
 def _run_iframe_check(page: Page, memory: AgentMemory, current_url: str, console_log, network_failures):
