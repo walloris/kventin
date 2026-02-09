@@ -17,7 +17,7 @@ try:
 except Exception:
     pass
 
-from config import IGNORE_CONSOLE_PATTERNS, IGNORE_NETWORK_STATUSES, DEFECT_IGNORE_PATTERNS, JIRA_ISSUE_TYPE
+from config import IGNORE_CONSOLE_PATTERNS, IGNORE_NETWORK_STATUSES, DEFECT_IGNORE_PATTERNS, JIRA_ISSUE_TYPE, JIRA_ASSIGNEE
 
 LOG = logging.getLogger("Jira")
 
@@ -347,6 +347,13 @@ def create_jira_issue(
     else:
         auth = (login, api_token)
 
+    # Assignee: если задан JIRA_ASSIGNEE — используем его, иначе — текущего пользователя (login)
+    assignee_value = None
+    if JIRA_ASSIGNEE:
+        assignee_value = JIRA_ASSIGNEE
+    elif login:
+        assignee_value = login
+    
     payload = {
         "fields": {
             "project": {"key": project_key},
@@ -356,12 +363,27 @@ def create_jira_issue(
             "labels": [JIRA_DEFECT_LABEL],
         }
     }
+    
+    # Добавляем assignee, если указан
+    if assignee_value:
+        # Для Jira Server: {"name": "username"}
+        # Для Jira Cloud: {"accountId": "..."} или {"name": "email"} (зависит от настроек)
+        # Пробуем универсальный вариант: если assignee_value похож на accountId (UUID) — используем accountId, иначе name
+        if len(assignee_value) > 30 and "-" in assignee_value:
+            # Похоже на accountId (UUID формат: 557058:xxx-xxx-xxx)
+            payload["fields"]["assignee"] = {"accountId": assignee_value}
+            LOG.info("Assignee: accountId=%s", assignee_value)
+        else:
+            # Username или email
+            payload["fields"]["assignee"] = {"name": assignee_value}
+            LOG.info("Assignee: name=%s", assignee_value)
 
     try:
         r = requests.post(url, json=payload, headers=headers, auth=auth, verify=False, timeout=30)
         r.raise_for_status()
         key = r.json().get("key")
-        LOG.info("Создан дефект: %s", key)
+        assignee_info = f" (assignee: {assignee_value})" if assignee_value else ""
+        LOG.info("Создан дефект: %s%s", key, assignee_info)
         register_local_defect(summary)  # запомнить для дедупликации
 
         if key and attachment_paths:

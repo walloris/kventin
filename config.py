@@ -45,6 +45,8 @@ JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN", "")
 JIRA_PROJECT_KEY = os.getenv("JIRA_PROJECT_KEY", "")
 # Тип задачи при создании (на время тестирования — Task, потом можно Bug)
 JIRA_ISSUE_TYPE = os.getenv("JIRA_ISSUE_TYPE", "Task")
+# Assignee (назначить дефект на пользователя): username для Server, accountId для Cloud, или пусто = текущий пользователь
+JIRA_ASSIGNEE = os.getenv("JIRA_ASSIGNEE", "").strip()
 
 # Видимость действий
 BROWSER_SLOW_MO = int(os.getenv("BROWSER_SLOW_MO", "300"))
