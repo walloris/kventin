@@ -17,24 +17,26 @@ JAN_API_KEY = os.getenv("JAN_API_KEY", "jan-api-key")
 # ID модели в Jan (как в интерфейсе Jan). Для скриншотов нужна vision-модель: Llama-3.2-11B-Vision, Qwen2-VL
 JAN_MODEL = os.getenv("JAN_MODEL", "llama-3.2-11b-vision-instruct")
 
-# GigaChat (как в твоём проекте: token_header, gateway URL, OAuth или password grant)
-GIGACHAT_TOKEN_HEADER = os.getenv("GIGACHAT_TOKEN_HEADER", "")  # "Bearer eyJ..." — готовый токен
-GIGACHAT_API_URL = os.getenv("GIGACHAT_API_URL", "")  # URL чата (например внутренний gateway)
-GIGACHAT_TOKEN_URL = os.getenv("GIGACHAT_TOKEN_URL", "")  # URL для получения токена (OAuth)
-GIGACHAT_MODEL = os.getenv("GIGACHAT_MODEL", "GigaChat-2-Max:latest")
-GIGACHAT_AUTHORIZATION_KEY = os.getenv("GIGACHAT_AUTHORIZATION_KEY", "")  # Base64(client_id:client_secret)
-GIGACHAT_CLIENT_ID = os.getenv("GIGACHAT_CLIENT_ID", "")
+# GigaChat (Keycloak password grant + gateway, как в рабочем примере)
+GIGACHAT_TOKEN_HEADER = os.getenv("GIGACHAT_TOKEN_HEADER", "")  # опционально: готовый "Bearer eyJ..."
+GIGACHAT_API_URL = os.getenv("GIGACHAT_API_URL", "")  # единый URL чата (если не заданы _DEV/_IFT)
+GIGACHAT_TOKEN_URL = os.getenv("GIGACHAT_TOKEN_URL", "")  # единый URL токена
+GIGACHAT_MODEL = os.getenv("GIGACHAT_MODEL", "GigaChat-2-Max")
+GIGACHAT_AUTHORIZATION_KEY = os.getenv("GIGACHAT_AUTHORIZATION_KEY", "")
+GIGACHAT_CLIENT_ID = os.getenv("GIGACHAT_CLIENT_ID", "fakeuser")
 GIGACHAT_CLIENT_SECRET = os.getenv("GIGACHAT_CLIENT_SECRET", "")
 GIGACHAT_USERNAME = os.getenv("GIGACHAT_USERNAME", "")
 GIGACHAT_PASSWORD = os.getenv("GIGACHAT_PASSWORD", "")
-GIGACHAT_ENV = os.getenv("GIGACHAT_ENV", "ift")  # "dev" или "ift" — для выбора token_url / api_url
+GIGACHAT_ENV = os.getenv("GIGACHAT_ENV", "ift").strip().lower()  # "dev" | "ift"
 GIGACHAT_VERIFY_SSL = os.getenv("GIGACHAT_VERIFY_SSL", "0") == "1"
-# Опционально: разные URL для dev/ift (если заданы — переопределяют GIGACHAT_TOKEN_URL / GIGACHAT_API_URL)
-GIGACHAT_TOKEN_URL_DEV = os.getenv("GIGACHAT_TOKEN_URL_DEV", "")
-GIGACHAT_TOKEN_URL_IFT = os.getenv("GIGACHAT_TOKEN_URL_IFT", "")
-GIGACHAT_API_URL_DEV = os.getenv("GIGACHAT_API_URL_DEV", "")
-GIGACHAT_API_URL_IFT = os.getenv("GIGACHAT_API_URL_IFT", "")
-# Совместимость со старым способом (публичный API)
+# Person ID для Keycloak (обязательно для password grant через x-hrp-person-id)
+GIGACHAT_PERSON_ID_DEV = os.getenv("GIGACHAT_PERSON_ID_DEV", "4c36eb04-0920-4449-9e07-ca4a68f80eef")
+GIGACHAT_PERSON_ID_IFT = os.getenv("GIGACHAT_PERSON_ID_IFT", "91ed8888-bff4-4d61-a72d-310db2eeaa37")
+# URL по стендам (если не заданы — подставляются дефолты под Sberbank HR)
+GIGACHAT_TOKEN_URL_DEV = os.getenv("GIGACHAT_TOKEN_URL_DEV", "https://hr-dev.sberbank.ru/auth/realms/PAOSberbank/protocol/openid-connect/token")
+GIGACHAT_TOKEN_URL_IFT = os.getenv("GIGACHAT_TOKEN_URL_IFT", "https://hr-ift.sberbank.ru/auth/realms/PAOSberbank/protocol/openid-connect/token")
+GIGACHAT_API_URL_DEV = os.getenv("GIGACHAT_API_URL_DEV", "https://hr-dev.sberbank.ru/api-web/neurosearchbar/api/v1/gigachat/completion")
+GIGACHAT_API_URL_IFT = os.getenv("GIGACHAT_API_URL_IFT", "https://hr-ift.sberbank.ru/api-web/neurosearchbar/api/v1/gigachat/completion")
 GIGACHAT_CREDENTIALS = os.getenv("GIGACHAT_CREDENTIALS", "")
 
 # Jira (логин: username или email — в зависимости от типа Jira)

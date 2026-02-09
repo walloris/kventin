@@ -1,7 +1,7 @@
 """
 Клиент GigaChat API для консультаций агента.
-Поддержка как в твоём проекте: token_header (готовый Bearer), свой gateway (api_url/token_url),
-OAuth (authorization_key или client_id+client_secret), password grant (username, password, client_id).
+Авторизация: Keycloak password grant (username, password, client_id, x-hrp-person-id)
+или готовый token_header. URL токена и API задаются по GIGACHAT_ENV (dev/ift).
 """
 import base64
 import logging
@@ -40,59 +40,83 @@ DEFAULT_API_URL = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
 
 def get_gigachat_token(env: str) -> Optional[str]:
     """
-    Получение токена методом из твоего проекта: grant_type=password, username, client_id (без пароля).
-    URL берётся из config: token_url_dev / token_url_ift по env.
+    Получение OAuth-токена через Keycloak (как в рабочем примере):
+    POST с grant_type=password, username, password, client_id;
+    заголовок x-hrp-person-id, куки KEYCLOAK_LOCALE=ru, User-Agent insomnia.
     """
     try:
         from config import (
             GIGACHAT_USERNAME,
+            GIGACHAT_PASSWORD,
             GIGACHAT_CLIENT_ID,
-            GIGACHAT_TOKEN_URL,
             GIGACHAT_TOKEN_URL_DEV,
             GIGACHAT_TOKEN_URL_IFT,
+            GIGACHAT_PERSON_ID_DEV,
+            GIGACHAT_PERSON_ID_IFT,
         )
     except ImportError:
         GIGACHAT_USERNAME = os.getenv("GIGACHAT_USERNAME", "")
-        GIGACHAT_CLIENT_ID = os.getenv("GIGACHAT_CLIENT_ID", "")
-        GIGACHAT_TOKEN_URL = os.getenv("GIGACHAT_TOKEN_URL", "")
+        GIGACHAT_PASSWORD = os.getenv("GIGACHAT_PASSWORD", "")
+        GIGACHAT_CLIENT_ID = os.getenv("GIGACHAT_CLIENT_ID", "fakeuser")
         GIGACHAT_TOKEN_URL_DEV = os.getenv("GIGACHAT_TOKEN_URL_DEV", "")
         GIGACHAT_TOKEN_URL_IFT = os.getenv("GIGACHAT_TOKEN_URL_IFT", "")
+        GIGACHAT_PERSON_ID_DEV = os.getenv("GIGACHAT_PERSON_ID_DEV", "")
+        GIGACHAT_PERSON_ID_IFT = os.getenv("GIGACHAT_PERSON_ID_IFT", "")
 
-    url = (GIGACHAT_TOKEN_URL_IFT if env == "ift" else GIGACHAT_TOKEN_URL_DEV) or GIGACHAT_TOKEN_URL or _config("TOKEN_URL") or DEFAULT_TOKEN_URL
-    if not GIGACHAT_USERNAME or not GIGACHAT_CLIENT_ID:
-        LOG.warning("get_gigachat_token: не заданы username или client_id")
+    url = GIGACHAT_TOKEN_URL_IFT if env == "ift" else GIGACHAT_TOKEN_URL_DEV
+    person_id = GIGACHAT_PERSON_ID_IFT if env == "ift" else GIGACHAT_PERSON_ID_DEV
+    if not url:
+        LOG.warning("get_gigachat_token: не задан token_url для env=%s", env)
+        return None
+    if not GIGACHAT_USERNAME or not GIGACHAT_PASSWORD or not GIGACHAT_CLIENT_ID:
+        LOG.warning("get_gigachat_token: не заданы username, password или client_id")
         return None
 
-    LOG.info("🔗 Попытка подключения к: %s", url)
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "x-hrp-person-id": person_id,
+        "User-Agent": "insomnia/8.6.1",
+        "Accept": "*/*",
+    }
+    cookies = {"KEYCLOAK_LOCALE": "ru"}
     payload = {
         "grant_type": "password",
         "username": GIGACHAT_USERNAME,
+        "password": GIGACHAT_PASSWORD,
         "client_id": GIGACHAT_CLIENT_ID,
     }
-    headers = {"Content-Type": "application/x-www-form-urlencoded"}
 
+    LOG.info("🔗 Получение токена из: %s", url[:60] + "..." if len(url) > 60 else url)
+    LOG.debug("🆔 Person ID: %s", person_id[:8] + "…" if len(person_id) > 8 else person_id)
     try:
         response = requests.post(
             url,
             data=payload,
             headers=headers,
+            cookies=cookies,
             verify=False,
-            timeout=30,
+            timeout=60,
         )
         if response.status_code == 200:
-            LOG.info("✅ Токен получен успешно")
-            return response.json().get("access_token")
-        LOG.error("❌ HTTP ошибка: %s - %s", response.status_code, response.text)
+            token_data = response.json()
+            access_token = token_data.get("access_token")
+            if access_token:
+                LOG.info("✅ Токен успешно получен")
+                return access_token
+            LOG.error("❌ Ответ 200, но нет access_token в JSON")
+            return None
+        LOG.error("❌ Ошибка авторизации HTTP %s: %s", response.status_code, response.text[:500])
+        if response.status_code == 401:
+            LOG.warning("⚠️ Проверь пароль и client_id в .env (client_id=fakeuser)")
         return None
     except requests.exceptions.ConnectionError as e:
         LOG.error("❌ Ошибка подключения: %s", e)
-        LOG.error("💡 Возможные причины: сервер недоступен, проблемы с сетью, блокировка файрволом")
         return None
     except requests.exceptions.Timeout as e:
-        LOG.error("❌ Таймаут подключения: %s", e)
+        LOG.error("❌ Таймаут: %s", e)
         return None
     except Exception as e:
-        LOG.error("❌ Неожиданная ошибка: %s", e)
+        LOG.error("❌ Неожиданная ошибка: %s", e, exc_info=True)
         return None
 
 
@@ -134,11 +158,10 @@ def _config(key: str, default: str = "") -> str:
     }
     v = m.get(key, default or "")
 
+    env = m.get("ENV", "ift")
     if key == "API_URL" and not v:
-        env = m.get("ENV", "ift")
         v = GIGACHAT_API_URL_IFT if env == "ift" else GIGACHAT_API_URL_DEV
     if key == "TOKEN_URL" and not v:
-        env = m.get("ENV", "ift")
         v = GIGACHAT_TOKEN_URL_IFT if env == "ift" else GIGACHAT_TOKEN_URL_DEV
 
     return v or default or ""
@@ -294,8 +317,8 @@ class GigaChatClient:
         if self.access_token and time.time() < self.token_expires_at - 60:
             LOG.debug("get_token: кэшированный токен до %s", time.strftime("%H:%M:%S", time.localtime(self.token_expires_at)))
             return self.access_token
-        # Твой метод: username + client_id (без пароля)
-        if self.username and self.client_id:
+        # Keycloak password grant: username + password + client_id + person_id
+        if self.username and self.password and self.client_id:
             LOG.debug("get_token: get_gigachat_token(env=%s)...", self.env)
             token = get_gigachat_token(self.env)
             if token:
