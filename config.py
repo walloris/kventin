@@ -48,9 +48,13 @@ JIRA_ISSUE_TYPE = os.getenv("JIRA_ISSUE_TYPE", "Task")
 # Assignee (назначить дефект на пользователя): username для Server, accountId для Cloud, или пусто = текущий пользователь
 JIRA_ASSIGNEE = os.getenv("JIRA_ASSIGNEE", "").strip()
 
+# --- Демо-режим: быстрый, активный, зрелищный агент ---
+# Включает: сниженные паузы, пропуск оракула, агрессивный промпт, чеклист реже
+DEMO_MODE = os.getenv("DEMO_MODE", "false").lower() in ("1", "true", "yes")
+
 # Видимость действий
-BROWSER_SLOW_MO = int(os.getenv("BROWSER_SLOW_MO", "300"))
-HIGHLIGHT_DURATION_MS = int(os.getenv("HIGHLIGHT_DURATION_MS", "800"))
+BROWSER_SLOW_MO = int(os.getenv("BROWSER_SLOW_MO", "100" if DEMO_MODE else "300"))
+HIGHLIGHT_DURATION_MS = int(os.getenv("HIGHLIGHT_DURATION_MS", "400" if DEMO_MODE else "800"))
 HEADLESS = os.getenv("HEADLESS", "false").lower() in ("1", "true", "yes")
 # Размер окна браузера (по умолчанию Full HD — на весь экран)
 VIEWPORT_WIDTH = int(os.getenv("VIEWPORT_WIDTH", "1920"))
@@ -116,19 +120,20 @@ DEFECT_IGNORE_PATTERNS = [
 ]
 
 # Чеклист: пауза между шагами (мс), чтобы агент шёл медленнее и по порядку
-CHECKLIST_STEP_DELAY_MS = int(os.getenv("CHECKLIST_STEP_DELAY_MS", "2000"))
+CHECKLIST_STEP_DELAY_MS = int(os.getenv("CHECKLIST_STEP_DELAY_MS", "500" if DEMO_MODE else "2000"))
 # Ожидание загрузки: таймаут networkidle (мс)
-WAIT_NETWORK_IDLE_MS = int(os.getenv("WAIT_NETWORK_IDLE_MS", "5000"))
+WAIT_NETWORK_IDLE_MS = int(os.getenv("WAIT_NETWORK_IDLE_MS", "3000" if DEMO_MODE else "5000"))
 
 # --- Улучшение качества тестирования ---
 # В начале сессии запросить у GigaChat тест-план по скриншоту (5–7 шагов)
 ENABLE_TEST_PLAN_START = os.getenv("ENABLE_TEST_PLAN_START", "true").lower() in ("1", "true", "yes")
 # После важных действий спрашивать GigaChat: достигнут ли ожидаемый результат (оракул)
-ENABLE_ORACLE_AFTER_ACTION = os.getenv("ENABLE_ORACLE_AFTER_ACTION", "true").lower() in ("1", "true", "yes")
+# В демо-режиме отключён — экономит 2-5с на каждом шаге
+ENABLE_ORACLE_AFTER_ACTION = os.getenv("ENABLE_ORACLE_AFTER_ACTION", "false" if DEMO_MODE else "true").lower() in ("1", "true", "yes")
 # Перед созданием дефекта — второй проход: «это точно баг?» (снижает ложные тикеты)
-ENABLE_SECOND_PASS_BUG = os.getenv("ENABLE_SECOND_PASS_BUG", "true").lower() in ("1", "true", "yes")
+ENABLE_SECOND_PASS_BUG = os.getenv("ENABLE_SECOND_PASS_BUG", "false" if DEMO_MODE else "true").lower() in ("1", "true", "yes")
 # Повторы при сбое: сколько раз повторять клик/действие при таймауте или not_found
-ACTION_RETRY_COUNT = int(os.getenv("ACTION_RETRY_COUNT", "2"))
+ACTION_RETRY_COUNT = int(os.getenv("ACTION_RETRY_COUNT", "1" if DEMO_MODE else "2"))
 # Печатать отчёт сессии каждые N шагов (0 = только в конце при создании дефекта)
 SESSION_REPORT_EVERY_N = int(os.getenv("SESSION_REPORT_EVERY_N", "0"))
 
@@ -145,14 +150,14 @@ MAX_ACTIONS_IN_MEMORY = int(os.getenv("MAX_ACTIONS_IN_MEMORY", "80"))  # раз�
 MAX_SCROLLS_IN_ROW = int(os.getenv("MAX_SCROLLS_IN_ROW", "5"))   # лимит прокруток подряд
 CONSOLE_LOG_LIMIT = int(os.getenv("CONSOLE_LOG_LIMIT", "150"))    # обрезка логов консоли
 NETWORK_LOG_LIMIT = int(os.getenv("NETWORK_LOG_LIMIT", "80"))     # обрезка сетевых ошибок
-POST_ACTION_DELAY = float(os.getenv("POST_ACTION_DELAY", "1.5"))  # пауза после действия (сек)
-PHASE_STEPS_TO_ADVANCE = int(os.getenv("PHASE_STEPS_TO_ADVANCE", "5"))  # шагов в фазе до перехода
+POST_ACTION_DELAY = float(os.getenv("POST_ACTION_DELAY", "0.3" if DEMO_MODE else "1.5"))  # пауза после действия (сек)
+PHASE_STEPS_TO_ADVANCE = int(os.getenv("PHASE_STEPS_TO_ADVANCE", "3" if DEMO_MODE else "5"))  # шагов в фазе до перехода
 
 # --- Продвинутые проверки ---
 # Accessibility (a11y) проверки каждые N шагов (0 = отключены)
-A11Y_CHECK_EVERY_N = int(os.getenv("A11Y_CHECK_EVERY_N", "10"))
+A11Y_CHECK_EVERY_N = int(os.getenv("A11Y_CHECK_EVERY_N", "20" if DEMO_MODE else "10"))
 # Performance-мониторинг каждые N шагов (0 = отключён)
-PERF_CHECK_EVERY_N = int(os.getenv("PERF_CHECK_EVERY_N", "15"))
+PERF_CHECK_EVERY_N = int(os.getenv("PERF_CHECK_EVERY_N", "25" if DEMO_MODE else "15"))
 # Responsive тестирование: после основного прохода переключить на мобильный viewport
 ENABLE_RESPONSIVE_TEST = os.getenv("ENABLE_RESPONSIVE_TEST", "true").lower() in ("1", "true", "yes")
 RESPONSIVE_VIEWPORTS = [

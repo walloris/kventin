@@ -78,17 +78,24 @@ def smart_wait_after_goto(page: Page, timeout: float = 30000) -> None:
     """
     Умное ожидание после page.goto: load, затем networkidle (если успеет),
     затем короткая пауза для стабилизации.
+    В демо-режиме — быстрее (пропускает networkidle, меньше пауза).
     """
+    try:
+        from config import DEMO_MODE
+    except ImportError:
+        DEMO_MODE = False
+
     try:
         page.wait_for_load_state("domcontentloaded", timeout=timeout)
     except Exception:
         pass
     try:
-        page.wait_for_load_state("load", timeout=max(5000, timeout - 5000))
+        page.wait_for_load_state("load", timeout=max(3000, timeout - 5000))
     except Exception:
         pass
-    try:
-        page.wait_for_load_state("networkidle", timeout=5000)
-    except Exception:
-        pass
-    time.sleep(0.5)
+    if not DEMO_MODE:
+        try:
+            page.wait_for_load_state("networkidle", timeout=5000)
+        except Exception:
+            pass
+    time.sleep(0.2 if DEMO_MODE else 0.5)

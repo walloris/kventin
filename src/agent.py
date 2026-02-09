@@ -317,12 +317,21 @@ class AgentMemory:
 
     def get_phase_instruction(self) -> str:
         """Краткая инструкция для GigaChat по текущей фазе."""
-        d = {
-            "orient": "Фаза: ОРИЕНТАЦИЯ. Определи тип страницы (лендинг, каталог, форма, ЛК). Выбери ОДНО действие для понимания контекста (например осмотр ключевых элементов или лёгкий клик по главному CTA).",
-            "smoke": "Фаза: SMOKE. Проверь, что страница живая: ключевые кнопки/ссылки есть и кликабельны. Выбери один важный элемент и проверь его (клик или hover).",
-            "critical_path": "Фаза: ОСНОВНОЙ СЦЕНАРИЙ. Тестируй главный пользовательский сценарий: основная кнопка, форма, навигация. Одно целенаправленное действие с ясной целью проверки.",
-            "exploratory": "Фаза: ИССЛЕДОВАТЕЛЬСКОЕ ТЕСТИРОВАНИЕ. Проверь меню, футер, формы, краевые случаи. Не повторяй уже сделанное. Цель каждого действия — осмысленная проверка, не случайный клик.",
-        }
+        from config import DEMO_MODE
+        if DEMO_MODE:
+            d = {
+                "orient": "БЫСТРЫЙ ОСМОТР. Кликни на главную кнопку или первый элемент меню. Не скролль — кликай!",
+                "smoke": "SMOKE: кликай по всем видимым кнопкам и ссылкам. Заполняй формы если есть. Действуй быстро!",
+                "critical_path": "ОСНОВНОЙ СЦЕНАРИЙ: заполни форму, нажми все кнопки, пройди навигацию. Каждый шаг — новый элемент!",
+                "exploratory": "ИССЛЕДОВАНИЕ: открой все дропдауны, табы, меню. Введи данные в каждое поле. Проверь всё что видишь!",
+            }
+        else:
+            d = {
+                "orient": "Фаза: ОРИЕНТАЦИЯ. Определи тип страницы (лендинг, каталог, форма, ЛК). Выбери ОДНО действие для понимания контекста (например осмотр ключевых элементов или лёгкий клик по главному CTA).",
+                "smoke": "Фаза: SMOKE. Проверь, что страница живая: ключевые кнопки/ссылки есть и кликабельны. Выбери один важный элемент и проверь его (клик или hover).",
+                "critical_path": "Фаза: ОСНОВНОЙ СЦЕНАРИЙ. Тестируй главный пользовательский сценарий: основная кнопка, форма, навигация. Одно целенаправленное действие с ясной целью проверки.",
+                "exploratory": "Фаза: ИССЛЕДОВАТЕЛЬСКОЕ ТЕСТИРОВАНИЕ. Проверь меню, футер, формы, краевые случаи. Не повторяй уже сделанное. Цель каждого действия — осмысленная проверка, не случайный клик.",
+            }
         return d.get(self.tester_phase, d["exploratory"])
 
     def get_session_report_text(self) -> str:
@@ -1076,7 +1085,8 @@ def run_agent(start_url: str = None):
                     page, step, memory, console_log, network_failures, checklist_results, context,
                 )
                 if action is None:
-                    time.sleep(10)
+                    from config import DEMO_MODE as _dm
+                    time.sleep(3 if _dm else 10)
                     continue
 
                 act_type = (action.get("action") or "").lower()
@@ -1162,7 +1172,8 @@ def run_agent(start_url: str = None):
                         report += "\n" + plan_progress
                     print(report)
 
-                time.sleep(1)
+                from config import DEMO_MODE as _dm2
+                time.sleep(0.3 if _dm2 else 1)
 
         except KeyboardInterrupt:
             print("\n[Agent] Остановлен по Ctrl+C.")
@@ -1188,9 +1199,11 @@ def run_agent(start_url: str = None):
 # ===== Step-функции (декомпозиция run_agent) =====
 
 def _step_checklist(page, step, console_log, network_failures, memory):
-    """STEP 1: Чеклист каждые 5 итераций."""
+    """STEP 1: Чеклист периодически (в демо — реже)."""
+    from config import DEMO_MODE as _dm
+    checklist_every = 15 if _dm else 5
     checklist_results = []
-    if step % 5 == 1:
+    if step % checklist_every == 1:
         smart_wait_after_goto(page, timeout=5000)
         def on_step(step_id, ok, detail, step_index, total):
             st = "+" if ok else "X"
@@ -1335,11 +1348,11 @@ def _step_handle_defect(page, action, possible_bug, current_url, checklist_resul
             print(f"[Agent] Второй проход: не баг, пропускаем.")
             update_llm_overlay(page, prompt="Ревью", response="Не баг", loading=False)
             memory.add_action(action, result="defect_skipped_second_pass")
-            time.sleep(1)
+            time.sleep(0.3)
             return
     _create_defect(page, possible_bug, current_url, checklist_results, console_log, network_failures, memory)
     memory.add_action(action, result="defect_reported")
-    time.sleep(3)
+    time.sleep(1)
 
 
 def _step_execute(page, action, step, memory, context):
