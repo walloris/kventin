@@ -732,11 +732,24 @@ def _do_click(page: Page, selector: str, reason: str = "") -> str:
     loc = _find_element(page, selector)
     if loc:
         try:
-            safe_highlight(loc, page, 0.4)
-            highlight_and_click(loc, page, description=reason[:30] or "Клик")
+            print(f"[Agent] 🔴 КЛИК: {selector[:50]} ({reason[:30]})")
+            # Показываем курсор и подсказку ДО highlight
+            box = loc.bounding_box()
+            if box:
+                cx = box["x"] + box["width"] / 2
+                cy = box["y"] + box["height"] / 2
+                move_cursor_to(page, cx, cy)
+                show_highlight_label(page, cx, cy, reason[:30] or "КЛИКАЮ!")
+                time.sleep(0.5)  # Пауза чтобы увидеть курсор и подсказку
+            
+            safe_highlight(loc, page, 0.8)  # Увеличиваем время highlight
+            highlight_and_click(loc, page, description=reason[:30] or "КЛИКАЮ!")
+            print(f"[Agent] ✅ Клик выполнен: {selector[:50]}")
             return f"clicked: {selector[:50]}"
         except Exception as e:
+            print(f"[Agent] ❌ Ошибка клика: {e}")
             return f"click_error: {e}"
+    print(f"[Agent] ⚠️ Элемент не найден: {selector[:50]}")
     return f"not_found: {selector[:50]}"
 
 
@@ -838,14 +851,22 @@ def _do_type(page: Page, selector: str, value: str, form_strategy: str = "happy"
                 loc = None
     if loc:
         try:
-            safe_highlight(loc, page, 0.3)
+            print(f"[Agent] ⌨️ ВВОД: {selector[:50]} = {value[:30]}")
+            # Показываем курсор и подсказку ДО highlight
             box = loc.bounding_box()
             if box:
-                move_cursor_to(page, box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
-                show_highlight_label(page, box["x"] + box["width"] / 2, box["y"] + box["height"] / 2, f"Ввожу: {value[:20]}")
+                cx = box["x"] + box["width"] / 2
+                cy = box["y"] + box["height"] / 2
+                move_cursor_to(page, cx, cy)
+                show_highlight_label(page, cx, cy, f"ВВОДЮ: {value[:20]}")
+                time.sleep(0.5)  # Пауза чтобы увидеть курсор и подсказку
+            
+            safe_highlight(loc, page, 0.8)  # Увеличиваем время highlight
             loc.click()
+            time.sleep(0.2)  # Пауза после клика
             loc.fill(value)
-            time.sleep(0.3)
+            time.sleep(0.5)  # Пауза после заполнения
+            print(f"[Agent] ✅ Ввод выполнен: {value[:30]}")
             
             # Проверка валидации: есть ли сообщение об ошибке после ввода?
             # Используем loc.evaluate() чтобы работать напрямую с найденным элементом
