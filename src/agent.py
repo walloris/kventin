@@ -1568,6 +1568,13 @@ def run_agent(start_url: str = None):
                     LOG.debug("detect_active_overlays: страница закрыта: %s", e)
                     break
 
+                # В демо ref-id не присваиваются (GigaChat не запускается) — присваиваем здесь
+                if DEMO_MODE and not page.is_closed():
+                    try:
+                        get_dom_summary(page, max_length=4000)
+                    except Exception:
+                        pass
+
                 # Проверяем: GigaChat уже ответил? (в DEMO_MODE — отключён)
                 gc_action = None if DEMO_MODE else _poll_gigachat()
 
@@ -1578,7 +1585,7 @@ def run_agent(start_url: str = None):
                     screenshot_b64 = _gigachat_meta.get("screenshot_b64")
                     source = "GigaChat"
                 else:
-                    # GigaChat ещё думает → быстрое локальное действие
+                    # GigaChat ещё думает (или демо) → быстрое локальное действие по ref-id
                     action = _get_fast_action(page, memory, has_overlay, demo_mode=DEMO_MODE)
                     screenshot_b64 = None
                     source = "Fast"
