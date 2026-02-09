@@ -149,7 +149,7 @@ LLM_RETRY_BASE_DELAY = float(os.getenv("LLM_RETRY_BASE_DELAY", "2.0"))  # сек
 # --- Константы агента (бывшие магические числа) ---
 SCROLL_PIXELS = int(os.getenv("SCROLL_PIXELS", "600"))           # пикселей за одну прокрутку
 MAX_ACTIONS_IN_MEMORY = int(os.getenv("MAX_ACTIONS_IN_MEMORY", "80"))  # размер истории
-MAX_SCROLLS_IN_ROW = int(os.getenv("MAX_SCROLLS_IN_ROW", "5"))   # лимит прокруток подряд
+MAX_SCROLLS_IN_ROW = int(os.getenv("MAX_SCROLLS_IN_ROW", "2" if DEMO_MODE else "5"))  # в демо — быстрее переключаемся на клики
 CONSOLE_LOG_LIMIT = int(os.getenv("CONSOLE_LOG_LIMIT", "150"))    # обрезка логов консоли
 NETWORK_LOG_LIMIT = int(os.getenv("NETWORK_LOG_LIMIT", "80"))     # обрезка сетевых ошибок
 POST_ACTION_DELAY = float(os.getenv("POST_ACTION_DELAY", "0.15" if DEMO_MODE else "1.5"))  # пауза после действия (сек)

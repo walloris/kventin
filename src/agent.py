@@ -1636,23 +1636,22 @@ def run_agent(start_url: str = None):
                     except Exception:
                         pass
 
-                # GigaChat (в т.ч. в демо — советуется по модулям)
-                gc_action = _poll_gigachat()
+                # В демо — только быстрый выбор (без GigaChat), чтобы не зависать на сети/ответе
+                gc_action = None if DEMO_MODE else _poll_gigachat()
 
                 if gc_action is not None:
                     action = gc_action
-                    _gigachat_action = None  # потребили
+                    _gigachat_action = None
                     has_overlay = _gigachat_meta.get("has_overlay", has_overlay)
                     screenshot_b64 = _gigachat_meta.get("screenshot_b64")
                     source = "GigaChat"
                 else:
-                    # GigaChat ещё не ответил → быстрое локальное действие по ref-id
                     action = _get_fast_action(page, memory, has_overlay, demo_mode=DEMO_MODE)
                     screenshot_b64 = None
                     source = "Fast"
 
-                # Запустить GigaChat для СЛЕДУЮЩЕГО шага (в т.ч. в демо — тестируем по модулям с подсказками)
-                if _gigachat_future is None and not page.is_closed():
+                # GigaChat только не в демо (демо = безбожно тыкает без ожидания LLM)
+                if not DEMO_MODE and _gigachat_future is None and not page.is_closed():
                     try:
                         _start_gigachat_async(page, step, memory, console_log, network_failures, checklist_results, context)
                     except Exception:
@@ -2203,7 +2202,27 @@ def _get_fast_action(
                         "expected_outcome": "Элемент реагирует",
                     }
 
-        # Все элементы протестированы → scroll
+        # Не уходить в бесконечный скролл: если уже много скроллов подряд — тыкать первый элемент (даже повторно)
+        if memory.should_avoid_scroll() and elements:
+            elem = elements[0]
+            ref = elem.get("ref", "")
+            etype = elem.get("type", "")
+            text = elem.get("text", "?")[:30]
+            if etype == "input":
+                try:
+                    from src.form_strategies import detect_field_type, get_test_value
+                    val = get_test_value(detect_field_type(placeholder=text, name=text), "happy")
+                    return {"action": "type", "selector": ref, "value": val, "reason": f"Повтор ввода: {text}", "test_goal": "Поле", "expected_outcome": "OK"}
+                except Exception:
+                    pass
+            if etype == "select":
+                return {"action": "select_option", "selector": ref, "value": (text.split(",")[0] if text else ""), "reason": "Повтор выбора", "test_goal": "Опция", "expected_outcome": "OK"}
+            return {"action": "click", "selector": ref, "reason": f"Повтор клика: {text}", "test_goal": "Клик", "expected_outcome": "OK"}
+
+        # Last resort: нет элементов с ref — клик по первой кнопке/ссылке на странице
+        if memory.should_avoid_scroll():
+            return {"action": "click", "selector": "button, a[href]", "reason": "Last resort — первая кнопка/ссылка", "test_goal": "Клик", "expected_outcome": "OK"}
+
         return {"action": "scroll", "selector": "down", "reason": "Все видимые элементы протестированы, ищу новые"}
 
     except Exception as e:
