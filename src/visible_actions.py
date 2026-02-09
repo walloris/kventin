@@ -259,10 +259,27 @@ def move_cursor_to(page: Page, x: float, y: float) -> None:
         pass
 
 
+def scroll_to_center(locator: Locator, page: Page) -> None:
+    """
+    Плавно прокрутить страницу так, чтобы элемент оказался в ЦЕНТРЕ экрана.
+    Использует scrollIntoView({ behavior: 'smooth', block: 'center' }).
+    """
+    try:
+        locator.evaluate("el => el.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' })")
+        time.sleep(0.4)  # Даём время на плавную прокрутку
+    except Exception:
+        # Fallback: стандартный Playwright-метод
+        try:
+            locator.scroll_into_view_if_needed()
+            time.sleep(0.15)
+        except Exception:
+            pass
+
+
 def highlight_and_click(locator: Locator, page: Page, description: str = "") -> None:
     """Подсветить элемент, подсказка, курсор, клик и эффект ряби."""
     try:
-        locator.scroll_into_view_if_needed()
+        scroll_to_center(locator, page)
         locator.highlight()
         box = locator.bounding_box()
         cx, cy = None, None
@@ -288,7 +305,7 @@ def safe_highlight(locator: Locator, page: Page, duration_sec: float = None) -> 
     """Подсветить элемент и показать подсказку «Проверяю»."""
     duration_sec = duration_sec or (HIGHLIGHT_DURATION_MS / 1000.0)
     try:
-        locator.scroll_into_view_if_needed()
+        scroll_to_center(locator, page)
         locator.highlight()
         box = locator.bounding_box()
         if box:
