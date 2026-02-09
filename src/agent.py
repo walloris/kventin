@@ -552,14 +552,22 @@ def _show_agent_ui(page: Page):
 def take_screenshot_b64(page: Page) -> Optional[str]:
     """Сделать скриншот (без UI агента) и вернуть base64-строку."""
     try:
+        if page.is_closed():
+            return None
         _hide_agent_ui(page)
         raw = page.screenshot(type="png")
         return base64.b64encode(raw).decode("ascii")
     except Exception as e:
+        if "closed" in str(e).lower() or "Target page" in str(e):
+            return None
         print(f"[Agent] Ошибка скриншота: {e}")
         return None
     finally:
-        _show_agent_ui(page)
+        try:
+            if not page.is_closed():
+                _show_agent_ui(page)
+        except Exception:
+            pass
 
 
 # --- Парсинг JSON-ответа от GigaChat ---
@@ -1366,19 +1374,29 @@ def run_agent(start_url: str = None):
         def _start_gigachat_async(page_, step_, memory_, console_log_, network_failures_, checklist_results_, context_):
             """Запустить GigaChat в фоновом потоке. Возвращает Future."""
             nonlocal _gigachat_future
+            # Проверка: страница закрыта — не запускаем GigaChat
+            if page_.is_closed():
+                return
+            
             # Собираем всё что нужно ДО отправки в фон (Playwright — только main thread)
             from config import DEMO_MODE as _dm_gc
             dom_max = 3000 if _dm_gc else 5000
             history_n = 8 if _dm_gc else 15
-            overlay_info = detect_active_overlays(page_)
-            has_overlay = overlay_info.get("has_overlay", False)
-            screenshot_b64 = take_screenshot_b64(page_)
-            screenshot_changed = memory_.is_screenshot_changed(screenshot_b64 or "")
-            current_url_ = page_.url
-            dom_summary = get_dom_summary(page_, max_length=dom_max)
-            history_text = memory_.get_history_text(last_n=history_n)
-            overlay_context = format_overlays_context(overlay_info)
-            page_type = detect_page_type(page_)
+            
+            try:
+                overlay_info = detect_active_overlays(page_)
+                has_overlay = overlay_info.get("has_overlay", False)
+                screenshot_b64 = take_screenshot_b64(page_)
+                screenshot_changed = memory_.is_screenshot_changed(screenshot_b64 or "")
+                current_url_ = page_.url
+                dom_summary = get_dom_summary(page_, max_length=dom_max)
+                history_text = memory_.get_history_text(last_n=history_n)
+                overlay_context = format_overlays_context(overlay_info)
+                page_type = detect_page_type(page_)
+            except Exception as e:
+                # Страница закрылась во время сбора данных
+                LOG.debug("_start_gigachat_async: страница закрыта во время сбора данных: %s", e)
+                return
             coverage_hint = ""
             if current_url_ in memory_._page_coverage:
                 tested_count = len(memory_._page_coverage[current_url_])
@@ -1499,8 +1517,18 @@ def run_agent(start_url: str = None):
                     checklist_results = _step_checklist_incremental(page, step, current_url, console_log, network_failures, memory)
 
                 # ========== ВЫБОР ДЕЙСТВИЯ: GigaChat (если готов) или быстрое локальное ==========
-                overlay_info_fast = detect_active_overlays(page)
-                has_overlay = overlay_info_fast.get("has_overlay", False)
+                # Проверка: страница закрыта — выходим из цикла
+                if page.is_closed():
+                    print(f"[Agent] #{step} Страница закрыта. Завершаю.")
+                    break
+                
+                try:
+                    overlay_info_fast = detect_active_overlays(page)
+                    has_overlay = overlay_info_fast.get("has_overlay", False)
+                except Exception as e:
+                    # Страница закрылась во время детекции оверлея
+                    LOG.debug("detect_active_overlays: страница закрыта: %s", e)
+                    break
 
                 # Проверяем: GigaChat уже ответил?
                 gc_action = _poll_gigachat()
@@ -1518,7 +1546,7 @@ def run_agent(start_url: str = None):
                     source = "Fast"
 
                 # Запустить GigaChat для СЛЕДУЮЩЕГО шага (параллельно с выполнением текущего)
-                if _gigachat_future is None:
+                if _gigachat_future is None and not page.is_closed():
                     try:
                         _start_gigachat_async(page, step, memory, console_log, network_failures, checklist_results, context)
                     except Exception:
@@ -1534,7 +1562,8 @@ def run_agent(start_url: str = None):
 
                 # Дефект
                 if act_type == "check_defect" and possible_bug:
-                    _step_handle_defect(page, action, possible_bug, current_url, checklist_results, console_log, network_failures, memory)
+                    if not page.is_closed():
+                        _step_handle_defect(page, action, possible_bug, current_url, checklist_results, console_log, network_failures, memory)
                     continue
 
                 # Anti-loop: серия неудач → reset
@@ -1549,7 +1578,18 @@ def run_agent(start_url: str = None):
                 memory.snapshot_logs_before_action(console_log, network_failures)
 
                 # ========== ВЫПОЛНИТЬ ДЕЙСТВИЕ ==========
-                result = _step_execute(page, action, step, memory, context)
+                # Проверка перед выполнением
+                if page.is_closed():
+                    print(f"[Agent] #{step} Страница закрыта перед выполнением действия. Завершаю.")
+                    break
+                
+                try:
+                    result = _step_execute(page, action, step, memory, context)
+                except Exception as e:
+                    if "closed" in str(e).lower() or "Target page" in str(e):
+                        print(f"[Agent] #{step} Страница закрыта во время выполнения: {e}")
+                        break
+                    raise
 
                 # Success/failure tracking
                 if "error" in (result or "").lower() or "not_found" in (result or "").lower():
@@ -1565,18 +1605,19 @@ def run_agent(start_url: str = None):
                     has_overlay, current_url, checklist_results, console_log, network_failures, memory,
                 )
 
-                # Периодические проверки (редко)
-                if step % 30 == 0:
-                    try:
-                        if ENABLE_IFRAME_TESTING:
-                            _run_iframe_check(page, memory, current_url, console_log, network_failures)
-                    except Exception:
-                        pass
-                if step % 50 == 0:
-                    try:
-                        _bg_submit(_run_a11y_check, page, memory, current_url, console_log, network_failures)
-                    except Exception:
-                        pass
+                # Периодические проверки (редко) — только если страница жива
+                if not page.is_closed():
+                    if step % 30 == 0:
+                        try:
+                            if ENABLE_IFRAME_TESTING:
+                                _run_iframe_check(page, memory, current_url, console_log, network_failures)
+                        except Exception:
+                            pass
+                    if step % 50 == 0:
+                        try:
+                            _bg_submit(_run_a11y_check, page, memory, current_url, console_log, network_failures)
+                        except Exception:
+                            pass
 
                 if SESSION_REPORT_EVERY_N > 0 and step % SESSION_REPORT_EVERY_N == 0:
                     report = memory.get_session_report_text()
@@ -1588,10 +1629,23 @@ def run_agent(start_url: str = None):
         except KeyboardInterrupt:
             print("\n[Agent] Остановлен по Ctrl+C.")
         finally:
-            # Дождаться фоновых задач
-            _flush_pending_analysis(page, memory, console_log, network_failures)
+            # Отменить фоновые задачи GigaChat
+            if '_gigachat_future' in locals() and _gigachat_future is not None:
+                try:
+                    _gigachat_future.cancel()
+                except Exception:
+                    pass
+            
+            # Дождаться фоновых задач (если страница ещё жива)
+            try:
+                if not page.is_closed():
+                    _flush_pending_analysis(page, memory, console_log, network_failures)
+            except Exception:
+                pass
+            
             if _bg_pool:
                 _bg_pool.shutdown(wait=False)
+            
             # Финальный отчёт
             report = memory.get_session_report_text()
             plan_progress = memory.get_test_plan_progress()
@@ -1604,10 +1658,17 @@ def run_agent(start_url: str = None):
             if memory.responsive_done:
                 report += f"\nResponsive: проверены viewports {', '.join(memory.responsive_done)}"
             print(report)
+            
             if browser:
-                browser.close()
+                try:
+                    browser.close()
+                except Exception:
+                    pass
             else:
-                context.close()
+                try:
+                    context.close()
+                except Exception:
+                    pass
 
 
 # ===== Step-функции (декомпозиция run_agent) =====
@@ -1767,6 +1828,10 @@ def _get_fast_action(page: Page, memory: AgentMemory, has_overlay: bool = False)
     Приоритет: кнопки CTA → inputs → ссылки навигации → scroll.
     """
     try:
+        # Проверка: страница закрыта
+        if page.is_closed():
+            return {"action": "scroll", "selector": "down", "reason": "Страница закрыта"}
+        
         if has_overlay:
             return {"action": "close_modal", "selector": "", "reason": "Закрываю оверлей"}
 
@@ -2146,7 +2211,7 @@ def _step_execute(page, action, step, memory, context):
     print(f"[Agent] #{step} Результат: {result}")
 
     # Карта покрытия
-    if act_type == "scroll":
+    if act_type == "scroll" and not page.is_closed():
         try:
             y = page.evaluate("() => window.scrollY")
             h = page.evaluate("() => Math.max(0, document.documentElement.scrollHeight - window.innerHeight)")
@@ -2178,21 +2243,38 @@ def _collect_post_data(page, has_overlay, memory):
     Собрать данные после действия ИЗ MAIN THREAD (Playwright).
     Возвращает dict с данными, которые потом можно анализировать в фоне.
     """
-    # Детекция нового оверлея
-    post_overlay = detect_active_overlays(page)
-    new_overlay = post_overlay.get("has_overlay") and not has_overlay
-    overlay_types = []
-    if new_overlay:
-        overlay_types = [o.get("type", "?") for o in post_overlay.get("overlays", [])]
+    # Проверка: страница закрыта
+    if page.is_closed():
+        return {
+            "new_overlay": False,
+            "overlay_types": [],
+            "post_screenshot_b64": None,
+        }
+    
+    try:
+        # Детекция нового оверлея
+        post_overlay = detect_active_overlays(page)
+        new_overlay = post_overlay.get("has_overlay") and not has_overlay
+        overlay_types = []
+        if new_overlay:
+            overlay_types = [o.get("type", "?") for o in post_overlay.get("overlays", [])]
 
-    # Скриншот после действия
-    post_screenshot_b64 = take_screenshot_b64(page)
+        # Скриншот после действия
+        post_screenshot_b64 = take_screenshot_b64(page)
 
-    return {
-        "new_overlay": new_overlay,
-        "overlay_types": overlay_types,
-        "post_screenshot_b64": post_screenshot_b64,
-    }
+        return {
+            "new_overlay": new_overlay,
+            "overlay_types": overlay_types,
+            "post_screenshot_b64": post_screenshot_b64,
+        }
+    except Exception as e:
+        if "closed" in str(e).lower() or "Target page" in str(e):
+            return {
+                "new_overlay": False,
+                "overlay_types": [],
+                "post_screenshot_b64": None,
+            }
+        raise
 
 
 def _analyze_in_background(
@@ -2278,10 +2360,22 @@ def _step_post_analysis(
     has_overlay, current_url, checklist_results, console_log, network_failures, memory,
 ):
     """STEP 4: Пост-анализ — быстрый сбор данных + фоновый анализ."""
-    update_demo_banner(page, step_text=f"#{step} Анализ результата…", progress_pct=90)
+    # Проверка: страница закрыта — не запускаем анализ
+    if page.is_closed():
+        return
+    
+    try:
+        update_demo_banner(page, step_text=f"#{step} Анализ результата…", progress_pct=90)
+    except Exception:
+        pass  # Страница закрылась
 
     # Быстрый сбор из Playwright (main thread)
-    post_data = _collect_post_data(page, has_overlay, memory)
+    try:
+        post_data = _collect_post_data(page, has_overlay, memory)
+    except Exception as e:
+        if "closed" in str(e).lower() or "Target page" in str(e):
+            return
+        raise
 
     # Новый оверлей — обработать сразу
     if post_data["new_overlay"]:
