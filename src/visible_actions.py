@@ -82,61 +82,61 @@ SHADOW_HOST_SCRIPT = """
     `;
     shadow.appendChild(cursor);
 
-    // --- Баннер (верх страницы) ---
+    // --- Баннер (левый нижний угол) ---
     const banner = document.createElement('div');
     banner.style.cssText = `
-        position: fixed; top: 0; left: 0; right: 0; z-index: 2147483643;
-        height: 44px; display: flex; align-items: center; padding: 0 20px;
+        position: fixed; bottom: 12px; left: 12px; z-index: 2147483643;
+        width: 300px; height: 32px; display: flex; align-items: center; padding: 0 12px;
         background: linear-gradient(90deg, #0f0f12 0%, #1a1b23 50%, #16171d 100%);
         background-size: 200% 100%; animation: agent-banner-shine 8s ease infinite;
-        border-bottom: 2px solid rgba(99,102,241,0.4);
-        box-shadow: 0 4px 24px rgba(0,0,0,0.4);
+        border: 1px solid rgba(99,102,241,0.4); border-radius: 8px;
+        box-shadow: 0 4px 24px rgba(0,0,0,0.6);
         font-family: system-ui, sans-serif; pointer-events: none;
     `;
     const bLeft = document.createElement('div');
-    bLeft.style.cssText = 'display:flex;align-items:center;gap:10px;font-weight:700;font-size:15px;color:#e6e8eb;';
-    bLeft.innerHTML = '🤖 <span>AI-тестировщик</span> <span style="color:#6366f1;font-size:12px;font-weight:500;">Kventin</span>';
+    bLeft.style.cssText = 'display:flex;align-items:center;gap:6px;font-weight:700;font-size:11px;color:#e6e8eb;white-space:nowrap;';
+    bLeft.innerHTML = '🤖 <span>AI-тестировщик</span>';
     const progressWrap = document.createElement('div');
-    progressWrap.style.cssText = 'flex:1;max-width:280px;height:8px;background:#2d323d;border-radius:4px;overflow:hidden;margin:0 16px;';
+    progressWrap.style.cssText = 'flex:1;height:6px;background:#2d323d;border-radius:3px;overflow:hidden;margin:0 8px;';
     const progressBar = document.createElement('div');
-    progressBar.style.cssText = 'height:100%;width:0%;background:linear-gradient(90deg,#6366f1,#8b5cf6);border-radius:4px;transition:width 0.4s ease;';
+    progressBar.style.cssText = 'height:100%;width:0%;background:linear-gradient(90deg,#6366f1,#8b5cf6);border-radius:3px;transition:width 0.4s ease;';
     progressWrap.appendChild(progressBar);
     const bRight = document.createElement('div');
-    bRight.style.cssText = 'font-size:13px;color:#8b949e;';
+    bRight.style.cssText = 'font-size:10px;color:#8b949e;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:80px;';
     bRight.textContent = 'Загрузка...';
     banner.appendChild(bLeft);
     banner.appendChild(progressWrap);
     banner.appendChild(bRight);
     shadow.appendChild(banner);
 
-    // --- LLM Overlay ---
+    // --- LLM Overlay (левый нижний угол, над баннером) ---
     const overlay = document.createElement('div');
     overlay.style.cssText = `
-        position: fixed; top: 56px; right: 12px; width: 400px; max-height: 82vh;
-        z-index: 2147483646; font-family: system-ui, -apple-system, sans-serif; font-size: 13px;
+        position: fixed; bottom: 50px; left: 12px; width: 300px; max-height: 200px;
+        z-index: 2147483646; font-family: system-ui, -apple-system, sans-serif; font-size: 11px;
         background: linear-gradient(160deg, #12141a 0%, #1c1f28 40%, #252a33 100%);
-        color: #e6e8eb; border: 2px solid #3d434d; border-radius: 16px;
-        box-shadow: 0 12px 40px rgba(0,0,0,0.6), inset 0 0 80px rgba(99,102,241,0.03);
+        color: #e6e8eb; border: 1px solid #3d434d; border-radius: 10px;
+        box-shadow: 0 8px 24px rgba(0,0,0,0.6), inset 0 0 60px rgba(99,102,241,0.03);
         overflow: hidden; display: flex; flex-direction: column; pointer-events: none;
         animation: agent-border-glow 3s ease-in-out infinite;
     `;
     const title = document.createElement('div');
     title.style.cssText = `
-        padding: 12px 16px; background: linear-gradient(90deg, #2d323d 0%, #363c48 100%);
-        font-weight: 700; font-size: 14px; border-bottom: 1px solid #3d434d;
-        display: flex; align-items: center; gap: 8px;
+        padding: 8px 10px; background: linear-gradient(90deg, #2d323d 0%, #363c48 100%);
+        font-weight: 700; font-size: 11px; border-bottom: 1px solid #3d434d;
+        display: flex; align-items: center; gap: 6px;
     `;
-    title.innerHTML = '✨ Диалог с LLM <span style="color:#6366f1;font-weight:500;">GigaChat</span>';
+    title.innerHTML = '✨ LLM <span style="color:#6366f1;font-weight:500;">GigaChat</span>';
     const status = document.createElement('div');
     status.style.cssText = `
-        padding: 8px 16px; background: #252a33; color: #8b949e; font-size: 12px;
-        border-bottom: 1px solid #3d434d; min-height: 20px;
+        padding: 6px 10px; background: #252a33; color: #8b949e; font-size: 10px;
+        border-bottom: 1px solid #3d434d; min-height: 16px;
     `;
     status.textContent = 'Ожидание...';
     const body = document.createElement('div');
     body.style.cssText = `
-        padding: 14px 16px; overflow-y: auto; flex: 1; min-height: 100px; max-height: 55vh;
-        line-height: 1.5;
+        padding: 10px; overflow-y: auto; flex: 1; min-height: 60px; max-height: 140px;
+        line-height: 1.4; font-size: 10px;
     `;
     const prompt = document.createElement('div');
     prompt.style.cssText = 'margin-bottom:12px;';
