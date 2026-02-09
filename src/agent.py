@@ -112,6 +112,9 @@ from src.page_analyzer import (
     detect_active_overlays,
     format_overlays_context,
     detect_cookie_banner,
+    detect_page_type,
+    detect_form_fields,
+    detect_table_structure,
 )
 from src.visible_actions import (
     inject_cursor,
@@ -201,6 +204,12 @@ class AgentMemory:
         self._consecutive_repeats: int = 0
         # Последние 5 действий (для детекции паттернов зацикливания)
         self._recent_action_keys: List[str] = []
+        # Кэш важных элементов страницы (для быстрого доступа)
+        self._page_elements_cache: Dict[str, List[Dict[str, Any]]] = {}
+        # Запомненные важные страницы (URL -> описание)
+        self._important_pages: Dict[str, str] = {}
+        # Покрытие элементов (какие элементы уже протестированы на текущей странице)
+        self._page_coverage: Dict[str, set] = {}  # URL -> set of element keys
 
     def add_action(self, action: Dict[str, Any], result: str = ""):
         act = (action.get("action") or "").lower()
@@ -332,6 +341,28 @@ class AgentMemory:
             last3 = self._recent_action_keys[-3:]
             if len(set(last3)) == 1:
                 self._consecutive_repeats += 1
+    
+    def record_page_element(self, url: str, element_key: str):
+        """Записать элемент как протестированный на странице."""
+        if url not in self._page_coverage:
+            self._page_coverage[url] = set()
+        self._page_coverage[url].add(element_key)
+    
+    def is_element_tested(self, url: str, element_key: str) -> bool:
+        """Проверить, был ли элемент уже протестирован на странице."""
+        return element_key in self._page_coverage.get(url, set())
+    
+    def cache_page_elements(self, url: str, elements: List[Dict[str, Any]]):
+        """Кэшировать важные элементы страницы."""
+        self._page_elements_cache[url] = elements[:50]  # Ограничиваем размер
+    
+    def get_cached_elements(self, url: str) -> List[Dict[str, Any]]:
+        """Получить кэшированные элементы страницы."""
+        return self._page_elements_cache.get(url, [])
+    
+    def remember_important_page(self, url: str, description: str):
+        """Запомнить важную страницу (например, форма регистрации, главная)."""
+        self._important_pages[url] = description[:200]
 
     def record_coverage_zone(self, zone: str):
         """Учесть, что эту зону страницы уже обходили (top/middle/bottom)."""
@@ -563,10 +594,26 @@ def execute_action(page: Page, action: Dict[str, Any], memory: AgentMemory) -> s
     print(f"[Agent] Действие: {act} -> {selector[:60]} | {reason[:60]}")
 
     if act == "click":
-        return _do_click(page, selector, reason)
+        result = _do_click(page, selector, reason)
+        # Записываем клик в покрытие
+        if memory and "clicked" in result.lower():
+            memory.record_page_element(page.url, f"click:{_norm_key(selector)}")
+        return result
+    elif act == "fill_form":
+        # Умное заполнение формы
+        form_strat = action.get("_form_strategy", "happy")
+        result = _fill_form_smart(page, form_strategy=form_strat, memory=memory)
+        # Записываем заполнение формы в покрытие
+        if memory and "form_filled" in result.lower():
+            memory.record_page_element(page.url, "fill_form:all_fields")
+        return result
     elif act == "type":
         form_strat = action.get("_form_strategy", "happy")
-        return _do_type(page, selector, value, form_strategy=form_strat)
+        result = _do_type(page, selector, value, form_strategy=form_strat)
+        # Записываем в покрытие
+        if memory and "typed" in result.lower():
+            memory.record_page_element(page.url, f"type:{_norm_key(selector)}")
+        return result
     elif act == "scroll":
         return _do_scroll(page, selector)
     elif act == "hover":
@@ -588,51 +635,91 @@ def execute_action(page: Page, action: Dict[str, Any], memory: AgentMemory) -> s
 
 def _find_element(page: Page, selector: str):
     """
-    Попытаться найти элемент по разным стратегиям:
-    1) CSS/XPath (если selector похож)
-    2) data-testid
-    3) aria-label
-    4) placeholder
-    5) Текст кнопки/ссылки
-    6) Текст любого элемента
-    7) getByText / getByRole
+    Улучшенный поиск элемента по разным стратегиям с приоритетом:
+    1) Точные селекторы (id, data-testid) — самые стабильные
+    2) aria-label, placeholder — семантические
+    3) Текст с ролью (button, link) — надёжные
+    4) Общий текст — fallback
     """
     if not selector:
         return None
+    
+    # Нормализация селектора
+    selector = selector.strip()
+    safe_text = selector.replace('"', '\\"').replace("'", "\\'")[:100]
+    
     strategies = []
-    # CSS/XPath
-    if selector.startswith((".", "#", "[", "//", "button", "a", "input", "div", "span")):
+    
+    # 1. Точные селекторы (высший приоритет)
+    if selector.startswith("#"):
+        # ID селектор
+        strategies.append(("id", lambda: page.locator(selector).first))
+    elif selector.startswith("."):
+        # Class селектор
+        strategies.append(("class", lambda: page.locator(selector).first))
+    elif selector.startswith(("[", "//")):
+        # CSS/XPath селектор
         strategies.append(("css/xpath", lambda: page.locator(selector).first))
-    safe_text = selector.replace('"', '\\"')[:80]
-    # data-testid (приоритет: самый стабильный селектор)
+    
+    # 2. data-testid (очень стабильный)
     strategies.append(("data-testid", lambda: page.locator(f'[data-testid="{safe_text}"]').first))
-    # aria-label
+    strategies.append(("data-testid-exact", lambda: page.locator(f'[data-testid*="{safe_text}"]').first))
+    
+    # 3. Семантические атрибуты
     strategies.append(("aria-label", lambda: page.locator(f'[aria-label="{safe_text}"]').first))
-    # placeholder (для полей ввода)
+    strategies.append(("aria-label-contains", lambda: page.locator(f'[aria-label*="{safe_text}"]').first))
     strategies.append(("placeholder", lambda: page.locator(f'[placeholder="{safe_text}"]').first))
-    # По тексту (основные стратегии)
+    strategies.append(("name", lambda: page.locator(f'[name="{safe_text}"]').first))
+    strategies.append(("title", lambda: page.locator(f'[title="{safe_text}"]').first))
+    
+    # 4. По тексту с ролью (надёжные стратегии)
     strategies.extend([
-        ("button:text", lambda: page.locator(f'button:has-text("{safe_text}")').first),
-        ("a:text", lambda: page.locator(f'a:has-text("{safe_text}")').first),
-        ("role=button", lambda: page.locator(f'[role="button"]:has-text("{safe_text}")').first),
-        ("role=link", lambda: page.locator(f'[role="link"]:has-text("{safe_text}")').first),
-        ("role=tab", lambda: page.locator(f'[role="tab"]:has-text("{safe_text}")').first),
-        ("role=menuitem", lambda: page.locator(f'[role="menuitem"]:has-text("{safe_text}")').first),
-        ("input:text", lambda: page.locator(f'input:has-text("{safe_text}")').first),
-        ("any:text", lambda: page.locator(f'text="{safe_text}"').first),
-        ("getByText", lambda: page.get_by_text(safe_text, exact=False).first),
-        ("getByRole:button", lambda: page.get_by_role("button", name=safe_text).first),
-        ("getByRole:link", lambda: page.get_by_role("link", name=safe_text).first),
-        ("getByLabel", lambda: page.get_by_label(safe_text).first),
-        ("getByPlaceholder", lambda: page.get_by_placeholder(safe_text).first),
+        ("button:has-text", lambda: page.locator(f'button:has-text("{safe_text}")').first),
+        ("a:has-text", lambda: page.locator(f'a:has-text("{safe_text}")').first),
+        ("[role=button]:has-text", lambda: page.locator(f'[role="button"]:has-text("{safe_text}")').first),
+        ("[role=link]:has-text", lambda: page.locator(f'[role="link"]:has-text("{safe_text}")').first),
+        ("[role=tab]:has-text", lambda: page.locator(f'[role="tab"]:has-text("{safe_text}")').first),
+        ("[role=menuitem]:has-text", lambda: page.locator(f'[role="menuitem"]:has-text("{safe_text}")').first),
     ])
+    
+    # 5. Playwright getBy методы (более умные)
+    strategies.extend([
+        ("getByRole:button", lambda: page.get_by_role("button", name=safe_text, exact=False).first),
+        ("getByRole:link", lambda: page.get_by_role("link", name=safe_text, exact=False).first),
+        ("getByLabel", lambda: page.get_by_label(safe_text, exact=False).first),
+        ("getByPlaceholder", lambda: page.get_by_placeholder(safe_text, exact=False).first),
+        ("getByText", lambda: page.get_by_text(safe_text, exact=False).first),
+    ])
+    
+    # 6. Fallback: общий поиск по тексту
+    strategies.extend([
+        ("text=exact", lambda: page.locator(f'text="{safe_text}"').first),
+        ("text-contains", lambda: page.locator(f'text=/{safe_text}/i').first),
+    ])
+    
+    # Пробуем стратегии по порядку
     for name, get_loc in strategies:
         try:
             loc = get_loc()
-            if loc.count() > 0 and loc.is_visible():
-                return loc
-        except Exception:
+            count = loc.count()
+            if count > 0:
+                # Если несколько элементов — берём первый видимый
+                if count == 1:
+                    if loc.is_visible():
+                        return loc
+                else:
+                    # Множественные элементы — ищем первый видимый
+                    for i in range(min(count, 5)):
+                        try:
+                            item = loc.nth(i)
+                            if item.is_visible():
+                                return item
+                        except Exception:
+                            continue
+        except Exception as e:
+            LOG.debug(f"_find_element strategy '{name}' failed: {e}")
             continue
+    
     return None
 
 
@@ -650,17 +737,91 @@ def _do_click(page: Page, selector: str, reason: str = "") -> str:
     return f"not_found: {selector[:50]}"
 
 
+def _fill_form_smart(page: Page, form_strategy: str = "happy", memory: Optional[AgentMemory] = None) -> str:
+    """
+    Умное заполнение формы: найти все поля формы и заполнить их за раз.
+    Возвращает результат заполнения.
+    """
+    try:
+        fields = detect_form_fields(page)
+        if not fields:
+            return "no_form_fields"
+        
+        filled_count = 0
+        from src.form_strategies import detect_field_type, get_test_value
+        
+        for field in fields:
+            selector = field.get("selector") or field.get("id") or field.get("name") or field.get("placeholder", "")
+            if not selector:
+                continue
+            
+            # Проверяем, не заполняли ли уже это поле
+            if memory:
+                field_key = f"type:{_norm_key(selector)}"
+                if memory.is_element_tested(page.url, field_key):
+                    continue
+            
+            # Определяем тип поля и генерируем значение
+            field_type = detect_field_type(
+                input_type=field.get("type", ""),
+                placeholder=field.get("placeholder", ""),
+                name=field.get("name", ""),
+                aria_label=field.get("ariaLabel", ""),
+            )
+            
+            # Для SELECT элементов используем специальную функцию
+            field_type_str = field.get("type", "").lower()
+            if field_type_str == "select":
+                # Выбираем первую доступную опцию
+                options = field.get("options", [])
+                if not options:
+                    continue  # Пропускаем если нет опций
+                value = options[0]
+                result = _do_select_option(page, selector, value)
+                if "selected" in result.lower():
+                    filled_count += 1
+                    if memory:
+                        memory.record_page_element(page.url, f"select:{_norm_key(selector)}")
+            else:
+                # Для обычных input/textarea используем _do_type
+                value = get_test_value(field_type, form_strategy)
+                result = _do_type(page, selector, value, form_strategy)
+                if "typed" in result.lower():
+                    filled_count += 1
+                    if memory:
+                        memory.record_page_element(page.url, f"type:{_norm_key(selector)}")
+            
+            time.sleep(0.2)  # Небольшая пауза между полями
+        
+        if filled_count > 0:
+            return f"form_filled: {filled_count} fields"
+        return "form_fill_failed"
+    except Exception as e:
+        return f"form_fill_error: {e}"
+
+
 def _do_type(page: Page, selector: str, value: str, form_strategy: str = "happy") -> str:
+    """
+    Улучшенный ввод в поле с валидацией, умным подбором значения и проверкой результата.
+    """
     # Smart value: если value пустой — подобрать по типу поля и стратегии
     if not value and selector:
         field_type = detect_field_type(placeholder=selector, name=selector, aria_label=selector)
         value = get_test_value(field_type, form_strategy)
     if not selector or not value:
         return "no_selector_or_value"
+    
     loc = _find_element(page, selector)
     if not loc:
-        # Попробуем найти ближайший input / textarea
-        for inp_sel in ["input[type='text']", "input[type='email']", "input[type='search']", "textarea", "input:not([type='hidden'])"]:
+        # Попробуем найти ближайший input / textarea по приоритету
+        input_selectors = [
+            "input[type='email']",  # email часто важнее
+            "input[type='text']",
+            "input[type='search']",
+            "textarea",
+            "input:not([type='hidden']):not([type='submit']):not([type='button'])",
+        ]
+        for inp_sel in input_selectors:
             try:
                 loc = page.locator(inp_sel).first
                 if loc.count() > 0 and loc.is_visible():
@@ -677,7 +838,39 @@ def _do_type(page: Page, selector: str, value: str, form_strategy: str = "happy"
                 show_highlight_label(page, box["x"] + box["width"] / 2, box["y"] + box["height"] / 2, f"Ввожу: {value[:20]}")
             loc.click()
             loc.fill(value)
-            time.sleep(0.5)
+            time.sleep(0.3)
+            
+            # Проверка валидации: есть ли сообщение об ошибке после ввода?
+            try:
+                # Проверяем наличие сообщений об ошибке рядом с полем
+                validation_error = page.evaluate("""(inputSelector) => {
+                    const input = document.querySelector(inputSelector);
+                    if (!input) return null;
+                    // Ищем сообщения об ошибке: aria-invalid, aria-describedby, .error, .invalid
+                    if (input.getAttribute('aria-invalid') === 'true') {
+                        const descId = input.getAttribute('aria-describedby');
+                        if (descId) {
+                            const desc = document.getElementById(descId);
+                            if (desc) return desc.textContent.trim().slice(0, 100);
+                        }
+                    }
+                    // Проверяем родительский контейнер на наличие .error, .invalid
+                    let parent = input.parentElement;
+                    for (let i = 0; i < 3 && parent; i++) {
+                        const errorEl = parent.querySelector('.error, .invalid, [class*="error"], [class*="invalid"]');
+                        if (errorEl && errorEl.textContent) {
+                            return errorEl.textContent.trim().slice(0, 100);
+                        }
+                        parent = parent.parentElement;
+                    }
+                    return null;
+                }""", selector)
+                
+                if validation_error:
+                    return f"typed_with_validation_error: {value[:30]} -> {validation_error[:50]}"
+            except Exception:
+                pass
+            
             return f"typed: {value[:30]} into {selector[:30]}"
         except Exception as e:
             return f"type_error: {e}"
@@ -1323,8 +1516,57 @@ def _step_get_action(page, step, memory, console_log, network_failures, checklis
         context_str = checklist_results_to_context(checklist_results) + "\n\n" + context_str
     if overlay_context:
         context_str = overlay_context + "\n\n" + context_str
+    
+    # Детекция типа страницы для адаптивной стратегии
+    page_type = detect_page_type(page)
+    page_type_hint = ""
+    if page_type != "unknown":
+        type_strategies = {
+            "landing": "Landing page: приоритет на CTA кнопки, формы регистрации, hero-секция",
+            "form": "Form page: заполни ВСЕ поля формы, проверь валидацию, отправь форму",
+            "dashboard": "Dashboard: проверь таблицы, фильтры, навигацию, данные",
+            "catalog": "Catalog: кликай по карточкам товаров, фильтры, сортировка, пагинация",
+            "article": "Article: проверь читаемость, ссылки, комментарии, навигацию",
+        }
+        page_type_hint = f"\nТип страницы: {page_type}. {type_strategies.get(page_type, '')}\n"
+    
     dom_summary = get_dom_summary(page, max_length=dom_max)
     history_text = memory.get_history_text(last_n=history_n)
+    
+    # Кэшируем важные элементы страницы для быстрого доступа
+    if current_url not in memory._page_elements_cache or step % 10 == 0:
+        try:
+            # Извлекаем приоритетные элементы (CTA, формы)
+            priority_elements = page.evaluate("""() => {
+                const result = [];
+                const ctaPatterns = ['купить', 'заказать', 'оформить', 'начать', 'попробовать', 'скачать', 'регистрация', 'войти', 'login', 'sign up', 'buy', 'order', 'start', 'try', 'download', 'register', 'cta', 'primary'];
+                document.querySelectorAll('button, [role="button"], a[href], input[type="submit"]').forEach(el => {
+                    const text = (el.textContent || el.getAttribute('aria-label') || '').toLowerCase();
+                    const cls = (el.className || '').toLowerCase();
+                    for (const p of ctaPatterns) {
+                        if (text.includes(p) || cls.includes(p)) {
+                            result.push({
+                                type: 'cta',
+                                text: (el.textContent || '').trim().slice(0, 50),
+                                selector: el.id ? '#' + el.id : (el.getAttribute('aria-label') || el.textContent || '').trim().slice(0, 50),
+                            });
+                            break;
+                        }
+                    }
+                });
+                return result.slice(0, 10);
+            }""")
+            if priority_elements:
+                memory.cache_page_elements(current_url, priority_elements)
+        except Exception:
+            pass
+    
+    # Проверяем покрытие элементов на текущей странице
+    coverage_hint = ""
+    if current_url in memory._page_coverage:
+        tested_count = len(memory._page_coverage[current_url])
+        if tested_count > 0:
+            coverage_hint = f"\nНа этой странице уже протестировано элементов: {tested_count}. Выбери НОВЫЙ элемент.\n"
 
     if has_overlay:
         stuck_warning = ""
@@ -1353,13 +1595,30 @@ DOM: {dom_summary[:3000]}
         if memory.is_stuck():
             stuck_warning = "\n🚨🚨🚨 КРИТИЧНО: Агент зациклился! Выбери действие, которого ТОЧНО НЕТ в списке 'УЖЕ СДЕЛАНО' выше. 🚨🚨🚨\n"
         
+        # Проверяем наличие формы для умного заполнения
+        form_hint_smart = ""
+        if page_type == "form" and step % 5 == 0:  # Каждые 5 шагов проверяем форму
+            form_fields = detect_form_fields(page)
+            if form_fields and len(form_fields) > 2:
+                untested_fields = [f for f in form_fields if not memory.is_element_tested(current_url, f"type:{_norm_key(f.get('selector', ''))}")]
+                if untested_fields:
+                    form_hint_smart = f"\n💡 На странице форма с {len(form_fields)} полями. Рекомендуется заполнить все поля формы за раз (action='fill_form').\n"
+        
+        # Проверяем наличие таблиц для умного тестирования
+        table_hint = ""
+        if page_type == "dashboard" and step % 7 == 0:  # Каждые 7 шагов проверяем таблицы
+            tables = detect_table_structure(page)
+            if tables:
+                table_hint = f"\n📊 На странице {len(tables)} таблиц. Рекомендуется протестировать фильтры, сортировку, пагинацию.\n"
+        
         question = f"""Вот скриншот и контекст страницы.
-DOM (кнопки, ссылки, формы): {dom_summary[:3000]}
+{page_type_hint}{coverage_hint}{form_hint_smart}{table_hint}
+DOM (кнопки, ссылки, формы, отсортированы по приоритету): {dom_summary[:3000]}
 {history_text}
 {plan_hint}{form_hint}{stuck_warning}
 ВЫБЕРИ ОДНО ДЕЙСТВИЕ, которого НЕТ в списке "УЖЕ СДЕЛАНО" выше.
 ⚠️ НЕ ПОВТОРЯЙ уже сделанные действия (они помечены ❌).
-✅ Выбери НОВЫЙ элемент для клика/ввода/hover.
+✅ Выбери НОВЫЙ элемент для клика/ввода/hover. Приоритет: CTA кнопки → формы (fill_form) → таблицы (фильтры/сортировка) → навигация → остальное.
 Укажи test_goal и expected_outcome. Оцени верстку. Если реальный баг — action=check_defect."""
 
     phase_instruction = memory.get_phase_instruction()
@@ -1613,10 +1872,29 @@ def _analyze_in_background(
         if oracle_ans and "ошибка" in oracle_ans.lower():
             findings["oracle_error"] = True
 
-    # Пост-анализ ошибок
+    # Пост-анализ ошибок с улучшенной классификацией
     if not new_network_fails and (new_errors or possible_bug or findings["oracle_error"]):
-        post_context = f"Действие: {action.get('action')} -> {action.get('selector', '')}. Результат: {result}. Ошибки: {', '.join(e.get('text', '')[:60] for e in new_errors[-3:])}"
-        post_answer = consult_agent_with_screenshot(post_context, "Это баг или нет?", screenshot_b64=post_screenshot_b64)
+        # Улучшенный контекст для классификации бага
+        error_summary = ""
+        if new_errors:
+            error_types = {}
+            for e in new_errors[-5:]:
+                err_type = e.get("type", "unknown")
+                error_types[err_type] = error_types.get(err_type, 0) + 1
+            error_summary = f"Типы ошибок: {', '.join(f'{k}({v})' for k, v in error_types.items())}. "
+        
+        post_context = f"""Действие: {action.get('action')} -> {action.get('selector', '')}.
+Результат: {result}
+{error_summary}Последние ошибки: {', '.join(e.get('text', '')[:60] for e in new_errors[-3:])}
+Visual diff: {visual_diff_info.get('change_percent', 0):.1f}% изменений.
+Ожидалось: {expected_outcome[:100] if expected_outcome else 'успешное выполнение'}.
+Классифицируй проблему: критический баг / некритический баг / не баг (ожидаемое поведение) / флак (нестабильный)."""
+        
+        post_answer = consult_agent_with_screenshot(
+            post_context,
+            "Это баг или нет? Если критический/некритический баг — JSON с action=check_defect и possible_bug (укажи тип: функциональный/UI/производительность/безопасность).",
+            screenshot_b64=post_screenshot_b64,
+        )
         if post_answer:
             post_action = parse_llm_action(post_answer)
             if post_action and post_action.get("action") == "check_defect" and post_action.get("possible_bug"):

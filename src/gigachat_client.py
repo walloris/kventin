@@ -582,7 +582,7 @@ def _llm_call_with_retry(prompt: str, screenshot_b64: Optional[str] = None, syst
 
 
 # Белый список допустимых действий (для валидации ответа GigaChat)
-VALID_ACTIONS = {"click", "type", "scroll", "hover", "close_modal", "select_option", "press_key", "check_defect", "explore"}
+VALID_ACTIONS = {"click", "type", "scroll", "hover", "close_modal", "select_option", "press_key", "check_defect", "explore", "fill_form"}
 
 
 def validate_llm_action(action: dict) -> dict:
@@ -662,8 +662,9 @@ def _build_system_prompt(
   "layout_issue": "проблема верстки или null"
 }
 
-Приоритет: кнопки CTA → формы (заполнить+отправить) → навигация → табы → дропдауны → ссылки.
-НЕ предлагай explore/scroll, пока есть элементы для click/type.
+Приоритет: кнопки CTA → формы (fill_form для заполнения всех полей за раз) → навигация → табы → дропдауны → ссылки.
+Если видишь форму с несколькими полями — используй action=fill_form вместо множественных type.
+НЕ предлагай explore/scroll, пока есть элементы для click/type/fill_form.
 НЕ предлагай СТОП."""
     else:
         base = """Ты — опытный ручной тестировщик веб-приложений. Ты выполняешь ОДНО действие за шаг, проверяешь результат, затем решаешь следующий шаг.
@@ -678,8 +679,8 @@ def _build_system_prompt(
 
 СТРОГО JSON (без markdown):
 {
-  "action": "click|type|scroll|hover|close_modal|select_option|press_key|check_defect|explore",
-  "selector": "CSS-селектор, текст, aria-label, data-testid или id элемента",
+  "action": "click|type|scroll|hover|close_modal|select_option|press_key|check_defect|explore|fill_form",
+  "selector": "CSS-селектор, текст, aria-label, data-testid или id элемента (для fill_form можно пустой)",
   "value": "текст (type) / опция (select_option) / клавиша (press_key)",
   "reason": "зачем",
   "test_goal": "что проверяю",
@@ -689,8 +690,9 @@ def _build_system_prompt(
   "layout_issue": "проблема верстки или null"
 }
 
-Приоритет элементов: CTA (главные кнопки) → формы → навигация → меню → футер → мелочи.
+Приоритет элементов: CTA (главные кнопки) → формы (fill_form для заполнения всех полей за раз) → навигация → меню → футер → мелочи.
 В формах — реалистичные тестовые данные (test@test.com, Иван Тестов, +79991234567).
+Если форма с несколькими полями — используй fill_form вместо множественных type.
 НЕ предлагай СТОП."""
 
     blocks = []

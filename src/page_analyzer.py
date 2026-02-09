@@ -83,6 +83,189 @@ def detect_cookie_banner(page: Page) -> Optional[Dict[str, Any]]:
     return None
 
 
+def detect_page_type(page: Page) -> str:
+    """
+    Определить тип страницы для адаптивной стратегии тестирования.
+    Возвращает: 'landing', 'dashboard', 'form', 'catalog', 'article', 'unknown'
+    """
+    try:
+        page_type = page.evaluate("""() => {
+            const url = window.location.pathname.toLowerCase();
+            const title = (document.title || '').toLowerCase();
+            const bodyText = (document.body.textContent || '').toLowerCase();
+            const hasForm = document.querySelectorAll('form, input[type="text"], input[type="email"], textarea').length > 2;
+            const hasTable = document.querySelectorAll('table, .table, [role="table"]').length > 0;
+            const hasCards = document.querySelectorAll('.card, .product-card, [class*="card"]').length > 3;
+            const hasHero = document.querySelectorAll('.hero, .banner, [class*="hero"], [class*="banner"]').length > 0;
+            const hasNav = document.querySelectorAll('nav, .nav, .navbar, [role="navigation"]').length > 0;
+            
+            // Landing page
+            if (hasHero || url.includes('landing') || url === '/' || url === '') {
+                return 'landing';
+            }
+            
+            // Form page
+            if (hasForm && (url.includes('form') || url.includes('register') || url.includes('login') || url.includes('signup'))) {
+                return 'form';
+            }
+            
+            // Dashboard
+            if (hasTable || (hasNav && url.includes('dashboard')) || url.includes('admin') || url.includes('panel')) {
+                return 'dashboard';
+            }
+            
+            // Catalog / List
+            if (hasCards || url.includes('catalog') || url.includes('list') || url.includes('products') || url.includes('items')) {
+                return 'catalog';
+            }
+            
+            // Article / Content
+            if (document.querySelectorAll('article, .article, main p').length > 5 || url.includes('article') || url.includes('post')) {
+                return 'article';
+            }
+            
+            return 'unknown';
+        }""")
+        return page_type or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def detect_table_structure(page: Page) -> List[Dict[str, Any]]:
+    """
+    Обнаружить таблицы на странице и их структуру (колонки, фильтры, сортировка).
+    """
+    try:
+        tables = page.evaluate("""() => {
+            const result = [];
+            const tableEls = document.querySelectorAll('table, [role="table"], .table, [class*="table"]');
+            
+            tableEls.forEach((table, idx) => {
+                const headers = [];
+                const rows = [];
+                
+                // Ищем заголовки
+                const headerCells = table.querySelectorAll('th, thead td, [role="columnheader"]');
+                headerCells.forEach(th => {
+                    const text = (th.textContent || '').trim();
+                    if (text) headers.push(text.slice(0, 50));
+                });
+                
+                // Ищем фильтры рядом с таблицей
+                const filters = [];
+                let parent = table.parentElement;
+                for (let i = 0; i < 3 && parent; i++) {
+                    const filterInputs = parent.querySelectorAll('input[type="text"], input[type="search"], select, [role="combobox"]');
+                    filterInputs.forEach(inp => {
+                        const label = inp.getAttribute('aria-label') || inp.getAttribute('placeholder') || '';
+                        if (label) filters.push(label.slice(0, 50));
+                    });
+                    parent = parent.parentElement;
+                }
+                
+                // Ищем кнопки сортировки
+                const sortButtons = [];
+                table.querySelectorAll('[aria-sort], [class*="sort"], button[aria-label*="sort"]').forEach(btn => {
+                    const label = btn.getAttribute('aria-label') || btn.textContent || '';
+                    if (label) sortButtons.push(label.slice(0, 50));
+                });
+                
+                if (headers.length > 0 || filters.length > 0) {
+                    result.push({
+                        index: idx,
+                        headers: headers.slice(0, 10),
+                        filters: filters.slice(0, 5),
+                        sortButtons: sortButtons.slice(0, 5),
+                        rowCount: table.querySelectorAll('tbody tr, [role="row"]').length,
+                    });
+                }
+            });
+            
+            return result;
+        }""")
+        return tables or []
+    except Exception:
+        return []
+
+
+def detect_form_fields(page: Page) -> List[Dict[str, Any]]:
+    """
+    Обнаружить все поля формы на странице для умного заполнения.
+    Возвращает список полей с их типами и селекторами.
+    """
+    try:
+        fields = page.evaluate("""() => {
+            const result = [];
+            const forms = document.querySelectorAll('form');
+            const standaloneInputs = document.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([type="button"]), textarea, select');
+            
+            const vis = (el) => {
+                if (!el) return false;
+                const r = el.getBoundingClientRect();
+                if (r.width === 0 || r.height === 0) return false;
+                const s = getComputedStyle(el);
+                return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
+            };
+            
+            // Обрабатываем формы
+            forms.forEach(form => {
+                if (!vis(form)) return;
+                const inputs = form.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([type="button"]), textarea, select');
+                inputs.forEach(inp => {
+                    if (!vis(inp) || inp.disabled) return;
+                    const field = {
+                        type: inp.type || inp.tagName.toLowerCase(),
+                        name: inp.name || '',
+                        id: inp.id || '',
+                        placeholder: inp.placeholder || '',
+                        ariaLabel: inp.getAttribute('aria-label') || '',
+                        required: inp.required || inp.hasAttribute('required'),
+                        selector: inp.id ? '#' + inp.id : (inp.name ? `[name="${inp.name}"]` : ''),
+                    };
+                    if (inp.tagName === 'SELECT') {
+                        field.options = Array.from(inp.options).slice(0, 10).map(opt => opt.text.trim());
+                    }
+                    result.push(field);
+                });
+            });
+            
+            // Обрабатываем standalone поля (не в форме)
+            standaloneInputs.forEach(inp => {
+                if (!vis(inp) || inp.disabled) return;
+                // Проверяем, не в форме ли уже
+                let inForm = false;
+                let parent = inp.parentElement;
+                for (let i = 0; i < 5 && parent; i++) {
+                    if (parent.tagName === 'FORM') {
+                        inForm = true;
+                        break;
+                    }
+                    parent = parent.parentElement;
+                }
+                if (!inForm) {
+                    const field = {
+                        type: inp.type || inp.tagName.toLowerCase(),
+                        name: inp.name || '',
+                        id: inp.id || '',
+                        placeholder: inp.placeholder || '',
+                        ariaLabel: inp.getAttribute('aria-label') || '',
+                        required: inp.required || inp.hasAttribute('required'),
+                        selector: inp.id ? '#' + inp.id : (inp.name ? `[name="${inp.name}"]` : ''),
+                    };
+                    if (inp.tagName === 'SELECT') {
+                        field.options = Array.from(inp.options).slice(0, 10).map(opt => opt.text.trim());
+                    }
+                    result.push(field);
+                }
+            });
+            
+            return result;
+        }""")
+        return fields or []
+    except Exception:
+        return []
+
+
 def get_iframes_info(page: Page) -> List[Dict[str, Any]]:
     """Список iframe на странице (src, name) для контекста."""
     try:
@@ -149,7 +332,53 @@ def get_dom_summary(page: Page, max_length: int = 8000) -> str:
                     const s = getComputedStyle(el);
                     return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
                 };
-                const desc = (el) => {
+                // Определение приоритета элемента (для умного выбора)
+                const getPriority = (el, type) => {
+                    let priority = 5; // по умолчанию средний приоритет
+                    const text = (el.textContent || el.value || el.getAttribute('aria-label') || '').toLowerCase();
+                    const cls = (el.className || '').toLowerCase();
+                    const id = (el.id || '').toLowerCase();
+                    const combined = text + ' ' + cls + ' ' + id;
+                    
+                    // CTA кнопки (высший приоритет)
+                    const ctaPatterns = ['купить', 'заказать', 'оформить', 'начать', 'попробовать', 'скачать', 'регистрация', 'войти', 'login', 'sign up', 'buy', 'order', 'start', 'try', 'download', 'register', 'cta', 'primary', 'btn-primary', 'button-primary'];
+                    for (const p of ctaPatterns) {
+                        if (combined.includes(p)) {
+                            priority = 1;
+                            break;
+                        }
+                    }
+                    
+                    // Формы (высокий приоритет) - используем Math.min чтобы не перезаписать CTA приоритет
+                    if (type === 'input' || type === 'form') {
+                        priority = Math.min(priority, 2);
+                    }
+                    
+                    // Навигация (средний-высокий)
+                    if (type === 'link' && (cls.includes('nav') || cls.includes('menu') || id.includes('nav'))) {
+                        priority = 3;
+                    }
+                    
+                    // Важные действия
+                    const importantPatterns = ['сохранить', 'отправить', 'подтвердить', 'save', 'submit', 'confirm', 'apply', 'применить'];
+                    for (const p of importantPatterns) {
+                        if (combined.includes(p)) {
+                            priority = Math.min(priority, 2);
+                        }
+                    }
+                    
+                    // Отмена/закрытие (низкий приоритет)
+                    const cancelPatterns = ['отмена', 'отменить', 'закрыть', 'cancel', 'close', 'отказ'];
+                    for (const p of cancelPatterns) {
+                        if (combined.includes(p)) {
+                            priority = 6;
+                        }
+                    }
+                    
+                    return priority;
+                };
+                
+                const desc = (el, type) => {
                     const o = {};
                     o.tag = el.tagName.toLowerCase();
                     if (el.id) o.id = el.id;
@@ -161,33 +390,34 @@ def get_dom_summary(page: Page, max_length: int = 8000) -> str:
                     if (el.getAttribute('title')) o.title = el.getAttribute('title').slice(0, 60);
                     if (el.getAttribute('role')) o.role = el.getAttribute('role');
                     if (el.disabled) o.disabled = true;
+                    o._priority = getPriority(el, type);
                     return o;
                 };
 
-                // Кнопки
+                // Кнопки (с приоритетом)
                 document.querySelectorAll('button, [role="button"], input[type="submit"], input[type="button"]').forEach(el => {
                     if (!vis(el) || isAgentUI(el) || isServiceElement(el)) return;
-                    const o = desc(el);
+                    const o = desc(el, 'button');
                     o._type = 'button';
                     if (el.type) o.type = el.type;
                     result.push(o);
                 });
 
-                // Ссылки
+                // Ссылки (с приоритетом)
                 document.querySelectorAll('a[href]').forEach(el => {
                     if (!vis(el) || isAgentUI(el) || isServiceElement(el)) return;
                     const href = el.getAttribute('href') || '';
                     if (href.startsWith('javascript:')) return;
-                    const o = desc(el);
+                    const o = desc(el, 'link');
                     o._type = 'link';
                     o.href = href.slice(0, 120);
                     result.push(o);
                 });
 
-                // Формы и инпуты
+                // Формы и инпуты (с приоритетом)
                 document.querySelectorAll('input, textarea, select').forEach(el => {
                     if (!vis(el) || isAgentUI(el) || isServiceElement(el)) return;
-                    const o = desc(el);
+                    const o = desc(el, 'input');
                     o._type = 'input';
                     o.inputType = el.type || 'text';
                     if (el.name) o.name = el.name;
@@ -258,6 +488,9 @@ def get_dom_summary(page: Page, max_length: int = 8000) -> str:
                     seen.add(key);
                     unique.push(o);
                 }
+                
+                // Сортировка по приоритету (ниже число = выше приоритет)
+                unique.sort((a, b) => (a._priority || 5) - (b._priority || 5));
 
                 return unique.map(o => JSON.stringify(o)).join('\\n');
             }
