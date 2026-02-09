@@ -54,9 +54,9 @@ JIRA_ASSIGNEE = os.getenv("JIRA_ASSIGNEE", "").strip()
 # Включает: сниженные паузы, пропуск оракула, агрессивный промпт, чеклист реже
 DEMO_MODE = os.getenv("DEMO_MODE", "false").lower() in ("1", "true", "yes")
 
-# Видимость действий
-BROWSER_SLOW_MO = int(os.getenv("BROWSER_SLOW_MO", "100" if DEMO_MODE else "300"))
-HIGHLIGHT_DURATION_MS = int(os.getenv("HIGHLIGHT_DURATION_MS", "400" if DEMO_MODE else "800"))
+# Видимость действий (в демо — быстрее клики и короче подсветка)
+BROWSER_SLOW_MO = int(os.getenv("BROWSER_SLOW_MO", "50" if DEMO_MODE else "300"))
+HIGHLIGHT_DURATION_MS = int(os.getenv("HIGHLIGHT_DURATION_MS", "250" if DEMO_MODE else "800"))
 HEADLESS = os.getenv("HEADLESS", "false").lower() in ("1", "true", "yes")
 # Размер окна браузера (по умолчанию Full HD — на весь экран)
 VIEWPORT_WIDTH = int(os.getenv("VIEWPORT_WIDTH", "1920"))
@@ -152,7 +152,7 @@ MAX_ACTIONS_IN_MEMORY = int(os.getenv("MAX_ACTIONS_IN_MEMORY", "80"))  # раз�
 MAX_SCROLLS_IN_ROW = int(os.getenv("MAX_SCROLLS_IN_ROW", "5"))   # лимит прокруток подряд
 CONSOLE_LOG_LIMIT = int(os.getenv("CONSOLE_LOG_LIMIT", "150"))    # обрезка логов консоли
 NETWORK_LOG_LIMIT = int(os.getenv("NETWORK_LOG_LIMIT", "80"))     # обрезка сетевых ошибок
-POST_ACTION_DELAY = float(os.getenv("POST_ACTION_DELAY", "0.3" if DEMO_MODE else "1.5"))  # пауза после действия (сек)
+POST_ACTION_DELAY = float(os.getenv("POST_ACTION_DELAY", "0.15" if DEMO_MODE else "1.5"))  # пауза после действия (сек)
 PHASE_STEPS_TO_ADVANCE = int(os.getenv("PHASE_STEPS_TO_ADVANCE", "3" if DEMO_MODE else "5"))  # шагов в фазе до перехода
 
 # --- Продвинутые проверки ---

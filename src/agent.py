@@ -1645,7 +1645,7 @@ def run_agent(start_url: str = None):
                     print(report)
 
                 # Минимальная пауза (только для видимости анимации)
-                time.sleep(0.2 if DEMO_MODE else 0.3)
+                time.sleep(0.1 if DEMO_MODE else 0.3)
 
         except KeyboardInterrupt:
             print("\n[Agent] Остановлен по Ctrl+C.")
@@ -1873,11 +1873,27 @@ def _get_fast_action(
                 }
                 return false;
             };
+            const inViewport = (el) => {
+                const r = el.getBoundingClientRect();
+                const vw = window.innerWidth, vh = window.innerHeight;
+                return r.top < vh && r.bottom > 0 && r.left < vw && r.right > 0;
+            };
+            const ancestorsVisible = (el) => {
+                let cur = el.parentElement;
+                while (cur && cur !== document.body) {
+                    const s = getComputedStyle(cur);
+                    if (s.display === 'none' || s.visibility === 'hidden' || parseFloat(s.opacity) === 0) return false;
+                    cur = cur.parentElement;
+                }
+                return true;
+            };
             const vis = (el) => {
                 const r = el.getBoundingClientRect();
                 if (r.width < 5 || r.height < 5) return false;
                 const s = getComputedStyle(el);
-                return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
+                if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return false;
+                if (!inViewport(el) || !ancestorsVisible(el)) return false;
+                return true;
             };
             // Кнопки (приоритет 1)
             document.querySelectorAll('button:not([disabled]), [role="button"]:not([disabled]), input[type="submit"]').forEach(el => {
@@ -1932,14 +1948,20 @@ def _get_fast_action(
             return result;
         }""") or []
 
-        # DEMO MODE: циклично обходим элементы, чтобы движение было постоянным
+        # DEMO MODE: приоритет кликам (кнопки, ссылки, табы), затем формы — движение активнее
         if demo_mode and elements:
+            # Сортируем: сначала все кликабельные (button/link/tab), потом input/select
+            click_types = ("click", "link", "tab")
+            elements = sorted(
+                elements,
+                key=lambda e: (0 if e.get("type") in click_types else 1, e.get("priority", 9)),
+            )
             step = getattr(memory, "iteration", 0)
-            # Каждые 4 шага — стараемся выбрать ссылку для перехода
-            if step % 4 == 0:
+            # Каждые 2 шага — подталкиваем ссылку вперёд (больше переходов по страницам)
+            if step % 2 == 0:
                 for elem in elements:
                     if elem.get("type") == "link":
-                        elements = [elem] + elements
+                        elements = [elem] + [x for x in elements if x != elem]
                         break
             idx = getattr(memory, "_demo_index", 0) % len(elements)
             memory._demo_index = idx + 1
@@ -2068,7 +2090,7 @@ def _step_get_action(page, step, memory, console_log, network_failures, checklis
             stuck_warning = "\n🚨 КРИТИЧНО: Агент зациклился! Выбери действие, которого НЕТ в списке выше.\n"
         question = f"""Вот скриншот. На странице АКТИВНЫЙ ОВЕРЛЕЙ (модалка/дропдаун/тултип/попап).
 {overlay_context}
-ЭЛЕМЕНТЫ СТРАНИЦЫ (формат: [N] тип "текст" атрибуты):
+ЭЛЕМЕНТЫ СТРАНИЦЫ (только видимые на экране, формат: [N] тип "текст" атрибуты):
 {dom_summary[:3000]}
 {history_text}{stuck_warning}
 🚀 Используй selector="ref:N" (N из [N] выше).
@@ -2119,7 +2141,7 @@ def _step_get_action(page, step, memory, console_log, network_failures, checklis
         
         question = f"""Вот скриншот и контекст страницы.
 {page_type_hint}{coverage_hint}{form_hint_smart}{table_hint}
-ЭЛЕМЕНТЫ СТРАНИЦЫ (формат: [N] тип "текст" атрибуты):
+ЭЛЕМЕНТЫ СТРАНИЦЫ (только видимые на экране, формат: [N] тип "текст" атрибуты):
 {dom_summary[:3000]}
 {history_text}
 {plan_hint}{form_hint}{stuck_warning}
@@ -2301,7 +2323,7 @@ def _step_execute(page, action, step, memory, context):
             pass
 
     # Минимальная пауза: только чтобы DOM обновился
-    time.sleep(0.2 if DEMO_MODE else 0.3)
+    time.sleep(0.1 if DEMO_MODE else 0.3)
     # Быстрый wait (не 3 секунды!)
     try:
         page.wait_for_load_state("domcontentloaded", timeout=2000)

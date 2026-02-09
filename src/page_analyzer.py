@@ -316,12 +316,28 @@ def get_dom_summary(page: Page, max_length: int = 8000) -> str:
                     }
                     return false;
                 };
+                const inViewport = (el) => {
+                    const r = el.getBoundingClientRect();
+                    const vw = window.innerWidth, vh = window.innerHeight;
+                    return r.top < vh && r.bottom > 0 && r.left < vw && r.right > 0;
+                };
+                const ancestorsVisible = (el) => {
+                    let cur = el.parentElement;
+                    while (cur && cur !== document.body) {
+                        const s = getComputedStyle(cur);
+                        if (s.display === 'none' || s.visibility === 'hidden' || parseFloat(s.opacity) === 0) return false;
+                        cur = cur.parentElement;
+                    }
+                    return true;
+                };
                 const vis = (el) => {
                     if (!el) return false;
                     const r = el.getBoundingClientRect();
                     if (r.width === 0 || r.height === 0) return false;
                     const s = getComputedStyle(el);
-                    return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
+                    if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return false;
+                    if (!inViewport(el) || !ancestorsVisible(el)) return false;
+                    return true;
                 };
 
                 // --- Назначить ref элементу ---
