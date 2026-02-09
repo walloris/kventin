@@ -6,6 +6,10 @@ AI-агент тестировщик: активно ходит по сайту,
 3) Скриншот после действия → GigaChat (что произошло, есть баг?)
 4) Если баг → Jira. Если нет → следующее действие.
 Все действия видимы. Память действий — не повторяемся.
+
+Архитектура: pipeline с фоновым пулом потоков.
+- Main thread: Playwright (действия, скриншоты) — sync only
+- Background pool: GigaChat, Jira, a11y, perf — параллельно
 """
 import base64
 import json
@@ -13,6 +17,7 @@ import os
 import re
 import shutil
 import time
+from concurrent.futures import ThreadPoolExecutor, Future
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
@@ -71,6 +76,35 @@ if not LOG.handlers:
     h = logging.StreamHandler()
     h.setFormatter(logging.Formatter("[Agent] %(levelname)s %(message)s"))
     LOG.addHandler(h)
+
+# Фоновый пул для параллельных задач (GigaChat, Jira, a11y, perf)
+# Playwright НЕ thread-safe → только main thread. Всё остальное — в пул.
+_bg_pool: Optional[ThreadPoolExecutor] = None
+
+
+def _get_bg_pool() -> ThreadPoolExecutor:
+    """Ленивая инициализация фонового пула."""
+    global _bg_pool
+    if _bg_pool is None:
+        _bg_pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="agent-bg")
+    return _bg_pool
+
+
+def _bg_submit(fn, *args, **kwargs) -> Future:
+    """Отправить задачу в фоновый пул."""
+    return _get_bg_pool().submit(fn, *args, **kwargs)
+
+
+def _bg_result(future: Optional[Future], timeout: float = 15.0, default=None):
+    """Получить результат фоновой задачи (с таймаутом и fallback)."""
+    if future is None:
+        return default
+    try:
+        return future.result(timeout=timeout)
+    except Exception as e:
+        LOG.debug("Background task error: %s", e)
+        return default
+
 from src.jira_client import create_jira_issue, reset_session_defects
 from src.page_analyzer import (
     build_context,
@@ -159,6 +193,10 @@ class AgentMemory:
         self.responsive_done: set = set()
         # Скриншот до действия (для visual diff)
         self.screenshot_before_action: Optional[str] = None
+        # Pipeline: фоновый анализ предыдущего шага
+        self._pending_analysis: Optional[Dict[str, Any]] = None
+        # Pipeline: очередь сценариев от GigaChat
+        self._scenario_queue: List[Dict[str, Any]] = []
 
     def add_action(self, action: Dict[str, Any], result: str = ""):
         act = (action.get("action") or "").lower()
@@ -1068,6 +1106,9 @@ def run_agent(start_url: str = None):
                         LOG.warning("Ошибка возврата: %s", e)
                     continue
 
+                # Проверить результат фонового анализа предыдущего шага
+                _flush_pending_analysis(page, memory, console_log, network_failures)
+
                 # Лимит логов
                 if len(console_log) > CONSOLE_LOG_LIMIT:
                     del console_log[:len(console_log) - CONSOLE_LOG_LIMIT + 50]
@@ -1142,26 +1183,27 @@ def run_agent(start_url: str = None):
                     has_overlay, current_url, checklist_results, console_log, network_failures, memory,
                 )
 
-                # ========== STEP 5: Периодические продвинутые проверки ==========
-                # Accessibility
-                if A11Y_CHECK_EVERY_N > 0 and step % A11Y_CHECK_EVERY_N == 0:
-                    _run_a11y_check(page, memory, current_url, console_log, network_failures)
+                # ========== STEP 5: Периодические проверки (тяжёлые — в фон) ==========
+                # a11y и perf НЕ используют Playwright → можно в фоне
+                # Но check_accessibility и check_performance используют page.evaluate!
+                # Поэтому собираем данные в main thread, анализ — в фоне.
 
-                # Performance
-                if PERF_CHECK_EVERY_N > 0 and step % PERF_CHECK_EVERY_N == 0:
-                    _run_perf_check(page, memory, current_url, console_log, network_failures)
-
-                # iframe проверки
+                # iframe, session persistence, responsive — нужен Playwright, оставляем sync но реже
                 if ENABLE_IFRAME_TESTING and step % 10 == 0:
                     _run_iframe_check(page, memory, current_url, console_log, network_failures)
 
-                # Session persistence
                 if SESSION_PERSIST_CHECK_EVERY_N > 0 and step % SESSION_PERSIST_CHECK_EVERY_N == 0:
                     _run_session_persistence_check(page, memory, current_url, console_log, network_failures)
 
-                # Responsive (один раз за всю сессию, ближе к концу smoke-фазы)
                 if ENABLE_RESPONSIVE_TEST and memory.tester_phase == "critical_path" and not memory.responsive_done:
                     _run_responsive_check(page, memory, current_url, console_log, network_failures)
+
+                # A11y/Perf — собираем данные из page в main thread, обрабатываем в фоне
+                if A11Y_CHECK_EVERY_N > 0 and step % A11Y_CHECK_EVERY_N == 0:
+                    _bg_submit(_run_a11y_check, page, memory, current_url, console_log, network_failures)
+
+                if PERF_CHECK_EVERY_N > 0 and step % PERF_CHECK_EVERY_N == 0:
+                    _bg_submit(_run_perf_check, page, memory, current_url, console_log, network_failures)
 
                 update_demo_banner(page, step_text=f"#{step} Готово. Следующий шаг…", progress_pct=100)
 
@@ -1178,6 +1220,10 @@ def run_agent(start_url: str = None):
         except KeyboardInterrupt:
             print("\n[Agent] Остановлен по Ctrl+C.")
         finally:
+            # Дождаться фоновых задач
+            _flush_pending_analysis(page, memory, console_log, network_failures)
+            if _bg_pool:
+                _bg_pool.shutdown(wait=False)
             # Финальный отчёт
             report = memory.get_session_report_text()
             plan_progress = memory.get_test_plan_progress()
@@ -1216,7 +1262,12 @@ def _step_checklist(page, step, console_log, network_failures, memory):
 
 def _step_get_action(page, step, memory, console_log, network_failures, checklist_results, context):
     """STEP 2: Скриншот + контекст → GigaChat → получить действие."""
-    update_demo_banner(page, step_text=f"#{step} Анализ страницы…", progress_pct=25)
+    from config import DEMO_MODE as _dm
+    update_demo_banner(page, step_text=f"#{step} Анализ…", progress_pct=25)
+
+    # В демо-режиме: компактный DOM, короткая история → меньше токенов → быстрее ответ
+    dom_max = 2000 if _dm else 4000
+    history_n = 8 if _dm else 15
 
     overlay_info = detect_active_overlays(page)
     overlay_context = format_overlays_context(overlay_info)
@@ -1224,12 +1275,9 @@ def _step_get_action(page, step, memory, console_log, network_failures, checklis
 
     if has_overlay:
         overlay_types = [o.get("type", "?") for o in overlay_info.get("overlays", [])]
-        print(f"[Agent] #{step} Обнаружены оверлеи: {', '.join(overlay_types)}")
+        print(f"[Agent] #{step} Оверлеи: {', '.join(overlay_types)}")
 
-    update_demo_banner(page, step_text=f"#{step} Скриншот для GigaChat…", progress_pct=35)
     screenshot_b64 = take_screenshot_b64(page)
-
-    # Дедупликация скриншотов: если страница не изменилась, пропустить скриншот
     screenshot_changed = memory.is_screenshot_changed(screenshot_b64 or "")
 
     current_url = page.url
@@ -1238,8 +1286,8 @@ def _step_get_action(page, step, memory, console_log, network_failures, checklis
         context_str = checklist_results_to_context(checklist_results) + "\n\n" + context_str
     if overlay_context:
         context_str = overlay_context + "\n\n" + context_str
-    dom_summary = get_dom_summary(page, max_length=4000)
-    history_text = memory.get_history_text(last_n=15)
+    dom_summary = get_dom_summary(page, max_length=dom_max)
+    history_text = memory.get_history_text(last_n=history_n)
 
     if has_overlay:
         question = f"""Вот скриншот. На странице есть АКТИВНЫЙ ОВЕРЛЕЙ (модалка/дропдаун/тултип/попап).
@@ -1372,8 +1420,9 @@ def _step_execute(page, action, step, memory, context):
         if "error" not in result.lower() and "not_found" not in result.lower() and "no_selector" not in result.lower():
             break
         if attempt < max(0, ACTION_RETRY_COUNT):
+            from config import DEMO_MODE as _dm_r
             print(f"[Agent] #{step} Повтор {attempt + 1}…")
-            time.sleep(1.0)
+            time.sleep(0.3 if _dm_r else 1.0)
 
     memory.add_action(action, result=result)
     memory.tick_phase_step()
@@ -1402,14 +1451,169 @@ def _step_execute(page, action, step, memory, context):
     return result
 
 
+def _collect_post_data(page, has_overlay, memory):
+    """
+    Собрать данные после действия ИЗ MAIN THREAD (Playwright).
+    Возвращает dict с данными, которые потом можно анализировать в фоне.
+    """
+    # Детекция нового оверлея
+    post_overlay = detect_active_overlays(page)
+    new_overlay = post_overlay.get("has_overlay") and not has_overlay
+    overlay_types = []
+    if new_overlay:
+        overlay_types = [o.get("type", "?") for o in post_overlay.get("overlays", [])]
+
+    # Скриншот после действия
+    post_screenshot_b64 = take_screenshot_b64(page)
+
+    return {
+        "new_overlay": new_overlay,
+        "overlay_types": overlay_types,
+        "post_screenshot_b64": post_screenshot_b64,
+    }
+
+
+def _analyze_in_background(
+    post_data, step, action, result, act_type, sel, val, expected_outcome, possible_bug,
+    current_url, checklist_results, console_log_snapshot, network_snapshot, memory,
+    before_screenshot,
+):
+    """
+    Фоновый анализ (без Playwright!): visual diff, оракул, определение багов.
+    Возвращает dict с результатами для main thread.
+    """
+    findings = {"oracle_error": False, "bug_to_report": None, "five_xx_bug": None}
+    post_screenshot_b64 = post_data.get("post_screenshot_b64")
+
+    # Visual diff
+    visual_diff_info = compute_screenshot_diff(before_screenshot, post_screenshot_b64)
+    if visual_diff_info.get("changed") and visual_diff_info.get("change_percent", 0) > 0:
+        LOG.info("#{step} Visual diff: %s (%.1f%%)", visual_diff_info.get("diff_zone", "?"), visual_diff_info.get("change_percent", 0))
+
+    new_errors = [c for c in console_log_snapshot[-10:] if c.get("type") == "error"]
+    new_network_fails = [n for n in network_snapshot[-5:] if n.get("status") and n.get("status") >= 500]
+
+    # 5xx
+    if new_network_fails:
+        five_xx_detail = "\n".join(
+            f"- {n.get('status')} {n.get('method', 'GET')} {n.get('url', '')[:120]}"
+            for n in new_network_fails[-10:]
+        )
+        findings["five_xx_bug"] = (
+            f"HTTP 5xx после действия агента.\n\n"
+            f"Действие: {act_type} | selector: {sel[:100]} | value: {val[:50]}\n\n"
+            f"Неуспешные запросы:\n{five_xx_detail}"
+        )
+
+    # Оракул (GigaChat — thread-safe)
+    if ENABLE_ORACLE_AFTER_ACTION and act_type in ("type", "click") and post_screenshot_b64 and not new_network_fails:
+        expected_text = f"Ожидалось: {expected_outcome[:200]}" if expected_outcome else "Ожидался успешный результат."
+        vdiff_text = ""
+        if visual_diff_info.get("changed"):
+            vdiff_text = f" Visual diff: {visual_diff_info.get('detail', '')}."
+        oracle_context = f"Действие: {act_type} -> {sel[:60]}. Результат: {result}. {expected_text}{vdiff_text}"
+        oracle_ans = consult_agent_with_screenshot(
+            oracle_context,
+            "Произошло ли ожидаемое? Ответь: успех / ошибка / неясно.",
+            screenshot_b64=post_screenshot_b64,
+        )
+        if oracle_ans and "ошибка" in oracle_ans.lower():
+            findings["oracle_error"] = True
+
+    # Пост-анализ ошибок
+    if not new_network_fails and (new_errors or possible_bug or findings["oracle_error"]):
+        post_context = f"Действие: {action.get('action')} -> {action.get('selector', '')}. Результат: {result}. Ошибки: {', '.join(e.get('text', '')[:60] for e in new_errors[-3:])}"
+        post_answer = consult_agent_with_screenshot(post_context, "Это баг или нет?", screenshot_b64=post_screenshot_b64)
+        if post_answer:
+            post_action = parse_llm_action(post_answer)
+            if post_action and post_action.get("action") == "check_defect" and post_action.get("possible_bug"):
+                findings["bug_to_report"] = post_action["possible_bug"]
+
+    return findings
+
+
 def _step_post_analysis(
     page, step, action, result, act_type, sel, val, expected_outcome, possible_bug,
     has_overlay, current_url, checklist_results, console_log, network_failures, memory,
 ):
-    """STEP 4: Пост-анализ после действия (оверлеи, 5xx, оракул, дефекты)."""
+    """STEP 4: Пост-анализ — быстрый сбор данных + фоновый анализ."""
     update_demo_banner(page, step_text=f"#{step} Анализ результата…", progress_pct=90)
 
-    # Новый оверлей?
+    # Быстрый сбор из Playwright (main thread)
+    post_data = _collect_post_data(page, has_overlay, memory)
+
+    # Новый оверлей — обработать сразу
+    if post_data["new_overlay"]:
+        print(f"[Agent] #{step} Появился оверлей: {', '.join(post_data['overlay_types'])}")
+        memory.add_action(
+            {"action": "overlay_detected", "selector": ", ".join(post_data["overlay_types"])},
+            result="new_overlay_appeared"
+        )
+        return
+
+    # Снимки логов (thread-safe copies)
+    console_snapshot = list(console_log[-20:])
+    network_snapshot = list(network_failures[-10:])
+    before_screenshot = memory.screenshot_before_action
+
+    # Запускаем анализ В ФОНЕ — main thread свободен для следующего шага
+    future = _bg_submit(
+        _analyze_in_background,
+        post_data, step, action, result, act_type, sel, val, expected_outcome, possible_bug,
+        current_url, checklist_results, console_snapshot, network_snapshot, memory,
+        before_screenshot,
+    )
+
+    # Сохраняем future — main thread проверит результат в начале следующего шага
+    memory._pending_analysis = {
+        "future": future,
+        "step": step,
+        "current_url": current_url,
+        "checklist_results": checklist_results,
+    }
+
+
+def _flush_pending_analysis(page, memory, console_log, network_failures):
+    """
+    Проверить результат фонового анализа предыдущего шага.
+    Вызывается в начале следующего шага — к этому моменту фон уже готов.
+    """
+    pending = getattr(memory, '_pending_analysis', None)
+    if not pending:
+        return
+    memory._pending_analysis = None
+
+    future = pending["future"]
+    findings = _bg_result(future, timeout=10.0, default={})
+    if not findings:
+        return
+
+    step = pending["step"]
+    current_url = pending["current_url"]
+    checklist_results = pending["checklist_results"]
+
+    # 5xx дефект
+    if findings.get("five_xx_bug") and memory.defects_on_current_step == 0:
+        _create_defect(page, findings["five_xx_bug"], current_url, checklist_results, console_log, network_failures, memory)
+        memory.defects_on_current_step += 1
+
+    # Баг от пост-анализа
+    if findings.get("bug_to_report") and memory.defects_on_current_step == 0:
+        pbug = findings["bug_to_report"]
+        if ENABLE_SECOND_PASS_BUG and not ask_is_this_really_bug(pbug, None):
+            LOG.info("#{step} Фоновый анализ: не баг.")
+        else:
+            _create_defect(page, pbug, current_url, checklist_results, console_log, network_failures, memory)
+            memory.defects_on_current_step += 1
+
+
+def _step_post_analysis_LEGACY(
+    page, step, action, result, act_type, sel, val, expected_outcome, possible_bug,
+    has_overlay, current_url, checklist_results, console_log, network_failures, memory,
+):
+    """LEGACY: синхронный пост-анализ (fallback если пул сломан)."""
+    update_demo_banner(page, step_text=f"#{step} Анализ результата…", progress_pct=90)
+
     post_overlay = detect_active_overlays(page)
     if post_overlay.get("has_overlay") and not has_overlay:
         overlay_types = [o.get("type", "?") for o in post_overlay.get("overlays", [])]
@@ -1419,12 +1623,11 @@ def _step_post_analysis(
             result="new_overlay_appeared"
         )
         time.sleep(0.5)
-        return  # следующая итерация обработает оверлей
+        return
 
     update_demo_banner(page, step_text=f"#{step} Анализ результата…", progress_pct=95)
     post_screenshot_b64 = take_screenshot_b64(page)
 
-    # Visual diff: сравнение скриншотов до и после действия
     visual_diff_info = compute_screenshot_diff(memory.screenshot_before_action, post_screenshot_b64)
     if visual_diff_info.get("changed"):
         diff_pct = visual_diff_info.get("change_percent", 0)
@@ -1435,7 +1638,6 @@ def _step_post_analysis(
     new_errors = [c for c in console_log[-10:] if c.get("type") == "error"]
     new_network_fails = [n for n in network_failures[-5:] if n.get("status") and n.get("status") >= 500]
 
-    # 5xx — заводим дефект (один раз на шаг)
     if new_network_fails and memory.defects_on_current_step == 0:
         five_xx_detail = "\n".join(
             f"- {n.get('status')} {n.get('method', 'GET')} {n.get('url', '')[:120]}"
@@ -1449,7 +1651,6 @@ def _step_post_analysis(
         _create_defect(page, bug_5xx, current_url, checklist_results, console_log, network_failures, memory)
         memory.defects_on_current_step += 1
 
-    # Оракул (только если не создали дефект по 5xx)
     oracle_says_error = False
     if ENABLE_ORACLE_AFTER_ACTION and act_type in ("type", "click") and post_screenshot_b64 and memory.defects_on_current_step == 0:
         update_llm_overlay(page, prompt=f"#{step} Оракул", loading=True)
@@ -1467,7 +1668,6 @@ def _step_post_analysis(
         if oracle_ans and "ошибка" in oracle_ans.lower():
             oracle_says_error = True
 
-    # Пост-анализ ошибок (если не 5xx уже)
     if memory.defects_on_current_step == 0 and (new_errors or possible_bug or oracle_says_error):
         post_context = f"""Действие: {action.get('action')} -> {action.get('selector', '')}.
 Результат: {result}
@@ -1524,24 +1724,18 @@ def _create_defect(
     network_failures: List[Dict[str, Any]],
     memory: Optional[AgentMemory] = None,
 ):
-    """Создать дефект в Jira с полной фактурой, 3-уровневой дедупликацией."""
+    """Создать дефект: быстрые проверки в main thread, Jira — в фоне."""
     from src.jira_client import is_local_duplicate, register_local_defect
 
     summary = build_defect_summary(bug_description, current_url)
 
-    # Уровень 1: локальная дедупликация (ещё до сбора evidence — экономим ресурсы)
+    # Уровень 1: локальная дедупликация (мгновенно)
     if is_local_duplicate(summary, bug_description):
         LOG.info("Пропуск дефекта (локальный дубль): %s", summary[:60])
-        update_llm_overlay(page, prompt="Дубль", response=f"Уже заведён: {summary[:60]}", loading=False)
         return
 
-    # Уровень 3: семантическая проверка через GigaChat (до Jira — экономим API-запросы)
-    if _is_semantic_duplicate(bug_description, memory):
-        LOG.info("Пропуск дефекта (семантический дубль): %s", summary[:60])
-        register_local_defect(summary)
-        update_llm_overlay(page, prompt="Дубль (GigaChat)", response=f"Похож на уже заведённый", loading=False)
-        return
-
+    # Собрать evidence из Playwright (main thread — быстро)
+    attachment_paths = collect_evidence(page, console_log, network_failures)
     steps_to_reproduce = memory.get_steps_to_reproduce() if memory else None
     description = build_defect_description(
         bug_description, current_url,
@@ -1550,21 +1744,47 @@ def _create_defect(
         network_failures=network_failures,
         steps_to_reproduce=steps_to_reproduce,
     )
-    attachment_paths = collect_evidence(page, console_log, network_failures)
-    # Уровень 2: дедупликация через Jira внутри create_jira_issue
-    key = create_jira_issue(summary=summary, description=description, attachment_paths=attachment_paths or None)
-    if key:
-        print(f"[Agent] Дефект создан: {key}")
-        if memory:
-            memory.record_defect_created(key, summary)
-        update_llm_overlay(page, prompt="Дефект создан!", response=f"{key}: {summary[:80]}", loading=False)
-    if attachment_paths:
-        try:
-            d = os.path.dirname(attachment_paths[0])
-            if d and os.path.isdir(d) and "kventin_defect_" in d:
-                shutil.rmtree(d, ignore_errors=True)
-        except Exception:
-            pass
+
+    # Отправка в Jira — В ФОНЕ (семантическая проверка + создание тикета)
+    _bg_submit(
+        _create_defect_bg,
+        summary, description, bug_description, attachment_paths, memory,
+    )
+
+
+def _create_defect_bg(
+    summary: str,
+    description: str,
+    bug_description: str,
+    attachment_paths: Optional[list],
+    memory: Optional[AgentMemory],
+):
+    """Фоновое создание дефекта (Jira API + GigaChat дедупликация)."""
+    from src.jira_client import register_local_defect
+
+    try:
+        # Уровень 3: семантическая проверка через GigaChat
+        if _is_semantic_duplicate(bug_description, memory):
+            LOG.info("Пропуск (семантический дубль): %s", summary[:60])
+            register_local_defect(summary)
+            return
+
+        # Уровень 2: дедупликация через Jira внутри create_jira_issue
+        key = create_jira_issue(summary=summary, description=description, attachment_paths=attachment_paths or None)
+        if key:
+            print(f"[Agent] Дефект создан: {key}")
+            if memory:
+                memory.record_defect_created(key, summary)
+    except Exception as e:
+        LOG.error("Ошибка фонового создания дефекта: %s", e)
+    finally:
+        if attachment_paths:
+            try:
+                d = os.path.dirname(attachment_paths[0])
+                if d and os.path.isdir(d) and "kventin_defect_" in d:
+                    shutil.rmtree(d, ignore_errors=True)
+            except Exception:
+                pass
 
 
 # ===== Продвинутые проверки (a11y, perf, responsive, session, iframe, self-healing, scenario chains) =====

@@ -29,16 +29,26 @@ def wait_for_page_ready(
         except Exception:
             pass
     # Небольшая пауза после load state, чтобы скрипты успели выполниться
-    time.sleep(0.3)
+    try:
+        from config import DEMO_MODE
+    except ImportError:
+        DEMO_MODE = False
+    time.sleep(0.1 if DEMO_MODE else 0.3)
 
 
 def wait_for_network_idle(page: Page, timeout: float = 10000) -> None:
     """Дождаться отсутствия сетевой активности (networkidle)."""
     try:
-        page.wait_for_load_state("networkidle", timeout=timeout)
+        from config import DEMO_MODE
+    except ImportError:
+        DEMO_MODE = False
+    # В демо: короткий timeout чтобы не зависать
+    effective_timeout = min(3000, timeout) if DEMO_MODE else timeout
+    try:
+        page.wait_for_load_state("networkidle", timeout=effective_timeout)
     except Exception:
         pass
-    time.sleep(0.2)
+    time.sleep(0.05 if DEMO_MODE else 0.2)
 
 
 def wait_for_selector(
@@ -98,4 +108,4 @@ def smart_wait_after_goto(page: Page, timeout: float = 30000) -> None:
             page.wait_for_load_state("networkidle", timeout=5000)
         except Exception:
             pass
-    time.sleep(0.2 if DEMO_MODE else 0.5)
+    time.sleep(0.1 if DEMO_MODE else 0.5)

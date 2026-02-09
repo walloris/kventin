@@ -356,22 +356,32 @@ class GigaChatClient:
             LOG.warning("upload_screenshot: ошибка: %s", e)
         return None
 
-    def chat(self, messages: List[Dict[str, Any]]) -> str:
+    def chat(self, messages: List[Dict[str, Any]], max_tokens: Optional[int] = None) -> str:
         token = self._get_token()
         if not token:
             LOG.error("chat: нет токена, запрос отменён")
             return ""
 
+        try:
+            from config import DEMO_MODE as _dm
+        except ImportError:
+            _dm = False
+
         model = self._normalize_model(self.model)
         payload = {
             "model": model,
             "messages": messages,
-            "temperature": 0.2,
+            "temperature": 0.15 if _dm else 0.2,
             "top_p": 0.9,
             "safe_mode": False,
             "profanity_check": False,
             "stream": False,
         }
+        # max_tokens: ограничиваем ответ → GigaChat отвечает быстрее
+        if max_tokens:
+            payload["max_tokens"] = max_tokens
+        elif _dm:
+            payload["max_tokens"] = 400  # в демо — короткие ответы
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {token}",
@@ -380,6 +390,8 @@ class GigaChatClient:
         last_msg = messages[-1] if messages else {}
         user_len = len(last_msg.get("content", "")) if isinstance(last_msg.get("content"), str) else 0
         has_image = "<img" in (last_msg.get("content", "") if isinstance(last_msg.get("content"), str) else "")
+        # Таймаут: в демо режиме короче чтобы не зависать
+        timeout = 45 if _dm else 120
         LOG.info("chat: POST %s model=%s msgs=%s user_len=%s has_image=%s", self.api_url, model, len(messages), user_len, has_image)
         try:
             r = requests.post(
@@ -387,7 +399,7 @@ class GigaChatClient:
                 json=payload,
                 headers=headers,
                 verify=self.verify_ssl,
-                timeout=120,
+                timeout=timeout,
             )
             LOG.info("chat: ответ %s body_len=%s", r.status_code, len(r.text))
             if r.status_code != 200:
@@ -455,23 +467,28 @@ class GigaChatClient:
 
     @staticmethod
     def _compress_screenshot(screenshot_b64: str) -> bytes:
-        """Сжать скриншот: PNG base64 → JPEG bytes, уменьшить до 1280px по ширине."""
+        """Сжать скриншот: PNG base64 → JPEG bytes. В демо-режиме — агрессивнее."""
         raw_png = base64.b64decode(screenshot_b64)
+        try:
+            from config import DEMO_MODE as _dm
+        except ImportError:
+            _dm = False
         try:
             from io import BytesIO
             from PIL import Image
             img = Image.open(BytesIO(raw_png))
-            # Уменьшить до 1280px по ширине
-            if img.width > 1280:
-                ratio = 1280 / img.width
-                new_size = (1280, int(img.height * ratio))
+            # В демо: ещё меньше, quality ниже → быстрее upload
+            max_width = 960 if _dm else 1280
+            quality = 50 if _dm else 70
+            if img.width > max_width:
+                ratio = max_width / img.width
+                new_size = (max_width, int(img.height * ratio))
                 img = img.resize(new_size, Image.LANCZOS)
-            # Конвертировать в RGB (JPEG не поддерживает alpha)
             if img.mode in ("RGBA", "P"):
                 img = img.convert("RGB")
             buf = BytesIO()
-            img.save(buf, format="JPEG", quality=70, optimize=True)
-            LOG.info("compress_screenshot: %d bytes PNG → %d bytes JPEG", len(raw_png), buf.tell())
+            img.save(buf, format="JPEG", quality=quality, optimize=True)
+            LOG.info("compress_screenshot: %d bytes PNG → %d bytes JPEG (q=%d)", len(raw_png), buf.tell(), quality)
             return buf.getvalue()
         except ImportError:
             LOG.warning("compress_screenshot: Pillow не установлен, отправляем PNG как есть")
@@ -543,19 +560,23 @@ def consult_agent(context: str, question: str) -> Optional[str]:
 def _llm_call_with_retry(prompt: str, screenshot_b64: Optional[str] = None, system: Optional[str] = None) -> Optional[str]:
     """Вызов GigaChat с retry и экспоненциальным backoff при пустом ответе."""
     try:
-        from config import LLM_RETRY_COUNT, LLM_RETRY_BASE_DELAY
+        from config import LLM_RETRY_COUNT, LLM_RETRY_BASE_DELAY, DEMO_MODE
     except ImportError:
-        LLM_RETRY_COUNT, LLM_RETRY_BASE_DELAY = 3, 2.0
+        LLM_RETRY_COUNT, LLM_RETRY_BASE_DELAY, DEMO_MODE = 3, 2.0, False
+
+    # В демо: меньше retry, короче задержка
+    retry_count = min(LLM_RETRY_COUNT, 2) if DEMO_MODE else LLM_RETRY_COUNT
+    base_delay = 0.5 if DEMO_MODE else LLM_RETRY_BASE_DELAY
 
     last_result = None
-    for attempt in range(max(1, LLM_RETRY_COUNT)):
+    for attempt in range(max(1, retry_count)):
         result = _get_client().chat_with_screenshot(prompt, screenshot_b64=screenshot_b64, system=system)
         if result and result.strip():
             return result
         last_result = result
-        if attempt < LLM_RETRY_COUNT - 1:
-            delay = LLM_RETRY_BASE_DELAY * (2 ** attempt)
-            LOG.warning("LLM retry %d/%d — пустой ответ, пауза %.1fс", attempt + 1, LLM_RETRY_COUNT, delay)
+        if attempt < retry_count - 1:
+            delay = base_delay * (2 ** attempt)
+            LOG.warning("LLM retry %d/%d — пустой ответ, пауза %.1fс", attempt + 1, retry_count, delay)
             time.sleep(delay)
     return last_result
 
