@@ -118,6 +118,30 @@ def get_dom_summary(page: Page, max_length: int = 8000) -> str:
                     }
                     return false;
                 };
+                // Фильтр служебных элементов: чаты, виджеты, баннеры поддержки
+                const isServiceElement = (el) => {
+                    if (!el) return true;
+                    const text = (el.textContent || el.getAttribute('aria-label') || el.getAttribute('title') || '').toLowerCase();
+                    const id = (el.id || '').toLowerCase();
+                    const cls = (el.className || '').toLowerCase();
+                    const patterns = ['chat', 'чат', 'support', 'поддержк', 'help', 'консультант', 'jivo', 'intercom', 'crisp', 'drift', 'tawk', 'livechat', 'live-chat', 'widget-chat', 'chat-widget', 'feedback', 'обратн', 'звонок', 'callback', 'kventin', 'agent-llm', 'agent-banner', 'диалог с llm', 'ai-тестировщик', 'gigachat', 'cookie', 'consent', 'banner', 'popup', 'overlay-widget'];
+                    const combined = text + ' ' + id + ' ' + cls;
+                    for (const p of patterns) {
+                        if (combined.includes(p)) return true;
+                    }
+                    // Проверка родительских элементов
+                    let cur = el.parentElement;
+                    let depth = 0;
+                    while (cur && cur !== document.body && depth < 3) {
+                        const parentText = (cur.className || cur.id || '').toLowerCase();
+                        for (const p of patterns) {
+                            if (parentText.includes(p)) return true;
+                        }
+                        cur = cur.parentElement;
+                        depth++;
+                    }
+                    return false;
+                };
                 const vis = (el) => {
                     if (!el) return false;
                     const r = el.getBoundingClientRect();
@@ -142,7 +166,7 @@ def get_dom_summary(page: Page, max_length: int = 8000) -> str:
 
                 // Кнопки
                 document.querySelectorAll('button, [role="button"], input[type="submit"], input[type="button"]').forEach(el => {
-                    if (!vis(el) || isAgentUI(el)) return;
+                    if (!vis(el) || isAgentUI(el) || isServiceElement(el)) return;
                     const o = desc(el);
                     o._type = 'button';
                     if (el.type) o.type = el.type;
@@ -151,7 +175,7 @@ def get_dom_summary(page: Page, max_length: int = 8000) -> str:
 
                 // Ссылки
                 document.querySelectorAll('a[href]').forEach(el => {
-                    if (!vis(el) || isAgentUI(el)) return;
+                    if (!vis(el) || isAgentUI(el) || isServiceElement(el)) return;
                     const href = el.getAttribute('href') || '';
                     if (href.startsWith('javascript:')) return;
                     const o = desc(el);
@@ -162,7 +186,7 @@ def get_dom_summary(page: Page, max_length: int = 8000) -> str:
 
                 // Формы и инпуты
                 document.querySelectorAll('input, textarea, select').forEach(el => {
-                    if (!vis(el) || isAgentUI(el)) return;
+                    if (!vis(el) || isAgentUI(el) || isServiceElement(el)) return;
                     const o = desc(el);
                     o._type = 'input';
                     o.inputType = el.type || 'text';
@@ -181,7 +205,7 @@ def get_dom_summary(page: Page, max_length: int = 8000) -> str:
 
                 // Табы
                 document.querySelectorAll('[role="tab"], [role="tablist"] > *').forEach(el => {
-                    if (!vis(el) || isAgentUI(el)) return;
+                    if (!vis(el) || isAgentUI(el) || isServiceElement(el)) return;
                     const o = desc(el);
                     o._type = 'tab';
                     o.selected = el.getAttribute('aria-selected') === 'true';
@@ -190,7 +214,7 @@ def get_dom_summary(page: Page, max_length: int = 8000) -> str:
 
                 // Модалки / диалоги
                 document.querySelectorAll('[role="dialog"], [role="alertdialog"], dialog, .modal, .popup, [class*="modal"], [class*="dialog"]').forEach(el => {
-                    if (!vis(el) || isAgentUI(el)) return;
+                    if (!vis(el) || isAgentUI(el) || isServiceElement(el)) return;
                     const o = desc(el);
                     o._type = 'modal';
                     o.open = true;
@@ -199,7 +223,7 @@ def get_dom_summary(page: Page, max_length: int = 8000) -> str:
 
                 // Меню
                 document.querySelectorAll('[role="menu"], [role="menuitem"], nav a, .nav-link, .menu-item').forEach(el => {
-                    if (!vis(el) || isAgentUI(el)) return;
+                    if (!vis(el) || isAgentUI(el) || isServiceElement(el)) return;
                     const o = desc(el);
                     o._type = 'menu';
                     result.push(o);
@@ -210,7 +234,7 @@ def get_dom_summary(page: Page, max_length: int = 8000) -> str:
                     if (!root) return;
                     try {
                         root.querySelectorAll('button, [role="button"], a[href], input:not([type="hidden"]), select, textarea').forEach(el => {
-                            if (!vis(el) || isAgentUI(el)) return;
+                            if (!vis(el) || isAgentUI(el) || isServiceElement(el)) return;
                             const o = desc(el);
                             o._type = o._type || 'shadow';
                             o._shadow = true;

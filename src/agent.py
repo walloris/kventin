@@ -197,11 +197,17 @@ class AgentMemory:
         self._pending_analysis: Optional[Dict[str, Any]] = None
         # Pipeline: очередь сценариев от GigaChat
         self._scenario_queue: List[Dict[str, Any]] = []
+        # Счётчик повторов подряд (для детекции зацикливания)
+        self._consecutive_repeats: int = 0
+        # Последние 5 действий (для детекции паттернов зацикливания)
+        self._recent_action_keys: List[str] = []
 
     def add_action(self, action: Dict[str, Any], result: str = ""):
         act = (action.get("action") or "").lower()
         sel = _norm_key(action.get("selector", ""))
         val = _norm_key(action.get("value", ""))
+        # Записать ключ для детекции паттернов
+        self.record_action_key(act, sel)
 
         self.iteration += 1
         entry = {
@@ -269,32 +275,63 @@ class AgentMemory:
     def get_history_text(self, last_n: int = 20) -> str:
         """Текст для GigaChat: что уже сделано. НЕ ПОВТОРЯТЬ эти действия."""
         lines = [
-            "——— УЖЕ СДЕЛАНО (НЕ ПОВТОРЯТЬ, выбирай другое действие!) ———",
+            "⚠️⚠️⚠️ КРИТИЧНО: УЖЕ СДЕЛАНО (НЕ ПОВТОРЯТЬ, выбирай ДРУГОЕ действие!) ⚠️⚠️⚠️",
+            "",
         ]
         if self.done_click:
-            items = sorted(self.done_click)[-25:]
-            lines.append(f"Кликнуто ({len(self.done_click)}): " + ", ".join(f'"{x[:40]}"' for x in items))
+            items = sorted(self.done_click)[-30:]
+            lines.append(f"❌ Кликнуто ({len(self.done_click)}): " + ", ".join(f'"{x[:40]}"' for x in items))
         if self.done_hover:
-            items = sorted(self.done_hover)[-15:]
-            lines.append(f"Наведено (hover) ({len(self.done_hover)}): " + ", ".join(f'"{x[:40]}"' for x in items))
+            items = sorted(self.done_hover)[-20:]
+            lines.append(f"❌ Наведено (hover) ({len(self.done_hover)}): " + ", ".join(f'"{x[:40]}"' for x in items))
         if self.done_type:
-            items = sorted(self.done_type)[-15:]
-            lines.append(f"Ввод в поля ({len(self.done_type)}): " + ", ".join(f'"{x[:40]}"' for x in items))
+            items = sorted(self.done_type)[-20:]
+            lines.append(f"❌ Ввод в поля ({len(self.done_type)}): " + ", ".join(f'"{x[:40]}"' for x in items))
         if self.done_close_modal:
-            lines.append(f"Закрыто модалок: {self.done_close_modal}")
+            lines.append(f"❌ Закрыто модалок: {self.done_close_modal}")
         if self.done_select_option:
-            items = list(self.done_select_option)[:15]
-            lines.append(f"Выбрано опций: " + ", ".join(str(x)[:50] for x in items))
+            items = list(self.done_select_option)[:20]
+            lines.append(f"❌ Выбрано опций: " + ", ".join(str(x)[:50] for x in items))
         if self.done_scroll_down or self.done_scroll_up:
-            lines.append(f"Прокручено: вниз {self.done_scroll_down}, вверх {self.done_scroll_up}")
+            lines.append(f"❌ Прокручено: вниз {self.done_scroll_down}, вверх {self.done_scroll_up}")
         if self.should_avoid_scroll():
-            lines.append("Внимание: недавно много прокруток — выбери клик/hover/type/close_modal, а не scroll.")
-        lines.append("——— Конец списка. Выбери действие, которого ещё НЕТ в списке выше. ———")
+            lines.append("⚠️ Внимание: недавно много прокруток — выбери клик/hover/type/close_modal, а не scroll.")
+        if self._consecutive_repeats >= 2:
+            lines.append(f"🚨 ЗАЦИКЛИВАНИЕ: {self._consecutive_repeats} повтора подряд! СРОЧНО выбери ДРУГОЕ действие, которого НЕТ выше!")
         lines.append("")
-        lines.append("Последние шаги:")
+        lines.append("✅ Выбери действие, которого ещё НЕТ в списке выше (❌).")
+        lines.append("")
+        lines.append("Последние выполненные шаги:")
         for a in self.actions[-last_n:]:
-            lines.append(f"  #{a['step']} {a['action']} -> {a['selector'][:45]} | {a['result'][:50]}")
+            act = a.get('action', '?')
+            sel = a.get('selector', '')[:45]
+            res = a.get('result', '')[:50]
+            lines.append(f"  #{a.get('step', '?')} {act} -> {sel} | {res}")
         return "\n".join(lines)
+    
+    def record_repeat(self):
+        """Записать повтор действия."""
+        self._consecutive_repeats += 1
+    
+    def reset_repeats(self):
+        """Сбросить счётчик повторов (успешное новое действие)."""
+        self._consecutive_repeats = 0
+    
+    def is_stuck(self) -> bool:
+        """Проверить, застрял ли агент (много повторов подряд)."""
+        return self._consecutive_repeats >= 3
+    
+    def record_action_key(self, action: str, selector: str):
+        """Записать ключ действия для детекции паттернов."""
+        key = f"{action}:{_norm_key(selector)}"
+        self._recent_action_keys.append(key)
+        if len(self._recent_action_keys) > 5:
+            self._recent_action_keys.pop(0)
+        # Детекция паттерна: последние 3 действия одинаковые
+        if len(self._recent_action_keys) >= 3:
+            last3 = self._recent_action_keys[-3:]
+            if len(set(last3)) == 1:
+                self._consecutive_repeats += 1
 
     def record_coverage_zone(self, zone: str):
         """Учесть, что эту зону страницы уже обходили (top/middle/bottom)."""
@@ -1141,8 +1178,8 @@ def run_agent(start_url: str = None):
                     _step_handle_defect(page, action, possible_bug, current_url, checklist_results, console_log, network_failures, memory)
                     continue
 
-                # Self-healing: серия неудач → мета-рефлексия
-                if memory.needs_self_healing():
+                # Self-healing: серия неудач ИЛИ зацикливание → мета-рефлексия
+                if memory.needs_self_healing() or memory.is_stuck():
                     _self_heal(page, memory, console_log, network_failures)
                     continue
 
@@ -1290,11 +1327,15 @@ def _step_get_action(page, step, memory, console_log, network_failures, checklis
     history_text = memory.get_history_text(last_n=history_n)
 
     if has_overlay:
+        stuck_warning = ""
+        if memory.is_stuck():
+            stuck_warning = "\n🚨 КРИТИЧНО: Агент зациклился! Выбери действие, которого НЕТ в списке выше.\n"
         question = f"""Вот скриншот. На странице есть АКТИВНЫЙ ОВЕРЛЕЙ (модалка/дропдаун/тултип/попап).
 {overlay_context}
 DOM: {dom_summary[:3000]}
-{history_text}
-Сейчас на экране оверлей! 1) Тестируй содержимое, 2) Если уже — закрой (close_modal), 3) Баг — check_defect.
+{history_text}{stuck_warning}
+Сейчас на экране оверлей! 1) Тестируй содержимое оверлея (если ещё не тестировал), 2) Если уже тестировал — закрой (close_modal), 3) Баг — check_defect.
+⚠️ НЕ ПОВТОРЯЙ действия из списка "УЖЕ СДЕЛАНО" выше.
 Выбери ОДНО действие."""
     else:
         plan_hint = ""
@@ -1307,12 +1348,19 @@ DOM: {dom_summary[:3000]}
         form_hint = ""
         if form_strategy != "happy":
             form_hint = f"\nСтратегия заполнения форм: {form_strategy} (негативные/граничные/security значения).\n"
+        # Предупреждение о зацикливании
+        stuck_warning = ""
+        if memory.is_stuck():
+            stuck_warning = "\n🚨🚨🚨 КРИТИЧНО: Агент зациклился! Выбери действие, которого ТОЧНО НЕТ в списке 'УЖЕ СДЕЛАНО' выше. 🚨🚨🚨\n"
+        
         question = f"""Вот скриншот и контекст страницы.
 DOM (кнопки, ссылки, формы): {dom_summary[:3000]}
 {history_text}
-{plan_hint}{form_hint}
-Выбери ОДНО действие. Укажи test_goal и expected_outcome. Не повторяй уже сделанное.
-Оцени верстку. Если реальный баг — action=check_defect."""
+{plan_hint}{form_hint}{stuck_warning}
+ВЫБЕРИ ОДНО ДЕЙСТВИЕ, которого НЕТ в списке "УЖЕ СДЕЛАНО" выше.
+⚠️ НЕ ПОВТОРЯЙ уже сделанные действия (они помечены ❌).
+✅ Выбери НОВЫЙ элемент для клика/ввода/hover.
+Укажи test_goal и expected_outcome. Оцени верстку. Если реальный баг — action=check_defect."""
 
     phase_instruction = memory.get_phase_instruction()
     update_demo_banner(page, step_text=f"#{step} Консультация с GigaChat…", progress_pct=60)
@@ -1335,9 +1383,27 @@ DOM (кнопки, ссылки, формы): {dom_summary[:3000]}
 
     # Проверить, есть ли действия из scenario chain в очереди
     if hasattr(memory, '_scenario_queue') and memory._scenario_queue:
-        action = memory._scenario_queue.pop(0)
-        print(f"[Agent] #{step} Scenario chain (из очереди): {action.get('action')} -> {action.get('selector', '')[:40]}")
-        return action, has_overlay, screenshot_b64
+        action = memory._scenario_queue[0]  # Не pop пока не проверим
+        act_check = (action.get("action") or "").lower()
+        sel_check = (action.get("selector") or "").strip()
+        # Если это повтор — очистить очередь и запросить новое действие
+        if act_check != "check_defect" and memory.is_already_done(act_check, sel_check, ""):
+            print(f"[Agent] #{step} ⚠️ Scenario chain содержит повтор: {act_check} -> {sel_check[:40]}. Очищаю очередь.")
+            memory._scenario_queue = []
+            # Продолжить к обычному запросу к GigaChat
+        else:
+            action = memory._scenario_queue.pop(0)
+            print(f"[Agent] #{step} Scenario chain (из очереди): {action.get('action')} -> {action.get('selector', '')[:40]}")
+            return action, has_overlay, screenshot_b64
+
+    # Если застряли — попробовать более агрессивную стратегию
+    if memory.is_stuck():
+        print(f"[Agent] #{step} 🚨 Зацикливание обнаружено, применяю анти-цикл стратегию...")
+        # Принудительно сменить фазу
+        memory.advance_tester_phase(force=True)
+        memory.reset_repeats()
+        # Попробовать прокрутку вверх для поиска новых элементов
+        return {"action": "scroll", "selector": "up", "reason": "Анти-цикл: прокрутка вверх"}, has_overlay, screenshot_b64
 
     raw_answer = consult_agent_with_screenshot(
         context_str, question, screenshot_b64=send_screenshot,
@@ -1356,6 +1422,21 @@ DOM (кнопки, ссылки, формы): {dom_summary[:3000]}
         action = {"action": "scroll", "selector": "down", "reason": "GigaChat не дал JSON"}
     # Валидация и нормализация
     action = validate_llm_action(action)
+    
+    # ПРЕДВАРИТЕЛЬНАЯ проверка повтора ПЕРЕД выполнением
+    act_precheck = (action.get("action") or "").lower()
+    sel_precheck = (action.get("selector") or "").strip()
+    val_precheck = (action.get("value") or "").strip()
+    if act_precheck != "check_defect" and memory.is_already_done(act_precheck, sel_precheck, val_precheck):
+        print(f"[Agent] #{step} ⚠️ GigaChat предложил повтор: {act_precheck} -> {sel_precheck[:40]}. Игнорирую и выбираю альтернативу.")
+        memory.record_repeat()
+        # Выбрать альтернативное действие
+        if has_overlay:
+            action = {"action": "close_modal", "selector": "", "reason": "GigaChat предложил повтор — закрываю оверлей"}
+        elif not memory.should_avoid_scroll():
+            action = {"action": "scroll", "selector": "down", "reason": "GigaChat предложил повтор — прокрутка"}
+        else:
+            action = {"action": "hover", "selector": "body", "reason": "GigaChat предложил повтор — hover для поиска"}
     # layout_issue → possible_bug
     if action.get("layout_issue") and not action.get("possible_bug"):
         action["possible_bug"] = action.get("layout_issue")
@@ -1364,17 +1445,29 @@ DOM (кнопки, ссылки, формы): {dom_summary[:3000]}
     sel = (action.get("selector") or "").strip()
     val = (action.get("value") or "").strip()
 
-    # Дедупликация действий
-    if act_type != "check_defect" and memory.is_already_done(act_type, sel, val):
-        print(f"[Agent] #{step} Повтор: {act_type} -> {sel[:40]}")
-        if has_overlay:
+    # Дедупликация действий: строгая проверка
+    is_repeat = act_type != "check_defect" and memory.is_already_done(act_type, sel, val)
+    if is_repeat:
+        memory.record_repeat()
+        print(f"[Agent] #{step} ⚠️ ПОВТОР: {act_type} -> {sel[:40]} (повторов подряд: {memory._consecutive_repeats})")
+        
+        # Если застряли (3+ повтора) — принудительная смена стратегии
+        if memory.is_stuck():
+            print(f"[Agent] #{step} 🚨 ЗАЦИКЛИВАНИЕ! Принудительная смена фазы и стратегии.")
+            memory.advance_tester_phase(force=True)
+            memory.reset_repeats()  # Сбросить после смены фазы
+            # Попробовать прокрутку вверх или переход на другую часть страницы
+            action = {"action": "scroll", "selector": "up", "reason": "Зацикливание — смена фазы, прокрутка вверх"}
+        elif has_overlay:
             action = {"action": "close_modal", "selector": "", "reason": "Повтор — закрываю оверлей"}
         elif not memory.should_avoid_scroll():
-            action = {"action": "scroll", "selector": "down", "reason": "Повтор — прокрутка"}
+            action = {"action": "scroll", "selector": "down", "reason": "Повтор — прокрутка вниз"}
         else:
-            # Попытка перейти в следующую фазу при зацикливании
-            memory.advance_tester_phase(force=True)
-            action = {"action": "scroll", "selector": "up", "reason": "Повтор — смена фазы, прокрутка вверх"}
+            # Много прокруток уже было — попробовать hover на новый элемент
+            action = {"action": "hover", "selector": "body", "reason": "Повтор — hover для поиска новых элементов"}
+    else:
+        # Успешное новое действие — сбросить счётчик повторов
+        memory.reset_repeats()
 
     # Логирование
     test_goal = action.get("test_goal", "")
@@ -1909,29 +2002,55 @@ def _run_iframe_check(page: Page, memory: AgentMemory, current_url: str, console
 
 def _self_heal(page: Page, memory: AgentMemory, console_log, network_failures):
     """
-    Self-healing: после серии неудач — мета-рефлексия.
+    Self-healing: после серии неудач ИЛИ зацикливания — мета-рефлексия.
     Спрашиваем GigaChat «что пошло не так и что делать?».
     """
-    print(f"[Agent] Self-healing: {memory.consecutive_failures} неудач подряд")
+    is_stuck = memory.is_stuck()
+    reason = f"{memory._consecutive_repeats} повторов подряд" if is_stuck else f"{memory.consecutive_failures} неудач подряд"
+    print(f"[Agent] 🚨 Self-healing: {reason}")
+    
     screenshot_b64 = take_screenshot_b64(page)
     recent_actions = "\n".join(
         f"  #{a['step']} {a['action']} -> {a['selector'][:40]} => {a['result'][:40]}"
-        for a in memory.actions[-6:]
+        for a in memory.actions[-8:]
     )
+    done_list = memory.get_history_text(last_n=10)
+    
+    prompt = f"""Агент {'зациклился (повторяет одни и те же действия)' if is_stuck else 'не может выполнить действия (ошибки)'}.
+Последние действия:\n{recent_actions}\n\n{done_list}\n
+Что идёт не так? Предложи ОДНО действие, которого НЕТ в списке "УЖЕ СДЕЛАНО" выше.
+Действие должно быть НОВЫМ (не повторять уже сделанное). JSON с action/selector/value/reason."""
+    
     answer = consult_agent_with_screenshot(
-        f"Последние действия (все неудачные):\n{recent_actions}\n\nЧто идёт не так? Какую стратегию выбрать?",
-        "Агент зациклился: несколько действий подряд не удались. Предложи одно действие, которое точно сработает (прокрутка, клик по видимому элементу, Escape). JSON.",
+        prompt,
+        "Предложи одно действие, которое точно сработает и НЕ будет повторением. JSON.",
         screenshot_b64=screenshot_b64,
     )
+    
+    # Сбросить счётчики
     memory.consecutive_failures = 0
+    memory.reset_repeats()
+    
     if answer:
         action = parse_llm_action(answer)
         if action:
             action = validate_llm_action(action)
+            # Проверить, что это не повтор
+            act = (action.get("action") or "").lower()
+            sel = (action.get("selector") or "").strip()
+            if act != "check_defect" and memory.is_already_done(act, sel, ""):
+                print(f"[Agent] Self-heal предложил повтор: {act} -> {sel[:40]}. Игнорирую.")
+                # Принудительно прокрутка
+                action = {"action": "scroll", "selector": "up", "reason": "Self-heal: прокрутка для поиска новых элементов"}
             execute_action(page, action, memory)
             memory.add_action(action, result="self_heal")
+    
     # Принудительная смена фазы
     memory.advance_tester_phase(force=True)
+    # Очистить scenario queue при зацикливании
+    if is_stuck and hasattr(memory, '_scenario_queue'):
+        memory._scenario_queue = []
+        print("[Agent] Очищена очередь scenario chain из-за зацикливания")
 
 
 def _request_scenario_chain(page: Page, memory: AgentMemory, context_str: str, screenshot_b64: Optional[str]) -> List[Dict]:
