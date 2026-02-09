@@ -718,10 +718,10 @@ def _find_element(page: Page, selector: str):
         except Exception:
             continue
 
-    # --- 3) Playwright getBy* методы (ССЫЛКИ ИСКЛЮЧЕНЫ) ---
+    # --- 3) Playwright getBy* методы ---
     getby_strategies = [
         ("getByRole:button", lambda: page.get_by_role("button", name=safe_text, exact=False).first),
-        # getByRole:link исключён — может перезагрузить страницу
+        ("getByRole:link", lambda: page.get_by_role("link", name=safe_text, exact=False).first),
         ("getByRole:tab", lambda: page.get_by_role("tab", name=safe_text, exact=False).first),
         ("getByRole:menuitem", lambda: page.get_by_role("menuitem", name=safe_text, exact=False).first),
         ("getByLabel", lambda: page.get_by_label(safe_text, exact=False).first),
@@ -736,11 +736,11 @@ def _find_element(page: Page, selector: str):
         except Exception:
             continue
 
-    # --- 4) Текстовый has-text fallback (ССЫЛКИ ИСКЛЮЧЕНЫ) ---
+    # --- 4) Текстовый has-text fallback ---
     text_strategies = [
         f'button:has-text("{safe_text}")',
+        f'a:has-text("{safe_text}")',
         f'[role="button"]:has-text("{safe_text}")',
-        # Ссылки исключены — могут перезагрузить страницу
     ]
     for css in text_strategies:
         try:
@@ -759,14 +759,30 @@ def _do_click(page: Page, selector: str, reason: str = "") -> str:
     loc = _find_element(page, selector)
     if loc:
         try:
-            # ПРОВЕРКА: не кликаем по ссылкам (могут перезагрузить страницу)
+            # ПРОВЕРКА: кликаем только по внутренним ссылкам
             try:
                 tag = loc.evaluate("el => el.tagName.toLowerCase()")
                 if tag == "a":
                     href = loc.evaluate("el => el.getAttribute('href') || ''")
                     if href and not href.startswith("javascript:") and href != "#":
-                        print(f"[Agent] ⚠️ Пропускаю ссылку (может перезагрузить страницу): {selector[:50]}")
-                        return f"skipped_link: {selector[:50]}"
+                        # Проверяем что это внутренняя ссылка (на том же домене)
+                        is_internal = False
+                        try:
+                            current_url = page.url
+                            if href.startswith("/") or href.startswith("./") or href.startswith("../") or not href.startswith("http"):
+                                is_internal = True  # Относительный путь — всегда внутренний
+                            elif href.startswith("http"):
+                                # Абсолютный URL — проверяем домен
+                                from urllib.parse import urlparse
+                                current_domain = urlparse(current_url).netloc
+                                href_domain = urlparse(href).netloc
+                                is_internal = (href_domain == current_domain or href_domain == "")
+                        except Exception:
+                            is_internal = True  # При ошибке разрешаем клик
+                        
+                        if not is_internal:
+                            print(f"[Agent] ⚠️ Пропускаю внешнюю ссылку: {selector[:50]}")
+                            return f"skipped_external_link: {selector[:50]}"
             except Exception:
                 pass
             
@@ -1492,9 +1508,20 @@ def run_agent(start_url: str = None):
 
                 current_url = page.url
 
-                # НАВИГАЦИЯ ОТКЛЮЧЕНА — агент остаётся на одной странице
-                # Новые вкладки — игнорируем
-                # Возврат на start_url — отключен
+                # НАВИГАЦИЯ ВКЛЮЧЕНА — агент активно переходит по страницам приложения
+                # Новые вкладки — обрабатываем
+                _handle_new_tabs(new_tabs_queue, page, start_url, step, console_log, network_failures, memory)
+                
+                # Если ушли на другой домен — возвращаемся на start_url
+                if not _same_page(start_url, page.url):
+                    print(f"[Agent] #{step} Навигация на {page.url[:60]}. Возврат на {start_url[:60]}")
+                    try:
+                        page.goto(start_url, wait_until="domcontentloaded", timeout=20000)
+                        smart_wait_after_goto(page, timeout=5000)
+                        _inject_all(page)
+                    except Exception as e:
+                        LOG.warning("Ошибка возврата: %s", e)
+                    continue
 
                 # Фоновый анализ предыдущего шага (не блокируем)
                 try:
@@ -1851,8 +1878,24 @@ def _get_fast_action(page: Page, memory: AgentMemory, has_overlay: bool = False)
                 const text = (el.placeholder || el.name || el.getAttribute('aria-label') || '').trim().slice(0, 50);
                 result.push({ref: 'ref:' + ref, type: 'input', text, priority: 2});
             });
-            // ССЫЛКИ ИСКЛЮЧЕНЫ — могут перезагрузить страницу
-            // Не добавляем ссылки в список действий
+            // Ссылки (приоритет 3) — только внутренние (на том же домене)
+            document.querySelectorAll('a[href]:not([disabled])').forEach(el => {
+                if (!vis(el) || isAgent(el)) return;
+                let ref = el.getAttribute('data-agent-ref');
+                if (!ref) return;
+                const text = (el.textContent || el.getAttribute('aria-label') || '').trim().slice(0, 50);
+                const href = (el.getAttribute('href') || '');
+                if (href.startsWith('javascript:') || href === '#') return;
+                // Проверяем что это внутренняя ссылка (относительный путь или тот же домен)
+                if (href.startsWith('http')) {
+                    try {
+                        const url = new URL(href, window.location.href);
+                        const currentDomain = window.location.hostname;
+                        if (url.hostname !== currentDomain && url.hostname !== '') return; // Внешняя ссылка — пропускаем
+                    } catch(e) { return; }
+                }
+                result.push({ref: 'ref:' + ref, type: 'link', text, priority: 3});
+            });
             // Select (приоритет 2)
             document.querySelectorAll('select:not([disabled])').forEach(el => {
                 if (!vis(el) || isAgent(el)) return;
@@ -1876,8 +1919,7 @@ def _get_fast_action(page: Page, memory: AgentMemory, has_overlay: bool = False)
         for elem in elements:
             ref = elem.get("ref", "")
             etype = elem.get("type", "")
-            # Ссылки исключены из действий — могут перезагрузить страницу
-            act = "click" if etype in ("click", "tab") else ("type" if etype == "input" else "select_option")
+            act = "click" if etype in ("click", "link", "tab") else ("type" if etype == "input" else "select_option")
             key = f"{act}:{ref}"
             if not memory.is_element_tested(current_url, key):
                 text = elem.get("text", "?")[:30]
