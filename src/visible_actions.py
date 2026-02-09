@@ -112,7 +112,7 @@ SHADOW_HOST_SCRIPT = """
     // --- LLM Overlay (левый нижний угол, над баннером) ---
     const overlay = document.createElement('div');
     overlay.style.cssText = `
-        position: fixed; bottom: 50px; left: 12px; width: 300px; max-height: 200px;
+        position: fixed; bottom: 200px; left: 12px; width: 300px; max-height: 250px;
         z-index: 2147483646; font-family: system-ui, -apple-system, sans-serif; font-size: 11px;
         background: linear-gradient(160deg, #12141a 0%, #1c1f28 40%, #252a33 100%);
         color: #e6e8eb; border: 1px solid #3d434d; border-radius: 10px;
@@ -135,7 +135,7 @@ SHADOW_HOST_SCRIPT = """
     status.textContent = 'Ожидание...';
     const body = document.createElement('div');
     body.style.cssText = `
-        padding: 10px; overflow-y: auto; flex: 1; min-height: 60px; max-height: 140px;
+        padding: 10px; overflow-y: auto; flex: 1; min-height: 80px; max-height: 190px;
         line-height: 1.4; font-size: 10px;
     `;
     const prompt = document.createElement('div');
