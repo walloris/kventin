@@ -38,6 +38,7 @@ from config import (
     SESSION_REPORT_EVERY_N,
     CRITICAL_FLOW_STEPS,
     MAX_STEPS,
+    DEMO_MODE,
     SCROLL_PIXELS,
     MAX_ACTIONS_IN_MEMORY,
     MAX_SCROLLS_IN_ROW,
@@ -1148,9 +1149,14 @@ def _inject_all(page: Page):
 
 
 def _same_page(start_url: str, current_url: str) -> bool:
-    def norm(u):
-        return (u or "").split("#")[0].rstrip("/").lower()
-    return norm(current_url) == norm(start_url)
+    """Сравнить только домен/протокол, чтобы не блокировать навигацию внутри сайта."""
+    try:
+        from urllib.parse import urlparse
+        s = urlparse(start_url or "")
+        c = urlparse(current_url or "")
+        return (s.scheme, s.netloc) == (c.scheme, c.netloc)
+    except Exception:
+        return True
 
 
 # --- Обработка новых вкладок ---
@@ -1397,6 +1403,7 @@ def run_agent(start_url: str = None):
         _gigachat_future: Optional[Future] = None
         _gigachat_action: Optional[Dict[str, Any]] = None
         _gigachat_meta: Dict[str, Any] = {}  # has_overlay, screenshot_b64
+        demo_deadline = time.time() + int(os.getenv("DEMO_DURATION_SEC", "20")) if DEMO_MODE else None
 
         def _start_gigachat_async(page_, step_, memory_, console_log_, network_failures_, checklist_results_, context_):
             """Запустить GigaChat в фоновом потоке. Возвращает Future."""
@@ -1502,6 +1509,10 @@ def run_agent(start_url: str = None):
                 step = memory.iteration
                 memory.defects_on_current_step = 0
 
+                if DEMO_MODE and demo_deadline and time.time() > demo_deadline:
+                    print("[Agent] Demo: 20 секунд закончились. Завершаю.")
+                    break
+
                 if MAX_STEPS > 0 and step > MAX_STEPS:
                     print(f"[Agent] Лимит {MAX_STEPS} шагов. Завершаю.")
                     break
@@ -1524,10 +1535,11 @@ def run_agent(start_url: str = None):
                     continue
 
                 # Фоновый анализ предыдущего шага (не блокируем)
-                try:
-                    _flush_pending_analysis(page, memory, console_log, network_failures)
-                except Exception:
-                    pass
+                if not DEMO_MODE:
+                    try:
+                        _flush_pending_analysis(page, memory, console_log, network_failures)
+                    except Exception:
+                        pass
 
                 # Лимит логов
                 if len(console_log) > CONSOLE_LOG_LIMIT:
@@ -1556,8 +1568,8 @@ def run_agent(start_url: str = None):
                     LOG.debug("detect_active_overlays: страница закрыта: %s", e)
                     break
 
-                # Проверяем: GigaChat уже ответил?
-                gc_action = _poll_gigachat()
+                # Проверяем: GigaChat уже ответил? (в DEMO_MODE — отключён)
+                gc_action = None if DEMO_MODE else _poll_gigachat()
 
                 if gc_action is not None:
                     action = gc_action
@@ -1567,12 +1579,12 @@ def run_agent(start_url: str = None):
                     source = "GigaChat"
                 else:
                     # GigaChat ещё думает → быстрое локальное действие
-                    action = _get_fast_action(page, memory, has_overlay)
+                    action = _get_fast_action(page, memory, has_overlay, demo_mode=DEMO_MODE)
                     screenshot_b64 = None
                     source = "Fast"
 
                 # Запустить GigaChat для СЛЕДУЮЩЕГО шага (параллельно с выполнением текущего)
-                if _gigachat_future is None and not page.is_closed():
+                if not DEMO_MODE and _gigachat_future is None and not page.is_closed():
                     try:
                         _start_gigachat_async(page, step, memory, console_log, network_failures, checklist_results, context)
                     except Exception:
@@ -1632,8 +1644,8 @@ def run_agent(start_url: str = None):
                     report = memory.get_session_report_text()
                     print(report)
 
-                # Минимальная пауза (только для видимости анимации) - уменьшено для активности
-                time.sleep(0.3)
+                # Минимальная пауза (только для видимости анимации)
+                time.sleep(0.2 if DEMO_MODE else 0.3)
 
         except KeyboardInterrupt:
             print("\n[Agent] Остановлен по Ctrl+C.")
@@ -1830,7 +1842,12 @@ def _step_checklist(page, step, console_log, network_failures, memory):
     return checklist_results
 
 
-def _get_fast_action(page: Page, memory: AgentMemory, has_overlay: bool = False) -> Dict[str, Any]:
+def _get_fast_action(
+    page: Page,
+    memory: AgentMemory,
+    has_overlay: bool = False,
+    demo_mode: bool = False,
+) -> Dict[str, Any]:
     """
     Мгновенный выбор действия БЕЗ LLM — по ref-id из DOM.
     Агент ВСЕГДА получает что-то для выполнения (< 50 мс).
@@ -1915,6 +1932,45 @@ def _get_fast_action(page: Page, memory: AgentMemory, has_overlay: bool = False)
             return result;
         }""") or []
 
+        # DEMO MODE: циклично обходим элементы, чтобы движение было постоянным
+        if demo_mode and elements:
+            step = getattr(memory, "iteration", 0)
+            # Каждые 4 шага — стараемся выбрать ссылку для перехода
+            if step % 4 == 0:
+                for elem in elements:
+                    if elem.get("type") == "link":
+                        elements = [elem] + elements
+                        break
+            idx = getattr(memory, "_demo_index", 0) % len(elements)
+            memory._demo_index = idx + 1
+            elem = elements[idx]
+            ref = elem.get("ref", "")
+            etype = elem.get("type", "")
+            text = elem.get("text", "?")[:30]
+            if etype == "input":
+                from src.form_strategies import detect_field_type, get_test_value
+                ftype = detect_field_type(placeholder=text, name=text)
+                val = get_test_value(ftype, "happy")
+                return {
+                    "action": "type", "selector": ref, "value": val,
+                    "reason": f"Ввод в '{text}'",
+                    "test_goal": f"Заполнить поле {text}",
+                    "expected_outcome": "Поле принимает значение",
+                }
+            if etype == "select":
+                return {
+                    "action": "select_option", "selector": ref, "value": text.split(",")[0] if text else "",
+                    "reason": "Выбор опции",
+                    "test_goal": "Выбрать опцию в дропдауне",
+                    "expected_outcome": "Опция выбирается",
+                }
+            return {
+                "action": "click", "selector": ref,
+                "reason": f"Клик: {text}",
+                "test_goal": f"Проверить '{text}'",
+                "expected_outcome": "Элемент реагирует",
+            }
+
         # Фильтруем: убираем уже протестированные элементы
         for elem in elements:
             ref = elem.get("ref", "")
@@ -1936,8 +1992,8 @@ def _get_fast_action(page: Page, memory: AgentMemory, has_overlay: bool = False)
                 elif etype == "select":
                     return {
                         "action": "select_option", "selector": ref, "value": text.split(",")[0] if text else "",
-                        "reason": f"Выбор опции",
-                        "test_goal": f"Выбрать опцию в дропдауне",
+                        "reason": "Выбор опции",
+                        "test_goal": "Выбрать опцию в дропдауне",
                         "expected_outcome": "Опция выбирается",
                     }
                 else:
@@ -2129,7 +2185,7 @@ def _step_get_action(page, step, memory, console_log, network_failures, checklis
     action = parse_llm_action(raw_answer)
     if not action:
         print(f"[Agent] #{step} Не удалось распарсить JSON: {raw_answer[:120]}")
-        action = _get_fast_action(page, memory, has_overlay)
+        action = _get_fast_action(page, memory, has_overlay, demo_mode=DEMO_MODE)
     # Валидация и нормализация
     action = validate_llm_action(action)
     
@@ -2244,8 +2300,8 @@ def _step_execute(page, action, step, memory, context):
         except Exception:
             pass
 
-    # Минимальная пауза: только чтобы DOM обновился - уменьшено для активности
-    time.sleep(0.3)
+    # Минимальная пауза: только чтобы DOM обновился
+    time.sleep(0.2 if DEMO_MODE else 0.3)
     # Быстрый wait (не 3 секунды!)
     try:
         page.wait_for_load_state("domcontentloaded", timeout=2000)
