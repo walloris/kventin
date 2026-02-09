@@ -191,14 +191,21 @@ def detect_table_structure(page: Page) -> List[Dict[str, Any]]:
 def detect_form_fields(page: Page) -> List[Dict[str, Any]]:
     """
     Обнаружить все поля формы на странице для умного заполнения.
-    Возвращает список полей с их типами и селекторами.
+    Возвращает список полей с ref-id (data-agent-ref) для мгновенного поиска.
     """
     try:
         fields = page.evaluate("""() => {
             const result = [];
-            const forms = document.querySelectorAll('form');
-            const standaloneInputs = document.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([type="button"]), textarea, select');
-            
+            const seen = new WeakSet();
+            if (!window.__agentRefs) window.__agentRefs = {};
+            // Находим текущий максимальный ref
+            let maxRef = 0;
+            for (const k of Object.keys(window.__agentRefs)) {
+                const n = parseInt(k, 10);
+                if (n > maxRef) maxRef = n;
+            }
+            let refCounter = maxRef + 1;
+
             const vis = (el) => {
                 if (!el) return false;
                 const r = el.getBoundingClientRect();
@@ -206,59 +213,45 @@ def detect_form_fields(page: Page) -> List[Dict[str, Any]]:
                 const s = getComputedStyle(el);
                 return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
             };
-            
-            // Обрабатываем формы
-            forms.forEach(form => {
+
+            const processInput = (inp) => {
+                if (!inp || !vis(inp) || inp.disabled || seen.has(inp)) return;
+                seen.add(inp);
+                // Если у элемента уже есть ref — используем его
+                let ref = inp.getAttribute('data-agent-ref');
+                if (!ref) {
+                    ref = String(refCounter++);
+                    inp.setAttribute('data-agent-ref', ref);
+                    window.__agentRefs[parseInt(ref)] = inp;
+                }
+                const field = {
+                    type: inp.type || inp.tagName.toLowerCase(),
+                    name: inp.name || '',
+                    id: inp.id || '',
+                    placeholder: inp.placeholder || '',
+                    ariaLabel: inp.getAttribute('aria-label') || '',
+                    required: inp.required || inp.hasAttribute('required'),
+                    selector: 'ref:' + ref,
+                    ref: parseInt(ref),
+                };
+                if (inp.tagName === 'SELECT') {
+                    field.type = 'select';
+                    field.options = Array.from(inp.options).slice(0, 10).map(opt => opt.text.trim());
+                }
+                result.push(field);
+            };
+
+            // Поля внутри форм
+            document.querySelectorAll('form').forEach(form => {
                 if (!vis(form)) return;
-                const inputs = form.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([type="button"]), textarea, select');
-                inputs.forEach(inp => {
-                    if (!vis(inp) || inp.disabled) return;
-                    const field = {
-                        type: inp.type || inp.tagName.toLowerCase(),
-                        name: inp.name || '',
-                        id: inp.id || '',
-                        placeholder: inp.placeholder || '',
-                        ariaLabel: inp.getAttribute('aria-label') || '',
-                        required: inp.required || inp.hasAttribute('required'),
-                        selector: inp.id ? '#' + inp.id : (inp.name ? `[name="${inp.name}"]` : ''),
-                    };
-                    if (inp.tagName === 'SELECT') {
-                        field.options = Array.from(inp.options).slice(0, 10).map(opt => opt.text.trim());
-                    }
-                    result.push(field);
-                });
+                form.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([type="button"]), textarea, select').forEach(processInput);
             });
-            
-            // Обрабатываем standalone поля (не в форме)
-            standaloneInputs.forEach(inp => {
-                if (!vis(inp) || inp.disabled) return;
-                // Проверяем, не в форме ли уже
-                let inForm = false;
-                let parent = inp.parentElement;
-                for (let i = 0; i < 5 && parent; i++) {
-                    if (parent.tagName === 'FORM') {
-                        inForm = true;
-                        break;
-                    }
-                    parent = parent.parentElement;
-                }
-                if (!inForm) {
-                    const field = {
-                        type: inp.type || inp.tagName.toLowerCase(),
-                        name: inp.name || '',
-                        id: inp.id || '',
-                        placeholder: inp.placeholder || '',
-                        ariaLabel: inp.getAttribute('aria-label') || '',
-                        required: inp.required || inp.hasAttribute('required'),
-                        selector: inp.id ? '#' + inp.id : (inp.name ? `[name="${inp.name}"]` : ''),
-                    };
-                    if (inp.tagName === 'SELECT') {
-                        field.options = Array.from(inp.options).slice(0, 10).map(opt => opt.text.trim());
-                    }
-                    result.push(field);
-                }
+            // Standalone поля (не в форме)
+            document.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([type="button"]), textarea, select').forEach(inp => {
+                if (seen.has(inp)) return;
+                processInput(inp);
             });
-            
+
             return result;
         }""")
         return fields or []
@@ -283,15 +276,24 @@ def get_iframes_info(page: Page) -> List[Dict[str, Any]]:
 
 def get_dom_summary(page: Page, max_length: int = 8000) -> str:
     """
-    Получить подробное описание DOM: кнопки, ссылки, формы, инпуты, дропдауны,
-    чекбоксы, табы, модалки, меню — всё интерактивное.
+    Получить описание DOM с уникальными ref-id для каждого элемента.
+    Каждому интерактивному элементу присваивается data-agent-ref="N",
+    и ссылка на DOM-ноду сохраняется в window.__agentRefs[N].
+    GigaChat возвращает ref:N как selector → _find_element находит элемент мгновенно.
     """
     try:
         summary = page.evaluate("""
             () => {
+                // Сбрасываем предыдущие ref-ы
+                if (window.__agentRefs) {
+                    document.querySelectorAll('[data-agent-ref]').forEach(el => el.removeAttribute('data-agent-ref'));
+                }
+                window.__agentRefs = {};
+                let refCounter = 1;
+
                 const result = [];
-                // UI агента живёт в closed Shadow DOM — невидим для querySelectorAll.
-                // Фильтр нужен только для временных элементов (label, ripple) с data-agent-host.
+
+                // --- Фильтры ---
                 const isAgentUI = (el) => {
                     if (!el) return true;
                     let cur = el;
@@ -301,27 +303,16 @@ def get_dom_summary(page: Page, max_length: int = 8000) -> str:
                     }
                     return false;
                 };
-                // Фильтр служебных элементов: чаты, виджеты, баннеры поддержки
+                const servicePatterns = ['chat','чат','support','поддержк','help','консультант','jivo','intercom','crisp','drift','tawk','livechat','live-chat','widget-chat','chat-widget','feedback','обратн','звонок','callback','kventin','agent-llm','agent-banner','диалог с llm','ai-тестировщик','gigachat','cookie','consent'];
                 const isServiceElement = (el) => {
                     if (!el) return true;
-                    const text = (el.textContent || el.getAttribute('aria-label') || el.getAttribute('title') || '').toLowerCase();
-                    const id = (el.id || '').toLowerCase();
-                    const cls = (el.className || '').toLowerCase();
-                    const patterns = ['chat', 'чат', 'support', 'поддержк', 'help', 'консультант', 'jivo', 'intercom', 'crisp', 'drift', 'tawk', 'livechat', 'live-chat', 'widget-chat', 'chat-widget', 'feedback', 'обратн', 'звонок', 'callback', 'kventin', 'agent-llm', 'agent-banner', 'диалог с llm', 'ai-тестировщик', 'gigachat', 'cookie', 'consent', 'banner', 'popup', 'overlay-widget'];
-                    const combined = text + ' ' + id + ' ' + cls;
-                    for (const p of patterns) {
-                        if (combined.includes(p)) return true;
-                    }
-                    // Проверка родительских элементов
-                    let cur = el.parentElement;
-                    let depth = 0;
-                    while (cur && cur !== document.body && depth < 3) {
-                        const parentText = (cur.className || cur.id || '').toLowerCase();
-                        for (const p of patterns) {
-                            if (parentText.includes(p)) return true;
-                        }
-                        cur = cur.parentElement;
-                        depth++;
+                    const combined = ((el.textContent||'')+(el.id||'')+(el.className||'')).toLowerCase();
+                    for (const p of servicePatterns) { if (combined.includes(p)) return true; }
+                    let cur = el.parentElement, d = 0;
+                    while (cur && cur !== document.body && d < 3) {
+                        const pt = ((cur.className||'')+(cur.id||'')).toLowerCase();
+                        for (const p of servicePatterns) { if (pt.includes(p)) return true; }
+                        cur = cur.parentElement; d++;
                     }
                     return false;
                 };
@@ -332,167 +323,66 @@ def get_dom_summary(page: Page, max_length: int = 8000) -> str:
                     const s = getComputedStyle(el);
                     return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
                 };
-                // Определение приоритета элемента (для умного выбора)
-                const getPriority = (el, type) => {
-                    let priority = 5; // по умолчанию средний приоритет
-                    const text = (el.textContent || el.value || el.getAttribute('aria-label') || '').toLowerCase();
-                    const cls = (el.className || '').toLowerCase();
-                    const id = (el.id || '').toLowerCase();
-                    const combined = text + ' ' + cls + ' ' + id;
-                    
-                    // CTA кнопки (высший приоритет)
-                    const ctaPatterns = ['купить', 'заказать', 'оформить', 'начать', 'попробовать', 'скачать', 'регистрация', 'войти', 'login', 'sign up', 'buy', 'order', 'start', 'try', 'download', 'register', 'cta', 'primary', 'btn-primary', 'button-primary'];
-                    for (const p of ctaPatterns) {
-                        if (combined.includes(p)) {
-                            priority = 1;
-                            break;
-                        }
-                    }
-                    
-                    // Формы (высокий приоритет) - используем Math.min чтобы не перезаписать CTA приоритет
-                    if (type === 'input' || type === 'form') {
-                        priority = Math.min(priority, 2);
-                    }
-                    
-                    // Навигация (средний-высокий)
-                    if (type === 'link' && (cls.includes('nav') || cls.includes('menu') || id.includes('nav'))) {
-                        priority = 3;
-                    }
-                    
-                    // Важные действия
-                    const importantPatterns = ['сохранить', 'отправить', 'подтвердить', 'save', 'submit', 'confirm', 'apply', 'применить'];
-                    for (const p of importantPatterns) {
-                        if (combined.includes(p)) {
-                            priority = Math.min(priority, 2);
-                        }
-                    }
-                    
-                    // Отмена/закрытие (низкий приоритет)
-                    const cancelPatterns = ['отмена', 'отменить', 'закрыть', 'cancel', 'close', 'отказ'];
-                    for (const p of cancelPatterns) {
-                        if (combined.includes(p)) {
-                            priority = 6;
-                        }
-                    }
-                    
-                    return priority;
+
+                // --- Назначить ref элементу ---
+                const assignRef = (el) => {
+                    const ref = refCounter++;
+                    el.setAttribute('data-agent-ref', String(ref));
+                    window.__agentRefs[ref] = el;
+                    return ref;
                 };
-                
+
+                // --- Описание элемента (компактное, с ref) ---
                 const desc = (el, type) => {
-                    const o = {};
-                    o.tag = el.tagName.toLowerCase();
-                    if (el.id) o.id = el.id;
-                    const cls = typeof el.className === 'string' ? el.className.trim() : '';
-                    if (cls) o.class = cls.slice(0, 80);
-                    const text = (el.textContent || el.value || el.placeholder || '').trim().replace(/\\s+/g, ' ');
-                    if (text) o.text = text.slice(0, 80);
-                    if (el.getAttribute('aria-label')) o.ariaLabel = el.getAttribute('aria-label').slice(0, 60);
-                    if (el.getAttribute('title')) o.title = el.getAttribute('title').slice(0, 60);
-                    if (el.getAttribute('role')) o.role = el.getAttribute('role');
-                    if (el.disabled) o.disabled = true;
-                    o._priority = getPriority(el, type);
-                    return o;
+                    const ref = assignRef(el);
+                    const tag = el.tagName.toLowerCase();
+                    const text = (el.textContent || el.value || el.placeholder || '').trim().replace(/\\s+/g, ' ').slice(0, 60);
+                    const parts = [`[${ref}]`, type || tag];
+                    if (text) parts.push(`"${text}"`);
+                    if (el.id) parts.push(`id=${el.id}`);
+                    if (el.getAttribute('aria-label')) parts.push(`aria="${el.getAttribute('aria-label').slice(0,40)}"`);
+                    if (el.name) parts.push(`name=${el.name}`);
+                    if (el.placeholder) parts.push(`ph="${el.placeholder.slice(0,30)}"`);
+                    if (el.disabled) parts.push('DISABLED');
+                    if (el.getAttribute('href')) parts.push(`href=${el.getAttribute('href').slice(0,60)}`);
+                    if (tag === 'select') {
+                        const opts = Array.from(el.options).slice(0,5).map(o => o.text.trim().slice(0,20));
+                        if (opts.length) parts.push(`opts=[${opts.join(',')}]`);
+                    }
+                    if (el.type === 'checkbox' || el.type === 'radio') parts.push(el.checked ? 'CHECKED' : 'unchecked');
+                    if (el.getAttribute('role')) parts.push(`role=${el.getAttribute('role')}`);
+                    return parts.join(' ');
                 };
 
-                // Кнопки (с приоритетом)
-                document.querySelectorAll('button, [role="button"], input[type="submit"], input[type="button"]').forEach(el => {
-                    if (!vis(el) || isAgentUI(el) || isServiceElement(el)) return;
-                    const o = desc(el, 'button');
-                    o._type = 'button';
-                    if (el.type) o.type = el.type;
-                    result.push(o);
-                });
+                // --- Сбор элементов ---
+                const seen = new WeakSet();
+                const collect = (el, type) => {
+                    if (!el || seen.has(el) || !vis(el) || isAgentUI(el) || isServiceElement(el)) return;
+                    seen.add(el);
+                    result.push(desc(el, type));
+                };
 
-                // Ссылки (с приоритетом)
+                // Кнопки
+                document.querySelectorAll('button, [role="button"], input[type="submit"], input[type="button"]').forEach(el => collect(el, 'button'));
+                // Ссылки
                 document.querySelectorAll('a[href]').forEach(el => {
-                    if (!vis(el) || isAgentUI(el) || isServiceElement(el)) return;
-                    const href = el.getAttribute('href') || '';
-                    if (href.startsWith('javascript:')) return;
-                    const o = desc(el, 'link');
-                    o._type = 'link';
-                    o.href = href.slice(0, 120);
-                    result.push(o);
+                    if ((el.getAttribute('href')||'').startsWith('javascript:')) return;
+                    collect(el, 'link');
                 });
-
-                // Формы и инпуты (с приоритетом)
-                document.querySelectorAll('input, textarea, select').forEach(el => {
-                    if (!vis(el) || isAgentUI(el) || isServiceElement(el)) return;
-                    const o = desc(el, 'input');
-                    o._type = 'input';
-                    o.inputType = el.type || 'text';
-                    if (el.name) o.name = el.name;
-                    if (el.placeholder) o.placeholder = el.placeholder.slice(0, 50);
-                    if (el.tagName === 'SELECT') {
-                        o._type = 'dropdown';
-                        const opts = Array.from(el.options).map(op => op.text.trim().slice(0, 30)).slice(0, 5);
-                        if (opts.length) o.options = opts;
-                    }
-                    if (el.type === 'checkbox' || el.type === 'radio') {
-                        o.checked = el.checked;
-                    }
-                    result.push(o);
+                // Инпуты
+                document.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([type="button"]), textarea, select').forEach(el => {
+                    const tag = el.tagName.toLowerCase();
+                    const type = tag === 'select' ? 'select' : (el.type === 'checkbox' ? 'checkbox' : (el.type === 'radio' ? 'radio' : 'input'));
+                    collect(el, type);
                 });
-
                 // Табы
-                document.querySelectorAll('[role="tab"], [role="tablist"] > *').forEach(el => {
-                    if (!vis(el) || isAgentUI(el) || isServiceElement(el)) return;
-                    const o = desc(el);
-                    o._type = 'tab';
-                    o.selected = el.getAttribute('aria-selected') === 'true';
-                    result.push(o);
-                });
-
-                // Модалки / диалоги
-                document.querySelectorAll('[role="dialog"], [role="alertdialog"], dialog, .modal, .popup, [class*="modal"], [class*="dialog"]').forEach(el => {
-                    if (!vis(el) || isAgentUI(el) || isServiceElement(el)) return;
-                    const o = desc(el);
-                    o._type = 'modal';
-                    o.open = true;
-                    result.push(o);
-                });
-
+                document.querySelectorAll('[role="tab"]').forEach(el => collect(el, 'tab'));
                 // Меню
-                document.querySelectorAll('[role="menu"], [role="menuitem"], nav a, .nav-link, .menu-item').forEach(el => {
-                    if (!vis(el) || isAgentUI(el) || isServiceElement(el)) return;
-                    const o = desc(el);
-                    o._type = 'menu';
-                    result.push(o);
-                });
+                document.querySelectorAll('[role="menuitem"], nav a, .nav-link, .menu-item').forEach(el => collect(el, 'menu'));
+                // Модалки
+                document.querySelectorAll('[role="dialog"], [role="alertdialog"], dialog').forEach(el => collect(el, 'modal'));
 
-                // Элементы внутри Shadow DOM
-                const walkShadow = (root) => {
-                    if (!root) return;
-                    try {
-                        root.querySelectorAll('button, [role="button"], a[href], input:not([type="hidden"]), select, textarea').forEach(el => {
-                            if (!vis(el) || isAgentUI(el) || isServiceElement(el)) return;
-                            const o = desc(el);
-                            o._type = o._type || 'shadow';
-                            o._shadow = true;
-                            result.push(o);
-                        });
-                        root.querySelectorAll('*').forEach(el => {
-                            if (el.shadowRoot) walkShadow(el.shadowRoot);
-                        });
-                    } catch(e) {}
-                };
-                document.querySelectorAll('*').forEach(el => {
-                    if (el.shadowRoot) walkShadow(el.shadowRoot);
-                });
-
-                // Дедупликация по text+tag
-                const seen = new Set();
-                const unique = [];
-                for (const o of result) {
-                    const key = (o.tag || '') + '|' + (o.text || '') + '|' + (o.id || '');
-                    if (seen.has(key)) continue;
-                    seen.add(key);
-                    unique.push(o);
-                }
-                
-                // Сортировка по приоритету (ниже число = выше приоритет)
-                unique.sort((a, b) => (a._priority || 5) - (b._priority || 5));
-
-                return unique.map(o => JSON.stringify(o)).join('\\n');
+                return result.join('\\n');
             }
         """)
         return (summary or "")[:max_length]
@@ -612,13 +502,18 @@ def detect_active_overlays(page: Page) -> Dict[str, Any]:
                     el.querySelectorAll('a[href]').forEach(a => {
                         if (vis(a)) o.links.push(textOf(a, 40));
                     });
-                    // Крестик закрытия
+                    // Крестик закрытия — назначаем ref для надёжного поиска
                     const closeBtn = el.querySelector('[aria-label*="close" i], [aria-label*="закрыть" i], [class*="close"], [class*="dismiss"], button.close, .modal-close, [data-dismiss="modal"], [data-bs-dismiss="modal"]');
                     if (closeBtn && vis(closeBtn)) {
-                        o.close_selector = closeBtn.id ? '#' + closeBtn.id
-                            : closeBtn.getAttribute('aria-label') ? '[aria-label="' + closeBtn.getAttribute('aria-label') + '"]'
-                            : closeBtn.className ? '.' + closeBtn.className.toString().split(' ').filter(c=>c).join('.')
-                            : null;
+                        let closeRef = closeBtn.getAttribute('data-agent-ref');
+                        if (!closeRef && window.__agentRefs) {
+                            let maxR = 0;
+                            for (const k of Object.keys(window.__agentRefs)) { const n = parseInt(k); if (n > maxR) maxR = n; }
+                            closeRef = String(maxR + 1);
+                            closeBtn.setAttribute('data-agent-ref', closeRef);
+                            window.__agentRefs[parseInt(closeRef)] = closeBtn;
+                        }
+                        o.close_selector = closeRef ? 'ref:' + closeRef : null;
                     }
                     if (o.text.length > 5 || o.buttons.length || o.inputs.length) overlays.push(o);
                 });
@@ -762,7 +657,7 @@ def build_context(
 
     dom = get_dom_summary(page)
     if dom:
-        lines.append("DOM (кнопки и ссылки):")
+        lines.append("ЭЛЕМЕНТЫ (формат [ref] тип \"текст\" атрибуты — используй ref:N как selector):")
         lines.append(dom[:4000])
         if len(dom) > 4000:
             lines.append("... (обрезано)")

@@ -638,91 +638,110 @@ def execute_action(page: Page, action: Dict[str, Any], memory: AgentMemory) -> s
 
 def _find_element(page: Page, selector: str):
     """
-    Улучшенный поиск элемента по разным стратегиям с приоритетом:
-    1) Точные селекторы (id, data-testid) — самые стабильные
-    2) aria-label, placeholder — семантические
-    3) Текст с ролью (button, link) — надёжные
-    4) Общий текст — fallback
+    Поиск элемента по ref-id (мгновенный) с fallback по атрибутам.
+
+    Стратегии (по приоритету):
+      0) ref:N — мгновенный поиск через data-agent-ref (присваивается в get_dom_summary)
+      1) window.__agentRefs[N] — прямая ссылка на DOM-ноду
+      2) CSS/XPath/ID — если передан явный селектор (#id, .class, [attr], //)
+      3) data-testid, aria-label, name, placeholder — семантический fallback
+      4) Playwright getByRole/getByText — текстовый fallback
     """
     if not selector:
         return None
-    
-    # Нормализация селектора
+
     selector = selector.strip()
+
+    # --- 0) ref:N — основной путь (мгновенный) ---
+    ref_num = None
+    if selector.startswith("ref:"):
+        try:
+            ref_num = int(selector[4:])
+        except ValueError:
+            pass
+    elif selector.isdigit():
+        ref_num = int(selector)
+
+    if ref_num is not None:
+        try:
+            # Сначала пробуем через data-agent-ref (надёжный CSS-селектор)
+            loc = page.locator(f'[data-agent-ref="{ref_num}"]').first
+            if loc.count() > 0 and loc.is_visible():
+                return loc
+        except Exception:
+            pass
+        try:
+            # Fallback: через сохранённую JS-ссылку (если DOM изменился, но ссылка жива)
+            exists = page.evaluate(f"() => !!window.__agentRefs && !!window.__agentRefs[{ref_num}] && document.contains(window.__agentRefs[{ref_num}])")
+            if exists:
+                loc = page.locator(f'[data-agent-ref="{ref_num}"]').first
+                if loc.count() > 0:
+                    return loc
+        except Exception:
+            pass
+        LOG.debug(f"_find_element ref:{ref_num} not found, falling back to text strategies")
+
     safe_text = selector.replace('"', '\\"').replace("'", "\\'")[:100]
-    
-    strategies = []
-    
-    # 1. Точные селекторы (высший приоритет)
-    if selector.startswith("#"):
-        # ID селектор
-        strategies.append(("id", lambda: page.locator(selector).first))
-    elif selector.startswith("."):
-        # Class селектор
-        strategies.append(("class", lambda: page.locator(selector).first))
-    elif selector.startswith(("[", "//")):
-        # CSS/XPath селектор
-        strategies.append(("css/xpath", lambda: page.locator(selector).first))
-    
-    # 2. data-testid (очень стабильный)
-    strategies.append(("data-testid", lambda: page.locator(f'[data-testid="{safe_text}"]').first))
-    strategies.append(("data-testid-exact", lambda: page.locator(f'[data-testid*="{safe_text}"]').first))
-    
-    # 3. Семантические атрибуты
-    strategies.append(("aria-label", lambda: page.locator(f'[aria-label="{safe_text}"]').first))
-    strategies.append(("aria-label-contains", lambda: page.locator(f'[aria-label*="{safe_text}"]').first))
-    strategies.append(("placeholder", lambda: page.locator(f'[placeholder="{safe_text}"]').first))
-    strategies.append(("name", lambda: page.locator(f'[name="{safe_text}"]').first))
-    strategies.append(("title", lambda: page.locator(f'[title="{safe_text}"]').first))
-    
-    # 4. По тексту с ролью (надёжные стратегии)
-    strategies.extend([
-        ("button:has-text", lambda: page.locator(f'button:has-text("{safe_text}")').first),
-        ("a:has-text", lambda: page.locator(f'a:has-text("{safe_text}")').first),
-        ("[role=button]:has-text", lambda: page.locator(f'[role="button"]:has-text("{safe_text}")').first),
-        ("[role=link]:has-text", lambda: page.locator(f'[role="link"]:has-text("{safe_text}")').first),
-        ("[role=tab]:has-text", lambda: page.locator(f'[role="tab"]:has-text("{safe_text}")').first),
-        ("[role=menuitem]:has-text", lambda: page.locator(f'[role="menuitem"]:has-text("{safe_text}")').first),
-    ])
-    
-    # 5. Playwright getBy методы (более умные)
-    strategies.extend([
+
+    # --- 1) Явные CSS/XPath/ID селекторы ---
+    if selector.startswith(("#", ".", "[", "//")):
+        try:
+            loc = page.locator(selector).first
+            if loc.count() > 0 and loc.is_visible():
+                return loc
+        except Exception:
+            pass
+
+    # --- 2) Семантические атрибуты (быстрые) ---
+    attr_strategies = [
+        f'[data-testid="{safe_text}"]',
+        f'[data-testid*="{safe_text}"]',
+        f'[aria-label="{safe_text}"]',
+        f'[aria-label*="{safe_text}"]',
+        f'[placeholder="{safe_text}"]',
+        f'[name="{safe_text}"]',
+        f'[title="{safe_text}"]',
+    ]
+    for css in attr_strategies:
+        try:
+            loc = page.locator(css).first
+            if loc.count() > 0 and loc.is_visible():
+                return loc
+        except Exception:
+            continue
+
+    # --- 3) Playwright getBy* методы ---
+    getby_strategies = [
         ("getByRole:button", lambda: page.get_by_role("button", name=safe_text, exact=False).first),
         ("getByRole:link", lambda: page.get_by_role("link", name=safe_text, exact=False).first),
+        ("getByRole:tab", lambda: page.get_by_role("tab", name=safe_text, exact=False).first),
+        ("getByRole:menuitem", lambda: page.get_by_role("menuitem", name=safe_text, exact=False).first),
         ("getByLabel", lambda: page.get_by_label(safe_text, exact=False).first),
         ("getByPlaceholder", lambda: page.get_by_placeholder(safe_text, exact=False).first),
-        ("getByText", lambda: page.get_by_text(safe_text, exact=False).first),
-    ])
-    
-    # 6. Fallback: общий поиск по тексту
-    strategies.extend([
-        ("text=exact", lambda: page.locator(f'text="{safe_text}"').first),
-        ("text-contains", lambda: page.locator(f'text=/{safe_text}/i').first),
-    ])
-    
-    # Пробуем стратегии по порядку
-    for name, get_loc in strategies:
+        ("getByText", lambda: page.get_by_text(safe_text, exact=True).first),
+    ]
+    for name, get_loc in getby_strategies:
         try:
             loc = get_loc()
-            count = loc.count()
-            if count > 0:
-                # Если несколько элементов — берём первый видимый
-                if count == 1:
-                    if loc.is_visible():
-                        return loc
-                else:
-                    # Множественные элементы — ищем первый видимый
-                    for i in range(min(count, 5)):
-                        try:
-                            item = loc.nth(i)
-                            if item.is_visible():
-                                return item
-                        except Exception:
-                            continue
-        except Exception as e:
-            LOG.debug(f"_find_element strategy '{name}' failed: {e}")
+            if loc.count() > 0 and loc.is_visible():
+                return loc
+        except Exception:
             continue
-    
+
+    # --- 4) Текстовый has-text fallback ---
+    text_strategies = [
+        f'button:has-text("{safe_text}")',
+        f'a:has-text("{safe_text}")',
+        f'[role="button"]:has-text("{safe_text}")',
+    ]
+    for css in text_strategies:
+        try:
+            loc = page.locator(css).first
+            if loc.count() > 0 and loc.is_visible():
+                return loc
+        except Exception:
+            continue
+
     return None
 
 
@@ -1792,34 +1811,6 @@ def _step_get_action(page, step, memory, console_log, network_failures, checklis
     dom_summary = get_dom_summary(page, max_length=dom_max)
     history_text = memory.get_history_text(last_n=history_n)
     
-    # Кэшируем важные элементы страницы для быстрого доступа
-    if current_url not in memory._page_elements_cache or step % 10 == 0:
-        try:
-            # Извлекаем приоритетные элементы (CTA, формы)
-            priority_elements = page.evaluate("""() => {
-                const result = [];
-                const ctaPatterns = ['купить', 'заказать', 'оформить', 'начать', 'попробовать', 'скачать', 'регистрация', 'войти', 'login', 'sign up', 'buy', 'order', 'start', 'try', 'download', 'register', 'cta', 'primary'];
-                document.querySelectorAll('button, [role="button"], a[href], input[type="submit"]').forEach(el => {
-                    const text = (el.textContent || el.getAttribute('aria-label') || '').toLowerCase();
-                    const cls = (el.className || '').toLowerCase();
-                    for (const p of ctaPatterns) {
-                        if (text.includes(p) || cls.includes(p)) {
-                            result.push({
-                                type: 'cta',
-                                text: (el.textContent || '').trim().slice(0, 50),
-                                selector: el.id ? '#' + el.id : (el.getAttribute('aria-label') || el.textContent || '').trim().slice(0, 50),
-                            });
-                            break;
-                        }
-                    }
-                });
-                return result.slice(0, 10);
-            }""")
-            if priority_elements:
-                memory.cache_page_elements(current_url, priority_elements)
-        except Exception:
-            pass
-    
     # Проверяем покрытие элементов на текущей странице
     coverage_hint = ""
     if current_url in memory._page_coverage:
@@ -1831,13 +1822,14 @@ def _step_get_action(page, step, memory, console_log, network_failures, checklis
         stuck_warning = ""
         if memory.is_stuck():
             stuck_warning = "\n🚨 КРИТИЧНО: Агент зациклился! Выбери действие, которого НЕТ в списке выше.\n"
-        question = f"""Вот скриншот. На странице есть АКТИВНЫЙ ОВЕРЛЕЙ (модалка/дропдаун/тултип/попап).
+        question = f"""Вот скриншот. На странице АКТИВНЫЙ ОВЕРЛЕЙ (модалка/дропдаун/тултип/попап).
 {overlay_context}
-DOM: {dom_summary[:3000]}
+ЭЛЕМЕНТЫ СТРАНИЦЫ (формат: [N] тип "текст" атрибуты):
+{dom_summary[:3000]}
 {history_text}{stuck_warning}
-🚀 ДЕЙСТВУЙ СЕЙЧАС! Сейчас на экране оверлей! 1) Тестируй содержимое оверлея (если ещё не тестировал), 2) Если уже тестировал — закрой (close_modal), 3) Баг — check_defect.
-⚠️ НЕ ПОВТОРЯЙ действия из списка "УЖЕ СДЕЛАНО" выше.
-🎯 ВЫБЕРИ КОНКРЕТНОЕ ДЕЙСТВИЕ ПРЯМО СЕЙЧАС!"""
+🚀 Используй selector="ref:N" (N из [N] выше).
+1) Тестируй содержимое оверлея, 2) Если уже тестировал — закрой (close_modal), 3) Баг — check_defect.
+⚠️ НЕ ПОВТОРЯЙ действия. Выбери КОНКРЕТНОЕ ДЕЙСТВИЕ."""
     else:
         plan_hint = ""
         if memory.test_plan:
@@ -1883,14 +1875,14 @@ DOM: {dom_summary[:3000]}
         
         question = f"""Вот скриншот и контекст страницы.
 {page_type_hint}{coverage_hint}{form_hint_smart}{table_hint}
-DOM (кнопки, ссылки, формы, отсортированы по приоритету): {dom_summary[:3000]}
+ЭЛЕМЕНТЫ СТРАНИЦЫ (формат: [N] тип "текст" атрибуты):
+{dom_summary[:3000]}
 {history_text}
 {plan_hint}{form_hint}{stuck_warning}
-🚀 ВАЖНО: Агент должен ПОСТОЯННО ДЕЙСТВОВАТЬ! Выбери ОДНО КОНКРЕТНОЕ действие СЕЙЧАС.
-⚠️ НЕ ПОВТОРЯЙ уже сделанные действия (они помечены ❌).
-✅ Выбери НОВЫЙ элемент для клика/ввода/hover. Приоритет: CTA кнопки → формы (fill_form) → таблицы (фильтры/сортировка) → навигация → остальное.
-🎯 ДЕЙСТВУЙ АКТИВНО: кликай, заполняй формы, тестируй функциональность. НЕ анализируй консоль вместо действий!
-Укажи test_goal и expected_outcome. Оцени верстку. Если реальный баг — action=check_defect."""
+🚀 Выбери ОДНО КОНКРЕТНОЕ действие. Используй selector="ref:N" (N из [N] выше).
+⚠️ НЕ ПОВТОРЯЙ уже сделанные действия.
+✅ Приоритет: CTA кнопки → формы (fill_form) → таблицы → навигация → остальное.
+🎯 ДЕЙСТВУЙ: кликай, заполняй, тестируй. Укажи test_goal и expected_outcome."""
 
     phase_instruction = memory.get_phase_instruction()
     update_demo_banner(page, step_text=f"#{step} Консультация с GigaChat…", progress_pct=60)
