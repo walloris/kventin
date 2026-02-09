@@ -405,13 +405,14 @@ class AgentMemory:
 
 # --- Скриншот в base64 ---
 def _hide_agent_ui(page: Page):
-    """Скрыть UI агента перед скриншотом (чтобы GigaChat не видел оверлей)."""
+    """Скрыть UI агента перед скриншотом (Shadow DOM host)."""
     try:
         page.evaluate("""() => {
-            ['agent-llm-overlay', 'agent-banner'].forEach(id => {
-                const el = document.getElementById(id);
-                if (el) el.style.display = 'none';
-            });
+            if (window.__agentShadow && window.__agentShadow.host) {
+                window.__agentShadow.host.style.display = 'none';
+            }
+            // Временные элементы (label, ripple)
+            document.querySelectorAll('[data-agent-host]').forEach(el => el.style.display = 'none');
         }""")
     except Exception:
         pass
@@ -421,10 +422,10 @@ def _show_agent_ui(page: Page):
     """Вернуть UI агента после скриншота."""
     try:
         page.evaluate("""() => {
-            const llm = document.getElementById('agent-llm-overlay');
-            if (llm) llm.style.display = '';
-            const banner = document.getElementById('agent-banner');
-            if (banner) banner.style.display = 'flex';
+            if (window.__agentShadow && window.__agentShadow.host) {
+                window.__agentShadow.host.style.display = '';
+            }
+            document.querySelectorAll('[data-agent-host]').forEach(el => el.style.display = '');
         }""")
     except Exception:
         pass

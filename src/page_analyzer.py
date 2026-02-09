@@ -107,13 +107,13 @@ def get_dom_summary(page: Page, max_length: int = 8000) -> str:
         summary = page.evaluate("""
             () => {
                 const result = [];
-                // Служебный UI агента (чат с LLM, баннер Kventin) — не часть тестируемого приложения
+                // UI агента живёт в closed Shadow DOM — невидим для querySelectorAll.
+                // Фильтр нужен только для временных элементов (label, ripple) с data-agent-host.
                 const isAgentUI = (el) => {
                     if (!el) return true;
                     let cur = el;
                     while (cur && cur !== document.body) {
-                        const id = (cur.id || '').toString();
-                        if (id.startsWith('agent-') || id === 'agent-banner' || id === 'agent-llm-overlay') return true;
+                        if (cur.hasAttribute && cur.hasAttribute('data-agent-host')) return true;
                         cur = cur.parentElement;
                     }
                     return false;
@@ -256,15 +256,12 @@ def detect_active_overlays(page: Page) -> Dict[str, Any]:
             """
             (ignorePatterns) => {
                 const overlays = [];
-                // Фильтр: UI агента (чат с LLM, баннер Kventin) — не часть тестируемого приложения
+                // UI агента в closed Shadow DOM — невидим. Фильтр только для host-элемента.
                 const isAgentUI = (el) => {
                     if (!el) return false;
                     let cur = el;
                     while (cur && cur !== document.body) {
-                        const id = (cur.id || '').toString();
-                        if (id.startsWith('agent-') || id === 'agent-banner' || id === 'agent-llm-overlay') return true;
-                        const cls = (cur.className || '').toString().toLowerCase();
-                        if (cls.includes('agent-llm') || cls.includes('agent-banner') || cls.includes('kventin')) return true;
+                        if (cur.hasAttribute && cur.hasAttribute('data-agent-host')) return true;
                         cur = cur.parentElement;
                     }
                     return false;
@@ -337,7 +334,7 @@ def detect_active_overlays(page: Page) -> Dict[str, Any]:
                         const r = el.getBoundingClientRect();
                         // Большой оверлей (не наш агентский UI)
                         if (z > 100 && r.width > 200 && r.height > 100
-                            && !el.id?.startsWith('agent-') && !el.className?.toString().includes('agent-')) {
+                            && !(el.hasAttribute && el.hasAttribute('data-agent-host'))) {
                             modalEls.add(el);
                         }
                     }
