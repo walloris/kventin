@@ -1511,10 +1511,8 @@ def run_agent(start_url: str = None):
                 if step > 1:
                     memory.advance_tester_phase()
 
-                # Чеклист — раз в 5 шагов (не на каждом)
+                # Чеклист ОТКЛЮЧЕН — агент должен активно кликать, а не проверять
                 checklist_results = []
-                if step % 5 == 1:
-                    checklist_results = _step_checklist_incremental(page, step, current_url, console_log, network_failures, memory)
 
                 # ========== ВЫБОР ДЕЙСТВИЯ: GigaChat (если готов) или быстрое локальное ==========
                 # Проверка: страница закрыта — выходим из цикла
@@ -1599,32 +1597,15 @@ def run_agent(start_url: str = None):
 
                 _track_test_plan(memory, action)
 
-                # Пост-анализ в фоне
-                _step_post_analysis(
-                    page, step, action, result, act_type, sel, val, expected_outcome, possible_bug,
-                    has_overlay, current_url, checklist_results, console_log, network_failures, memory,
-                )
-
-                # Периодические проверки (редко) — только если страница жива
-                if not page.is_closed():
-                    if step % 30 == 0:
-                        try:
-                            if ENABLE_IFRAME_TESTING:
-                                _run_iframe_check(page, memory, current_url, console_log, network_failures)
-                        except Exception:
-                            pass
-                    if step % 50 == 0:
-                        try:
-                            _bg_submit(_run_a11y_check, page, memory, current_url, console_log, network_failures)
-                        except Exception:
-                            pass
+                # Пост-анализ ОТКЛЮЧЕН — агент должен активно кликать
+                # Периодические проверки ОТКЛЮЧЕНЫ — только клики!
 
                 if SESSION_REPORT_EVERY_N > 0 and step % SESSION_REPORT_EVERY_N == 0:
                     report = memory.get_session_report_text()
                     print(report)
 
-                # Минимальная пауза (только для видимости анимации)
-                time.sleep(0.15)
+                # Минимальная пауза (только для видимости анимации) - уменьшено для активности
+                time.sleep(0.3)
 
         except KeyboardInterrupt:
             print("\n[Agent] Остановлен по Ctrl+C.")
@@ -2227,8 +2208,8 @@ def _step_execute(page, action, step, memory, context):
         except Exception:
             pass
 
-    # Минимальная пауза: только чтобы DOM обновился
-    time.sleep(0.2)
+    # Минимальная пауза: только чтобы DOM обновился - уменьшено для активности
+    time.sleep(0.3)
     # Быстрый wait (не 3 секунды!)
     try:
         page.wait_for_load_state("domcontentloaded", timeout=2000)

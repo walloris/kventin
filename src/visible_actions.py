@@ -37,8 +37,8 @@ SHADOW_HOST_SCRIPT = """
     style.textContent = `
         *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
         @keyframes agent-cursor-pulse {
-            0%, 100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(231, 76, 60, 0.9), 0 0 30px 8px rgba(231,76,60,0.6), 0 0 60px 12px rgba(231,76,60,0.4); }
-            50% { transform: scale(1.2); box-shadow: 0 0 0 12px rgba(231, 76, 60, 0), 0 0 40px 12px rgba(231,76,60,0.8), 0 0 80px 16px rgba(231,76,60,0.5); }
+            0%, 100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(231, 76, 60, 1), 0 0 50px 12px rgba(231,76,60,0.9), 0 0 100px 20px rgba(231,76,60,0.6), 0 0 150px 30px rgba(231,76,60,0.3); }
+            50% { transform: scale(1.3); box-shadow: 0 0 0 20px rgba(231, 76, 60, 0), 0 0 70px 18px rgba(231,76,60,1), 0 0 120px 25px rgba(231,76,60,0.8), 0 0 180px 35px rgba(231,76,60,0.5); }
         }
         @keyframes agent-ripple {
             0% { transform: scale(0); opacity: 1; border-width: 4px; }
@@ -66,17 +66,17 @@ SHADOW_HOST_SCRIPT = """
     `;
     shadow.appendChild(style);
 
-    // --- Курсор (больше и ярче для лучшей видимости) ---
+    // --- Курсор (ОГРОМНЫЙ и ЯРКИЙ для максимальной видимости) ---
     const cursor = document.createElement('div');
     cursor.style.cssText = `
-        position: fixed; width: 40px; height: 40px;
-        border: 4px solid #e74c3c; border-radius: 50%;
-        background: radial-gradient(circle, rgba(231,76,60,0.8) 0%, rgba(231,76,60,0.3) 70%);
+        position: fixed; width: 60px; height: 60px;
+        border: 6px solid #e74c3c; border-radius: 50%;
+        background: radial-gradient(circle, rgba(231,76,60,1) 0%, rgba(231,76,60,0.6) 50%, rgba(231,76,60,0.2) 80%);
         pointer-events: none; z-index: 2147483647;
         left: -100px; top: -100px;
-        transition: left 0.1s ease-out, top 0.1s ease-out;
-        box-shadow: 0 0 30px 8px rgba(231,76,60,0.8), 0 0 60px 12px rgba(231,76,60,0.4);
-        animation: agent-cursor-pulse 1.2s ease-in-out infinite;
+        transition: left 0.15s ease-out, top 0.15s ease-out;
+        box-shadow: 0 0 50px 12px rgba(231,76,60,1), 0 0 100px 20px rgba(231,76,60,0.6), 0 0 150px 30px rgba(231,76,60,0.3);
+        animation: agent-cursor-pulse 0.8s ease-in-out infinite;
         display: block !important;
         opacity: 1 !important;
     `;
@@ -198,26 +198,27 @@ def show_click_ripple(page: Page, x: float, y: float) -> None:
                 // Создаём БОЛЬШУЮ яркую рябь для видимости
                 const r = document.createElement('div');
                 r.style.cssText = `
-                    position: fixed; left: ${x}px; top: ${y}px; width: 60px; height: 60px;
-                    margin-left: -30px; margin-top: -30px; border: 6px solid rgba(231,76,60,1);
+                    position: fixed; left: ${x}px; top: ${y}px; width: 120px; height: 120px;
+                    margin-left: -60px; margin-top: -60px; border: 10px solid rgba(231,76,60,1);
                     border-radius: 50%; pointer-events: none; z-index: 2147483645;
-                    background: radial-gradient(circle, rgba(231,76,60,0.3) 0%, transparent 70%);
-                    animation: agent-ripple 0.8s ease-out forwards;
-                    box-shadow: 0 0 40px rgba(231,76,60,0.8);
+                    background: radial-gradient(circle, rgba(231,76,60,0.5) 0%, rgba(231,76,60,0.2) 50%, transparent 70%);
+                    animation: agent-ripple 1.2s ease-out forwards;
+                    box-shadow: 0 0 80px rgba(231,76,60,1), 0 0 120px rgba(231,76,60,0.6);
                 `;
                 document.body.appendChild(r);
-                setTimeout(() => { if (r.parentNode) r.remove(); }, 800);
+                setTimeout(() => { if (r.parentNode) r.remove(); }, 1200);
                 
-                // Дополнительный эффект - яркая вспышка
+                // Дополнительный эффект - ОГРОМНАЯ яркая вспышка
                 const flash = document.createElement('div');
                 flash.style.cssText = `
-                    position: fixed; left: ${x}px; top: ${y}px; width: 100px; height: 100px;
-                    margin-left: -50px; margin-top: -50px; background: rgba(231,76,60,0.4);
+                    position: fixed; left: ${x}px; top: ${y}px; width: 200px; height: 200px;
+                    margin-left: -100px; margin-top: -100px; background: radial-gradient(circle, rgba(231,76,60,0.6) 0%, rgba(231,76,60,0.3) 50%, transparent 70%);
                     border-radius: 50%; pointer-events: none; z-index: 2147483644;
-                    animation: agent-ripple 0.5s ease-out forwards;
+                    animation: agent-ripple 0.8s ease-out forwards;
+                    box-shadow: 0 0 100px rgba(231,76,60,0.8);
                 `;
                 document.body.appendChild(flash);
-                setTimeout(() => { if (flash.parentNode) flash.remove(); }, 500);
+                setTimeout(() => { if (flash.parentNode) flash.remove(); }, 800);
             }""",
             [x, y],
         )
@@ -236,17 +237,17 @@ def show_highlight_label(page: Page, x: float, y: float, text: str = "Клика
                 window.__agentLabel = el;
                 el.textContent = text;
                 el.style.cssText = `
-                    position: fixed; left: ${x}px; top: ${y - 50}px; transform: translateX(-50%);
-                    padding: 10px 16px; background: linear-gradient(135deg, #e74c3c 0%, #c0392b 100%);
-                    color: white; font: 700 16px system-ui, sans-serif; border-radius: 10px; white-space: nowrap;
-                    box-shadow: 0 6px 20px rgba(231,76,60,0.8), 0 0 30px rgba(231,76,60,0.5);
+                    position: fixed; left: ${x}px; top: ${y - 70}px; transform: translateX(-50%);
+                    padding: 14px 20px; background: linear-gradient(135deg, #e74c3c 0%, #c0392b 100%);
+                    color: white; font: 700 20px system-ui, sans-serif; border-radius: 12px; white-space: nowrap;
+                    box-shadow: 0 8px 30px rgba(231,76,60,1), 0 0 50px rgba(231,76,60,0.7), 0 0 80px rgba(231,76,60,0.4);
                     pointer-events: none; z-index: 2147483644;
-                    border: 2px solid rgba(255,255,255,0.3);
-                    text-shadow: 0 1px 3px rgba(0,0,0,0.5);
+                    border: 3px solid rgba(255,255,255,0.5);
+                    text-shadow: 0 2px 5px rgba(0,0,0,0.8), 0 0 10px rgba(255,255,255,0.3);
                     animation: agent-label-pop 0.3s ease-out;
                 `;
                 document.body.appendChild(el);
-                setTimeout(() => { if (el.parentNode) el.remove(); window.__agentLabel = null; }, 3000);
+                setTimeout(() => { if (el.parentNode) el.remove(); window.__agentLabel = null; }, 4000);
             }""",
             [x, y, text],
         )
@@ -261,8 +262,8 @@ def move_cursor_to(page: Page, x: float, y: float) -> None:
             """([x, y]) => {
                 if (window.__agentShadow && window.__agentShadow.cursor) {
                     const cursor = window.__agentShadow.cursor;
-                    cursor.style.left = (x - 20) + 'px';  // Центрируем курсор (40px / 2)
-                    cursor.style.top = (y - 20) + 'px';
+                    cursor.style.left = (x - 30) + 'px';  // Центрируем курсор (60px / 2)
+                    cursor.style.top = (y - 30) + 'px';
                     cursor.style.display = 'block';
                     cursor.style.opacity = '1';
                     cursor.style.zIndex = '2147483647';
@@ -307,14 +308,14 @@ def highlight_and_click(locator: Locator, page: Page, description: str = "") -> 
             cy = box["y"] + box["height"] / 2
             # Сначала показываем курсор и подсказку - это самое заметное
             move_cursor_to(page, cx, cy)
-            show_highlight_label(page, cx, cy, description or "Кликаю сюда")
-            time.sleep(0.2)  # Пауза чтобы пользователь увидел курсор и подсказку
+            show_highlight_label(page, cx, cy, description or "КЛИКАЮ!")
+            time.sleep(0.5)  # Дольше пауза чтобы пользователь точно увидел
         
         # Затем подсвечиваем элемент (Playwright highlight)
         locator.highlight()
         
-        # Увеличиваем время показа - минимум 0.8 секунды чтобы было видно
-        highlight_duration = max(0.8, HIGHLIGHT_DURATION_MS / 1000.0)
+        # Увеличиваем время показа - минимум 1.0 секунда чтобы было видно
+        highlight_duration = max(1.0, HIGHLIGHT_DURATION_MS / 1000.0)
         time.sleep(highlight_duration)
         
         # Клик
@@ -323,7 +324,7 @@ def highlight_and_click(locator: Locator, page: Page, description: str = "") -> 
         # Эффект ряби после клика
         if cx is not None and cy is not None:
             show_click_ripple(page, cx, cy)
-            time.sleep(0.2)  # Пауза чтобы увидеть эффект ряби
+            time.sleep(0.4)  # Дольше пауза чтобы увидеть эффект ряби
     except Exception as e:
         raise e
     finally:
@@ -346,7 +347,7 @@ def safe_highlight(locator: Locator, page: Page, duration_sec: float = None) -> 
             cy = box["y"] + box["height"] / 2
             move_cursor_to(page, cx, cy)
             show_highlight_label(page, cx, cy, "Проверяю")
-            time.sleep(0.2)  # Пауза чтобы увидеть курсор
+            time.sleep(0.4)  # Дольше пауза чтобы увидеть курсор
         
         # Затем подсвечиваем элемент
         locator.highlight()
