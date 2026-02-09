@@ -1356,42 +1356,132 @@ def run_agent(start_url: str = None):
         else:
             print(f"[Agent] Бесконечный цикл. Ctrl+C для остановки.")
 
+        # ========== PIPELINE: Асинхронный GigaChat + мгновенные действия ==========
+        # GigaChat работает в фоне. Пока ждём ответ — агент кликает по ref-id.
+        # Когда GigaChat отвечает — берём его действие следующим.
+        _gigachat_future: Optional[Future] = None
+        _gigachat_action: Optional[Dict[str, Any]] = None
+        _gigachat_meta: Dict[str, Any] = {}  # has_overlay, screenshot_b64
+
+        def _start_gigachat_async(page_, step_, memory_, console_log_, network_failures_, checklist_results_, context_):
+            """Запустить GigaChat в фоновом потоке. Возвращает Future."""
+            nonlocal _gigachat_future
+            # Собираем всё что нужно ДО отправки в фон (Playwright — только main thread)
+            from config import DEMO_MODE as _dm_gc
+            dom_max = 3000 if _dm_gc else 5000
+            history_n = 8 if _dm_gc else 15
+            overlay_info = detect_active_overlays(page_)
+            has_overlay = overlay_info.get("has_overlay", False)
+            screenshot_b64 = take_screenshot_b64(page_)
+            screenshot_changed = memory_.is_screenshot_changed(screenshot_b64 or "")
+            current_url_ = page_.url
+            dom_summary = get_dom_summary(page_, max_length=dom_max)
+            history_text = memory_.get_history_text(last_n=history_n)
+            overlay_context = format_overlays_context(overlay_info)
+            page_type = detect_page_type(page_)
+            coverage_hint = ""
+            if current_url_ in memory_._page_coverage:
+                tested_count = len(memory_._page_coverage[current_url_])
+                if tested_count > 0:
+                    coverage_hint = f"\nПротестировано: {tested_count}. Выбери НОВЫЙ элемент.\n"
+
+            _gigachat_meta["has_overlay"] = has_overlay
+            _gigachat_meta["screenshot_b64"] = screenshot_b64
+
+            # Формируем контекст и вопрос
+            ctx = build_context(page_, current_url_, console_log_, network_failures_)
+            if checklist_results_:
+                ctx = checklist_results_to_context(checklist_results_) + "\n\n" + ctx
+            if overlay_context:
+                ctx = overlay_context + "\n\n" + ctx
+
+            type_strategies = {
+                "landing": "Landing page: CTA, формы", "form": "Form: заполни поля",
+                "dashboard": "Dashboard: таблицы, фильтры", "catalog": "Catalog: карточки, фильтры",
+            }
+            ptype_hint = f"\nТип: {page_type}. {type_strategies.get(page_type, '')}\n" if page_type != "unknown" else ""
+
+            if has_overlay:
+                question = f"""Скриншот. АКТИВНЫЙ ОВЕРЛЕЙ.
+{overlay_context}
+ЭЛЕМЕНТЫ: {dom_summary[:2500]}
+{history_text}
+Используй selector="ref:N". Тестируй оверлей или закрой (close_modal)."""
+            else:
+                plan_hint = ""
+                if memory_.test_plan:
+                    plan_hint = memory_.get_test_plan_progress() + "\n"
+                stuck_w = "\n🚨 ЗАЦИКЛИВАНИЕ! Выбери НОВЫЙ элемент!\n" if memory_.is_stuck() else ""
+                question = f"""Скриншот и контекст.
+{ptype_hint}{coverage_hint}
+ЭЛЕМЕНТЫ: {dom_summary[:2500]}
+{history_text}
+{plan_hint}{stuck_w}
+Используй selector="ref:N". Выбери КОНКРЕТНОЕ действие."""
+
+            phase_instruction = memory_.get_phase_instruction()
+            send_screenshot = screenshot_b64 if screenshot_changed else None
+
+            def _call_gigachat():
+                raw = consult_agent_with_screenshot(
+                    ctx, question, screenshot_b64=send_screenshot,
+                    phase_instruction=phase_instruction, tester_phase=memory_.tester_phase,
+                    has_overlay=has_overlay,
+                )
+                if raw:
+                    action = parse_llm_action(raw)
+                    if action:
+                        return validate_llm_action(action)
+                return None
+
+            _gigachat_future = _bg_submit(_call_gigachat)
+
+        def _poll_gigachat() -> Optional[Dict[str, Any]]:
+            """Проверить готов ли GigaChat (не блокирует)."""
+            nonlocal _gigachat_future, _gigachat_action
+            if _gigachat_future is None:
+                return _gigachat_action
+            if _gigachat_future.done():
+                try:
+                    result = _gigachat_future.result(timeout=0)
+                    _gigachat_action = result
+                except Exception:
+                    _gigachat_action = None
+                _gigachat_future = None
+                return _gigachat_action
+            return None  # ещё думает
+
         try:
             while True:
                 memory.iteration += 1
                 step = memory.iteration
                 memory.defects_on_current_step = 0
 
-                # Лимит шагов
                 if MAX_STEPS > 0 and step > MAX_STEPS:
-                    print(f"[Agent] Достигнут лимит {MAX_STEPS} шагов. Завершаю.")
+                    print(f"[Agent] Лимит {MAX_STEPS} шагов. Завершаю.")
                     break
 
                 current_url = page.url
 
-                # ========== Обработка новых вкладок ==========
+                # Новые вкладки
                 _handle_new_tabs(new_tabs_queue, page, start_url, step, console_log, network_failures, memory)
 
-                # Проверка: ушли на другую страницу → вернуться
+                # Навигация на другой домен → вернуться
                 if not _same_page(start_url, page.url):
-                    print(f"[Agent] #{step} Навигация: {page.url[:60]}. Возврат на {start_url}")
-                    update_demo_banner(page, step_text="Возврат на основную страницу…", progress_pct=0)
+                    print(f"[Agent] #{step} Навигация на {page.url[:60]}. Возврат.")
                     try:
                         page.goto(start_url, wait_until="domcontentloaded", timeout=20000)
-                        smart_wait_after_goto(page, timeout=10000)
+                        smart_wait_after_goto(page, timeout=5000)
                         _inject_all(page)
                     except Exception as e:
                         LOG.warning("Ошибка возврата: %s", e)
                     continue
 
-                # Проверить результат фонового анализа предыдущего шага (быстро, не блокируем)
-                # В демо-режиме пропускаем чтобы не замедлять
-                from config import DEMO_MODE as _dm_flush
-                if not _dm_flush or step % 3 == 0:  # В демо проверяем реже
-                    try:
-                        _flush_pending_analysis(page, memory, console_log, network_failures)
-                    except Exception:
-                        pass  # Не блокируем основной цикл из-за ошибок анализа
+                # Фоновый анализ предыдущего шага (не блокируем)
+                try:
+                    _flush_pending_analysis(page, memory, console_log, network_failures)
+                except Exception:
+                    pass
 
                 # Лимит логов
                 if len(console_log) > CONSOLE_LOG_LIMIT:
@@ -1399,25 +1489,40 @@ def run_agent(start_url: str = None):
                 if len(network_failures) > NETWORK_LOG_LIMIT:
                     del network_failures[:len(network_failures) - NETWORK_LOG_LIMIT + 30]
 
-                # ========== STEP 1: Фаза + чеклист ==========
+                # Фаза
                 if step > 1:
                     memory.advance_tester_phase()
 
-                # Чеклист: создаётся один раз для страницы, выполняется постепенно
-                checklist_results = _step_checklist_incremental(page, step, current_url, console_log, network_failures, memory)
+                # Чеклист — раз в 5 шагов (не на каждом)
+                checklist_results = []
+                if step % 5 == 1:
+                    checklist_results = _step_checklist_incremental(page, step, current_url, console_log, network_failures, memory)
 
-                # ========== STEP 2: Получить действие от GigaChat ==========
-                action, has_overlay, screenshot_b64 = _step_get_action(
-                    page, step, memory, console_log, network_failures, checklist_results, context,
-                )
-                if action is None:
-                    # Fallback: если GigaChat не отвечает — делаем активное действие сами
-                    print(f"[Agent] #{step} GigaChat не ответил, выполняю fallback действие...")
-                    action = _get_fallback_action(page, memory, has_overlay)
-                    if not action:
-                        from config import DEMO_MODE as _dm
-                        time.sleep(1 if _dm else 3)
-                        continue
+                # ========== ВЫБОР ДЕЙСТВИЯ: GigaChat (если готов) или быстрое локальное ==========
+                overlay_info_fast = detect_active_overlays(page)
+                has_overlay = overlay_info_fast.get("has_overlay", False)
+
+                # Проверяем: GigaChat уже ответил?
+                gc_action = _poll_gigachat()
+
+                if gc_action is not None:
+                    action = gc_action
+                    _gigachat_action = None  # потребили
+                    has_overlay = _gigachat_meta.get("has_overlay", has_overlay)
+                    screenshot_b64 = _gigachat_meta.get("screenshot_b64")
+                    source = "GigaChat"
+                else:
+                    # GigaChat ещё думает → быстрое локальное действие
+                    action = _get_fast_action(page, memory, has_overlay)
+                    screenshot_b64 = None
+                    source = "Fast"
+
+                # Запустить GigaChat для СЛЕДУЮЩЕГО шага (параллельно с выполнением текущего)
+                if _gigachat_future is None:
+                    try:
+                        _start_gigachat_async(page, step, memory, console_log, network_failures, checklist_results, context)
+                    except Exception:
+                        pass
 
                 act_type = (action.get("action") or "").lower()
                 sel = (action.get("selector") or "").strip()
@@ -1425,102 +1530,60 @@ def run_agent(start_url: str = None):
                 possible_bug = action.get("possible_bug")
                 expected_outcome = action.get("expected_outcome", "")
 
-                # ========== STEP 3: Выполнить действие ==========
+                print(f"[Agent] #{step} [{source}] {act_type.upper()}: {sel[:40]} | {action.get('reason', '')[:40]}")
+
+                # Дефект
                 if act_type == "check_defect" and possible_bug:
                     _step_handle_defect(page, action, possible_bug, current_url, checklist_results, console_log, network_failures, memory)
                     continue
 
-                # Self-healing: серия неудач ИЛИ зацикливание → мета-рефлексия
-                if memory.needs_self_healing() or memory.is_stuck():
-                    _self_heal(page, memory, console_log, network_failures)
-                    continue
+                # Anti-loop: серия неудач → reset
+                if memory.is_stuck():
+                    memory.advance_tester_phase(force=True)
+                    memory.reset_repeats()
+                    action = {"action": "scroll", "selector": "down", "reason": "Anti-loop reset"}
+                    act_type, sel, val = "scroll", "down", ""
 
-                # Запомнить скриншот до действия (для visual diff)
+                # Запомнить скриншот до действия
                 memory.screenshot_before_action = screenshot_b64
-
-                # Запомнить длину логов до действия (для корреляции)
                 memory.snapshot_logs_before_action(console_log, network_failures)
 
+                # ========== ВЫПОЛНИТЬ ДЕЙСТВИЕ ==========
                 result = _step_execute(page, action, step, memory, context)
 
-                # Корреляция: отслеживаем ошибки именно от этого действия (быстро, не блокируем)
-                # В демо-режиме логируем только критичные ошибки
-                from config import DEMO_MODE as _dm_err
-                if not _dm_err:
-                    action_errors = memory.get_new_errors_after_action(console_log, network_failures)
-                    if action_errors["console_errors"]:
-                        err_texts = "; ".join(e.get("text", "")[:60] for e in action_errors["console_errors"][:3])
-                        LOG.info("#{step} Console ошибки после действия: %s", err_texts)
-                    if action_errors["network_errors"]:
-                        net_texts = "; ".join(f"{n.get('status')} {n.get('url', '')[:40]}" for n in action_errors["network_errors"][:3])
-                        LOG.info("#{step} Network ошибки после действия: %s", net_texts)
-
-                # Трекинг success/failure для self-healing
+                # Success/failure tracking
                 if "error" in (result or "").lower() or "not_found" in (result or "").lower():
                     memory.record_action_failure()
                 else:
                     memory.record_action_success()
 
-                # Отслеживание тест-плана
                 _track_test_plan(memory, action)
 
-                # Network verification после submit-подобных кликов (только для важных действий, не блокируем)
-                from config import DEMO_MODE as _dm_net
-                if not _dm_net and act_type in ("click", "fill_form"):
-                    try:
-                        net_issue = _check_network_after_action(page, memory, action, network_failures)
-                        if net_issue:
-                            print(f"[Agent] #{step} Network issue: {net_issue[:80]}")
-                    except Exception:
-                        pass  # Не блокируем из-за ошибок проверки сети
-
-                # ========== STEP 4: Пост-анализ (быстро, в фоне) ==========
+                # Пост-анализ в фоне
                 _step_post_analysis(
                     page, step, action, result, act_type, sel, val, expected_outcome, possible_bug,
                     has_overlay, current_url, checklist_results, console_log, network_failures, memory,
                 )
 
-                # ========== STEP 5: Периодические проверки (тяжёлые — в фон) ==========
-                # a11y и perf НЕ используют Playwright → можно в фоне
-                # Но check_accessibility и check_performance используют page.evaluate!
-                # Поэтому собираем данные в main thread, анализ — в фоне.
-
-                # iframe, session persistence, responsive — нужен Playwright, оставляем sync но реже (в демо ещё реже)
-                from config import DEMO_MODE as _dm_adv
-                iframe_every = 20 if _dm_adv else 10
-                session_every = SESSION_PERSIST_CHECK_EVERY_N * 2 if _dm_adv else SESSION_PERSIST_CHECK_EVERY_N
-                
-                if ENABLE_IFRAME_TESTING and step % iframe_every == 0:
-                    _run_iframe_check(page, memory, current_url, console_log, network_failures)
-
-                if session_every > 0 and step % session_every == 0:
-                    _run_session_persistence_check(page, memory, current_url, console_log, network_failures)
-
-                if ENABLE_RESPONSIVE_TEST and memory.tester_phase == "critical_path" and not memory.responsive_done:
-                    _run_responsive_check(page, memory, current_url, console_log, network_failures)
-
-                # A11y/Perf — собираем данные из page в main thread, обрабатываем в фоне (реже в демо)
-                from config import DEMO_MODE as _dm_chk
-                a11y_every = A11Y_CHECK_EVERY_N * 2 if _dm_chk else A11Y_CHECK_EVERY_N
-                perf_every = PERF_CHECK_EVERY_N * 2 if _dm_chk else PERF_CHECK_EVERY_N
-                if a11y_every > 0 and step % a11y_every == 0:
-                    _bg_submit(_run_a11y_check, page, memory, current_url, console_log, network_failures)
-
-                if perf_every > 0 and step % perf_every == 0:
-                    _bg_submit(_run_perf_check, page, memory, current_url, console_log, network_failures)
-
-                update_demo_banner(page, step_text=f"#{step} Готово. Следующий шаг…", progress_pct=100)
+                # Периодические проверки (редко)
+                if step % 30 == 0:
+                    try:
+                        if ENABLE_IFRAME_TESTING:
+                            _run_iframe_check(page, memory, current_url, console_log, network_failures)
+                    except Exception:
+                        pass
+                if step % 50 == 0:
+                    try:
+                        _bg_submit(_run_a11y_check, page, memory, current_url, console_log, network_failures)
+                    except Exception:
+                        pass
 
                 if SESSION_REPORT_EVERY_N > 0 and step % SESSION_REPORT_EVERY_N == 0:
                     report = memory.get_session_report_text()
-                    plan_progress = memory.get_test_plan_progress()
-                    if plan_progress:
-                        report += "\n" + plan_progress
                     print(report)
 
-                # Минимальная пауза между действиями для видимости
-                from config import DEMO_MODE as _dm2
-                time.sleep(0.1 if _dm2 else 0.5)
+                # Минимальная пауза (только для видимости анимации)
+                time.sleep(0.15)
 
         except KeyboardInterrupt:
             print("\n[Agent] Остановлен по Ctrl+C.")
@@ -1697,75 +1760,118 @@ def _step_checklist(page, step, console_log, network_failures, memory):
     return checklist_results
 
 
-def _get_fallback_action(page: Page, memory: AgentMemory, has_overlay: bool) -> Optional[Dict[str, Any]]:
+def _get_fast_action(page: Page, memory: AgentMemory, has_overlay: bool = False) -> Dict[str, Any]:
     """
-    Fallback действие когда GigaChat не отвечает.
-    Агент должен продолжать работать активно.
+    Мгновенный выбор действия БЕЗ LLM — по ref-id из DOM.
+    Агент ВСЕГДА получает что-то для выполнения (< 50 мс).
+    Приоритет: кнопки CTA → inputs → ссылки навигации → scroll.
     """
     try:
-        # Если есть оверлей — закрыть его
         if has_overlay:
-            return {"action": "close_modal", "selector": "", "reason": "Fallback: закрываю оверлей"}
-        
-        # Пробуем найти неиспользованные элементы на странице
-        untested_elements = page.evaluate("""() => {
+            return {"action": "close_modal", "selector": "", "reason": "Закрываю оверлей"}
+
+        current_url = page.url
+        # Собираем ВСЕ кликабельные элементы с ref-id за один evaluate
+        elements = page.evaluate("""() => {
             const result = [];
-            const buttons = document.querySelectorAll('button:not([disabled]), [role="button"]:not([disabled]), a[href]');
-            for (const btn of Array.from(buttons).slice(0, 20)) {
-                const r = btn.getBoundingClientRect();
-                const s = getComputedStyle(btn);
-                if (r.width > 0 && r.height > 0 && 
-                    s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0') {
-                    const text = (btn.textContent || btn.getAttribute('aria-label') || '').trim().slice(0, 50);
-                    if (text && text.length > 1) {
-                        result.push({
-                            type: 'button',
-                            text: text,
-                            selector: btn.id ? '#' + btn.id : text,
-                        });
+            const isAgent = (el) => {
+                let c = el;
+                while (c && c !== document.body) {
+                    if (c.hasAttribute && c.hasAttribute('data-agent-host')) return true;
+                    c = c.parentElement;
+                }
+                return false;
+            };
+            const vis = (el) => {
+                const r = el.getBoundingClientRect();
+                if (r.width < 5 || r.height < 5) return false;
+                const s = getComputedStyle(el);
+                return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
+            };
+            // Кнопки (приоритет 1)
+            document.querySelectorAll('button:not([disabled]), [role="button"]:not([disabled]), input[type="submit"]').forEach(el => {
+                if (!vis(el) || isAgent(el)) return;
+                let ref = el.getAttribute('data-agent-ref');
+                if (!ref) return;
+                const text = (el.textContent || el.getAttribute('aria-label') || '').trim().slice(0, 50);
+                result.push({ref: 'ref:' + ref, type: 'click', text, priority: 1});
+            });
+            // Инпуты (приоритет 2)
+            document.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([disabled]), textarea:not([disabled])').forEach(el => {
+                if (!vis(el) || isAgent(el)) return;
+                let ref = el.getAttribute('data-agent-ref');
+                if (!ref) return;
+                const text = (el.placeholder || el.name || el.getAttribute('aria-label') || '').trim().slice(0, 50);
+                result.push({ref: 'ref:' + ref, type: 'input', text, priority: 2});
+            });
+            // Ссылки (приоритет 3)
+            document.querySelectorAll('a[href]:not([disabled])').forEach(el => {
+                if (!vis(el) || isAgent(el)) return;
+                let ref = el.getAttribute('data-agent-ref');
+                if (!ref) return;
+                const text = (el.textContent || el.getAttribute('aria-label') || '').trim().slice(0, 50);
+                const href = (el.getAttribute('href') || '');
+                if (href.startsWith('javascript:') || href === '#') return;
+                result.push({ref: 'ref:' + ref, type: 'link', text, priority: 3});
+            });
+            // Select (приоритет 2)
+            document.querySelectorAll('select:not([disabled])').forEach(el => {
+                if (!vis(el) || isAgent(el)) return;
+                let ref = el.getAttribute('data-agent-ref');
+                if (!ref) return;
+                const opts = Array.from(el.options).slice(0,3).map(o => o.text.trim()).join(',');
+                result.push({ref: 'ref:' + ref, type: 'select', text: opts, priority: 2});
+            });
+            // Табы (приоритет 2)
+            document.querySelectorAll('[role="tab"]').forEach(el => {
+                if (!vis(el) || isAgent(el)) return;
+                let ref = el.getAttribute('data-agent-ref');
+                if (!ref) return;
+                const text = (el.textContent || '').trim().slice(0, 50);
+                result.push({ref: 'ref:' + ref, type: 'tab', text, priority: 2});
+            });
+            return result;
+        }""") or []
+
+        # Фильтруем: убираем уже протестированные элементы
+        for elem in elements:
+            ref = elem.get("ref", "")
+            etype = elem.get("type", "")
+            act = "click" if etype in ("click", "link", "tab") else ("type" if etype == "input" else "select_option")
+            key = f"{act}:{ref}"
+            if not memory.is_element_tested(current_url, key):
+                text = elem.get("text", "?")[:30]
+                if etype == "input":
+                    from src.form_strategies import detect_field_type, get_test_value
+                    ftype = detect_field_type(placeholder=text, name=text)
+                    val = get_test_value(ftype, "happy")
+                    return {
+                        "action": "type", "selector": ref, "value": val,
+                        "reason": f"Ввод в '{text}'",
+                        "test_goal": f"Заполнить поле {text}",
+                        "expected_outcome": "Поле принимает значение",
                     }
-                }
-            }
-            return result.slice(0, 5);
-        }""")
-        
-        # Ищем первый элемент, который еще не кликали
-        for elem in (untested_elements or []):
-            selector = elem.get("selector", "")
-            text = elem.get("text", "")
-            # Проверяем что элемент не был протестирован
-            if selector and not memory.is_already_done("click", selector, ""):
-                # Используем текст как селектор если нет ID
-                final_selector = selector if selector.startswith("#") else text
-                return {
-                    "action": "click",
-                    "selector": final_selector,
-                    "reason": f"Fallback: клик по '{text[:30]}'",
-                    "test_goal": "Продолжение активного тестирования",
-                    "expected_outcome": "Элемент должен откликнуться на клик",
-                }
-        
-        # Если нет кнопок — прокрутка
-        if not memory.should_avoid_scroll():
-            return {
-                "action": "scroll",
-                "selector": "down",
-                "reason": "Fallback: прокрутка для поиска элементов",
-                "test_goal": "Найти новые элементы",
-                "expected_outcome": "Появятся новые элементы на экране",
-            }
-        
-        # Последний вариант — прокрутка вверх
-        return {
-            "action": "scroll",
-            "selector": "up",
-            "reason": "Fallback: прокрутка вверх",
-            "test_goal": "Вернуться к началу страницы",
-            "expected_outcome": "Страница прокрутится вверх",
-        }
+                elif etype == "select":
+                    return {
+                        "action": "select_option", "selector": ref, "value": text.split(",")[0] if text else "",
+                        "reason": f"Выбор опции",
+                        "test_goal": f"Выбрать опцию в дропдауне",
+                        "expected_outcome": "Опция выбирается",
+                    }
+                else:
+                    return {
+                        "action": "click", "selector": ref,
+                        "reason": f"Клик: {text}",
+                        "test_goal": f"Проверить '{text}'",
+                        "expected_outcome": "Элемент реагирует",
+                    }
+
+        # Все элементы протестированы → scroll
+        return {"action": "scroll", "selector": "down", "reason": "Все видимые элементы протестированы, ищу новые"}
+
     except Exception as e:
-        LOG.debug("_get_fallback_action error: %s", e)
-        return {"action": "scroll", "selector": "down", "reason": "Fallback: ошибка"}
+        LOG.debug("_get_fast_action error: %s", e)
+        return {"action": "scroll", "selector": "down", "reason": "Fast action error"}
 
 
 def _step_get_action(page, step, memory, console_log, network_failures, checklist_results, context):
@@ -1941,10 +2047,7 @@ def _step_get_action(page, step, memory, console_log, network_failures, checklis
     action = parse_llm_action(raw_answer)
     if not action:
         print(f"[Agent] #{step} Не удалось распарсить JSON: {raw_answer[:120]}")
-        # Fallback: активное действие вместо scroll
-        action = _get_fallback_action(page, memory, has_overlay)
-        if not action:
-            action = {"action": "scroll", "selector": "down", "reason": "GigaChat не дал JSON, fallback scroll"}
+        action = _get_fast_action(page, memory, has_overlay)
     # Валидация и нормализация
     action = validate_llm_action(action)
     
@@ -2032,15 +2135,11 @@ def _step_execute(page, action, step, memory, context):
         memory.form_strategy_iteration += 1
     update_demo_banner(page, step_text=f"#{step} {act_type.upper()}: {sel[:30]}…", progress_pct=80)
 
-    result = ""
-    for attempt in range(1 + max(0, ACTION_RETRY_COUNT)):
+    result = execute_action(page, action, memory)
+    # Один быстрый retry при неудаче
+    if "error" in result.lower() or "not_found" in result.lower():
+        time.sleep(0.15)
         result = execute_action(page, action, memory)
-        if "error" not in result.lower() and "not_found" not in result.lower() and "no_selector" not in result.lower():
-            break
-        if attempt < max(0, ACTION_RETRY_COUNT):
-            from config import DEMO_MODE as _dm_r
-            print(f"[Agent] #{step} Повтор {attempt + 1}…")
-            time.sleep(0.3 if _dm_r else 1.0)
 
     memory.add_action(action, result=result)
     memory.tick_phase_step()
@@ -2063,8 +2162,13 @@ def _step_execute(page, action, step, memory, context):
         except Exception:
             pass
 
-    time.sleep(POST_ACTION_DELAY)
-    smart_wait_after_goto(page, timeout=3000)
+    # Минимальная пауза: только чтобы DOM обновился
+    time.sleep(0.2)
+    # Быстрый wait (не 3 секунды!)
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=2000)
+    except Exception:
+        pass
 
     return result
 
