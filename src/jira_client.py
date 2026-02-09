@@ -252,6 +252,58 @@ def is_ignorable_issue(summary: str, description: str) -> bool:
     return False
 
 
+def _assign_issue(
+    jira_url: str,
+    issue_key: str,
+    assignee_value: str,
+    *,
+    headers: dict,
+    auth: Optional[tuple],
+    use_bearer: bool,
+) -> bool:
+    """
+    Назначить задачу на пользователя отдельным PUT-запросом.
+    Пробует несколько форматов: name → accountId → emailAddress.
+    """
+    url = f"{jira_url}/rest/api/2/issue/{issue_key}/assignee"
+    h = {k: v for k, v in headers.items()}
+
+    # Определяем все варианты payload в порядке приоритета
+    attempts = []
+    if len(assignee_value) > 30 and "-" in assignee_value:
+        # Похоже на accountId
+        attempts.append(("accountId", {"accountId": assignee_value}))
+        attempts.append(("name", {"name": assignee_value}))
+    elif "@" in assignee_value:
+        # Похоже на email
+        attempts.append(("name", {"name": assignee_value}))
+        attempts.append(("emailAddress", {"emailAddress": assignee_value}))
+    else:
+        # Username
+        attempts.append(("name", {"name": assignee_value}))
+        attempts.append(("accountId", {"accountId": assignee_value}))
+
+    for label, body in attempts:
+        try:
+            r = requests.put(
+                url,
+                json=body,
+                headers=h,
+                auth=auth if not use_bearer else None,
+                verify=False,
+                timeout=15,
+            )
+            if r.status_code in (200, 204):
+                LOG.info("Assignee %s: %s=%s", issue_key, label, assignee_value)
+                return True
+            LOG.debug("Assignee попытка %s: %s — %s", label, r.status_code, r.text[:150])
+        except Exception as e:
+            LOG.debug("Assignee попытка %s: %s", label, e)
+
+    LOG.warning("Не удалось назначить %s на %s. Проверьте JIRA_ASSIGNEE.", issue_key, assignee_value)
+    return False
+
+
 def _attach_files(
     jira_url: str,
     issue_key: str,
@@ -348,12 +400,8 @@ def create_jira_issue(
         auth = (login, api_token)
 
     # Assignee: если задан JIRA_ASSIGNEE — используем его, иначе — текущего пользователя (login)
-    assignee_value = None
-    if JIRA_ASSIGNEE:
-        assignee_value = JIRA_ASSIGNEE
-    elif login:
-        assignee_value = login
-    
+    assignee_value = JIRA_ASSIGNEE if JIRA_ASSIGNEE else login
+
     payload = {
         "fields": {
             "project": {"key": project_key},
@@ -363,28 +411,17 @@ def create_jira_issue(
             "labels": [JIRA_DEFECT_LABEL],
         }
     }
-    
-    # Добавляем assignee, если указан
-    if assignee_value:
-        # Для Jira Server: {"name": "username"}
-        # Для Jira Cloud: {"accountId": "..."} или {"name": "email"} (зависит от настроек)
-        # Пробуем универсальный вариант: если assignee_value похож на accountId (UUID) — используем accountId, иначе name
-        if len(assignee_value) > 30 and "-" in assignee_value:
-            # Похоже на accountId (UUID формат: 557058:xxx-xxx-xxx)
-            payload["fields"]["assignee"] = {"accountId": assignee_value}
-            LOG.info("Assignee: accountId=%s", assignee_value)
-        else:
-            # Username или email
-            payload["fields"]["assignee"] = {"name": assignee_value}
-            LOG.info("Assignee: name=%s", assignee_value)
 
     try:
         r = requests.post(url, json=payload, headers=headers, auth=auth, verify=False, timeout=30)
         r.raise_for_status()
         key = r.json().get("key")
-        assignee_info = f" (assignee: {assignee_value})" if assignee_value else ""
-        LOG.info("Создан дефект: %s%s", key, assignee_info)
-        register_local_defect(summary)  # запомнить для дедупликации
+        LOG.info("Создан дефект: %s", key)
+        register_local_defect(summary)
+
+        # Назначить ПОСЛЕ создания отдельным запросом (надёжнее чем в payload)
+        if key and assignee_value:
+            _assign_issue(jira_url, key, assignee_value, headers=headers, auth=auth, use_bearer=use_bearer)
 
         if key and attachment_paths:
             paths = [os.fspath(p) for p in attachment_paths]
@@ -397,8 +434,8 @@ def create_jira_issue(
             )
         return key
     except requests.exceptions.HTTPError as e:
-        print(f"[Jira] Ошибка API: {e.response.status_code} — {e.response.text[:200]}")
+        LOG.error("Ошибка API: %s — %s", e.response.status_code, e.response.text[:300])
         return None
     except Exception as e:
-        print(f"[Jira] Ошибка: {e}")
+        LOG.error("Ошибка: %s", e)
         return None
