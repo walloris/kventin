@@ -731,6 +731,9 @@ def _do_click(page: Page, selector: str, reason: str = "") -> str:
     loc = _find_element(page, selector)
     if loc:
         try:
+            # Прокручиваем страницу до элемента, чтобы он был виден на экране
+            loc.scroll_into_view_if_needed()
+            time.sleep(0.1)  # Небольшая пауза после прокрутки
             safe_highlight(loc, page, 0.4)
             highlight_and_click(loc, page, description=reason[:30] or "Клик")
             return f"clicked: {selector[:50]}"
@@ -837,6 +840,9 @@ def _do_type(page: Page, selector: str, value: str, form_strategy: str = "happy"
                 loc = None
     if loc:
         try:
+            # Прокручиваем страницу до элемента, чтобы он был виден на экране
+            loc.scroll_into_view_if_needed()
+            time.sleep(0.1)  # Небольшая пауза после прокрутки
             safe_highlight(loc, page, 0.3)
             box = loc.bounding_box()
             if box:
@@ -909,6 +915,9 @@ def _do_hover(page: Page, selector: str) -> str:
     loc = _find_element(page, selector)
     if loc:
         try:
+            # Прокручиваем страницу до элемента, чтобы он был виден на экране
+            loc.scroll_into_view_if_needed()
+            time.sleep(0.1)  # Небольшая пауза после прокрутки
             safe_highlight(loc, page, 0.3)
             loc.hover()
             time.sleep(1.0)  # Ждём появления тултипа/дропдауна после ховера
@@ -931,6 +940,9 @@ def _do_close_modal(page: Page, selector: str = "") -> str:
         loc = _find_element(page, selector)
         if loc:
             try:
+                # Прокручиваем страницу до элемента, чтобы он был виден на экране
+                loc.scroll_into_view_if_needed()
+                time.sleep(0.1)  # Небольшая пауза после прокрутки
                 safe_highlight(loc, page, 0.3)
                 highlight_and_click(loc, page, description="Закрываю")
                 time.sleep(0.5)
@@ -963,6 +975,9 @@ def _do_close_modal(page: Page, selector: str = "") -> str:
         try:
             loc = page.locator(cs).first
             if loc.count() > 0 and loc.is_visible():
+                # Прокручиваем страницу до кнопки закрытия, чтобы она была видна на экране
+                loc.scroll_into_view_if_needed()
+                time.sleep(0.1)  # Небольшая пауза после прокрутки
                 safe_highlight(loc, page, 0.3)
                 highlight_and_click(loc, page, description="Закрываю")
                 time.sleep(0.5)
@@ -996,6 +1011,9 @@ def _do_select_option(page: Page, selector: str, value: str) -> str:
     loc = _find_element(page, selector)
     if loc:
         try:
+            # Прокручиваем страницу до элемента, чтобы он был виден на экране
+            loc.scroll_into_view_if_needed()
+            time.sleep(0.1)  # Небольшая пауза после прокрутки
             tag = loc.evaluate("el => el.tagName.toLowerCase()")
             if tag == "select":
                 loc.select_option(label=value)
@@ -1018,6 +1036,9 @@ def _do_select_option(page: Page, selector: str, value: str) -> str:
             try:
                 opt = page.locator(os_sel).first
                 if opt.count() > 0 and opt.is_visible():
+                    # Прокручиваем страницу до опции, чтобы она была видна на экране
+                    opt.scroll_into_view_if_needed()
+                    time.sleep(0.1)  # Небольшая пауза после прокрутки
                     safe_highlight(opt, page, 0.3)
                     highlight_and_click(opt, page, description=f"Выбираю: {value[:20]}")
                     time.sleep(0.5)
