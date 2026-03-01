@@ -39,6 +39,7 @@ from config import (
     SESSION_REPORT_PATH,
     SESSION_REPORT_HTML_PATH,
     SESSION_REPORT_JSONL,
+    SESSION_REPORT_SAVE_EVERY_N,
     SAVE_STEP_SCREENSHOTS_DIR,
     ORACLE_ON_VISUAL_OR_ERROR,
     CRITICAL_FLOW_STEPS,
@@ -2139,6 +2140,22 @@ def run_agent(start_url: str = None):
                 if SESSION_REPORT_EVERY_N > 0 and step % SESSION_REPORT_EVERY_N == 0:
                     report = memory.get_session_report_text()
                     print(report)
+
+                # Периодически сохранять отчёт в файл во время работы (агент может крутиться бесконечно)
+                if SESSION_REPORT_SAVE_EVERY_N > 0 and step > 0 and step % SESSION_REPORT_SAVE_EVERY_N == 0:
+                    if SESSION_REPORT_PATH or SESSION_REPORT_HTML_PATH:
+                        try:
+                            report = memory.get_session_report_text()
+                            if SESSION_REPORT_PATH:
+                                with open(SESSION_REPORT_PATH, "w", encoding="utf-8") as f:
+                                    f.write(report)
+                            if SESSION_REPORT_HTML_PATH:
+                                html_content = _build_html_report(memory, report, start_url or "", video_dir=RECORD_VIDEO_DIR or "")
+                                with open(SESSION_REPORT_HTML_PATH, "w", encoding="utf-8") as f:
+                                    f.write(html_content)
+                            print(f"[Agent] Отчёт обновлён (шаг {step})")
+                        except Exception as e:
+                            LOG.warning("Промежуточный отчёт: %s", e)
 
                 time.sleep(0.3)
 

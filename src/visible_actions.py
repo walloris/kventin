@@ -66,19 +66,17 @@ SHADOW_HOST_SCRIPT = """
     `;
     shadow.appendChild(style);
 
-    // --- Курсор (ОГРОМНЫЙ и ЯРКИЙ для максимальной видимости) ---
+    // --- Курсор: яркая большая стрелка (не загораживает контент) ---
     const cursor = document.createElement('div');
+    cursor.innerHTML = '▼';
     cursor.style.cssText = `
-        position: fixed; width: 60px; height: 60px;
-        border: 6px solid #e74c3c; border-radius: 50%;
-        background: radial-gradient(circle, rgba(231,76,60,1) 0%, rgba(231,76,60,0.6) 50%, rgba(231,76,60,0.2) 80%);
+        position: fixed; width: 48px; height: 48px; display: flex; align-items: center; justify-content: center;
+        font-size: 42px; line-height: 1; color: #fff;
+        text-shadow: 0 0 12px rgba(255,255,255,1), 0 0 24px rgba(99,102,241,0.9), 0 2px 4px rgba(0,0,0,0.8);
         pointer-events: none; z-index: 2147483647;
         left: -100px; top: -100px;
-        transition: left 0.15s ease-out, top 0.15s ease-out;
-        box-shadow: 0 0 50px 12px rgba(231,76,60,1), 0 0 100px 20px rgba(231,76,60,0.6), 0 0 150px 30px rgba(231,76,60,0.3);
-        animation: agent-cursor-pulse 0.8s ease-in-out infinite;
-        display: block !important;
-        opacity: 1 !important;
+        transition: left 0.12s ease-out, top 0.12s ease-out;
+        display: flex !important; opacity: 1 !important;
     `;
     shadow.appendChild(cursor);
 
@@ -191,34 +189,20 @@ def inject_demo_banner(page: Page) -> None:
 
 
 def show_click_ripple(page: Page, x: float, y: float) -> None:
-    """Эффект «рябь» в точке клика - БОЛЬШЕ и ЯРЧЕ."""
+    """Короткая подсветка стрелки в точке клика (без большого круга)."""
     try:
         page.evaluate(
             """([x, y]) => {
-                // Создаём БОЛЬШУЮ яркую рябь для видимости
-                const r = document.createElement('div');
-                r.style.cssText = `
-                    position: fixed; left: ${x}px; top: ${y}px; width: 120px; height: 120px;
-                    margin-left: -60px; margin-top: -60px; border: 10px solid rgba(231,76,60,1);
-                    border-radius: 50%; pointer-events: none; z-index: 2147483645;
-                    background: radial-gradient(circle, rgba(231,76,60,0.5) 0%, rgba(231,76,60,0.2) 50%, transparent 70%);
-                    animation: agent-ripple 1.2s ease-out forwards;
-                    box-shadow: 0 0 80px rgba(231,76,60,1), 0 0 120px rgba(231,76,60,0.6);
+                const arr = document.createElement('div');
+                arr.textContent = '▼';
+                arr.style.cssText = `
+                    position: fixed; left: ${x}px; top: ${y}px; width: 40px; height: 40px;
+                    margin-left: -20px; margin-top: -20px; display: flex; align-items: center; justify-content: center;
+                    font-size: 32px; color: #fff; pointer-events: none; z-index: 2147483645;
+                    text-shadow: 0 0 16px rgba(255,255,255,1), 0 0 32px rgba(99,102,241,0.8);
                 `;
-                document.body.appendChild(r);
-                setTimeout(() => { if (r.parentNode) r.remove(); }, 1200);
-                
-                // Дополнительный эффект - ОГРОМНАЯ яркая вспышка
-                const flash = document.createElement('div');
-                flash.style.cssText = `
-                    position: fixed; left: ${x}px; top: ${y}px; width: 200px; height: 200px;
-                    margin-left: -100px; margin-top: -100px; background: radial-gradient(circle, rgba(231,76,60,0.6) 0%, rgba(231,76,60,0.3) 50%, transparent 70%);
-                    border-radius: 50%; pointer-events: none; z-index: 2147483644;
-                    animation: agent-ripple 0.8s ease-out forwards;
-                    box-shadow: 0 0 100px rgba(231,76,60,0.8);
-                `;
-                document.body.appendChild(flash);
-                setTimeout(() => { if (flash.parentNode) flash.remove(); }, 800);
+                document.body.appendChild(arr);
+                setTimeout(() => { if (arr.parentNode) arr.remove(); }, 500);
             }""",
             [x, y],
         )
@@ -262,8 +246,8 @@ def move_cursor_to(page: Page, x: float, y: float) -> None:
             """([x, y]) => {
                 if (window.__agentShadow && window.__agentShadow.cursor) {
                     const cursor = window.__agentShadow.cursor;
-                    cursor.style.left = (x - 30) + 'px';  // Центрируем курсор (60px / 2)
-                    cursor.style.top = (y - 30) + 'px';
+                    cursor.style.left = (x - 24) + 'px';  // Центрируем стрелку (48px / 2)
+                    cursor.style.top = (y - 24) + 'px';
                     cursor.style.display = 'block';
                     cursor.style.opacity = '1';
                     cursor.style.zIndex = '2147483647';
