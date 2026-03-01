@@ -157,9 +157,10 @@ GIGACHAT_CIRCUIT_BREAKER_COOLDOWN_SEC = int(os.getenv("GIGACHAT_CIRCUIT_BREAKER_
 # Таймаут на одно действие Playwright (клик, fill, wait), мс
 ACTION_TIMEOUT_MS = int(os.getenv("ACTION_TIMEOUT_MS", "10000"))
 # Путь к файлу итогового отчёта сессии (пусто = только в консоль)
-SESSION_REPORT_PATH = os.getenv("SESSION_REPORT_PATH", "").strip()
-# Путь к HTML-отчёту (красивый отчёт в браузере)
-SESSION_REPORT_HTML_PATH = os.getenv("SESSION_REPORT_HTML_PATH", "").strip()
+# Путь к текстовому отчёту сессии (пусто = только в консоль). По умолчанию — для теста отчёта.
+SESSION_REPORT_PATH = os.getenv("SESSION_REPORT_PATH", "./session_report.txt").strip()
+# Путь к HTML-отчёту (красивый отчёт в браузере). По умолчанию — для теста.
+SESSION_REPORT_HTML_PATH = os.getenv("SESSION_REPORT_HTML_PATH", "./session_report.html").strip()
 # JSONL-лог шагов (одна строка JSON на шаг)
 SESSION_REPORT_JSONL = os.getenv("SESSION_REPORT_JSONL", "").strip()
 # Сохранять скриншот после каждого шага в папку (путь к папке)
