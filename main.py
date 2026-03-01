@@ -64,6 +64,9 @@ def main():
     args = parser.parse_args()
 
     urls = _collect_urls(args)
+    if not urls:
+        print("[main] Нет URL для тестирования (укажи URL, --urls-file или START_URLS в .env)", file=sys.stderr)
+        sys.exit(2)
     total_defects = 0
     total_steps = 0
     error_seen = None

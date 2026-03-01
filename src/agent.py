@@ -737,7 +737,7 @@ def execute_action(page: Page, action: Dict[str, Any], memory: AgentMemory) -> s
     if act == "click":
         result = _do_click(page, selector, reason)
         # Записываем клик в покрытие
-        if memory and "clicked" in result.lower():
+        if memory and "clicked" in (result or "").lower():
             memory.record_page_element(page.url, f"click:{_norm_key(selector)}")
         return result
     elif act == "fill_form":
@@ -745,14 +745,14 @@ def execute_action(page: Page, action: Dict[str, Any], memory: AgentMemory) -> s
         form_strat = action.get("_form_strategy", "happy")
         result = _fill_form_smart(page, form_strategy=form_strat, memory=memory)
         # Записываем заполнение формы в покрытие
-        if memory and "form_filled" in result.lower():
+        if memory and "form_filled" in (result or "").lower():
             memory.record_page_element(page.url, "fill_form:all_fields")
         return result
     elif act == "type":
         form_strat = action.get("_form_strategy", "happy")
         result = _do_type(page, selector, value, form_strategy=form_strat)
         # Записываем в покрытие
-        if memory and "typed" in result.lower():
+        if memory and "typed" in (result or "").lower():
             memory.record_page_element(page.url, f"type:{_norm_key(selector)}")
         return result
     elif act == "scroll":
@@ -1017,7 +1017,7 @@ def _fill_form_smart(page: Page, form_strategy: str = "happy", memory: Optional[
                     continue  # Пропускаем если нет опций
                 value = options[0]
                 result = _do_select_option(page, selector, value)
-                if "selected" in result.lower():
+                if "selected" in (result or "").lower():
                     filled_count += 1
                     if memory:
                         memory.record_page_element(page.url, f"select:{_norm_key(selector)}")
@@ -1025,7 +1025,7 @@ def _fill_form_smart(page: Page, form_strategy: str = "happy", memory: Optional[
                 # Для обычных input/textarea используем _do_type
                 value = get_test_value(field_type, form_strategy)
                 result = _do_type(page, selector, value, form_strategy)
-                if "typed" in result.lower():
+                if "typed" in (result or "").lower():
                     filled_count += 1
                     if memory:
                         memory.record_page_element(page.url, f"type:{_norm_key(selector)}")
@@ -2568,6 +2568,8 @@ pre {{ margin: 0; font-size: 0.8rem; color: var(--text2); white-space: pre-wrap;
 (function(){{
 var steps = {json.dumps([{{"step": e.get("step"), "thumb": ((e.get("screenshot_path") or "").split("/")[-1] if e.get("screenshot_path") else "")}} for e in step_log])};
 var idx = 0, total = steps.length, playing = false, t;
+if (!total) {{ document.getElementById("replay-info").textContent = "Нет шагов"; }}
+else {{
 var strip = document.getElementById("replay-strip");
 steps.forEach(function(s, i){{
  var a = document.createElement("a");
@@ -2596,6 +2598,7 @@ document.getElementById("replay-play").onclick = function(){{
  else clearInterval(t);
 }};
 strip.querySelectorAll(".replay-thumb").forEach(function(el){{ el.onclick = function(e){{ e.preventDefault(); go(parseInt(this.dataset.step,10)); }}; }});
+}}
 }})();
 </script>
 </section>
@@ -3360,7 +3363,7 @@ def _step_execute(page, action, step, memory, context):
 
     result = execute_action(page, action, memory)
     # Один быстрый retry при неудаче
-    if "error" in result.lower() or "not_found" in result.lower():
+    if "error" in (result or "").lower() or "not_found" in (result or "").lower():
         time.sleep(0.15)
         result = execute_action(page, action, memory)
 
@@ -3544,10 +3547,6 @@ def _step_post_analysis(
     # Проверка: страница закрыта — не запускаем анализ
     if page.is_closed():
         return
-    
-    try:
-    except Exception:
-        pass  # Страница закрылась
 
     # Быстрый сбор из Playwright (main thread)
     try:

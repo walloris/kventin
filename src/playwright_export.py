@@ -57,7 +57,7 @@ def build_playwright_script(
         elif action == "type" or action == "fill_form":
             sel = selector or "unknown"
             if sel.startswith("ref:"):
-                lines.append(f'        page.locator("[data-kventin-ref=\\"{}\"]").first.fill("")  # value: {_esc(value[:80])}'.format(sel.replace("ref:", "")))
+                lines.append(f'        page.locator("[data-kventin-ref=\\"{}\"]").first.fill("{_esc(value[:200])}")'.format(sel.replace("ref:", "")))
             else:
                 lines.append(f'        page.locator("{_esc(sel[:200])}").first.fill("{_esc(value[:200])}")')
         elif action == "select_option":
