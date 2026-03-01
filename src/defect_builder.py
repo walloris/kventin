@@ -11,6 +11,69 @@ from playwright.sync_api import Page
 
 DEFECT_SUMMARY_PREFIX = "[Kventin]"
 
+# Уровни серьёзности для приоритизации (Critical -> Highest, Major -> High, Minor -> Medium в Jira)
+SEVERITY_CRITICAL = "critical"
+SEVERITY_MAJOR = "major"
+SEVERITY_MINOR = "minor"
+
+
+def infer_defect_severity(
+    summary: str,
+    description: str = "",
+    console_log: Optional[List[Dict[str, Any]]] = None,
+    network_failures: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    """
+    Определить severity по контексту: critical (5xx, белый экран, crash),
+    major (4xx на ключевых ресурсах, нерабочие кнопки), minor (a11y, предупреждения).
+    """
+    text = (summary + " " + description).lower()
+    cons = (console_log or [])
+    net = (network_failures or [])
+
+    # Critical: 5xx, белый экран, crash, internal server error
+    if any(
+        x in text
+        for x in (
+            "500", "502", "503", "504", "5xx",
+            "ошибка сервера", "server error", "internal server error",
+            "белый экран", "blank screen", "страница не загружается",
+            "crash", "краш", "uncaught exception", "необработанное исключение",
+        )
+    ):
+        return SEVERITY_CRITICAL
+    for n in net[-20:]:
+        status = n.get("status") or 0
+        if status >= 500:
+            return SEVERITY_CRITICAL
+
+    # Major: 4xx на документе/API, нерабочие элементы, форма не отправляется
+    if any(
+        x in text
+        for x in (
+            "404", "403", "401", "4xx",
+            "кнопка не работает", "форма не отправляется", "не находит элемент",
+            "not found", "not_found", "element not found",
+        )
+    ):
+        return SEVERITY_MAJOR
+    for n in net[-20:]:
+        status = n.get("status") or 0
+        if 400 <= status < 500:
+            return SEVERITY_MAJOR
+
+    # Accessibility, предупреждения консоли — minor
+    if any(
+        x in text
+        for x in (
+            "accessibility", "a11y", "контраст", "contrast", "alt", "aria",
+            "предупреждение", "warning", "deprecation",
+        )
+    ):
+        return SEVERITY_MINOR
+
+    return SEVERITY_MAJOR  # по умолчанию — major
+
 
 def build_defect_summary(llm_answer: str, url: str) -> str:
     """

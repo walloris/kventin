@@ -91,3 +91,71 @@ def compute_screenshot_diff(
     except Exception as e:
         LOG.debug("visual_diff error: %s", e)
         return {"changed": True, "change_percent": -1, "diff_zone": "unknown", "detail": str(e)}
+
+
+def _url_to_baseline_key(url: str, viewport: str = "") -> str:
+    """Строка для имени файла baseline (без опасных символов)."""
+    import hashlib
+    import re
+    key = (url or "") + "|" + (viewport or "")
+    h = hashlib.sha256(key.encode()).hexdigest()[:16]
+    safe = re.sub(r"[^\w\-]", "_", url or "")[:80]
+    return f"{safe}_{h}"
+
+
+def save_baseline(baseline_dir: str, url: str, screenshot_b64: Optional[str], viewport: str = "") -> bool:
+    """Сохранить скриншот как baseline для URL. Возвращает True при успехе."""
+    if not baseline_dir or not url or not screenshot_b64:
+        return False
+    try:
+        import os
+        os.makedirs(baseline_dir, exist_ok=True)
+        key = _url_to_baseline_key(url, viewport)
+        path = os.path.join(baseline_dir, key + ".b64")
+        with open(path, "wb") as f:
+            f.write(screenshot_b64.encode("ascii") if isinstance(screenshot_b64, str) else screenshot_b64)
+        return True
+    except Exception as e:
+        LOG.debug("save_baseline: %s", e)
+        return False
+
+
+def load_baseline(baseline_dir: str, url: str, viewport: str = "") -> Optional[str]:
+    """Загрузить baseline (base64) для URL. Возвращает None если нет файла."""
+    if not baseline_dir or not url:
+        return None
+    try:
+        import os
+        key = _url_to_baseline_key(url, viewport)
+        path = os.path.join(baseline_dir, key + ".b64")
+        if not os.path.isfile(path):
+            return None
+        with open(path, "rb") as f:
+            return f.read().decode("ascii")
+    except Exception as e:
+        LOG.debug("load_baseline: %s", e)
+        return None
+
+
+def compare_with_baseline(
+    baseline_dir: str,
+    url: str,
+    current_b64: Optional[str],
+    viewport: str = "",
+    threshold_pct: float = 5.0,
+) -> Optional[Dict]:
+    """
+    Сравнить текущий скриншот с baseline. Если нет baseline — вернуть None.
+    Если есть и разница > threshold_pct — вернуть {"regression": True, "change_percent": ..., "detail": ...}.
+    Иначе {"regression": False, "change_percent": ...}.
+    """
+    baseline_b64 = load_baseline(baseline_dir, url, viewport)
+    if not baseline_b64 or not current_b64:
+        return None
+    diff = compute_screenshot_diff(baseline_b64, current_b64)
+    pct = diff.get("change_percent", 0) or 0
+    return {
+        "regression": pct > threshold_pct,
+        "change_percent": pct,
+        "detail": diff.get("detail", ""),
+    }

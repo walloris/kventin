@@ -36,9 +36,13 @@ from config import (
     ENABLE_SECOND_PASS_BUG,
     ACTION_RETRY_COUNT,
     SESSION_REPORT_EVERY_N,
+    SESSION_REPORT_PATH,
+    SESSION_REPORT_HTML_PATH,
+    SESSION_REPORT_JSONL,
+    SAVE_STEP_SCREENSHOTS_DIR,
+    ORACLE_ON_VISUAL_OR_ERROR,
     CRITICAL_FLOW_STEPS,
     MAX_STEPS,
-    DEMO_MODE,
     SCROLL_PIXELS,
     MAX_ACTIONS_IN_MEMORY,
     MAX_SCROLLS_IN_ROW,
@@ -46,6 +50,10 @@ from config import (
     NETWORK_LOG_LIMIT,
     POST_ACTION_DELAY,
     PHASE_STEPS_TO_ADVANCE,
+    GIGACHAT_RESPONSE_TIMEOUT_SEC,
+    GIGACHAT_CIRCUIT_BREAKER_AFTER_N_TIMEOUTS,
+    GIGACHAT_CIRCUIT_BREAKER_COOLDOWN_SEC,
+    ACTION_TIMEOUT_MS,
     A11Y_CHECK_EVERY_N,
     PERF_CHECK_EVERY_N,
     ENABLE_RESPONSIVE_TEST,
@@ -55,6 +63,31 @@ from config import (
     ENABLE_SCENARIO_CHAINS,
     SCENARIO_CHAIN_LENGTH,
     ENABLE_IFRAME_TESTING,
+    MAX_NAVIGATION_DEPTH,
+    AUTH_URL,
+    AUTH_USERNAME,
+    AUTH_PASSWORD,
+    AUTH_SUBMIT_SELECTOR,
+    SESSION_STATE_SAVE_PATH,
+    SESSION_STATE_RESTORE_PATH,
+    RECORD_VIDEO_DIR,
+    SESSION_BASELINE_JSONL,
+    JUNIT_REPORT_PATH,
+    BROKEN_LINKS_CHECK_EVERY_N,
+    ENABLE_CONSOLE_WARNINGS_IN_REPORT,
+    ENABLE_MIXED_CONTENT_CHECK,
+    ENABLE_WEBSOCKET_MONITOR,
+    TEST_UPLOAD_FILE_PATH,
+    ENABLE_SHADOW_DOM,
+    BROWSER_ENGINE,
+    PLAYWRIGHT_EXPORT_PATH,
+    ENABLE_API_INTERCEPT,
+    API_LOG_MAX,
+    ENABLE_DOM_DIFF_AFTER_ACTION,
+    VISUAL_BASELINE_DIR,
+    VISUAL_REGRESSION_THRESHOLD_PCT,
+    TEST_SPEC_YAML_PATH,
+    FLAKINESS_RERUN_COUNT,
 )
 from src.gigachat_client import (
     consult_agent_with_screenshot,
@@ -66,10 +99,16 @@ from src.gigachat_client import (
 )
 from src.form_strategies import detect_field_type, get_test_value, get_form_fill_strategy
 from src.accessibility import check_accessibility, format_a11y_issues
-from src.visual_diff import compute_screenshot_diff
+from src.visual_diff import (
+    compute_screenshot_diff,
+    compare_with_baseline,
+    save_baseline,
+    load_baseline,
+)
 from src.performance import check_performance, format_performance_issues
 
 import hashlib
+import html as html_module
 import logging
 
 LOG = logging.getLogger("Agent")
@@ -77,6 +116,9 @@ if not LOG.handlers:
     h = logging.StreamHandler()
     h.setFormatter(logging.Formatter("[Agent] %(levelname)s %(message)s"))
     LOG.addHandler(h)
+
+# Текущая память агента в основном цикле (для self-healing в _find_element)
+_current_agent_memory: Optional["AgentMemory"] = None
 
 # Фоновый пул для параллельных задач (GigaChat, Jira, a11y, perf)
 # Playwright НЕ thread-safe → только main thread. Всё остальное — в пул.
@@ -111,6 +153,7 @@ from src.page_analyzer import (
     build_context,
     get_dom_summary,
     get_page_modules,
+    get_page_resource_urls,
     detect_active_overlays,
     format_overlays_context,
     detect_cookie_banner,
@@ -126,13 +169,16 @@ from src.visible_actions import (
     scroll_to_center,
     inject_llm_overlay,
     update_llm_overlay,
-    inject_demo_banner,
-    update_demo_banner,
     show_highlight_label,
 )
 from src.wait_utils import smart_wait_after_goto
 from src.checklist import run_checklist, checklist_results_to_context, build_checklist
-from src.defect_builder import build_defect_summary, build_defect_description, collect_evidence
+from src.defect_builder import (
+    build_defect_summary,
+    build_defect_description,
+    collect_evidence,
+    infer_defect_severity,
+)
 
 
 # --- Нормализация ключа для дедупликации ---
@@ -220,6 +266,52 @@ class AgentMemory:
         self.current_module_index: int = 0
         self.steps_in_current_module: int = 0
         self._modules_page_url: str = ""
+        # Структурированный лог шагов (step, url, action, result, source) для отчёта
+        self._step_log: List[Dict[str, Any]] = []
+        # Граф навигации: список {from_url, to_url, step, selector} для отчёта и лимита глубины
+        self._nav_graph: List[Dict[str, Any]] = []
+        # Глубина от start_url по каждому URL (для MAX_NAVIGATION_DEPTH)
+        self._url_depths: Dict[str, int] = {}
+        self._start_url_nav: str = ""
+        # Битые ссылки (проверка BROKEN_LINKS_CHECK_EVERY_N): список {url, status, error}
+        self._broken_links: List[Dict[str, Any]] = []
+        self._checked_link_urls: set = set()
+        # WebSocket: неожиданное закрытие/ошибки (ENABLE_WEBSOCKET_MONITOR)
+        self._websocket_issues: List[Dict[str, Any]] = []
+        # Mixed content: HTTP-ресурсы на HTTPS-странице (ENABLE_MIXED_CONTENT_CHECK)
+        self._mixed_content: List[Dict[str, Any]] = []
+        # API-интеркепт: XHR/fetch запросы и ответы (ENABLE_API_INTERCEPT)
+        self._api_log: List[Dict[str, Any]] = []
+        # Visual regression: сравнение с baseline (url -> {regression, change_percent, detail})
+        self._visual_regressions: List[Dict[str, Any]] = []
+        self._visual_baseline_checked: set = set()  # URL уже проверены на baseline
+        # Self-healing: кеш успешных селекторов (original -> {strategy, role?, name?})
+        self._selector_heal_cache: Dict[str, Dict[str, Any]] = {}
+
+    def set_start_url_for_nav(self, url: str) -> None:
+        """Задать стартовый URL для подсчёта глубины навигации."""
+        self._start_url_nav = url or ""
+        if self._start_url_nav:
+            self._url_depths[self._start_url_nav] = 0
+
+    def record_navigation(self, from_url: str, to_url: str, step: int, selector: str = "") -> None:
+        """Записать переход по ссылке (для графа и глубины)."""
+        from_url = (from_url or "").strip()
+        to_url = (to_url or "").strip()
+        if not to_url or from_url == to_url:
+            return
+        self._nav_graph.append({"from_url": from_url, "to_url": to_url, "step": step, "selector": selector[:80]})
+        prev_depth = self._url_depths.get(from_url, 0)
+        if to_url not in self._url_depths:
+            self._url_depths[to_url] = prev_depth + 1
+
+    def get_navigation_depth(self, url: str) -> int:
+        """Глубина перехода от start_url (0 = стартовая страница)."""
+        return self._url_depths.get((url or "").strip(), 0)
+
+    def append_step_log(self, entry: Dict[str, Any]) -> None:
+        """Добавить запись о шаге в лог (для итогового отчёта)."""
+        self._step_log.append(entry)
 
     def set_page_modules(self, modules: List[Dict[str, Any]], page_url: str) -> None:
         """Задать список модулей для текущей страницы (при смене URL или первой загрузке)."""
@@ -444,8 +536,8 @@ class AgentMemory:
                 steps.append("Прокрутка страницы")
         return steps
 
-    def record_defect_created(self, key: str, summary: str):
-        self.defects_created.append({"key": key, "summary": summary[:200]})
+    def record_defect_created(self, key: str, summary: str, severity: str = "major"):
+        self.defects_created.append({"key": key, "summary": summary[:200], "severity": severity})
 
     def advance_tester_phase(self, force: bool = False) -> str:
         """
@@ -473,21 +565,12 @@ class AgentMemory:
 
     def get_phase_instruction(self) -> str:
         """Краткая инструкция для GigaChat по текущей фазе."""
-        from config import DEMO_MODE
-        if DEMO_MODE:
-            d = {
-                "orient": "БЫСТРЫЙ ОСМОТР. Кликни на главную кнопку или первый элемент меню. Не скролль — кликай!",
-                "smoke": "SMOKE: кликай по всем видимым кнопкам и ссылкам. Заполняй формы если есть. Действуй быстро!",
-                "critical_path": "ОСНОВНОЙ СЦЕНАРИЙ: заполни форму, нажми все кнопки, пройди навигацию. Каждый шаг — новый элемент!",
-                "exploratory": "ИССЛЕДОВАНИЕ: открой все дропдауны, табы, меню. Введи данные в каждое поле. Проверь всё что видишь!",
-            }
-        else:
-            d = {
-                "orient": "Фаза: ОРИЕНТАЦИЯ. Определи тип страницы (лендинг, каталог, форма, ЛК). Выбери ОДНО действие для понимания контекста (например осмотр ключевых элементов или лёгкий клик по главному CTA).",
-                "smoke": "Фаза: SMOKE. Проверь, что страница живая: ключевые кнопки/ссылки есть и кликабельны. Выбери один важный элемент и проверь его (клик или hover).",
-                "critical_path": "Фаза: ОСНОВНОЙ СЦЕНАРИЙ. Тестируй главный пользовательский сценарий: основная кнопка, форма, навигация. Одно целенаправленное действие с ясной целью проверки.",
-                "exploratory": "Фаза: ИССЛЕДОВАТЕЛЬСКОЕ ТЕСТИРОВАНИЕ. Проверь меню, футер, формы, краевые случаи. Не повторяй уже сделанное. Цель каждого действия — осмысленная проверка, не случайный клик.",
-            }
+        d = {
+            "orient": "Фаза: ОРИЕНТАЦИЯ. Определи тип страницы. Выбери одно действие для понимания контекста (клик по главному CTA или ключевому элементу).",
+            "smoke": "Фаза: SMOKE. Проверь ключевые кнопки/ссылки. Выбери один важный элемент и проверь его (клик или hover).",
+            "critical_path": "Фаза: ОСНОВНОЙ СЦЕНАРИЙ. Тестируй главный сценарий: кнопка, форма, навигация. Одно целенаправленное действие.",
+            "exploratory": "Фаза: ИССЛЕДОВАНИЕ. Проверь меню, футер, формы. Не повторяй уже сделанное. Осмысленная проверка.",
+        }
         return d.get(self.tester_phase, d["exploratory"])
 
     def get_session_report_text(self) -> str:
@@ -684,6 +767,11 @@ def execute_action(page: Page, action: Dict[str, Any], memory: AgentMemory) -> s
         return _do_select_option(page, selector, value)
     elif act == "press_key":
         return _do_press_key(page, selector or value or "Escape")
+    elif act == "upload_file":
+        result = _do_upload_file(page, selector, value)
+        if memory and "uploaded" in (result or "").lower():
+            memory.record_page_element(page.url, f"type:{_norm_key(selector)}")
+        return result
     elif act == "check_defect":
         return "defect_found"
     else:
@@ -694,20 +782,48 @@ def execute_action(page: Page, action: Dict[str, Any], memory: AgentMemory) -> s
 def _find_element(page: Page, selector: str):
     """
     Поиск элемента по ref-id (мгновенный) с fallback по атрибутам.
+    Self-healing: при успехе fallback кешируем селектор в memory._selector_heal_cache;
+    при следующем вызове сначала пробуем кешированный вариант.
 
     Стратегии (по приоритету):
-      0) ref:N — мгновенный поиск через data-agent-ref (присваивается в get_dom_summary)
-      1) window.__agentRefs[N] — прямая ссылка на DOM-ноду
-      2) CSS/XPath/ID — если передан явный селектор (#id, .class, [attr], //)
-      3) data-testid, aria-label, name, placeholder — семантический fallback
-      4) Playwright getByRole/getByText — текстовый fallback
+      0) кеш self-healing (если ref ранее найден через getByRole/getByText)
+      1) ref:N — мгновенный поиск через data-agent-ref
+      2) CSS/XPath/ID, семантика, getByRole/getByText
     """
+    global _current_agent_memory
     if not selector:
         return None
 
     selector = selector.strip()
 
-    # --- 0) ref:N — основной путь (мгновенный) ---
+    # --- 0) Self-healing: попробовать кешированный селектор ---
+    mem = _current_agent_memory
+    if mem and getattr(mem, "_selector_heal_cache", None) and selector in mem._selector_heal_cache:
+        c = mem._selector_heal_cache[selector]
+        try:
+            strat = c.get("strategy") or ""
+            role = c.get("role")
+            name = (c.get("name") or "").strip()
+            if strat == "getByRole" and role and name:
+                loc = page.get_by_role(role, name=name, exact=False).first
+                if loc.count() > 0 and loc.is_visible():
+                    return loc
+            elif strat == "getByLabel" and name:
+                loc = page.get_by_label(name, exact=False).first
+                if loc.count() > 0 and loc.is_visible():
+                    return loc
+            elif strat == "getByText" and name:
+                loc = page.get_by_text(name, exact=False).first
+                if loc.count() > 0 and loc.is_visible():
+                    return loc
+            elif strat == "getByPlaceholder" and name:
+                loc = page.get_by_placeholder(name, exact=False).first
+                if loc.count() > 0 and loc.is_visible():
+                    return loc
+        except Exception:
+            pass
+
+    # --- 1) ref:N — основной путь (мгновенный) ---
     ref_num = None
     if selector.startswith("ref:"):
         try:
@@ -767,18 +883,20 @@ def _find_element(page: Page, selector: str):
 
     # --- 3) Playwright getBy* методы ---
     getby_strategies = [
-        ("getByRole:button", lambda: page.get_by_role("button", name=safe_text, exact=False).first),
-        ("getByRole:link", lambda: page.get_by_role("link", name=safe_text, exact=False).first),
-        ("getByRole:tab", lambda: page.get_by_role("tab", name=safe_text, exact=False).first),
-        ("getByRole:menuitem", lambda: page.get_by_role("menuitem", name=safe_text, exact=False).first),
-        ("getByLabel", lambda: page.get_by_label(safe_text, exact=False).first),
-        ("getByPlaceholder", lambda: page.get_by_placeholder(safe_text, exact=False).first),
-        ("getByText", lambda: page.get_by_text(safe_text, exact=True).first),
+        ("getByRole:button", "getByRole", "button", lambda: page.get_by_role("button", name=safe_text, exact=False).first),
+        ("getByRole:link", "getByRole", "link", lambda: page.get_by_role("link", name=safe_text, exact=False).first),
+        ("getByRole:tab", "getByRole", "tab", lambda: page.get_by_role("tab", name=safe_text, exact=False).first),
+        ("getByRole:menuitem", "getByRole", "menuitem", lambda: page.get_by_role("menuitem", name=safe_text, exact=False).first),
+        ("getByLabel", "getByLabel", None, lambda: page.get_by_label(safe_text, exact=False).first),
+        ("getByPlaceholder", "getByPlaceholder", None, lambda: page.get_by_placeholder(safe_text, exact=False).first),
+        ("getByText", "getByText", None, lambda: page.get_by_text(safe_text, exact=True).first),
     ]
-    for name, get_loc in getby_strategies:
+    for _label, strat, role, get_loc in getby_strategies:
         try:
             loc = get_loc()
             if loc.count() > 0 and loc.is_visible():
+                if mem and selector:
+                    mem._selector_heal_cache[selector] = {"strategy": strat, "role": role, "name": safe_text}
                 return loc
         except Exception:
             continue
@@ -967,6 +1085,14 @@ def _do_type(page: Page, selector: str, value: str, form_strategy: str = "happy"
             time.sleep(0.2)  # Пауза после клика
             loc.fill(value)
             time.sleep(0.5)  # Пауза после заполнения
+            # Верификация: значение действительно попало в поле
+            try:
+                current_val = (loc.input_value() or "").strip()
+                val_stripped = (value or "").strip()
+                if val_stripped and current_val != val_stripped and val_stripped not in current_val:
+                    return f"typed_but_value_mismatch: expected '{val_stripped[:30]}', got '{current_val[:30]}'"
+            except Exception:
+                pass
             print(f"[Agent] ✅ Ввод выполнен: {value[:30]}")
             
             # Проверка валидации: есть ли сообщение об ошибке после ввода?
@@ -1154,6 +1280,20 @@ def _do_select_option(page: Page, selector: str, value: str) -> str:
     return f"select_not_found: {selector[:30]} / {value[:30]}"
 
 
+def _do_upload_file(page: Page, selector: str, file_path: str) -> str:
+    """Загрузить файл в input[type=file] по селектору (ref:N или иной)."""
+    if not file_path or not os.path.isfile(file_path):
+        return f"upload_error: file not found {file_path[:50]}"
+    loc = _find_element(page, selector)
+    if not loc:
+        return f"upload_error: element not_found {selector[:30]}"
+    try:
+        loc.set_input_files(file_path)
+        return f"uploaded: {os.path.basename(file_path)[:40]}"
+    except Exception as e:
+        return f"upload_error: {e}"
+
+
 def _do_press_key(page: Page, key: str) -> str:
     """Нажать клавишу (Escape, Enter, Tab и т.д.)."""
     try:
@@ -1162,6 +1302,47 @@ def _do_press_key(page: Page, key: str) -> str:
         return f"key_pressed: {key}"
     except Exception as e:
         return f"key_error: {e}"
+
+
+# --- Автологин ---
+def _do_auth_login(page: Page, auth_url: str, username: str, password: str, submit_selector: str) -> bool:
+    """Выполнить вход на auth_url (заполнить логин/пароль, нажать кнопку). Возвращает True при успехе."""
+    if not auth_url or not username or not password:
+        return False
+    try:
+        page.goto(auth_url, wait_until="domcontentloaded", timeout=20000)
+        page.wait_for_load_state("domcontentloaded", timeout=5000)
+        # Ищем поля логина и пароля по type, name, placeholder
+        login_sel = 'input[type="email"], input[type="text"]:not([type="search"]), input[name*="login" i], input[name*="user" i], input[name*="email" i], input[placeholder*="логин" i], input[placeholder*="email" i], input[id*="login" i], input[id*="email" i]'
+        pass_sel = 'input[type="password"]'
+        try:
+            page.locator(login_sel).first.fill(username, timeout=5000)
+            page.locator(pass_sel).first.fill(password, timeout=5000)
+        except Exception:
+            # Пробуем по первому text/email и второму password
+            inputs = page.query_selector_all("input[type='text'], input[type='email'], input:not([type])")
+            for inp in inputs:
+                if inp.get_attribute("type") == "password":
+                    continue
+                inp.fill(username)
+                break
+            pw = page.query_selector("input[type='password']")
+            if pw:
+                pw.fill(password)
+        # Кнопка отправки
+        if submit_selector:
+            try:
+                page.locator(submit_selector).first.click(timeout=3000)
+            except Exception:
+                page.get_by_role("button", name=submit_selector).first.click(timeout=3000)
+        else:
+            page.locator('button[type="submit"], input[type="submit"], button:has-text("Войти"), button:has-text("Вход"), button:has-text("Login"), button:has-text("Sign in")').first.click(timeout=3000)
+        time.sleep(2)
+        print("[Agent] Автологин выполнен")
+        return True
+    except Exception as e:
+        LOG.warning("Автологин не удался: %s", e)
+        return False
 
 
 # --- Cookie/баннер согласия ---
@@ -1186,12 +1367,69 @@ def try_accept_cookie_banner(page: Page) -> bool:
     return False
 
 
+# --- Test spec YAML (сценарии до автономного прохода) ---
+def _run_test_spec_yaml(page: Page, memory: AgentMemory, spec_path: str) -> None:
+    """Выполнить сценарии из YAML: navigate, click, type. Селектор — ref:N или текст."""
+    if not spec_path or not os.path.isfile(spec_path):
+        return
+    try:
+        import yaml
+        with open(spec_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+    except Exception as e:
+        LOG.warning("test_spec YAML: не удалось загрузить %s: %s", spec_path, e)
+        return
+    scenarios = data.get("scenarios") or data.get("steps") or []
+    if isinstance(scenarios, dict):
+        scenarios = [scenarios]
+    for scenario in scenarios:
+        steps = scenario.get("steps") or scenario.get("step") or []
+        if isinstance(steps, dict):
+            steps = [steps]
+        name = scenario.get("name", "")
+        for idx, step in enumerate(steps):
+            if isinstance(step, str):
+                step = {"navigate": step}
+            action = step.get("action") or ("navigate" if step.get("navigate") else "click")
+            if action == "navigate" or step.get("navigate"):
+                url = (step.get("url") or step.get("navigate") or "").strip()
+                if url:
+                    try:
+                        page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                        smart_wait_after_goto(page, timeout=5000)
+                        get_dom_summary(page, max_length=4000, include_shadow_dom=ENABLE_SHADOW_DOM)
+                    except Exception as e:
+                        LOG.warning("test_spec navigate %s: %s", url[:50], e)
+            elif action == "click":
+                sel = (step.get("selector") or step.get("element") or "").strip()
+                if sel:
+                    loc = _find_element(page, sel)
+                    if loc:
+                        try:
+                            loc.click(timeout=5000)
+                            time.sleep(0.5)
+                        except Exception as e:
+                            LOG.warning("test_spec click %s: %s", sel[:30], e)
+            elif action == "type":
+                sel = (step.get("selector") or step.get("element") or "").strip()
+                val = (step.get("value") or step.get("text") or "").strip()
+                if sel and val is not None:
+                    loc = _find_element(page, sel)
+                    if loc:
+                        try:
+                            loc.fill(val, timeout=5000)
+                            time.sleep(0.3)
+                        except Exception as e:
+                            LOG.warning("test_spec type %s: %s", sel[:30], e)
+        if name:
+            print(f"[Agent] Test spec сценарий выполнен: {name[:50]}")
+
+
 # --- Инициализация страницы ---
 def _inject_all(page: Page):
     """Инжектировать все визуальные элементы."""
     inject_cursor(page)
     inject_llm_overlay(page)
-    inject_demo_banner(page)
 
 
 def _same_page(start_url: str, current_url: str) -> bool:
@@ -1231,7 +1469,6 @@ def _handle_new_tabs(
             new_tab.wait_for_load_state("domcontentloaded", timeout=15000)
             tab_url = new_tab.url or "(пустая)"
             print(f"[Agent] #{step} Новая вкладка загрузилась: {tab_url[:80]}")
-            update_demo_banner(main_page, step_text=f"Новая вкладка: {tab_url[:40]}…", progress_pct=50)
 
             # Проверяем, что страница не пустая/ошибочная
             title = ""
@@ -1299,7 +1536,6 @@ def _handle_new_tabs(
                 # Загрузка успешна
                 load_ok = True
                 print(f"[Agent] #{step} Новая вкладка OK: {tab_url[:60]} → закрываю")
-                update_demo_banner(main_page, step_text=f"Вкладка OK: {tab_url[:30]}. Закрываю.", progress_pct=70)
                 memory.add_action({"action": "new_tab_ok", "selector": tab_url}, result=f"tab_loaded: {title[:40]}")
 
         except Exception as e:
@@ -1339,6 +1575,7 @@ def run_agent(start_url: str = None):
     Phase 3: Скриншот после действия → GigaChat (анализ)
     Phase 4: Если дефект → Jira с фактурой
     """
+    global _current_agent_memory
     start_url = start_url or START_URL
     if not start_url.startswith("http"):
         start_url = "https://" + start_url
@@ -1351,13 +1588,16 @@ def run_agent(start_url: str = None):
     # Инициализация соединения с GigaChat до запуска браузера
     if not init_gigachat_connection():
         print("[Agent] GigaChat недоступен. Проверьте настройки (токен, URL). Браузер не запускается.")
-        return
+        return {"defects": 0, "steps": 0, "error": "GigaChat недоступен"}
+
     print("[Agent] GigaChat готов. Запуск браузера…")
+    result = {"defects": 0, "steps": 0, "error": None}
 
     with sync_playwright() as p:
         browser = None
+        engine = getattr(p, BROWSER_ENGINE, p.chromium)
         if BROWSER_USER_DATA_DIR:
-            # Профиль на диске — сохраняется выбранный сертификат, куки, логин
+            # Профиль на диске — поддерживается только Chromium
             context = p.chromium.launch_persistent_context(
                 BROWSER_USER_DATA_DIR,
                 headless=HEADLESS,
@@ -1366,12 +1606,28 @@ def run_agent(start_url: str = None):
                 ignore_https_errors=True,
             )
         else:
-            browser = p.chromium.launch(headless=HEADLESS, slow_mo=BROWSER_SLOW_MO)
-            context = browser.new_context(
-                viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
-                ignore_https_errors=True,
-            )
+            browser = engine.launch(headless=HEADLESS, slow_mo=BROWSER_SLOW_MO)
+            ctx_opts = {
+                "viewport": {"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
+                "ignore_https_errors": True,
+            }
+            if RECORD_VIDEO_DIR:
+                os.makedirs(RECORD_VIDEO_DIR, exist_ok=True)
+                ctx_opts["record_video_dir"] = RECORD_VIDEO_DIR
+            context = browser.new_context(**ctx_opts)
         page = context.new_page()
+        page.set_default_timeout(ACTION_TIMEOUT_MS)
+
+        # Восстановление состояния (cookies) из предыдущей сессии
+        if SESSION_STATE_RESTORE_PATH and os.path.isfile(SESSION_STATE_RESTORE_PATH):
+            try:
+                with open(SESSION_STATE_RESTORE_PATH, "r", encoding="utf-8") as f:
+                    cookies = json.load(f)
+                if isinstance(cookies, list) and cookies:
+                    context.add_cookies(cookies)
+                    print(f"[Agent] Восстановлено {len(cookies)} cookies из {SESSION_STATE_RESTORE_PATH}")
+            except Exception as e:
+                LOG.debug("Восстановление состояния: %s", e)
 
         # Параметры в localStorage на каждой загружаемой странице
         context.add_init_script("""
@@ -1404,8 +1660,52 @@ def run_agent(start_url: str = None):
                     })
                 except Exception:
                     pass
+            if ENABLE_MIXED_CONTENT_CHECK and response.url and page.url.startswith("https://") and response.url.startswith("http://"):
+                try:
+                    memory._mixed_content.append({"url": response.url[:300], "page": page.url[:200]})
+                except Exception:
+                    pass
+            if ENABLE_API_INTERCEPT and response.request.resource_type in ("xhr", "fetch"):
+                try:
+                    req = response.request
+                    entry = {
+                        "method": req.method,
+                        "url": (req.url or "")[:500],
+                        "status": response.status,
+                        "ok": response.ok,
+                    }
+                    memory._api_log.append(entry)
+                    if len(memory._api_log) > API_LOG_MAX:
+                        memory._api_log.pop(0)
+                except Exception:
+                    pass
         page.on("response", on_response)
         page._agent_network_failures = network_failures
+
+        if ENABLE_WEBSOCKET_MONITOR:
+            def on_websocket(ws):
+                url_ws = ws.url or ""
+                def on_close():
+                    try:
+                        memory._websocket_issues.append({"url": url_ws[:200], "event": "close"})
+                    except Exception:
+                        pass
+                def on_error(err):
+                    try:
+                        memory._websocket_issues.append({"url": url_ws[:200], "event": "error", "error": str(err)[:150]})
+                    except Exception:
+                        pass
+                try:
+                    ws.on("close", on_close)
+                    ws.on("socketerror", on_error)
+                except Exception:
+                    pass
+            page.on("websocket", on_websocket)
+
+        # Автологин перед стартом (если задан AUTH_URL)
+        if AUTH_URL and AUTH_USERNAME and AUTH_PASSWORD:
+            _do_auth_login(page, AUTH_URL, AUTH_USERNAME, AUTH_PASSWORD, AUTH_SUBMIT_SELECTOR)
+            time.sleep(1)
 
         # Загрузка начальной страницы
         try:
@@ -1418,17 +1718,24 @@ def run_agent(start_url: str = None):
                 browser.close()
             else:
                 context.close()
-            return
+            result["error"] = str(e)[:500]
+            return result
 
         memory.session_start = datetime.now()
+        memory.set_start_url_for_nav(start_url)
         # Закрыть баннер cookies/согласия, если есть
         if try_accept_cookie_banner(page):
             time.sleep(1.5)
             smart_wait_after_goto(page, timeout=3000)
 
+        # Спецификация теста (YAML): выполнить сценарии до автономного прохода
+        if TEST_SPEC_YAML_PATH:
+            get_dom_summary(page, max_length=4000, include_shadow_dom=ENABLE_SHADOW_DOM)
+            _run_test_spec_yaml(page, memory, TEST_SPEC_YAML_PATH)
+            time.sleep(1)
+
         # Тест-план в начале сессии (GigaChat по скриншоту предлагает 5–7 шагов)
         if ENABLE_TEST_PLAN_START:
-            update_demo_banner(page, step_text="Получение тест-плана от GigaChat…", progress_pct=10)
             plan_screenshot = take_screenshot_b64(page)
             test_plan_steps = get_test_plan_from_screenshot(plan_screenshot, start_url)
             if test_plan_steps:
@@ -1447,9 +1754,11 @@ def run_agent(start_url: str = None):
         # GigaChat работает в фоне. Пока ждём ответ — агент кликает по ref-id.
         # Когда GigaChat отвечает — берём его действие следующим.
         _gigachat_future: Optional[Future] = None
+        _gigachat_future_started_at: float = 0.0
         _gigachat_action: Optional[Dict[str, Any]] = None
         _gigachat_meta: Dict[str, Any] = {}  # has_overlay, screenshot_b64
-        demo_deadline = time.time() + int(os.getenv("DEMO_DURATION_SEC", "20")) if DEMO_MODE else None
+        _gigachat_circuit_open_until: float = 0.0  # Circuit breaker: не вызывать GigaChat до этого времени
+        _gigachat_consecutive_timeouts: int = 0
 
         def _start_gigachat_async(page_, step_, memory_, console_log_, network_failures_, checklist_results_, context_):
             """Запустить GigaChat в фоновом потоке. Возвращает Future."""
@@ -1459,9 +1768,8 @@ def run_agent(start_url: str = None):
                 return
             
             # Собираем всё что нужно ДО отправки в фон (Playwright — только main thread)
-            from config import DEMO_MODE as _dm_gc
-            dom_max = 3000 if _dm_gc else 5000
-            history_n = 8 if _dm_gc else 15
+            dom_max = 5000
+            history_n = 15
             
             try:
                 overlay_info = detect_active_overlays(page_)
@@ -1469,7 +1777,7 @@ def run_agent(start_url: str = None):
                 screenshot_b64 = take_screenshot_b64(page_)
                 screenshot_changed = memory_.is_screenshot_changed(screenshot_b64 or "")
                 current_url_ = page_.url
-                dom_summary = get_dom_summary(page_, max_length=dom_max)
+                dom_summary = get_dom_summary(page_, max_length=dom_max, include_shadow_dom=ENABLE_SHADOW_DOM)
                 history_text = memory_.get_history_text(last_n=history_n)
                 overlay_context = format_overlays_context(overlay_info)
                 page_type = detect_page_type(page_)
@@ -1512,10 +1820,13 @@ def run_agent(start_url: str = None):
                 plan_hint = ""
                 if memory_.test_plan:
                     plan_hint = memory_.get_test_plan_progress() + "\n"
+                critical_hint = ""
+                if CRITICAL_FLOW_STEPS:
+                    critical_hint = f"\nКритический сценарий (сделай в первую очередь): {', '.join(CRITICAL_FLOW_STEPS[:5])}.\n"
                 stuck_w = "\n🚨 ЗАЦИКЛИВАНИЕ! Выбери НОВЫЙ элемент!\n" if memory_.is_stuck() else ""
                 question = f"""Скриншот и контекст.
 {module_ctx}
-{ptype_hint}{coverage_hint}
+{ptype_hint}{coverage_hint}{critical_hint}
 ЭЛЕМЕНТЫ СТРАНИЦЫ (только видимые на экране, формат: [N] тип "текст" атрибуты):
 {dom_summary[:2500]}
 {history_text}
@@ -1535,23 +1846,50 @@ def run_agent(start_url: str = None):
                     action = parse_llm_action(raw)
                     if action:
                         return validate_llm_action(action)
+                    # Один retry с запросом только валидного JSON
+                    retry_q = "Ответь ТОЛЬКО валидным JSON с полями action, selector, value, reason, test_goal, expected_outcome. Без markdown и пояснений."
+                    retry_raw = consult_agent_with_screenshot(
+                        ctx, retry_q, screenshot_b64=send_screenshot,
+                        phase_instruction=phase_instruction, tester_phase=memory_.tester_phase,
+                        has_overlay=has_overlay,
+                    )
+                    if retry_raw:
+                        action = parse_llm_action(retry_raw)
+                        if action:
+                            return validate_llm_action(action)
                 return None
 
+            nonlocal _gigachat_future_started_at
+            _gigachat_future_started_at = time.time()
             _gigachat_future = _bg_submit(_call_gigachat)
 
         def _poll_gigachat() -> Optional[Dict[str, Any]]:
-            """Проверить готов ли GigaChat (не блокирует)."""
-            nonlocal _gigachat_future, _gigachat_action
+            """Проверить готов ли GigaChat (не блокирует). При таймауте — отменить и вернуть None."""
+            nonlocal _gigachat_future, _gigachat_action, _gigachat_future_started_at, _gigachat_consecutive_timeouts, _gigachat_circuit_open_until
             if _gigachat_future is None:
                 return _gigachat_action
             if _gigachat_future.done():
                 try:
                     result = _gigachat_future.result(timeout=0)
                     _gigachat_action = result
+                    if result is not None:
+                        _gigachat_consecutive_timeouts = 0  # успех — сброс счётчика
                 except Exception:
                     _gigachat_action = None
                 _gigachat_future = None
                 return _gigachat_action
+            if GIGACHAT_RESPONSE_TIMEOUT_SEC > 0 and (time.time() - _gigachat_future_started_at) > GIGACHAT_RESPONSE_TIMEOUT_SEC:
+                try:
+                    _gigachat_future.cancel()
+                except Exception:
+                    pass
+                _gigachat_future = None
+                if GIGACHAT_CIRCUIT_BREAKER_AFTER_N_TIMEOUTS > 0:
+                    _gigachat_consecutive_timeouts += 1
+                    if _gigachat_consecutive_timeouts >= GIGACHAT_CIRCUIT_BREAKER_AFTER_N_TIMEOUTS:
+                        _gigachat_circuit_open_until = time.time() + GIGACHAT_CIRCUIT_BREAKER_COOLDOWN_SEC
+                        print(f"[Agent] Circuit breaker: GigaChat не отвечает {_gigachat_consecutive_timeouts} раз подряд. Только fast action следующие {GIGACHAT_CIRCUIT_BREAKER_COOLDOWN_SEC} сек.")
+                return None
             return None  # ещё думает
 
         try:
@@ -1559,16 +1897,36 @@ def run_agent(start_url: str = None):
                 memory.iteration += 1
                 step = memory.iteration
                 memory.defects_on_current_step = 0
-
-                if DEMO_MODE and demo_deadline and time.time() > demo_deadline:
-                    print("[Agent] Demo: 20 секунд закончились. Завершаю.")
-                    break
+                _current_agent_memory = memory
 
                 if MAX_STEPS > 0 and step > MAX_STEPS:
                     print(f"[Agent] Лимит {MAX_STEPS} шагов. Завершаю.")
                     break
 
                 current_url = page.url
+
+                # Visual regression baseline: один раз на URL — сравнить с baseline или сохранить
+                if VISUAL_BASELINE_DIR and current_url and current_url not in memory._visual_baseline_checked:
+                    try:
+                        b64 = take_screenshot_b64(page)
+                        if b64:
+                            baseline = load_baseline(VISUAL_BASELINE_DIR, current_url, "")
+                            if not baseline:
+                                save_baseline(VISUAL_BASELINE_DIR, current_url, b64, "")
+                            else:
+                                res = compare_with_baseline(
+                                    VISUAL_BASELINE_DIR, current_url, b64, "",
+                                    threshold_pct=VISUAL_REGRESSION_THRESHOLD_PCT,
+                                )
+                                if res and res.get("regression"):
+                                    memory._visual_regressions.append({
+                                        "url": current_url[:200],
+                                        "change_percent": res.get("change_percent", 0),
+                                        "detail": (res.get("detail") or "")[:200],
+                                    })
+                            memory._visual_baseline_checked.add(current_url)
+                    except Exception as e:
+                        LOG.debug("visual baseline check: %s", e)
 
                 # НАВИГАЦИЯ ВКЛЮЧЕНА — агент активно переходит по страницам приложения
                 # Новые вкладки — обрабатываем
@@ -1585,12 +1943,10 @@ def run_agent(start_url: str = None):
                         LOG.warning("Ошибка возврата: %s", e)
                     continue
 
-                # Фоновый анализ предыдущего шага (не блокируем)
-                if not DEMO_MODE:
-                    try:
-                        _flush_pending_analysis(page, memory, console_log, network_failures)
-                    except Exception:
-                        pass
+                try:
+                    _flush_pending_analysis(page, memory, console_log, network_failures)
+                except Exception:
+                    pass
 
                 # Лимит логов
                 if len(console_log) > CONSOLE_LOG_LIMIT:
@@ -1632,12 +1988,11 @@ def run_agent(start_url: str = None):
                 # Ref-id для быстрого выбора (и для GigaChat)
                 if not page.is_closed():
                     try:
-                        get_dom_summary(page, max_length=4000)
+                        get_dom_summary(page, max_length=4000, include_shadow_dom=ENABLE_SHADOW_DOM)
                     except Exception:
                         pass
 
-                # В демо — только быстрый выбор (без GigaChat), чтобы не зависать на сети/ответе
-                gc_action = None if DEMO_MODE else _poll_gigachat()
+                gc_action = _poll_gigachat()
 
                 if gc_action is not None:
                     action = gc_action
@@ -1646,16 +2001,19 @@ def run_agent(start_url: str = None):
                     screenshot_b64 = _gigachat_meta.get("screenshot_b64")
                     source = "GigaChat"
                 else:
-                    action = _get_fast_action(page, memory, has_overlay, demo_mode=DEMO_MODE)
+                    action = _get_fast_action(page, memory, has_overlay)
                     screenshot_b64 = None
                     source = "Fast"
 
-                # GigaChat только не в демо (демо = безбожно тыкает без ожидания LLM)
-                if not DEMO_MODE and _gigachat_future is None and not page.is_closed():
-                    try:
-                        _start_gigachat_async(page, step, memory, console_log, network_failures, checklist_results, context)
-                    except Exception:
-                        pass
+                # Circuit breaker: не вызывать GigaChat пока открыт контур
+                if _gigachat_future is None and not page.is_closed():
+                    if time.time() < _gigachat_circuit_open_until:
+                        pass  # только fast action
+                    else:
+                        try:
+                            _start_gigachat_async(page, step, memory, console_log, network_failures, checklist_results, context)
+                        except Exception:
+                            pass
 
                 act_type = (action.get("action") or "").lower()
                 sel = (action.get("selector") or "").strip()
@@ -1673,6 +2031,9 @@ def run_agent(start_url: str = None):
 
                 # Anti-loop: серия неудач → reset
                 if memory.is_stuck():
+                    if memory.advance_module():
+                        m = memory.get_current_module()
+                        print(f"[Agent] Зацикливание — смена модуля: {(m or {}).get('name', '')[:50]}")
                     memory.advance_tester_phase(force=True)
                     memory.reset_repeats()
                     action = {"action": "scroll", "selector": "down", "reason": "Anti-loop reset"}
@@ -1702,6 +2063,66 @@ def run_agent(start_url: str = None):
                 else:
                     memory.record_action_success()
 
+                # Опционально: скриншот после шага для отчёта
+                screenshot_path_rel = ""
+                if not page.is_closed():
+                    if SESSION_REPORT_HTML_PATH:
+                        screenshot_dir = os.path.join(os.path.dirname(SESSION_REPORT_HTML_PATH), "screenshots")
+                        try:
+                            os.makedirs(screenshot_dir, exist_ok=True)
+                            path = os.path.join(screenshot_dir, f"step_{step:04d}.png")
+                            page.screenshot(path=path)
+                            screenshot_path_rel = f"screenshots/step_{step:04d}.png"
+                        except Exception as e:
+                            LOG.debug("Скриншот шага: %s", e)
+                    elif SAVE_STEP_SCREENSHOTS_DIR:
+                        try:
+                            os.makedirs(SAVE_STEP_SCREENSHOTS_DIR, exist_ok=True)
+                            path = os.path.join(SAVE_STEP_SCREENSHOTS_DIR, f"step_{step:04d}.png")
+                            page.screenshot(path=path)
+                            screenshot_path_rel = path
+                        except Exception as e:
+                            LOG.debug("Скриншот шага: %s", e)
+
+                flak = getattr(memory, "_last_step_flakiness", None)
+                step_entry = {
+                    "step": step,
+                    "url": (current_url or "")[:200],
+                    "action": act_type,
+                    "selector": sel[:80] if sel else "",
+                    "value": (action.get("value") or "")[:200],
+                    "result": (result or "")[:200],
+                    "source": source,
+                    "screenshot_path": screenshot_path_rel,
+                }
+                if flak:
+                    step_entry["flakiness_ok"], step_entry["flakiness_total"] = flak[0], flak[1]
+                memory.append_step_log(step_entry)
+
+                # Граф навигации и лимит глубины
+                url_after = page.url if not page.is_closed() else current_url
+                if url_after and url_after != (current_url or ""):
+                    memory.record_navigation(current_url or "", url_after, step, sel or "")
+                if MAX_NAVIGATION_DEPTH > 0 and not page.is_closed():
+                    depth = memory.get_navigation_depth(page.url)
+                    if depth > MAX_NAVIGATION_DEPTH:
+                        print(f"[Agent] Глубина {depth} > {MAX_NAVIGATION_DEPTH}, возврат на {start_url[:60]}")
+                        try:
+                            page.goto(start_url, wait_until="domcontentloaded", timeout=20000)
+                            smart_wait_after_goto(page, timeout=5000)
+                            _inject_all(page)
+                        except Exception as e:
+                            LOG.warning("Возврат на start_url: %s", e)
+
+                # Проверка битых ссылок каждые N шагов (в фоне)
+                if BROKEN_LINKS_CHECK_EVERY_N > 0 and step % BROKEN_LINKS_CHECK_EVERY_N == 0 and not page.is_closed():
+                    try:
+                        urls_to_check = get_page_resource_urls(page, current_url or page.url)
+                        if urls_to_check:
+                            _bg_submit(_check_broken_links_bg, urls_to_check[:50], memory)  # не более 50 за раз
+                    except Exception as e:
+                        LOG.debug("Broken links collect: %s", e)
+
                 # Шаги по модулю: после N шагов переключаемся на следующий модуль
                 memory.tick_module_step()
                 if memory.get_current_module() and memory.steps_in_current_module >= PHASE_STEPS_TO_ADVANCE:
@@ -1719,8 +2140,7 @@ def run_agent(start_url: str = None):
                     report = memory.get_session_report_text()
                     print(report)
 
-                # Минимальная пауза (только для видимости анимации)
-                time.sleep(0.1 if DEMO_MODE else 0.3)
+                time.sleep(0.3)
 
         except KeyboardInterrupt:
             print("\n[Agent] Остановлен по Ctrl+C.")
@@ -1742,6 +2162,12 @@ def run_agent(start_url: str = None):
             if _bg_pool:
                 _bg_pool.shutdown(wait=False)
             
+            if ENABLE_CONSOLE_WARNINGS_IN_REPORT:
+                try:
+                    memory._session_console_warnings = [c for c in console_log if c.get("type") in ("warning", "error")][-100:]
+                except Exception:
+                    memory._session_console_warnings = []
+
             # Финальный отчёт
             report = memory.get_session_report_text()
             plan_progress = memory.get_test_plan_progress()
@@ -1753,8 +2179,81 @@ def run_agent(start_url: str = None):
                 report += f"\nPerf: обнаружено {len(memory.reported_perf_rules)} проблем"
             if memory.responsive_done:
                 report += f"\nResponsive: проверены viewports {', '.join(memory.responsive_done)}"
+            if ENABLE_CONSOLE_WARNINGS_IN_REPORT and getattr(memory, "_session_console_warnings", None):
+                report += f"\nКонсоль (warnings/errors): {len(memory._session_console_warnings)}"
+            if getattr(memory, "_mixed_content", None):
+                report += f"\nMixed content: {len(memory._mixed_content)}"
+            if getattr(memory, "_websocket_issues", None):
+                report += f"\nWebSocket issues: {len(memory._websocket_issues)}"
+            if getattr(memory, "_api_log", None):
+                api_fail = sum(1 for a in memory._api_log if not a.get("ok", True))
+                report += f"\nAPI (XHR/fetch): {len(memory._api_log)} записей, с ошибкой: {api_fail}"
+            if getattr(memory, "_visual_regressions", None):
+                report += f"\nVisual regressions: {len(memory._visual_regressions)}"
+            if getattr(memory, "_step_log", None):
+                report += "\n--- Лог шагов ---"
+                for e in memory._step_log[-50:]:
+                    report += f"\n  #{e.get('step')} [{e.get('source')}] {e.get('action')} -> {e.get('result', '')[:60]}"
             print(report)
-            
+            if SESSION_REPORT_PATH:
+                try:
+                    with open(SESSION_REPORT_PATH, "w", encoding="utf-8") as f:
+                        f.write(report)
+                    print(f"[Agent] Отчёт записан в {SESSION_REPORT_PATH}")
+                except Exception as e:
+                    LOG.warning("Не удалось записать отчёт в файл %s: %s", SESSION_REPORT_PATH, e)
+            if SESSION_REPORT_HTML_PATH:
+                try:
+                    html_content = _build_html_report(memory, report, start_url or "", video_dir=RECORD_VIDEO_DIR or "")
+                    with open(SESSION_REPORT_HTML_PATH, "w", encoding="utf-8") as f:
+                        f.write(html_content)
+                    print(f"[Agent] HTML-отчёт записан в {SESSION_REPORT_HTML_PATH}")
+                except Exception as e:
+                    LOG.warning("Не удалось записать HTML-отчёт %s: %s", SESSION_REPORT_HTML_PATH, e)
+            if SESSION_REPORT_JSONL and getattr(memory, "_step_log", None):
+                try:
+                    with open(SESSION_REPORT_JSONL, "w", encoding="utf-8") as f:
+                        for e in memory._step_log:
+                            line = json.dumps(e, ensure_ascii=False) + "\n"
+                            f.write(line)
+                    print(f"[Agent] JSONL-лог записан в {SESSION_REPORT_JSONL}")
+                except Exception as e:
+                    LOG.warning("Не удалось записать JSONL %s: %s", SESSION_REPORT_JSONL, e)
+            if PLAYWRIGHT_EXPORT_PATH and getattr(memory, "_step_log", None):
+                try:
+                    from src.playwright_export import build_playwright_script
+                    script = build_playwright_script(memory._step_log, start_url or "")
+                    with open(PLAYWRIGHT_EXPORT_PATH, "w", encoding="utf-8") as f:
+                        f.write(script)
+                    print(f"[Agent] Playwright-скрипт записан в {PLAYWRIGHT_EXPORT_PATH}")
+                except Exception as e:
+                    LOG.warning("Не удалось записать Playwright-скрипт %s: %s", PLAYWRIGHT_EXPORT_PATH, e)
+            if SESSION_BASELINE_JSONL and getattr(memory, "_step_log", None):
+                try:
+                    with open(SESSION_BASELINE_JSONL, "w", encoding="utf-8") as f:
+                        for e in memory._step_log:
+                            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+                    print(f"[Agent] Baseline сохранён в {SESSION_BASELINE_JSONL}")
+                except Exception as e:
+                    LOG.warning("Не удалось сохранить baseline %s: %s", SESSION_BASELINE_JSONL, e)
+            if SESSION_STATE_SAVE_PATH and "context" in locals():
+                try:
+                    cookies = context.cookies()
+                    with open(SESSION_STATE_SAVE_PATH, "w", encoding="utf-8") as f:
+                        json.dump(cookies, f, ensure_ascii=False, indent=0)
+                    print(f"[Agent] Состояние (cookies) сохранено в {SESSION_STATE_SAVE_PATH}")
+                except Exception as e:
+                    LOG.warning("Не удалось сохранить состояние %s: %s", SESSION_STATE_SAVE_PATH, e)
+            if JUNIT_REPORT_PATH and getattr(memory, "_step_log", None):
+                try:
+                    _write_junit_report(memory, JUNIT_REPORT_PATH)
+                    print(f"[Agent] JUnit-отчёт записан в {JUNIT_REPORT_PATH}")
+                except Exception as e:
+                    LOG.warning("Не удалось записать JUnit %s: %s", JUNIT_REPORT_PATH, e)
+
+            result["defects"] = len(getattr(memory, "defects_created", []))
+            result["steps"] = getattr(memory, "iteration", 0)
+
             if browser:
                 try:
                     browser.close()
@@ -1766,8 +2265,397 @@ def run_agent(start_url: str = None):
                 except Exception:
                     pass
 
+    return result
 
-# ===== Step-функции (декомпозиция run_agent) =====
+
+def _write_junit_report(memory: AgentMemory, path: str) -> None:
+    """Записать отчёт в формате JUnit XML."""
+    step_log = getattr(memory, "_step_log", None) or []
+    failures = sum(1 for e in step_log if "error" in (e.get("result") or "").lower() or "not_found" in (e.get("result") or "").lower())
+    ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    duration_sec = 0.0
+    if getattr(memory, "session_start", None):
+        duration_sec = (datetime.now() - memory.session_start).total_seconds()
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        f'<testsuite name="Kventin" tests="{len(step_log)}" failures="{failures}" errors="0" skipped="0" time="{duration_sec:.2f}" timestamp="{ts}">',
+    ]
+    for e in step_log:
+        step = e.get("step", 0)
+        result = (e.get("result") or "")
+        fail = "error" in result.lower() or "not_found" in result.lower()
+        name = html_module.escape(f"step_{step}_{e.get('action', '')}")
+        res_esc = html_module.escape(result[:500])
+        if fail:
+            lines.append(f'  <testcase name="{name}"><failure message="{res_esc}"/></testcase>')
+        else:
+            lines.append(f'  <testcase name="{name}"><system-out>{res_esc}</system-out></testcase>')
+    lines.append("</testsuite>")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
+def _build_html_report(memory: AgentMemory, report_text: str, start_url: str = "", video_dir: str = "") -> str:
+    """Собрать красивый HTML-отчёт сессии."""
+    def esc(s: str) -> str:
+        return html_module.escape(str(s) if s else "", quote=True)
+
+    if not memory.session_start:
+        duration_sec = 0
+    else:
+        duration_sec = (datetime.now() - memory.session_start).total_seconds()
+    step_log = getattr(memory, "_step_log", None) or []
+    defects = getattr(memory, "defects_created", None) or []
+    coverage = ", ".join(memory.coverage_zones) if memory.coverage_zones else "—"
+
+    steps_rows = []
+    for e in step_log:
+        sp = e.get("screenshot_path") or ""
+        img_cell = ""
+        if sp and not os.path.isabs(sp) and "screenshots/" in sp:
+            img_cell = f'<a href="{esc(sp)}" target="_blank"><img src="{esc(sp)}" alt="шаг" class="step-thumb"/></a>'
+        fok, ftot = e.get("flakiness_ok"), e.get("flakiness_total")
+        flak_cell = f"{fok}/{ftot}" if (fok is not None and ftot) else "—"
+        steps_rows.append(
+            f"<tr><td>{e.get('step')}</td><td class=\"url\">{esc((e.get('url') or '')[:80])}</td>"
+            f"<td><span class=\"act act-{esc(e.get('action', ''))}\">{esc(e.get('action', ''))}</span></td>"
+            f"<td class=\"sel\">{esc((e.get('selector') or '')[:50])}</td>"
+            f"<td class=\"result\">{esc((e.get('result') or '')[:80])}</td>"
+            f"<td><span class=\"src src-{esc(e.get('source', ''))}\">{esc(e.get('source', ''))}</span></td>"
+            f"<td class=\"sub\">{flak_cell}</td><td class=\"thumb\">{img_cell}</td></tr>"
+        )
+    steps_body = "\n".join(steps_rows) if steps_rows else "<tr><td colspan=\"8\">Нет данных</td></tr>"
+
+    defects_rows = []
+    for d in defects:
+        key = d.get("key", "")
+        summary = d.get("summary", "")[:120]
+        sev = d.get("severity", "major")
+        defects_rows.append(f"<tr><td class=\"key\">{esc(key)}</td><td><span class=\"sev sev-{esc(sev)}\">{esc(sev)}</span></td><td>{esc(summary)}</td></tr>")
+    defects_body = "\n".join(defects_rows) if defects_rows else "<tr><td colspan=\"3\">Нет</td></tr>"
+
+    nav_graph = getattr(memory, "_nav_graph", None) or []
+    nav_rows = []
+    for edge in nav_graph[-100:]:
+        frm = (edge.get("from_url") or "")[:60]
+        to = (edge.get("to_url") or "")[:60]
+        step = edge.get("step", "")
+        nav_rows.append(f"<tr><td>{step}</td><td class=\"url\">{esc(frm)}</td><td class=\"url\">→ {esc(to)}</td></tr>")
+    nav_body = "\n".join(nav_rows) if nav_rows else "<tr><td colspan=\"3\">Нет переходов</td></tr>"
+
+    broken_links = getattr(memory, "_broken_links", None) or []
+    broken_rows = []
+    for b in broken_links[-80:]:
+        url_short = (b.get("url") or "")[:100]
+        status = b.get("status") or ""
+        err = (b.get("error") or "")[:80]
+        broken_rows.append(f"<tr><td class=\"url\">{esc(url_short)}</td><td>{status}</td><td class=\"result\">{esc(err)}</td></tr>")
+    broken_body = "\n".join(broken_rows) if broken_rows else "<tr><td colspan=\"3\">Нет</td></tr>"
+
+    console_warnings = getattr(memory, "_session_console_warnings", None) or []
+    cw_rows = []
+    for c in console_warnings[-50:]:
+        cw_rows.append(f"<tr><td><span class=\"sev sev-{esc(c.get('type', 'log'))}\">{esc(c.get('type', ''))}</span></td><td class=\"result\">{esc((c.get('text') or '')[:150])}</td></tr>")
+    cw_body = "\n".join(cw_rows) if cw_rows else "<tr><td colspan=\"2\">Нет</td></tr>"
+
+    mixed_content = getattr(memory, "_mixed_content", None) or []
+    mc_body = "<br/>".join(esc((m.get("url") or "")[:80]) for m in mixed_content[-20:]) if mixed_content else "—"
+    ws_issues = getattr(memory, "_websocket_issues", None) or []
+    ws_body = "<br/>".join(f"{esc((w.get('url') or '')[:60])} ({w.get('event', '')})" for w in ws_issues[-20:]) if ws_issues else "—"
+    api_log = getattr(memory, "_api_log", None) or []
+    api_failed = [a for a in api_log if not a.get("ok", True)]
+    api_rows = []
+    for a in api_log[-50:]:
+        method = a.get("method", "")
+        url_short = (a.get("url") or "")[:80]
+        status = a.get("status", "")
+        ok = a.get("ok", True)
+        cls = "result" if ok else "sev sev-major"
+        api_rows.append(f"<tr><td>{esc(method)}</td><td class=\"url\">{esc(url_short)}</td><td class=\"{cls}\">{status}</td></tr>")
+    api_body = "\n".join(api_rows) if api_rows else "<tr><td colspan=\"3\">Нет XHR/fetch</td></tr>"
+    visual_regressions = getattr(memory, "_visual_regressions", None) or []
+    vr_rows = []
+    for v in visual_regressions:
+        vr_rows.append(f"<tr><td class=\"url\">{esc((v.get('url') or '')[:80])}</td><td>{v.get('change_percent', 0)}%</td><td class=\"result\">{esc((v.get('detail') or '')[:100])}</td></tr>")
+    vr_body = "\n".join(vr_rows) if vr_rows else "<tr><td colspan=\"3\">Нет</td></tr>"
+
+    total_steps = len(step_log)
+    timeline_bars = ""
+    if total_steps > 0:
+        for e in step_log[-60:]:
+            s = e.get("step", 0)
+            act = e.get("action", "")
+            is_fail = "error" in (e.get("result") or "").lower() or "not_found" in (e.get("result") or "").lower()
+            pct = 100 * s / max(total_steps, 1)
+            cls = "timeline-fail" if is_fail else "timeline-ok"
+            timeline_bars += f'<span class="timeline-bar {cls}" style="width:{max(2, 100/60)}%" title="#{s} {act}"/>'
+
+    return f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Kventin — отчёт сессии</title>
+<style>
+:root {{
+  --bg: #0f0f14;
+  --surface: #1a1a24;
+  --surface2: #252532;
+  --text: #e8e8ed;
+  --text2: #9898a8;
+  --accent: #6366f1;
+  --accent2: #818cf8;
+  --success: #22c55e;
+  --warn: #eab308;
+  --danger: #ef4444;
+  --radius: 12px;
+  --font: 'Segoe UI', system-ui, -apple-system, sans-serif;
+}}
+* {{ box-sizing: border-box; }}
+body {{
+  margin: 0;
+  padding: 2rem;
+  font-family: var(--font);
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.5;
+  background-image: radial-gradient(ellipse 80% 50% at 50% -20%, rgba(99,102,241,0.15), transparent);
+}}
+.container {{ max-width: 1200px; margin: 0 auto; }}
+h1 {{
+  font-size: 1.75rem;
+  font-weight: 700;
+  margin: 0 0 0.5rem;
+  background: linear-gradient(135deg, var(--accent2), var(--accent));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}}
+.sub {{
+  color: var(--text2);
+  font-size: 0.9rem;
+  margin-bottom: 2rem;
+}}
+.cards {{
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 1rem;
+  margin-bottom: 2rem;
+}}
+.card {{
+  background: var(--surface);
+  border: 1px solid var(--surface2);
+  border-radius: var(--radius);
+  padding: 1rem 1.25rem;
+  text-align: center;
+}}
+.card .val {{
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: var(--accent2);
+}}
+.card .lbl {{ font-size: 0.8rem; color: var(--text2); margin-top: 0.25rem; }}
+section {{
+  background: var(--surface);
+  border: 1px solid var(--surface2);
+  border-radius: var(--radius);
+  padding: 1.5rem;
+  margin-bottom: 1.5rem;
+}}
+section h2 {{
+  font-size: 1rem;
+  margin: 0 0 1rem;
+  color: var(--text2);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}}
+table {{
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}}
+th {{
+  text-align: left;
+  padding: 0.6rem 0.75rem;
+  color: var(--text2);
+  font-weight: 600;
+  border-bottom: 1px solid var(--surface2);
+}}
+td {{
+  padding: 0.6rem 0.75rem;
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+}}
+tr:hover td {{ background: rgba(255,255,255,0.02); }}
+.url {{ max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+.sel {{ max-width: 120px; overflow: hidden; text-overflow: ellipsis; }}
+.result {{ max-width: 220px; overflow: hidden; text-overflow: ellipsis; }}
+.act {{ padding: 0.2em 0.5em; border-radius: 6px; font-weight: 500; background: var(--surface2); color: var(--text); }}
+.act-click {{ background: rgba(99,102,241,0.25); color: var(--accent2); }}
+.act-type {{ background: rgba(34,197,94,0.2); color: var(--success); }}
+.act-scroll {{ background: rgba(234,179,8,0.2); color: var(--warn); }}
+.act-hover {{ background: rgba(129,140,248,0.2); color: var(--accent2); }}
+.act-close_modal {{ background: rgba(239,68,68,0.2); color: var(--danger); }}
+.act-fill_form {{ background: rgba(34,197,94,0.25); color: var(--success); }}
+.src {{ padding: 0.2em 0.4em; border-radius: 4px; font-size: 0.8em; }}
+.src-gigachat {{ background: rgba(99,102,241,0.2); color: var(--accent2); }}
+.src-fast {{ background: var(--surface2); color: var(--text2); }}
+.step-thumb {{ width: 80px; height: 45px; object-fit: cover; border-radius: 6px; display: block; }}
+.thumb {{ width: 90px; }}
+.key {{ font-family: monospace; color: var(--accent2); }}
+.sev {{ padding: 0.2em 0.5em; border-radius: 6px; font-size: 0.85em; font-weight: 500; }}
+.sev-critical {{ background: rgba(239,68,68,0.25); color: var(--danger); }}
+.sev-major {{ background: rgba(234,179,8,0.25); color: var(--warn); }}
+.sev-minor {{ background: var(--surface2); color: var(--text2); }}
+pre {{ margin: 0; font-size: 0.8rem; color: var(--text2); white-space: pre-wrap; }}
+.timeline-wrap {{ display: flex; flex-wrap: wrap; gap: 2px; margin-top: 0.5rem; }}
+.timeline-bar {{ height: 20px; border-radius: 4px; display: inline-block; min-width: 4px; }}
+.timeline-ok {{ background: var(--accent); opacity: 0.8; }}
+.timeline-fail {{ background: var(--danger); }}
+.replay-wrap {{ display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.75rem; flex-wrap: wrap; }}
+.replay-btn {{ padding: 0.4rem 0.8rem; border-radius: 8px; background: var(--surface2); color: var(--text); border: 1px solid var(--surface2); cursor: pointer; }}
+.replay-btn:hover {{ background: var(--accent); color: #fff; }}
+.replay-strip {{ display: flex; flex-wrap: wrap; gap: 4px; max-height: 120px; overflow-y: auto; }}
+.replay-thumb {{ width: 80px; height: 45px; border-radius: 6px; overflow: hidden; border: 2px solid transparent; cursor: pointer; }}
+.replay-thumb.active {{ border-color: var(--accent); }}
+.replay-thumb img {{ width: 100%; height: 100%; object-fit: cover; display: block; }}
+@media (max-width: 768px) {{ .url, .result {{ max-width: 100px; }} }}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>Kventin</h1>
+<p class="sub">Отчёт сессии AI-тестировщика · {esc(datetime.now().strftime("%d.%m.%Y %H:%M"))} · {esc(start_url or "—")[:60]}</p>
+<div class="cards">
+<div class="card"><div class="val">{len(step_log)}</div><div class="lbl">Шагов</div></div>
+<div class="card"><div class="val">{int(duration_sec)}</div><div class="lbl">Секунд</div></div>
+<div class="card"><div class="val">{esc(memory.tester_phase)}</div><div class="lbl">Фаза</div></div>
+<div class="card"><div class="val">{len(defects)}</div><div class="lbl">Дефектов</div></div>
+<div class="card"><div class="val">{len(memory.done_click)}</div><div class="lbl">Кликов</div></div>
+<div class="card"><div class="val">{len(memory.done_type)}</div><div class="lbl">Вводов</div></div>
+</div>
+{f'<p class="sub">Видео сессии: <code>{esc(video_dir)}</code></p>' if video_dir else ''}
+<section>
+<h2>Сводка</h2>
+<pre>{esc(report_text)}</pre>
+</section>
+<section>
+<h2>Покрытие</h2>
+<p>{esc(coverage)}</p>
+</section>
+<section>
+<h2>Навигация</h2>
+<table>
+<thead><tr><th>Шаг</th><th>От</th><th>Куда</th></tr></thead>
+<tbody>
+{nav_body}
+</tbody>
+</table>
+</section>
+<section>
+<h2>Timeline</h2>
+<div class="timeline-wrap">{timeline_bars}</div>
+</section>
+<section>
+<h2>Session Replay</h2>
+<div class="replay-wrap" id="replay-wrap">
+<button type="button" class="replay-btn" id="replay-prev">◀ Prev</button>
+<button type="button" class="replay-btn" id="replay-play">Play</button>
+<button type="button" class="replay-btn" id="replay-next">Next ▶</button>
+<span class="sub" id="replay-info">Шаг 0 / {total_steps}</span>
+</div>
+<div class="replay-strip" id="replay-strip"></div>
+<script>
+(function(){{
+var steps = {json.dumps([{{"step": e.get("step"), "thumb": ((e.get("screenshot_path") or "").split("/")[-1] if e.get("screenshot_path") else "")}} for e in step_log])};
+var idx = 0, total = steps.length, playing = false, t;
+var strip = document.getElementById("replay-strip");
+steps.forEach(function(s, i){{
+ var a = document.createElement("a");
+ a.href = "#step-" + s.step;
+ a.className = "replay-thumb" + (i===0 ? " active" : "");
+ a.dataset.step = i;
+ a.innerHTML = s.thumb ? "<img src=\\"screenshots/" + s.thumb + "\\" alt=\\"#"+s.step+"\\"/>" : "<span>#"+s.step+"</span>";
+ strip.appendChild(a);
+}});
+function go(i){{
+ idx = Math.max(0, Math.min(i, total-1));
+ strip.querySelectorAll(".replay-thumb").forEach(function(el, j){{ el.classList.toggle("active", j===idx); }});
+ document.getElementById("replay-info").textContent = "Шаг " + (steps[idx]&&steps[idx].step) + " / " + total;
+ var stepNum = steps[idx] && steps[idx].step;
+ if(stepNum) document.querySelectorAll("section h2 + table tbody tr").forEach(function(r){{
+  var n = r.querySelector("td");
+  if(n && n.textContent == String(stepNum)) r.scrollIntoView({{block:"center"}});
+ }});
+}}
+document.getElementById("replay-prev").onclick = function(){{ go(idx-1); }};
+document.getElementById("replay-next").onclick = function(){{ go(idx+1); }};
+document.getElementById("replay-play").onclick = function(){{
+ playing = !playing;
+ this.textContent = playing ? "Pause" : "Play";
+ if(playing) t = setInterval(function(){{ go(idx+1); if(idx>=total-1) clearInterval(t); }}, 2000);
+ else clearInterval(t);
+}};
+strip.querySelectorAll(".replay-thumb").forEach(function(el){{ el.onclick = function(e){{ e.preventDefault(); go(parseInt(this.dataset.step,10)); }}; }});
+}})();
+</script>
+</section>
+<section>
+<h2>Битые ссылки</h2>
+<table>
+<thead><tr><th>URL</th><th>Статус</th><th>Ошибка</th></tr></thead>
+<tbody>
+{broken_body}
+</tbody>
+</table>
+</section>
+<section>
+<h2>Консоль (warnings/errors)</h2>
+<table>
+<thead><tr><th>Тип</th><th>Текст</th></tr></thead>
+<tbody>{cw_body}</tbody>
+</table>
+</section>
+<section>
+<h2>Visual regression (baseline)</h2>
+<table>
+<thead><tr><th>URL</th><th>Изменение %</th><th>Детали</th></tr></thead>
+<tbody>{vr_body}</tbody>
+</table>
+</section>
+<section>
+<h2>API (XHR/fetch)</h2>
+<table>
+<thead><tr><th>Метод</th><th>URL</th><th>Статус</th></tr></thead>
+<tbody>{api_body}</tbody>
+</table>
+<p class="sub">Всего записей: {len(api_log)}, с ошибкой: {len(api_failed)}</p>
+</section>
+<section>
+<h2>Mixed content / WebSocket</h2>
+<p><strong>Mixed content:</strong> {mc_body}</p>
+<p><strong>WebSocket:</strong> {ws_body}</p>
+</section>
+<section>
+<h2>Шаги</h2>
+<table>
+<thead><tr><th>#</th><th>URL</th><th>Действие</th><th>Селектор</th><th>Результат</th><th>Источник</th><th>Flakiness</th><th>Скрин</th></tr></thead>
+<tbody>
+{steps_body}
+</tbody>
+</table>
+</section>
+<section>
+<h2>Созданные дефекты</h2>
+<table>
+<thead><tr><th>Ключ</th><th>Severity</th><th>Описание</th></tr></thead>
+<tbody>
+{defects_body}
+</tbody>
+</table>
+</section>
+</div>
+</body>
+</html>"""
 
 def _should_create_new_checklist(page: Page, current_url: str, memory: AgentMemory, has_overlay: bool, overlay_types: List[str], checklist_key: str) -> bool:
     """
@@ -1889,7 +2777,6 @@ def _step_checklist_incremental(
         # Обновляем UI
         st = "+" if ok else "X"
         total = len(items)
-        update_demo_banner(page, step_text=f"Чеклист {current_index + 1}/{total}: {item['id']}", progress_pct=round(100 * (current_index + 1) / total))
         update_llm_overlay(page, prompt=f"Чеклист: {item['id']}", response=f"{st} {detail[:120]}", loading=False)
         
         # Если выполнили все пункты — помечаем как завершённый
@@ -1903,15 +2790,13 @@ def _step_checklist_incremental(
 
 def _step_checklist(page, step, console_log, network_failures, memory):
     """LEGACY: Старый способ (полный запуск чеклиста). Оставлен для совместимости."""
-    from config import DEMO_MODE as _dm
-    checklist_every = 15 if _dm else 5
+    checklist_every = 5
     checklist_results = []
     if step % checklist_every == 1:
         smart_wait_after_goto(page, timeout=5000)
         def on_step(step_id, ok, detail, step_index, total):
             st = "+" if ok else "X"
             pct = round(100 * step_index / total) if total else 0
-            update_demo_banner(page, step_text=f"Чеклист {step_index}/{total}: {step_id}", progress_pct=pct)
             update_llm_overlay(page, prompt=f"Чеклист: {step_id}", response=f"{st} {detail[:120]}", loading=False)
         checklist_results = run_checklist(page, console_log, network_failures, step_delay_ms=CHECKLIST_STEP_DELAY_MS, on_step=on_step)
     return checklist_results
@@ -1921,7 +2806,6 @@ def _get_fast_action(
     page: Page,
     memory: AgentMemory,
     has_overlay: bool = False,
-    demo_mode: bool = False,
 ) -> Dict[str, Any]:
     """
     Мгновенный выбор действия БЕЗ LLM — по ref-id из DOM.
@@ -2031,11 +2915,32 @@ def _get_fast_action(
                 const text = (el.textContent || '').trim().slice(0, 50);
                 result.push({ref: 'ref:' + ref, type: 'tab', text, priority: 2});
             });
+            document.querySelectorAll('input[type="file"]').forEach(el => {
+                if (!vis(el) || isAgent(el)) return;
+                """ + ("if (scopeEl && !scopeEl.contains(el)) return;" if scope_sel else "") + """
+                let ref = el.getAttribute('data-agent-ref');
+                if (!ref) return;
+                result.push({ref: 'ref:' + ref, type: 'file', text: 'file', priority: 2});
+            });
             return result;
             }
             """
 
         elements = page.evaluate(_collect_js(scope_selector), scope_selector) or []
+
+        # Если задан тестовый файл для загрузки — предпочитаем input[type=file]
+        if TEST_UPLOAD_FILE_PATH and os.path.isfile(TEST_UPLOAD_FILE_PATH):
+            file_elems = [e for e in elements if e.get("type") == "file" and _norm_key(e.get("ref", "")) not in memory.done_type]
+            if file_elems:
+                elem = file_elems[0]
+                return {
+                    "action": "upload_file",
+                    "selector": elem.get("ref", ""),
+                    "value": TEST_UPLOAD_FILE_PATH,
+                    "reason": "Загрузка тестового файла",
+                    "test_goal": "Проверка загрузки файла",
+                    "expected_outcome": "Файл принят",
+                }
 
         # Старая логика без scope — один большой evaluate (оставляем запасной вариант)
         if scope_selector and not elements:
@@ -2121,58 +3026,21 @@ def _get_fast_action(
                 const text = (el.textContent || '').trim().slice(0, 50);
                 result.push({ref: 'ref:' + ref, type: 'tab', text, priority: 2});
             });
+            document.querySelectorAll('input[type="file"]').forEach(el => {
+                if (!vis(el) || isAgent(el)) return;
+                let ref = el.getAttribute('data-agent-ref');
+                if (!ref) return;
+                result.push({ref: 'ref:' + ref, type: 'file', text: 'file', priority: 2});
+            });
             return result;
         }""") or []
-
-        # DEMO MODE: приоритет кликам (кнопки, ссылки, табы), затем формы — движение активнее
-        if demo_mode and elements:
-            # Сортируем: сначала все кликабельные (button/link/tab), потом input/select
-            click_types = ("click", "link", "tab")
-            elements = sorted(
-                elements,
-                key=lambda e: (0 if e.get("type") in click_types else 1, e.get("priority", 9)),
-            )
-            step = getattr(memory, "iteration", 0)
-            # Каждые 2 шага — подталкиваем ссылку вперёд (больше переходов по страницам)
-            if step % 2 == 0:
-                for elem in elements:
-                    if elem.get("type") == "link":
-                        elements = [elem] + [x for x in elements if x != elem]
-                        break
-            idx = getattr(memory, "_demo_index", 0) % len(elements)
-            memory._demo_index = idx + 1
-            elem = elements[idx]
-            ref = elem.get("ref", "")
-            etype = elem.get("type", "")
-            text = elem.get("text", "?")[:30]
-            if etype == "input":
-                from src.form_strategies import detect_field_type, get_test_value
-                ftype = detect_field_type(placeholder=text, name=text)
-                val = get_test_value(ftype, "happy")
-                return {
-                    "action": "type", "selector": ref, "value": val,
-                    "reason": f"Ввод в '{text}'",
-                    "test_goal": f"Заполнить поле {text}",
-                    "expected_outcome": "Поле принимает значение",
-                }
-            if etype == "select":
-                return {
-                    "action": "select_option", "selector": ref, "value": text.split(",")[0] if text else "",
-                    "reason": "Выбор опции",
-                    "test_goal": "Выбрать опцию в дропдауне",
-                    "expected_outcome": "Опция выбирается",
-                }
-            return {
-                "action": "click", "selector": ref,
-                "reason": f"Клик: {text}",
-                "test_goal": f"Проверить '{text}'",
-                "expected_outcome": "Элемент реагирует",
-            }
 
         # Фильтруем: убираем уже протестированные элементы
         for elem in elements:
             ref = elem.get("ref", "")
             etype = elem.get("type", "")
+            if etype == "file":
+                continue  # file уже обработан выше (TEST_UPLOAD_FILE_PATH) или пропускаем
             act = "click" if etype in ("click", "link", "tab") else ("type" if etype == "input" else "select_option")
             key = f"{act}:{ref}"
             if not memory.is_element_tested(current_url, key):
@@ -2232,12 +3100,8 @@ def _get_fast_action(
 
 def _step_get_action(page, step, memory, console_log, network_failures, checklist_results, context):
     """STEP 2: Скриншот + контекст → GigaChat → получить действие."""
-    from config import DEMO_MODE as _dm
-    update_demo_banner(page, step_text=f"#{step} Анализ…", progress_pct=25)
-
-    # В демо-режиме: компактный DOM, короткая история → меньше токенов → быстрее ответ
-    dom_max = 2000 if _dm else 4000
-    history_n = 8 if _dm else 15
+    dom_max = 4000
+    history_n = 15
 
     overlay_info = detect_active_overlays(page)
     overlay_context = format_overlays_context(overlay_info)
@@ -2270,7 +3134,7 @@ def _step_get_action(page, step, memory, console_log, network_failures, checklis
         }
         page_type_hint = f"\nТип страницы: {page_type}. {type_strategies.get(page_type, '')}\n"
     
-    dom_summary = get_dom_summary(page, max_length=dom_max)
+    dom_summary = get_dom_summary(page, max_length=dom_max, include_shadow_dom=ENABLE_SHADOW_DOM)
     history_text = memory.get_history_text(last_n=history_n)
     
     # Проверяем покрытие элементов на текущей странице
@@ -2347,7 +3211,6 @@ def _step_get_action(page, step, memory, console_log, network_failures, checklis
 🎯 ДЕЙСТВУЙ: кликай, заполняй, тестируй. Укажи test_goal и expected_outcome."""
 
     phase_instruction = memory.get_phase_instruction()
-    update_demo_banner(page, step_text=f"#{step} Консультация с GigaChat…", progress_pct=60)
     update_llm_overlay(page, prompt=f"#{step} [{memory.tester_phase}]", loading=True)
 
     # Скриншот для GigaChat: если не изменился — можно не отправлять (экономия токенов)
@@ -2403,7 +3266,7 @@ def _step_get_action(page, step, memory, console_log, network_failures, checklis
     action = parse_llm_action(raw_answer)
     if not action:
         print(f"[Agent] #{step} Не удалось распарсить JSON: {raw_answer[:120]}")
-        action = _get_fast_action(page, memory, has_overlay, demo_mode=DEMO_MODE)
+        action = _get_fast_action(page, memory, has_overlay)
     # Валидация и нормализация
     action = validate_llm_action(action)
     
@@ -2484,18 +3347,33 @@ def _step_execute(page, action, step, memory, context):
     """STEP 3: Выполнение действия с retry."""
     act_type = (action.get("action") or "").lower()
     sel = (action.get("selector") or "").strip()
+    if ENABLE_DOM_DIFF_AFTER_ACTION and not page.is_closed():
+        try:
+            memory._dom_hash_before = page.evaluate("() => document.body ? document.body.innerHTML.length : 0")
+        except Exception:
+            memory._dom_hash_before = None
     # Передаём стратегию заполнения формы
     if act_type == "type":
         strategy = get_form_fill_strategy(memory.tester_phase, memory.form_strategy_iteration)
         action["_form_strategy"] = strategy
         memory.form_strategy_iteration += 1
-    update_demo_banner(page, step_text=f"#{step} {act_type.upper()}: {sel[:30]}…", progress_pct=80)
 
     result = execute_action(page, action, memory)
     # Один быстрый retry при неудаче
     if "error" in result.lower() or "not_found" in result.lower():
         time.sleep(0.15)
         result = execute_action(page, action, memory)
+
+    # Flakiness: при сбое перезапустить действие ещё N раз и записать долю успехов
+    memory._last_step_flakiness = None
+    if FLAKINESS_RERUN_COUNT >= 2 and act_type in ("click", "type"):
+        ok = 1 if ("not_found" not in (result or "").lower() and "error" not in (result or "").lower()) else 0
+        for _ in range(FLAKINESS_RERUN_COUNT - 1):
+            time.sleep(0.2)
+            r2 = execute_action(page, action, memory)
+            if "not_found" not in (r2 or "").lower() and "error" not in (r2 or "").lower():
+                ok += 1
+        memory._last_step_flakiness = (ok, FLAKINESS_RERUN_COUNT)
 
     memory.add_action(action, result=result)
     memory.tick_phase_step()
@@ -2518,8 +3396,17 @@ def _step_execute(page, action, step, memory, context):
         except Exception:
             pass
 
+    # DOM diff: после клика DOM не изменился — возможный мёртвый клик
+    if ENABLE_DOM_DIFF_AFTER_ACTION and act_type == "click" and not page.is_closed():
+        try:
+            h = page.evaluate("() => document.body ? document.body.innerHTML.length : 0")
+            if getattr(memory, "_dom_hash_before", None) is not None and h == memory._dom_hash_before:
+                result = (result or "") + " possible_dead_click"
+        except Exception:
+            pass
+
     # Минимальная пауза: только чтобы DOM обновился
-    time.sleep(0.1 if DEMO_MODE else 0.3)
+    time.sleep(0.3)
     # Быстрый wait (не 3 секунды!)
     try:
         page.wait_for_load_state("domcontentloaded", timeout=2000)
@@ -2600,8 +3487,11 @@ def _analyze_in_background(
             f"Неуспешные запросы:\n{five_xx_detail}"
         )
 
-    # Оракул (GigaChat — thread-safe)
-    if ENABLE_ORACLE_AFTER_ACTION and act_type in ("type", "click") and post_screenshot_b64 and not new_network_fails:
+    # Оракул (GigaChat — thread-safe). Lazy: только при изменении экрана или новых ошибках (ORACLE_ON_VISUAL_OR_ERROR)
+    run_oracle = ENABLE_ORACLE_AFTER_ACTION and act_type in ("type", "click") and post_screenshot_b64 and not new_network_fails
+    if run_oracle and ORACLE_ON_VISUAL_OR_ERROR:
+        run_oracle = visual_diff_info.get("changed") or bool(new_errors)
+    if run_oracle:
         expected_text = f"Ожидалось: {expected_outcome[:200]}" if expected_outcome else "Ожидался успешный результат."
         vdiff_text = ""
         if visual_diff_info.get("changed"):
@@ -2656,7 +3546,6 @@ def _step_post_analysis(
         return
     
     try:
-        update_demo_banner(page, step_text=f"#{step} Анализ результата…", progress_pct=90)
     except Exception:
         pass  # Страница закрылась
 
@@ -2738,7 +3627,6 @@ def _step_post_analysis_LEGACY(
     has_overlay, current_url, checklist_results, console_log, network_failures, memory,
 ):
     """LEGACY: синхронный пост-анализ (fallback если пул сломан)."""
-    update_demo_banner(page, step_text=f"#{step} Анализ результата…", progress_pct=90)
 
     post_overlay = detect_active_overlays(page)
     if post_overlay.get("has_overlay") and not has_overlay:
@@ -2751,7 +3639,6 @@ def _step_post_analysis_LEGACY(
         time.sleep(0.5)
         return
 
-    update_demo_banner(page, step_text=f"#{step} Анализ результата…", progress_pct=95)
     post_screenshot_b64 = take_screenshot_b64(page)
 
     visual_diff_info = compute_screenshot_diff(memory.screenshot_before_action, post_screenshot_b64)
@@ -2870,11 +3757,19 @@ def _create_defect(
         network_failures=network_failures,
         steps_to_reproduce=steps_to_reproduce,
     )
+    if memory and getattr(memory, "_last_step_flakiness", None):
+        ok, total = memory._last_step_flakiness
+        description += f"\n\nFlakiness: {ok}/{total} повторных прогонов успешны."
+    severity = infer_defect_severity(
+        summary, bug_description,
+        console_log=console_log,
+        network_failures=network_failures,
+    )
 
     # Отправка в Jira — В ФОНЕ (семантическая проверка + создание тикета)
     _bg_submit(
         _create_defect_bg,
-        summary, description, bug_description, attachment_paths, memory,
+        summary, description, bug_description, attachment_paths, memory, severity,
     )
 
 
@@ -2884,6 +3779,7 @@ def _create_defect_bg(
     bug_description: str,
     attachment_paths: Optional[list],
     memory: Optional[AgentMemory],
+    severity: str = "major",
 ):
     """Фоновое создание дефекта (Jira API + GigaChat дедупликация)."""
     from src.jira_client import register_local_defect
@@ -2896,11 +3792,16 @@ def _create_defect_bg(
             return
 
         # Уровень 2: дедупликация через Jira внутри create_jira_issue
-        key = create_jira_issue(summary=summary, description=description, attachment_paths=attachment_paths or None)
+        key = create_jira_issue(
+            summary=summary,
+            description=description,
+            attachment_paths=attachment_paths or None,
+            severity=severity,
+        )
         if key:
-            print(f"[Agent] Дефект создан: {key}")
+            print(f"[Agent] Дефект создан: {key} [{severity}]")
             if memory:
-                memory.record_defect_created(key, summary)
+                memory.record_defect_created(key, summary, severity)
     except Exception as e:
         LOG.error("Ошибка фонового создания дефекта: %s", e)
     finally:
@@ -2911,6 +3812,21 @@ def _create_defect_bg(
                     shutil.rmtree(d, ignore_errors=True)
             except Exception:
                 pass
+
+
+def _check_broken_links_bg(urls_list: List[str], memory: AgentMemory) -> None:
+    """Фоновая проверка URL: HEAD-запросы, битые (4xx/5xx/timeout) добавляются в memory._broken_links."""
+    import requests
+    for url in urls_list:
+        if url in memory._checked_link_urls:
+            continue
+        memory._checked_link_urls.add(url)
+        try:
+            r = requests.head(url, timeout=5, allow_redirects=True)
+            if r.status_code >= 400:
+                memory._broken_links.append({"url": url[:300], "status": r.status_code, "error": ""})
+        except Exception as e:
+            memory._broken_links.append({"url": url[:300], "status": 0, "error": str(e)[:200]})
 
 
 # ===== Продвинутые проверки (a11y, perf, responsive, session, iframe, self-healing, scenario chains) =====

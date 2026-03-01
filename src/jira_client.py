@@ -339,6 +339,14 @@ def _attach_files(
             print(f"[Jira] Ошибка вложения {path}: {e}")
 
 
+# Маппинг severity (Kventin) -> priority name в Jira (стандартные имена)
+SEVERITY_TO_JIRA_PRIORITY = {
+    "critical": "Highest",
+    "major": "High",
+    "minor": "Medium",
+}
+
+
 def create_jira_issue(
     summary: str,
     description: str,
@@ -349,11 +357,13 @@ def create_jira_issue(
     api_token: Optional[str] = None,
     project_key: Optional[str] = None,
     attachment_paths: Optional[List[Union[str, os.PathLike]]] = None,
+    severity: Optional[str] = None,
 ) -> Optional[str]:
     """
     Создать дефект в Jira с описанием и вложениями (фактура).
     Возвращает ключ задачи (PROJ-123) или None.
     attachment_paths: список путей к файлам (скриншот, console.log, network.log и т.д.).
+    severity: critical | major | minor — задаёт priority в Jira (Highest/High/Medium).
     """
     jira_url = (jira_url or os.getenv("JIRA_URL", "")).rstrip("/")
     login = username or os.getenv("JIRA_USERNAME", "") or email or os.getenv("JIRA_EMAIL", "")
@@ -411,6 +421,8 @@ def create_jira_issue(
             "labels": [JIRA_DEFECT_LABEL],
         }
     }
+    if severity and severity.lower() in SEVERITY_TO_JIRA_PRIORITY:
+        payload["fields"]["priority"] = {"name": SEVERITY_TO_JIRA_PRIORITY[severity.lower()]}
 
     try:
         r = requests.post(url, json=payload, headers=headers, auth=auth, verify=False, timeout=30)

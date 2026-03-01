@@ -274,16 +274,17 @@ def get_iframes_info(page: Page) -> List[Dict[str, Any]]:
         return []
 
 
-def get_dom_summary(page: Page, max_length: int = 8000) -> str:
+def get_dom_summary(page: Page, max_length: int = 8000, include_shadow_dom: bool = True) -> str:
     """
     Получить описание DOM с уникальными ref-id для каждого элемента.
     Каждому интерактивному элементу присваивается data-agent-ref="N",
     и ссылка на DOM-ноду сохраняется в window.__agentRefs[N].
     GigaChat возвращает ref:N как selector → _find_element находит элемент мгновенно.
+    include_shadow_dom: обходить Shadow DOM (Web Components).
     """
     try:
         summary = page.evaluate("""
-            () => {
+            (includeShadow) => {
                 // Сбрасываем предыдущие ref-ы
                 if (window.__agentRefs) {
                     document.querySelectorAll('[data-agent-ref]').forEach(el => el.removeAttribute('data-agent-ref'));
@@ -398,9 +399,25 @@ def get_dom_summary(page: Page, max_length: int = 8000) -> str:
                 // Модалки
                 document.querySelectorAll('[role="dialog"], [role="alertdialog"], dialog').forEach(el => collect(el, 'modal'));
 
+                const processRoot = (root) => {
+                    if (!root || root === document && result.length > 500) return;
+                    root.querySelectorAll('button, [role="button"], input[type="submit"], input[type="button"]').forEach(el => collect(el, 'button'));
+                    root.querySelectorAll('a[href]').forEach(el => { if (!(el.getAttribute('href')||'').startsWith('javascript:')) collect(el, 'link'); });
+                    root.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([type="button"]), textarea, select').forEach(el => {
+                        const tag = el.tagName.toLowerCase();
+                        const type = tag === 'select' ? 'select' : (el.type === 'checkbox' ? 'checkbox' : (el.type === 'radio' ? 'radio' : 'input'));
+                        collect(el, type);
+                    });
+                    root.querySelectorAll('[role="tab"]').forEach(el => collect(el, 'tab'));
+                    root.querySelectorAll('[role="menuitem"], nav a, .nav-link, .menu-item').forEach(el => collect(el, 'menu'));
+                    root.querySelectorAll('[role="dialog"], [role="alertdialog"], dialog').forEach(el => collect(el, 'modal'));
+                    if (includeShadow) root.querySelectorAll('*').forEach(el => { if (el.shadowRoot) processRoot(el.shadowRoot); });
+                };
+                if (includeShadow) document.querySelectorAll('*').forEach(el => { if (el.shadowRoot) processRoot(el.shadowRoot); });
+
                 return result.join('\\n');
             }
-        """)
+        """, include_shadow_dom)
         return (summary or "")[:max_length]
     except Exception as e:
         return f"[Ошибка DOM: {e}]"
@@ -780,3 +797,40 @@ def build_context(
             lines.append("... (обрезано)")
 
     return "\n".join(lines)
+
+
+def get_page_resource_urls(page: Page, base_url: str) -> List[str]:
+    """
+    Собрать все URL ресурсов со страницы: a[href], img[src], link[href], script[src].
+    Возвращает список абсолютных URL (без дубликатов, без javascript:, mailto:, #).
+    """
+    try:
+        from urllib.parse import urljoin, urlparse
+        origin = (urlparse(base_url or "").scheme or "https") + "://" + (urlparse(base_url or "").netloc or "")
+        urls = page.evaluate("""(base) => {
+            const out = new Set();
+            const add = (url) => {
+                if (!url || typeof url !== 'string') return;
+                url = url.trim();
+                if (url.startsWith('javascript:') || url.startsWith('mailto:') || url.startsWith('tel:') || url === '#' || url.startsWith('#')) return;
+                out.add(url);
+            };
+            document.querySelectorAll('a[href], img[src], link[href], script[src], source[src]').forEach(el => {
+                const u = el.getAttribute('href') || el.getAttribute('src');
+                if (u) add(u);
+            });
+            return Array.from(out);
+        }""", base_url or "")
+        if not urls:
+            return []
+        resolved = []
+        for u in urls:
+            try:
+                abs_u = urljoin(base_url or origin, u)
+                if abs_u.startswith("http"):
+                    resolved.append(abs_u)
+            except Exception:
+                pass
+        return list(dict.fromkeys(resolved))  # dedupe preserving order
+    except Exception:
+        return []

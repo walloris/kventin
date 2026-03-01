@@ -28,27 +28,16 @@ def wait_for_page_ready(
             page.wait_for_load_state("networkidle", timeout=timeout)
         except Exception:
             pass
-    # Небольшая пауза после load state, чтобы скрипты успели выполниться
-    try:
-        from config import DEMO_MODE
-    except ImportError:
-        DEMO_MODE = False
-    time.sleep(0.1 if DEMO_MODE else 0.3)
+    time.sleep(0.3)
 
 
 def wait_for_network_idle(page: Page, timeout: float = 10000) -> None:
     """Дождаться отсутствия сетевой активности (networkidle)."""
     try:
-        from config import DEMO_MODE
-    except ImportError:
-        DEMO_MODE = False
-    # В демо: короткий timeout чтобы не зависать
-    effective_timeout = min(3000, timeout) if DEMO_MODE else timeout
-    try:
-        page.wait_for_load_state("networkidle", timeout=effective_timeout)
+        page.wait_for_load_state("networkidle", timeout=timeout)
     except Exception:
         pass
-    time.sleep(0.05 if DEMO_MODE else 0.2)
+    time.sleep(0.2)
 
 
 def wait_for_selector(
@@ -85,16 +74,7 @@ def wait_for_dom_stable(page: Page, poll_interval: float = 0.2, stable_for_ms: f
 
 
 def smart_wait_after_goto(page: Page, timeout: float = 30000) -> None:
-    """
-    Умное ожидание после page.goto: load, затем networkidle (если успеет),
-    затем короткая пауза для стабилизации.
-    В демо-режиме — быстрее (пропускает networkidle, меньше пауза).
-    """
-    try:
-        from config import DEMO_MODE
-    except ImportError:
-        DEMO_MODE = False
-
+    """Ожидание после page.goto: domcontentloaded, load, networkidle, пауза."""
     try:
         page.wait_for_load_state("domcontentloaded", timeout=timeout)
     except Exception:
@@ -103,9 +83,8 @@ def smart_wait_after_goto(page: Page, timeout: float = 30000) -> None:
         page.wait_for_load_state("load", timeout=max(3000, timeout - 5000))
     except Exception:
         pass
-    if not DEMO_MODE:
-        try:
-            page.wait_for_load_state("networkidle", timeout=5000)
-        except Exception:
-            pass
-    time.sleep(0.1 if DEMO_MODE else 0.5)
+    try:
+        page.wait_for_load_state("networkidle", timeout=5000)
+    except Exception:
+        pass
+    time.sleep(0.5)

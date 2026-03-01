@@ -8,14 +8,22 @@ load_dotenv()
 # Страница для тестирования
 START_URL = os.getenv("START_URL", "https://example.com")
 
-# --- Провайдер LLM: gigachat | jan ---
-# Рекомендуется gigachat для режима «реальный тестировщик» (фазы, оракул, GigaChat лучше держит контекст).
-# jan — локальная модель в Jan (OpenAI-совместимый API на http://127.0.0.1:1337)
+# --- Провайдер LLM: gigachat | jan | openai | anthropic | ollama ---
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gigachat").strip().lower()
+# Jan (локальная модель, OpenAI-совместимый API)
 JAN_API_URL = os.getenv("JAN_API_URL", "http://127.0.0.1:1337").rstrip("/")
 JAN_API_KEY = os.getenv("JAN_API_KEY", "jan-api-key")
-# ID модели в Jan (как в интерфейсе Jan). Для скриншотов нужна vision-модель: Llama-3.2-11B-Vision, Qwen2-VL
 JAN_MODEL = os.getenv("JAN_MODEL", "llama-3.2-11b-vision-instruct")
+# OpenAI (gpt-4o, gpt-4o-mini с vision)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+# Anthropic (Claude с vision)
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
+# Ollama (локально: llava, llama3.2-vision)
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llava")
 
 # GigaChat (Keycloak password grant + gateway, как в рабочем примере)
 GIGACHAT_TOKEN_HEADER = os.getenv("GIGACHAT_TOKEN_HEADER", "")  # опционально: готовый "Bearer eyJ..."
@@ -50,14 +58,13 @@ JIRA_ISSUE_TYPE = os.getenv("JIRA_ISSUE_TYPE", "Task")
 # Assignee (назначить дефект на пользователя): username для Server, accountId для Cloud, или пусто = текущий пользователь
 JIRA_ASSIGNEE = os.getenv("JIRA_ASSIGNEE", "").strip()
 
-# --- Демо-режим: быстрый, активный, зрелищный агент ---
-# Включает: сниженные паузы, пропуск оракула, агрессивный промпт, чеклист реже
-DEMO_MODE = os.getenv("DEMO_MODE", "false").lower() in ("1", "true", "yes")
-
-# Видимость действий (в демо — быстрее клики и короче подсветка)
-BROWSER_SLOW_MO = int(os.getenv("BROWSER_SLOW_MO", "50" if DEMO_MODE else "300"))
-HIGHLIGHT_DURATION_MS = int(os.getenv("HIGHLIGHT_DURATION_MS", "250" if DEMO_MODE else "800"))
-HEADLESS = os.getenv("HEADLESS", "false").lower() in ("1", "true", "yes")
+# Видимость действий
+BROWSER_SLOW_MO = int(os.getenv("BROWSER_SLOW_MO", "300"))
+HIGHLIGHT_DURATION_MS = int(os.getenv("HIGHLIGHT_DURATION_MS", "800"))
+# В CI (GITHUB_ACTIONS, GITLAB_CI, CI=1) по умолчанию headless, если не задан HEADLESS вручную
+_headless_env = os.getenv("HEADLESS", "").lower()
+_ci_env = bool(os.getenv("CI") or os.getenv("GITHUB_ACTIONS") or os.getenv("GITLAB_CI"))
+HEADLESS = _headless_env in ("1", "true", "yes") or (_ci_env and _headless_env != "false" and _headless_env != "0")
 # Размер окна браузера (по умолчанию Full HD — на весь экран)
 VIEWPORT_WIDTH = int(os.getenv("VIEWPORT_WIDTH", "1920"))
 VIEWPORT_HEIGHT = int(os.getenv("VIEWPORT_HEIGHT", "1080"))
@@ -121,21 +128,16 @@ DEFECT_IGNORE_PATTERNS = [
     "flaky",
 ]
 
-# Чеклист: пауза между шагами (мс), чтобы агент шёл медленнее и по порядку
-CHECKLIST_STEP_DELAY_MS = int(os.getenv("CHECKLIST_STEP_DELAY_MS", "500" if DEMO_MODE else "2000"))
+# Чеклист: пауза между шагами (мс)
+CHECKLIST_STEP_DELAY_MS = int(os.getenv("CHECKLIST_STEP_DELAY_MS", "2000"))
 # Ожидание загрузки: таймаут networkidle (мс)
-WAIT_NETWORK_IDLE_MS = int(os.getenv("WAIT_NETWORK_IDLE_MS", "3000" if DEMO_MODE else "5000"))
+WAIT_NETWORK_IDLE_MS = int(os.getenv("WAIT_NETWORK_IDLE_MS", "5000"))
 
 # --- Улучшение качества тестирования ---
-# В начале сессии запросить у GigaChat тест-план по скриншоту (5–7 шагов)
 ENABLE_TEST_PLAN_START = os.getenv("ENABLE_TEST_PLAN_START", "true").lower() in ("1", "true", "yes")
-# После важных действий спрашивать GigaChat: достигнут ли ожидаемый результат (оракул)
-# В демо-режиме отключён — экономит 2-5с на каждом шаге
-ENABLE_ORACLE_AFTER_ACTION = os.getenv("ENABLE_ORACLE_AFTER_ACTION", "false" if DEMO_MODE else "true").lower() in ("1", "true", "yes")
-# Перед созданием дефекта — второй проход: «это точно баг?» (снижает ложные тикеты)
-ENABLE_SECOND_PASS_BUG = os.getenv("ENABLE_SECOND_PASS_BUG", "false" if DEMO_MODE else "true").lower() in ("1", "true", "yes")
-# Повторы при сбое: сколько раз повторять клик/действие при таймауте или not_found
-ACTION_RETRY_COUNT = int(os.getenv("ACTION_RETRY_COUNT", "1" if DEMO_MODE else "2"))
+ENABLE_ORACLE_AFTER_ACTION = os.getenv("ENABLE_ORACLE_AFTER_ACTION", "true").lower() in ("1", "true", "yes")
+ENABLE_SECOND_PASS_BUG = os.getenv("ENABLE_SECOND_PASS_BUG", "true").lower() in ("1", "true", "yes")
+ACTION_RETRY_COUNT = int(os.getenv("ACTION_RETRY_COUNT", "2"))
 # Печатать отчёт сессии каждые N шагов (0 = только в конце при создании дефекта)
 SESSION_REPORT_EVERY_N = int(os.getenv("SESSION_REPORT_EVERY_N", "0"))
 
@@ -145,26 +147,41 @@ MAX_STEPS = int(os.getenv("MAX_STEPS", "0"))
 # Retry при сбое GigaChat (пустой ответ / не JSON): экспоненциальный backoff
 LLM_RETRY_COUNT = int(os.getenv("LLM_RETRY_COUNT", "3"))
 LLM_RETRY_BASE_DELAY = float(os.getenv("LLM_RETRY_BASE_DELAY", "2.0"))  # секунды
+# Если GigaChat не ответил за N секунд — берём fast action (не зависаем)
+GIGACHAT_RESPONSE_TIMEOUT_SEC = int(os.getenv("GIGACHAT_RESPONSE_TIMEOUT_SEC", "20"))
+# Circuit breaker: после N таймаутов подряд не вызывать GigaChat 60 сек (0 = отключить)
+GIGACHAT_CIRCUIT_BREAKER_AFTER_N_TIMEOUTS = int(os.getenv("GIGACHAT_CIRCUIT_BREAKER_AFTER_N_TIMEOUTS", "3"))
+GIGACHAT_CIRCUIT_BREAKER_COOLDOWN_SEC = int(os.getenv("GIGACHAT_CIRCUIT_BREAKER_COOLDOWN_SEC", "60"))
+# Таймаут на одно действие Playwright (клик, fill, wait), мс
+ACTION_TIMEOUT_MS = int(os.getenv("ACTION_TIMEOUT_MS", "10000"))
+# Путь к файлу итогового отчёта сессии (пусто = только в консоль)
+SESSION_REPORT_PATH = os.getenv("SESSION_REPORT_PATH", "").strip()
+# Путь к HTML-отчёту (красивый отчёт в браузере)
+SESSION_REPORT_HTML_PATH = os.getenv("SESSION_REPORT_HTML_PATH", "").strip()
+# JSONL-лог шагов (одна строка JSON на шаг)
+SESSION_REPORT_JSONL = os.getenv("SESSION_REPORT_JSONL", "").strip()
+# Сохранять скриншот после каждого шага в папку (путь к папке)
+SAVE_STEP_SCREENSHOTS_DIR = os.getenv("SAVE_STEP_SCREENSHOTS_DIR", "").strip()
+# Оракул только при изменении экрана или новых ошибках (экономия вызовов GigaChat)
+ORACLE_ON_VISUAL_OR_ERROR = os.getenv("ORACLE_ON_VISUAL_OR_ERROR", "true").lower() in ("1", "true", "yes")
 
 # --- Константы агента (бывшие магические числа) ---
 SCROLL_PIXELS = int(os.getenv("SCROLL_PIXELS", "600"))           # пикселей за одну прокрутку
 MAX_ACTIONS_IN_MEMORY = int(os.getenv("MAX_ACTIONS_IN_MEMORY", "80"))  # размер истории
-MAX_SCROLLS_IN_ROW = int(os.getenv("MAX_SCROLLS_IN_ROW", "2" if DEMO_MODE else "5"))  # в демо — быстрее переключаемся на клики
-CONSOLE_LOG_LIMIT = int(os.getenv("CONSOLE_LOG_LIMIT", "150"))    # обрезка логов консоли
-NETWORK_LOG_LIMIT = int(os.getenv("NETWORK_LOG_LIMIT", "80"))     # обрезка сетевых ошибок
-POST_ACTION_DELAY = float(os.getenv("POST_ACTION_DELAY", "0.15" if DEMO_MODE else "1.5"))  # пауза после действия (сек)
-PHASE_STEPS_TO_ADVANCE = int(os.getenv("PHASE_STEPS_TO_ADVANCE", "3" if DEMO_MODE else "5"))  # шагов в фазе до перехода
+MAX_SCROLLS_IN_ROW = int(os.getenv("MAX_SCROLLS_IN_ROW", "5"))
+CONSOLE_LOG_LIMIT = int(os.getenv("CONSOLE_LOG_LIMIT", "150"))
+NETWORK_LOG_LIMIT = int(os.getenv("NETWORK_LOG_LIMIT", "80"))
+POST_ACTION_DELAY = float(os.getenv("POST_ACTION_DELAY", "1.5"))
+PHASE_STEPS_TO_ADVANCE = int(os.getenv("PHASE_STEPS_TO_ADVANCE", "5"))
 
 # --- Продвинутые проверки ---
-# Accessibility (a11y) проверки каждые N шагов (0 = отключены)
-A11Y_CHECK_EVERY_N = int(os.getenv("A11Y_CHECK_EVERY_N", "20" if DEMO_MODE else "10"))
-# Performance-мониторинг каждые N шагов (0 = отключён)
-PERF_CHECK_EVERY_N = int(os.getenv("PERF_CHECK_EVERY_N", "25" if DEMO_MODE else "15"))
+A11Y_CHECK_EVERY_N = int(os.getenv("A11Y_CHECK_EVERY_N", "10"))
+PERF_CHECK_EVERY_N = int(os.getenv("PERF_CHECK_EVERY_N", "15"))
 # Responsive тестирование: после основного прохода переключить на мобильный viewport
 ENABLE_RESPONSIVE_TEST = os.getenv("ENABLE_RESPONSIVE_TEST", "true").lower() in ("1", "true", "yes")
 RESPONSIVE_VIEWPORTS = [
-    {"name": "mobile", "width": 375, "height": 812},
-    {"name": "tablet", "width": 768, "height": 1024},
+    {"name": "mobile", "width": 375, "height": 812, "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"},
+    {"name": "tablet", "width": 768, "height": 1024, "user_agent": "Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"},
 ]
 # Session persistence: проверять сохранение состояния после reload каждые N шагов (0 = отключено)
 SESSION_PERSIST_CHECK_EVERY_N = int(os.getenv("SESSION_PERSIST_CHECK_EVERY_N", "20"))
@@ -187,3 +204,89 @@ COOKIE_BANNER_BUTTON_TEXTS = [s.strip() for s in os.getenv("COOKIE_BANNER_BUTTON
 # Оверлеи, которые НЕ часть приложения: чат, поддержка, виджеты + служебный UI агента (чат с LLM, Kventin).
 # Паттерны в id/class/aria-label/тексте (нижний регистр). Через запятую.
 OVERLAY_IGNORE_PATTERNS = [s.strip().lower() for s in os.getenv("OVERLAY_IGNORE_PATTERNS", "chat,чат,support,поддержк,help,консультант,jivo,intercom,crisp,drift,tawk,livechat,live-chat,widget-chat,chat-widget,feedback,обратн,звонок,callback,kventin,agent-llm,agent-banner,диалог с llm,ai-тестировщик,gigachat").split(",") if s.strip()]
+
+# --- Навигация и покрытие ---
+# Максимальная глубина переходов от start_url (0 = без лимита). Не уходить глубже N кликов.
+MAX_NAVIGATION_DEPTH = int(os.getenv("MAX_NAVIGATION_DEPTH", "0"))
+# После exploratory — обход непосещённых ссылок внутри домена (0 = отключено)
+ENABLE_FULL_SITEMAP_CRAWL = os.getenv("ENABLE_FULL_SITEMAP_CRAWL", "false").lower() in ("1", "true", "yes")
+
+# --- Аутентификация ---
+# URL страницы логина, логин/пароль, селектор кнопки входа (пусто = без автологина)
+AUTH_URL = os.getenv("AUTH_URL", "").strip()
+AUTH_USERNAME = os.getenv("AUTH_USERNAME", "").strip()
+AUTH_PASSWORD = os.getenv("AUTH_PASSWORD", "").strip()
+AUTH_SUBMIT_SELECTOR = os.getenv("AUTH_SUBMIT_SELECTOR", "").strip()  # например button[type=submit] или "Войти"
+
+# --- Состояние и восстановление ---
+# Путь к файлу для сохранения cookies+localStorage (пусто = не сохранять)
+SESSION_STATE_SAVE_PATH = os.getenv("SESSION_STATE_SAVE_PATH", "").strip()
+# Восстановить состояние из файла перед стартом (если файл есть)
+SESSION_STATE_RESTORE_PATH = os.getenv("SESSION_STATE_RESTORE_PATH", "").strip()
+
+# --- Видеозапись и отчёты ---
+# Папка для записи видео сессии (Playwright record_video_dir)
+RECORD_VIDEO_DIR = os.getenv("RECORD_VIDEO_DIR", "").strip()
+# Путь к baseline JSONL для сравнения регрессий (загрузить предыдущий прогон)
+SESSION_BASELINE_JSONL = os.getenv("SESSION_BASELINE_JSONL", "").strip()
+# Экспорт в JUnit XML (путь к файлу)
+JUNIT_REPORT_PATH = os.getenv("JUNIT_REPORT_PATH", "").strip()
+
+# --- Расширенные проверки ---
+# Учитывать Shadow DOM при сборе элементов (get_dom_summary)
+ENABLE_SHADOW_DOM = os.getenv("ENABLE_SHADOW_DOM", "true").lower() in ("1", "true", "yes")
+# Проверять битые ссылки (href/src) на странице каждые N шагов (0 = отключено)
+BROKEN_LINKS_CHECK_EVERY_N = int(os.getenv("BROKEN_LINKS_CHECK_EVERY_N", "0"))
+# Логировать предупреждения и deprecation из консоли в отчёт
+ENABLE_CONSOLE_WARNINGS_IN_REPORT = os.getenv("ENABLE_CONSOLE_WARNINGS_IN_REPORT", "true").lower() in ("1", "true", "yes")
+# Детектировать mixed content (HTTPS-страница загружает HTTP-ресурсы)
+ENABLE_MIXED_CONTENT_CHECK = os.getenv("ENABLE_MIXED_CONTENT_CHECK", "true").lower() in ("1", "true", "yes")
+# Мониторинг WebSocket (ошибки, неожиданное закрытие)
+ENABLE_WEBSOCKET_MONITOR = os.getenv("ENABLE_WEBSOCKET_MONITOR", "true").lower() in ("1", "true", "yes")
+
+# --- Загрузка файлов ---
+# Путь к тестовому файлу для input type=file (пусто = не тестировать загрузку)
+TEST_UPLOAD_FILE_PATH = os.getenv("TEST_UPLOAD_FILE_PATH", "").strip()
+
+# --- Браузер: движок Playwright ---
+# chromium | firefox | webkit
+BROWSER_ENGINE = os.getenv("BROWSER_ENGINE", "chromium").strip().lower() or "chromium"
+if BROWSER_ENGINE not in ("chromium", "firefox", "webkit"):
+    BROWSER_ENGINE = "chromium"
+
+# --- Visual regression baseline ---
+# Папка для эталонных скриншотов (URL -> hash). Пусто = не сравнивать с baseline.
+VISUAL_BASELINE_DIR = os.getenv("VISUAL_BASELINE_DIR", "").strip()
+# Порог изменения в % для детекции регрессии (0–100)
+VISUAL_REGRESSION_THRESHOLD_PCT = float(os.getenv("VISUAL_REGRESSION_THRESHOLD_PCT", "5.0"))
+
+# --- Экспорт сессии в Playwright-скрипт ---
+PLAYWRIGHT_EXPORT_PATH = os.getenv("PLAYWRIGHT_EXPORT_PATH", "").strip()
+
+# --- API-интеркепт (сбор XHR/fetch) ---
+ENABLE_API_INTERCEPT = os.getenv("ENABLE_API_INTERCEPT", "true").lower() in ("1", "true", "yes")
+API_LOG_MAX = int(os.getenv("API_LOG_MAX", "100"))
+
+# --- Flakiness: повторные прогоны перед дефектом ---
+# Сколько раз перезапустить действие при сбое для оценки flakiness (0 = не перезапускать, 2–5 типично)
+FLAKINESS_RERUN_COUNT = int(os.getenv("FLAKINESS_RERUN_COUNT", "0"))
+
+# --- Спецификация теста (YAML): сценарии до автономного прохода ---
+TEST_SPEC_YAML_PATH = os.getenv("TEST_SPEC_YAML_PATH", "").strip()
+
+# --- Утверждения на естественном языке (проверка через LLM после шагов) ---
+# Список утверждений через запятую, например: "После логина видна фамилия пользователя"
+NL_ASSERTIONS = [s.strip() for s in os.getenv("NL_ASSERTIONS", "").split(",") if s.strip()]
+
+# --- Несколько стартовых URL (через запятую; приоритет над START_URL) ---
+START_URLS = [s.strip() for s in os.getenv("START_URLS", "").split(",") if s.strip()]
+
+# --- DOM diff: считать изменение DOM после действия (нет изменения = возможный баг) ---
+ENABLE_DOM_DIFF_AFTER_ACTION = os.getenv("ENABLE_DOM_DIFF_AFTER_ACTION", "true").lower() in ("1", "true", "yes")
+
+# --- CI/CD ---
+# Режим CI (авто-определение или KVENTIN_CI=1)
+_ci_detected = bool(os.getenv("CI") or os.getenv("GITHUB_ACTIONS") or os.getenv("GITLAB_CI"))
+CI_MODE = os.getenv("KVENTIN_CI", "1" if _ci_detected else "0").lower() in ("1", "true", "yes")
+# Порог дефектов для exit code: если создано дефектов > N — exit 1 (0 = падать при любом дефекте, -1 = не падать)
+FAIL_ON_DEFECTS = int(os.getenv("FAIL_ON_DEFECTS", "-1"))

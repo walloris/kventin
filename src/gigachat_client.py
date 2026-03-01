@@ -385,26 +385,18 @@ class GigaChatClient:
             LOG.error("chat: нет токена, запрос отменён")
             return ""
 
-        try:
-            from config import DEMO_MODE as _dm
-        except ImportError:
-            _dm = False
-
         model = self._normalize_model(self.model)
         payload = {
             "model": model,
             "messages": messages,
-            "temperature": 0.15 if _dm else 0.2,
+            "temperature": 0.2,
             "top_p": 0.9,
             "safe_mode": False,
             "profanity_check": False,
             "stream": False,
         }
-        # max_tokens: ограничиваем ответ → GigaChat отвечает быстрее
         if max_tokens:
             payload["max_tokens"] = max_tokens
-        elif _dm:
-            payload["max_tokens"] = 400  # в демо — короткие ответы
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {token}",
@@ -413,8 +405,7 @@ class GigaChatClient:
         last_msg = messages[-1] if messages else {}
         user_len = len(last_msg.get("content", "")) if isinstance(last_msg.get("content"), str) else 0
         has_image = "<img" in (last_msg.get("content", "") if isinstance(last_msg.get("content"), str) else "")
-        # Таймаут: в демо режиме короче чтобы не зависать
-        timeout = 45 if _dm else 120
+        timeout = 120
         LOG.info("chat: POST %s model=%s msgs=%s user_len=%s has_image=%s", self.api_url, model, len(messages), user_len, has_image)
         try:
             r = requests.post(
@@ -490,19 +481,14 @@ class GigaChatClient:
 
     @staticmethod
     def _compress_screenshot(screenshot_b64: str) -> bytes:
-        """Сжать скриншот: PNG base64 → JPEG bytes. В демо-режиме — агрессивнее."""
+        """Сжать скриншот: PNG base64 → JPEG bytes."""
         raw_png = base64.b64decode(screenshot_b64)
-        try:
-            from config import DEMO_MODE as _dm
-        except ImportError:
-            _dm = False
         try:
             from io import BytesIO
             from PIL import Image
             img = Image.open(BytesIO(raw_png))
-            # В демо: ещё меньше, quality ниже → быстрее upload
-            max_width = 960 if _dm else 1280
-            quality = 50 if _dm else 70
+            max_width = 1280
+            quality = 70
             if img.width > max_width:
                 ratio = max_width / img.width
                 new_size = (max_width, int(img.height * ratio))
@@ -534,11 +520,18 @@ _client: Optional[Any] = None
 
 
 def _get_client():
-    """Вернуть клиент LLM: всегда GigaChat."""
+    """Вернуть клиент LLM: GigaChat, Jan, OpenAI, Anthropic или Ollama по LLM_PROVIDER."""
     global _client
     if _client is None:
-        _client = GigaChatClient()
-        LOG.info("Using LLM: GigaChat")
+        try:
+            from src.llm_provider import get_llm_client
+            _client = get_llm_client()
+        except Exception as e:
+            LOG.debug("llm_provider.get_llm_client: %s", e)
+            _client = None
+        if _client is None:
+            _client = GigaChatClient()
+            LOG.info("Using LLM: GigaChat")
     return _client
 
 
@@ -583,13 +576,12 @@ def consult_agent(context: str, question: str) -> Optional[str]:
 def _llm_call_with_retry(prompt: str, screenshot_b64: Optional[str] = None, system: Optional[str] = None) -> Optional[str]:
     """Вызов GigaChat с retry и экспоненциальным backoff при пустом ответе."""
     try:
-        from config import LLM_RETRY_COUNT, LLM_RETRY_BASE_DELAY, DEMO_MODE
+        from config import LLM_RETRY_COUNT, LLM_RETRY_BASE_DELAY
     except ImportError:
-        LLM_RETRY_COUNT, LLM_RETRY_BASE_DELAY, DEMO_MODE = 3, 2.0, False
+        LLM_RETRY_COUNT, LLM_RETRY_BASE_DELAY = 3, 2.0
 
-    # В демо: меньше retry, короче задержка
-    retry_count = min(LLM_RETRY_COUNT, 2) if DEMO_MODE else LLM_RETRY_COUNT
-    base_delay = 0.5 if DEMO_MODE else LLM_RETRY_BASE_DELAY
+    retry_count = LLM_RETRY_COUNT
+    base_delay = LLM_RETRY_BASE_DELAY
 
     last_result = None
     for attempt in range(max(1, retry_count)):
@@ -651,52 +643,9 @@ def _build_system_prompt(
     has_overlay: bool = False,
 ) -> str:
     """
-    Динамический системный промпт: базовая роль + блоки по ситуации.
-    Вместо одного огромного промпта — компактное ядро и контекстные блоки.
+    Системный промпт: роль тестировщика + блоки по фазе и оверлею.
     """
-    try:
-        from config import DEMO_MODE
-    except ImportError:
-        DEMO_MODE = False
-
-    if DEMO_MODE:
-        base = """Ты — АКТИВНЫЙ энергичный тестировщик. Действуй БЫСТРО, РЕШИТЕЛЬНО и ПОСТОЯННО!
-
-🚀 КРИТИЧНО: Агент должен ПОСТОЯННО что-то ДЕЛАТЬ, а не анализировать консоль!
-
-ЭЛЕМЕНТЫ СТРАНИЦЫ:
-Каждый элемент пронумерован: [N] тип "текст" атрибуты.
-Используй "ref:N" как selector (N = число из квадратных скобок).
-Пример: [42] button "Войти" → selector = "ref:42"
-
-ПРАВИЛА:
-1) ВСЕГДА указывай selector = "ref:N". НИКОГДА не используй CSS-селекторы или текст кнопки как selector.
-2) ВСЕГДА выбирай КОНКРЕТНОЕ действие (click/type/fill_form). НЕ предлагай анализ/проверку.
-3) СНАЧАЛА кликай: кнопки, ссылки, табы, пункты меню. Ввод в поля — после того как обошёл кликабельное.
-4) Кликай на ВСЕ кнопки, ссылки, элементы меню. Заполняй формы только когда нечего кликнуть.
-5) Вводи реалистичные данные: test@test.com, Иван Тестов, +79991234567, Москва.
-6) Не повторяй одно и то же — двигайся дальше. Каждый шаг = НОВЫЙ элемент.
-7) Если видишь форму — можно fill_form разом, иначе по полям + кнопка отправки.
-8) Баги (check_defect) — только при явных ошибках (500, сломанная верстка).
-9) НЕ предлагай "explore" — только КОНКРЕТНОЕ действие (click/type)!
-
-СТРОГО JSON (без markdown):
-{
-  "action": "click|type|scroll|hover|close_modal|select_option|press_key|check_defect|fill_form",
-  "selector": "ref:N (число из [N] в списке элементов)",
-  "value": "текст/опция/клавиша",
-  "reason": "зачем (кратко)",
-  "test_goal": "что проверяю",
-  "expected_outcome": "что жду",
-  "observation": "что вижу",
-  "possible_bug": "баг или null",
-  "layout_issue": "проблема верстки или null"
-}
-
-Приоритет: кнопки CTA → формы → навигация → табы → дропдауны → ссылки.
-НЕ предлагай СТОП."""
-    else:
-        base = """Ты — опытный ручной тестировщик веб-приложений. Ты выполняешь ОДНО действие за шаг, проверяешь результат, затем решаешь следующий шаг.
+    base = """Ты — опытный ручной тестировщик веб-приложений. Ты выполняешь ОДНО действие за шаг, проверяешь результат, затем решаешь следующий шаг.
 
 ЭЛЕМЕНТЫ СТРАНИЦЫ:
 Каждый элемент пронумерован: [N] тип "текст" атрибуты.
