@@ -1971,13 +1971,8 @@ def run_agent(start_url: str = None):
                     print(f"[Agent] Лимит {MAX_STEPS} шагов. Завершаю.")
                     break
 
-                # Сразу пишем HTML/текстовый отчёт в начале шага (шаг 1 и каждые N), чтобы файл появился до долгого LLM/действия
-                save_report_now = (
-                    SESSION_REPORT_SAVE_EVERY_N > 0
-                    and step >= 1
-                    and (step == 1 or step % SESSION_REPORT_SAVE_EVERY_N == 0)
-                )
-                if save_report_now and (SESSION_REPORT_PATH or SESSION_REPORT_HTML_PATH):
+                # Сохранять отчёт в начале каждого шага (файл появляется/обновляется до долгого LLM)
+                if SESSION_REPORT_SAVE_EVERY_N > 0 and step >= 1 and (SESSION_REPORT_PATH or SESSION_REPORT_HTML_PATH):
                     try:
                         if not page.is_closed():
                             _collect_browser_metrics(page, memory, step)
@@ -1985,10 +1980,14 @@ def run_agent(start_url: str = None):
                         if SESSION_REPORT_PATH:
                             with open(SESSION_REPORT_PATH, "w", encoding="utf-8") as f:
                                 f.write(report)
+                                f.flush()
+                                os.fsync(f.fileno())
                         if SESSION_REPORT_HTML_PATH:
                             html_content = _build_html_report(memory, report, start_url or "", video_dir=RECORD_VIDEO_DIR or "")
                             with open(SESSION_REPORT_HTML_PATH, "w", encoding="utf-8") as f:
                                 f.write(html_content)
+                                f.flush()
+                                os.fsync(f.fileno())
                         print(f"[Agent] Отчёт обновлён (шаг {step})")
                     except Exception as e:
                         LOG.warning("Промежуточный отчёт: %s", e)
@@ -2230,9 +2229,8 @@ def run_agent(start_url: str = None):
                     report = memory.get_session_report_text()
                     print(report)
 
-                # Сохранять отчёт в файл после каждого шага (чтобы отчёт обновлялся часто)
-                save_report_now = SESSION_REPORT_SAVE_EVERY_N > 0 and step >= 1
-                if save_report_now and (SESSION_REPORT_PATH or SESSION_REPORT_HTML_PATH):
+                # Сохранять отчёт после каждого шага (с флушем на диск, чтобы при открытом файле видели обновления)
+                if SESSION_REPORT_SAVE_EVERY_N > 0 and step >= 1 and (SESSION_REPORT_PATH or SESSION_REPORT_HTML_PATH):
                     try:
                         if not page.is_closed():
                             _collect_browser_metrics(page, memory, step)
@@ -2240,10 +2238,14 @@ def run_agent(start_url: str = None):
                         if SESSION_REPORT_PATH:
                             with open(SESSION_REPORT_PATH, "w", encoding="utf-8") as f:
                                 f.write(report)
+                                f.flush()
+                                os.fsync(f.fileno())
                         if SESSION_REPORT_HTML_PATH:
                             html_content = _build_html_report(memory, report, start_url or "", video_dir=RECORD_VIDEO_DIR or "")
                             with open(SESSION_REPORT_HTML_PATH, "w", encoding="utf-8") as f:
                                 f.write(html_content)
+                                f.flush()
+                                os.fsync(f.fileno())
                         print(f"[Agent] Отчёт обновлён (шаг {step})")
                     except Exception as e:
                         LOG.warning("Промежуточный отчёт: %s", e)
