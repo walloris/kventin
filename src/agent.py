@@ -1628,14 +1628,16 @@ def run_agent(start_url: str = None):
     with sync_playwright() as p:
         browser = None
         engine = getattr(p, BROWSER_ENGINE, p.chromium)
-        # Аргументы Chromium: подавить диалог выбора сертификата в headless/CI
+        # Аргументы Chromium: подавить диалог выбора сертификата в headless/CI.
+        # Используем Chromium при ENGINE=chromium или при persistent context (USER_DATA_DIR — только Chromium).
+        use_chromium = BROWSER_ENGINE == "chromium" or bool(BROWSER_USER_DATA_DIR)
         chromium_args = list(BROWSER_CHROMIUM_ARGS)
-        if BROWSER_ENGINE == "chromium" and BROWSER_SUPPRESS_CERT_PROMPT:
+        if use_chromium and BROWSER_SUPPRESS_CERT_PROMPT:
             chromium_args.append("--ignore-certificate-errors")
             if sys.platform == "darwin":
                 chromium_args.append("--use-mock-keychain")
         launch_kw = {"headless": HEADLESS, "slow_mo": BROWSER_SLOW_MO}
-        if BROWSER_ENGINE == "chromium" and chromium_args:
+        if use_chromium and chromium_args:
             launch_kw["args"] = chromium_args
         if BROWSER_USER_DATA_DIR:
             # Профиль на диске — поддерживается только Chromium
