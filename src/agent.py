@@ -2726,6 +2726,23 @@ def _build_html_report(memory: AgentMemory, report_text: str, start_url: str = "
             cls = "timeline-fail" if is_fail else "timeline-ok"
             timeline_bars += f'<span class="timeline-bar {cls}" style="width:{max(2, 100/60)}%" title="#{s} {act}"/>'
 
+    # Данные для Session Replay (без json.dumps, чтобы избежать проблем с несериализуемыми типами)
+    steps_js_items: List[str] = []
+    for e in step_log:
+        step_val = e.get("step")
+        if isinstance(step_val, dict):
+            step_num = 0
+        else:
+            try:
+                step_num = int(step_val or 0)
+            except (TypeError, ValueError):
+                step_num = 0
+        sp = e.get("screenshot_path") or ""
+        thumb = os.path.basename(sp) if sp else ""
+        thumb_safe = thumb.replace("\\", "\\\\").replace('"', '\\"')
+        steps_js_items.append(f'{{"step": {step_num}, "thumb": "{thumb_safe}"}}')
+    steps_js = "[" + ",".join(steps_js_items) + "]"
+
     return f"""<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -2979,7 +2996,7 @@ pre {{ margin: 0; font-size: 0.85rem; color: var(--text2); white-space: pre-wrap
 <div class="replay-strip" id="replay-strip"></div>
 <script>
 (function(){{
-var steps = {json.dumps([{{"step": e.get("step") if not isinstance(e.get("step"), dict) else 0, "thumb": ((e.get("screenshot_path") or "").split("/")[-1] if e.get("screenshot_path") else "")}} for e in step_log], default=str)};
+var steps = {steps_js};
 var idx = 0, total = steps.length, playing = false, t;
 if (!total) {{ document.getElementById("replay-info").textContent = "Нет шагов"; }}
 else {{
