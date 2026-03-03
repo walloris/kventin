@@ -2204,9 +2204,8 @@ def run_agent(start_url: str = None):
                     report = memory.get_session_report_text()
                     print(report)
 
-                # Периодически сохранять отчёт в файл во время работы (с шага 1 и каждые N шагов)
-                save_report_now = (SESSION_REPORT_SAVE_EVERY_N > 0 and step >= 1 and
-                    (step == 1 or step % SESSION_REPORT_SAVE_EVERY_N == 0))
+                # Сохранять отчёт в файл после каждого шага (чтобы отчёт обновлялся часто)
+                save_report_now = SESSION_REPORT_SAVE_EVERY_N > 0 and step >= 1
                 if save_report_now and (SESSION_REPORT_PATH or SESSION_REPORT_HTML_PATH):
                     try:
                         if not page.is_closed():
@@ -2627,50 +2626,88 @@ def _build_html_report(memory: AgentMemory, report_text: str, start_url: str = "
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
+<meta http-equiv="refresh" content="15"/>
 <title>Kventin — отчёт сессии</title>
 <style>
 :root {{
-  --bg: #0f0f14;
-  --surface: #1a1a24;
-  --surface2: #252532;
-  --text: #e8e8ed;
-  --text2: #9898a8;
+  --bg: #0c0c10;
+  --bg2: #12121a;
+  --surface: #18181f;
+  --surface2: #22222e;
+  --surface3: #2a2a38;
+  --text: #f0f0f5;
+  --text2: #a0a0b0;
   --accent: #6366f1;
   --accent2: #818cf8;
+  --accent-dim: rgba(99,102,241,0.12);
   --success: #22c55e;
   --warn: #eab308;
   --danger: #ef4444;
-  --radius: 12px;
-  --font: 'Segoe UI', system-ui, -apple-system, sans-serif;
+  --radius: 14px;
+  --radius-sm: 8px;
+  --shadow: 0 4px 24px rgba(0,0,0,0.35);
+  --font: 'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif;
 }}
 * {{ box-sizing: border-box; }}
 body {{
   margin: 0;
-  padding: 2rem;
+  padding: 0;
   font-family: var(--font);
+  font-size: 15px;
+  line-height: 1.55;
   background: var(--bg);
   color: var(--text);
-  line-height: 1.5;
-  background-image: radial-gradient(ellipse 80% 50% at 50% -20%, rgba(99,102,241,0.15), transparent);
+  background-image: radial-gradient(ellipse 100% 60% at 50% -30%, rgba(99,102,241,0.12), transparent 55%);
+  min-height: 100vh;
 }}
-.container {{ max-width: 1200px; margin: 0 auto; }}
-h1 {{
-  font-size: 1.75rem;
+.container {{ max-width: 1280px; margin: 0 auto; padding: 0 1.5rem 2rem; }}
+.header-bar {{
+  background: var(--surface);
+  border-bottom: 1px solid var(--surface2);
+  padding: 1rem 1.5rem;
+  margin-bottom: 1.5rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}}
+.header-bar h1 {{
+  margin: 0;
+  font-size: 1.5rem;
   font-weight: 700;
-  margin: 0 0 0.5rem;
   background: linear-gradient(135deg, var(--accent2), var(--accent));
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
   background-clip: text;
 }}
+.live-badge {{
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.35rem 0.75rem;
+  border-radius: 999px;
+  background: var(--accent-dim);
+  color: var(--accent2);
+  font-size: 0.8rem;
+  font-weight: 500;
+}}
+.live-badge::before {{
+  content: "";
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--success);
+  animation: pulse 2s ease-in-out infinite;
+}}
+@keyframes pulse {{ 0%,100% {{ opacity: 1; }} 50% {{ opacity: 0.5; }} }}
 .sub {{
   color: var(--text2);
   font-size: 0.9rem;
-  margin-bottom: 2rem;
+  margin-bottom: 0.5rem;
 }}
 .cards {{
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 1rem;
   margin-bottom: 2rem;
 }}
@@ -2678,85 +2715,106 @@ h1 {{
   background: var(--surface);
   border: 1px solid var(--surface2);
   border-radius: var(--radius);
-  padding: 1rem 1.25rem;
+  padding: 1.25rem 1.5rem;
   text-align: center;
+  box-shadow: var(--shadow);
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
 }}
+.card:hover {{ transform: translateY(-2px); box-shadow: 0 8px 32px rgba(0,0,0,0.4); }}
 .card .val {{
-  font-size: 1.5rem;
+  font-size: 1.75rem;
   font-weight: 700;
   color: var(--accent2);
+  letter-spacing: -0.02em;
 }}
-.card .lbl {{ font-size: 0.8rem; color: var(--text2); margin-top: 0.25rem; }}
+.card .lbl {{ font-size: 0.8rem; color: var(--text2); margin-top: 0.35rem; text-transform: uppercase; letter-spacing: 0.04em; }}
 section {{
   background: var(--surface);
   border: 1px solid var(--surface2);
   border-radius: var(--radius);
-  padding: 1.5rem;
-  margin-bottom: 1.5rem;
+  padding: 1.5rem 1.75rem;
+  margin-bottom: 1.25rem;
+  box-shadow: var(--shadow);
 }}
 section h2 {{
-  font-size: 1rem;
+  font-size: 0.95rem;
   margin: 0 0 1rem;
   color: var(--text2);
   text-transform: uppercase;
-  letter-spacing: 0.05em;
+  letter-spacing: 0.06em;
+  font-weight: 600;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--surface2);
 }}
 table {{
   width: 100%;
   border-collapse: collapse;
-  font-size: 0.85rem;
+  font-size: 0.9rem;
+  border-radius: var(--radius-sm);
+  overflow: hidden;
 }}
 th {{
   text-align: left;
-  padding: 0.6rem 0.75rem;
+  padding: 0.75rem 1rem;
   color: var(--text2);
   font-weight: 600;
-  border-bottom: 1px solid var(--surface2);
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  background: var(--surface2);
 }}
 td {{
-  padding: 0.6rem 0.75rem;
+  padding: 0.7rem 1rem;
   border-bottom: 1px solid rgba(255,255,255,0.04);
+  background: var(--surface);
 }}
-tr:hover td {{ background: rgba(255,255,255,0.02); }}
-.url {{ max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
-.sel {{ max-width: 120px; overflow: hidden; text-overflow: ellipsis; }}
-.result {{ max-width: 220px; overflow: hidden; text-overflow: ellipsis; }}
-.act {{ padding: 0.2em 0.5em; border-radius: 6px; font-weight: 500; background: var(--surface2); color: var(--text); }}
-.act-click {{ background: rgba(99,102,241,0.25); color: var(--accent2); }}
-.act-type {{ background: rgba(34,197,94,0.2); color: var(--success); }}
-.act-scroll {{ background: rgba(234,179,8,0.2); color: var(--warn); }}
-.act-hover {{ background: rgba(129,140,248,0.2); color: var(--accent2); }}
-.act-close_modal {{ background: rgba(239,68,68,0.2); color: var(--danger); }}
-.act-fill_form {{ background: rgba(34,197,94,0.25); color: var(--success); }}
-.src {{ padding: 0.2em 0.4em; border-radius: 4px; font-size: 0.8em; }}
-.src-gigachat {{ background: rgba(99,102,241,0.2); color: var(--accent2); }}
-.src-fast {{ background: var(--surface2); color: var(--text2); }}
-.step-thumb {{ width: 80px; height: 45px; object-fit: cover; border-radius: 6px; display: block; }}
-.thumb {{ width: 90px; }}
-.key {{ font-family: monospace; color: var(--accent2); }}
-.sev {{ padding: 0.2em 0.5em; border-radius: 6px; font-size: 0.85em; font-weight: 500; }}
-.sev-critical {{ background: rgba(239,68,68,0.25); color: var(--danger); }}
-.sev-major {{ background: rgba(234,179,8,0.25); color: var(--warn); }}
-.sev-minor {{ background: var(--surface2); color: var(--text2); }}
-pre {{ margin: 0; font-size: 0.8rem; color: var(--text2); white-space: pre-wrap; }}
+tr:nth-child(even) td {{ background: rgba(255,255,255,0.02); }}
+tr:hover td {{ background: rgba(99,102,241,0.06); }}
+tr:last-child td {{ border-bottom: none; }}
+.url {{ max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+.sel {{ max-width: 140px; overflow: hidden; text-overflow: ellipsis; }}
+.result {{ max-width: 260px; overflow: hidden; text-overflow: ellipsis; }}
+.act {{ padding: 0.25em 0.6em; border-radius: var(--radius-sm); font-weight: 500; background: var(--surface3); color: var(--text); font-size: 0.85em; }}
+.act-click {{ background: rgba(99,102,241,0.28); color: var(--accent2); }}
+.act-type {{ background: rgba(34,197,94,0.22); color: var(--success); }}
+.act-scroll {{ background: rgba(234,179,8,0.22); color: var(--warn); }}
+.act-hover {{ background: rgba(129,140,248,0.22); color: var(--accent2); }}
+.act-close_modal {{ background: rgba(239,68,68,0.22); color: var(--danger); }}
+.act-fill_form {{ background: rgba(34,197,94,0.28); color: var(--success); }}
+.src {{ padding: 0.2em 0.45em; border-radius: 4px; font-size: 0.78em; }}
+.src-gigachat {{ background: rgba(99,102,241,0.22); color: var(--accent2); }}
+.src-fast {{ background: var(--surface3); color: var(--text2); }}
+.step-thumb {{ width: 88px; height: 50px; object-fit: cover; border-radius: var(--radius-sm); display: block; }}
+.thumb {{ width: 100px; }}
+.key {{ font-family: ui-monospace, monospace; color: var(--accent2); }}
+.sev {{ padding: 0.25em 0.55em; border-radius: var(--radius-sm); font-size: 0.82em; font-weight: 500; }}
+.sev-critical {{ background: rgba(239,68,68,0.28); color: var(--danger); }}
+.sev-major {{ background: rgba(234,179,8,0.28); color: var(--warn); }}
+.sev-minor {{ background: var(--surface3); color: var(--text2); }}
+pre {{ margin: 0; font-size: 0.85rem; color: var(--text2); white-space: pre-wrap; line-height: 1.5; }}
 .timeline-wrap {{ display: flex; flex-wrap: wrap; gap: 2px; margin-top: 0.5rem; }}
-.timeline-bar {{ height: 20px; border-radius: 4px; display: inline-block; min-width: 4px; }}
-.timeline-ok {{ background: var(--accent); opacity: 0.8; }}
+.timeline-bar {{ height: 22px; border-radius: 5px; display: inline-block; min-width: 5px; }}
+.timeline-ok {{ background: linear-gradient(180deg, var(--accent), var(--accent2)); opacity: 0.9; }}
 .timeline-fail {{ background: var(--danger); }}
 .replay-wrap {{ display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.75rem; flex-wrap: wrap; }}
-.replay-btn {{ padding: 0.4rem 0.8rem; border-radius: 8px; background: var(--surface2); color: var(--text); border: 1px solid var(--surface2); cursor: pointer; }}
-.replay-btn:hover {{ background: var(--accent); color: #fff; }}
-.replay-strip {{ display: flex; flex-wrap: wrap; gap: 4px; max-height: 120px; overflow-y: auto; }}
-.replay-thumb {{ width: 80px; height: 45px; border-radius: 6px; overflow: hidden; border: 2px solid transparent; cursor: pointer; }}
-.replay-thumb.active {{ border-color: var(--accent); }}
+.replay-btn {{ padding: 0.5rem 1rem; border-radius: var(--radius-sm); background: var(--surface2); color: var(--text); border: 1px solid var(--surface3); cursor: pointer; font-size: 0.9rem; }}
+.replay-btn:hover {{ background: var(--accent); color: #fff; border-color: var(--accent); }}
+.replay-strip {{ display: flex; flex-wrap: wrap; gap: 6px; max-height: 130px; overflow-y: auto; }}
+.replay-thumb {{ width: 84px; height: 47px; border-radius: var(--radius-sm); overflow: hidden; border: 2px solid transparent; cursor: pointer; }}
+.replay-thumb.active {{ border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }}
 .replay-thumb img {{ width: 100%; height: 100%; object-fit: cover; display: block; }}
-@media (max-width: 768px) {{ .url, .result {{ max-width: 100px; }} }}
+@media (max-width: 768px) {{ .url, .result {{ max-width: 120px; }} .header-bar {{ flex-direction: column; align-items: flex-start; }} }}
 </style>
 </head>
 <body>
-<div class="container">
+<div class="header-bar">
+<div>
 <h1>Kventin</h1>
-<p class="sub">Отчёт сессии AI-тестировщика · {esc(datetime.now().strftime("%d.%m.%Y %H:%M"))} · {esc(start_url or "—")[:60]}</p>
+<p class="sub">Отчёт сессии · {esc(start_url or "—")[:70]}</p>
+</div>
+<span class="live-badge">Обновлено {esc(datetime.now().strftime("%H:%M:%S"))}</span>
+</div>
+<div class="container">
 <div class="cards">
 <div class="card"><div class="val">{len(step_log)}</div><div class="lbl">Шагов</div></div>
 <div class="card"><div class="val">{int(duration_sec)}</div><div class="lbl">Секунд</div></div>

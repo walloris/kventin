@@ -152,8 +152,8 @@ ENABLE_SECOND_PASS_BUG = os.getenv("ENABLE_SECOND_PASS_BUG", "true").lower() in 
 ACTION_RETRY_COUNT = int(os.getenv("ACTION_RETRY_COUNT", "2"))
 # Печатать отчёт сессии каждые N шагов (0 = только в конце при создании дефекта)
 SESSION_REPORT_EVERY_N = int(os.getenv("SESSION_REPORT_EVERY_N", "0"))
-# Сохранять отчёт в файл(ы) каждые N шагов во время работы (0 = только в конце при выходе)
-SESSION_REPORT_SAVE_EVERY_N = int(os.getenv("SESSION_REPORT_SAVE_EVERY_N", "10"))
+# Сохранять отчёт в файл(ы) каждые N шагов во время работы (0 = только в конце при выходе). 1 = каждый шаг.
+SESSION_REPORT_SAVE_EVERY_N = int(os.getenv("SESSION_REPORT_SAVE_EVERY_N", "2"))
 
 # Максимальное число шагов агента (0 = бесконечный цикл). При достижении — печатает отчёт и останавливается.
 MAX_STEPS = int(os.getenv("MAX_STEPS", "0"))
