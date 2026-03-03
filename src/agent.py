@@ -602,9 +602,22 @@ class AgentMemory:
         if m:
             lines.append("--- Метрики браузера (последний сбор) ---")
             lines.append(f"  Шаг: {m.get('step', '—')}, URL: {(m.get('url') or '')[:80]}")
-            for key in ("loadEventEnd", "domContentLoaded", "domComplete", "responseStart"):
-                if m.get(key) is not None:
-                    lines.append(f"  {key}: {m[key]} мс")
+            page = m.get("page") or {}
+            for key, label in [
+                ("ttfb", "TTFB"), ("domContentLoaded", "DCL"), ("loadComplete", "Load"),
+                ("firstContentfulPaint", "FCP"), ("lcp", "LCP"),
+            ]:
+                if page.get(key) is not None:
+                    lines.append(f"  {label}: {page[key]} мс")
+            res = m.get("resources") or {}
+            for rtype, data in sorted(res.items())[:6]:
+                count = data.get("count", 0)
+                avg = data.get("avgDuration")
+                mx = data.get("durationMax")
+                lines.append(f"  [{rtype}] n={count}, avg={avg or '—'} мс, max={mx or '—'} мс")
+            resp = m.get("response") or {}
+            if resp.get("avgMs") is not None:
+                lines.append(f"  XHR/fetch отклик: avg={resp['avgMs']} мс, max={resp.get('maxMs', '—')} мс")
             if m.get("scrollHeight") is not None:
                 lines.append(f"  scrollHeight/scrollWidth: {m.get('scrollHeight')} / {m.get('scrollWidth', '—')}")
             if m.get("usedJSHeapSize") is not None:
@@ -2326,31 +2339,85 @@ def run_agent(start_url: str = None):
 
 
 def _collect_browser_metrics(page: Page, memory: AgentMemory, step: int) -> None:
-    """Собрать метрики браузера (timing, document, memory) и сохранить в memory."""
+    """Собрать метрики: загрузка страницы, ресурсы по типам, время отклика, память."""
     try:
         url = page.url[:200] if page.url else ""
         metrics = page.evaluate("""() => {
             const out = { url: window.location.href ? window.location.href.slice(0, 200) : '' };
+            out.page = {};
+            out.resources = {};
+            out.response = {};
             try {
                 const t = performance.timing || {};
                 const nav = performance.getEntriesByType('navigation')[0];
+                const toMs = (a, b) => (a > 0 && b >= 0) ? Math.round(a - b) : null;
                 if (nav) {
-                    out.loadEventEnd = nav.loadEventEnd > 0 ? Math.round(nav.loadEventEnd - nav.fetchStart) : null;
-                    out.domContentLoaded = nav.domContentLoadedEventEnd > 0 ? Math.round(nav.domContentLoadedEventEnd - nav.fetchStart) : null;
-                    out.domComplete = nav.domComplete > 0 ? Math.round(nav.domComplete - nav.fetchStart) : null;
-                    out.responseStart = nav.responseStart > 0 ? Math.round(nav.responseStart - nav.fetchStart) : null;
+                    out.page.ttfb = toMs(nav.responseStart, nav.fetchStart);
+                    out.page.domInteractive = toMs(nav.domInteractive, nav.fetchStart);
+                    out.page.domContentLoaded = toMs(nav.domContentLoadedEventEnd, nav.fetchStart);
+                    out.page.loadComplete = toMs(nav.loadEventEnd, nav.fetchStart);
+                    out.page.domComplete = toMs(nav.domComplete, nav.fetchStart);
+                    out.loadEventEnd = out.page.loadComplete;
+                    out.domContentLoaded = out.page.domContentLoaded;
+                    out.domComplete = out.page.domComplete;
+                    out.responseStart = out.page.ttfb;
                 } else if (t.loadEventEnd) {
-                    out.loadEventEnd = t.loadEventEnd - t.navigationStart;
-                    out.domContentLoaded = t.domContentLoadedEventEnd - t.navigationStart;
-                    out.domComplete = t.domComplete - t.navigationStart;
-                    out.responseStart = t.responseStart - t.navigationStart;
+                    const start = t.navigationStart;
+                    out.page.ttfb = t.responseStart - start;
+                    out.page.domInteractive = t.domInteractive - start;
+                    out.page.domContentLoaded = t.domContentLoadedEventEnd - start;
+                    out.page.loadComplete = t.loadEventEnd - start;
+                    out.page.domComplete = t.domComplete - start;
+                    out.loadEventEnd = out.page.loadComplete;
+                    out.domContentLoaded = out.page.domContentLoaded;
+                    out.domComplete = out.page.domComplete;
+                    out.responseStart = out.page.ttfb;
                 }
+                const paint = performance.getEntriesByType('paint');
+                paint.forEach(p => {
+                    if (p.name === 'first-paint') out.page.firstPaint = Math.round(p.startTime);
+                    if (p.name === 'first-contentful-paint') out.page.firstContentfulPaint = Math.round(p.startTime);
+                });
             } catch (e) {}
             try {
                 out.scrollHeight = document.documentElement ? document.documentElement.scrollHeight : 0;
                 out.scrollWidth = document.documentElement ? document.documentElement.scrollWidth : 0;
                 out.bodyChildren = document.body ? document.body.childElementCount : 0;
                 out.readyState = document.readyState || '';
+            } catch (e) {}
+            try {
+                const resources = performance.getEntriesByType('resource');
+                const byType = {};
+                let xhrFetch = [];
+                resources.forEach(r => {
+                    const type = (r.initiatorType || 'other').toLowerCase();
+                    if (!byType[type]) byType[type] = { count: 0, durationSum: 0, durationMax: 0, transferSum: 0, items: [] };
+                    const d = Math.round(r.duration || 0);
+                    const sz = r.transferSize || 0;
+                    byType[type].count++;
+                    byType[type].durationSum += d;
+                    byType[type].durationMax = Math.max(byType[type].durationMax, d);
+                    byType[type].transferSum += sz;
+                    if (d > 0) byType[type].items.push({ n: (r.name || '').slice(-80), d, sz });
+                    if ((type === 'xmlhttprequest' || type === 'fetch') && r.responseStart > 0) {
+                        const resp = Math.round((r.responseEnd || r.startTime) - r.responseStart);
+                        xhrFetch.push({ n: (r.name || '').slice(-60), ms: resp });
+                    }
+                });
+                Object.keys(byType).forEach(k => {
+                    const x = byType[k];
+                    x.avgDuration = x.count ? Math.round(x.durationSum / x.count) : 0;
+                    x.slowest = x.items.sort((a, b) => b.d - a.d).slice(0, 3).map(i => ({ name: i.n, duration: i.d, size: i.sz }));
+                });
+                out.resources = byType;
+                xhrFetch.sort((a, b) => b.ms - a.ms);
+                out.response.xhrFetch = xhrFetch.slice(0, 10);
+                if (xhrFetch.length) {
+                    out.response.avgMs = Math.round(xhrFetch.reduce((s, i) => s + i.ms, 0) / xhrFetch.length);
+                    out.response.maxMs = xhrFetch[0] ? xhrFetch[0].ms : 0;
+                }
+                const lcp = performance.getEntriesByType('largest-contentful-paint');
+                if (lcp.length) out.page.lcp = Math.round(lcp[lcp.length - 1].startTime);
             } catch (e) {}
             try {
                 if (performance.memory) {
@@ -2486,9 +2553,39 @@ def _build_html_report(memory: AgentMemory, report_text: str, start_url: str = "
     metrics_rows = []
     if browser_metrics:
         m = browser_metrics
-        for key in ["loadEventEnd", "domContentLoaded", "domComplete", "responseStart"]:
-            if m.get(key) is not None:
-                metrics_rows.append(f"<tr><td>{esc(str(key))}</td><td>{m[key]} мс</td></tr>")
+        page = m.get("page") or {}
+        for key, label in [
+            ("ttfb", "TTFB (время до первого байта)"),
+            ("domInteractive", "DOM interactive"),
+            ("domContentLoaded", "DOM Content Loaded"),
+            ("loadComplete", "Полная загрузка (load)"),
+            ("firstPaint", "First Paint"),
+            ("firstContentfulPaint", "First Contentful Paint"),
+            ("lcp", "LCP (Largest Contentful Paint)"),
+        ]:
+            val = page.get(key)
+            if val is not None:
+                metrics_rows.append(f"<tr><td>{esc(label)}</td><td>{val} мс</td></tr>")
+        res = m.get("resources") or {}
+        if res:
+            metrics_rows.append("<tr><td colspan=\"2\"><strong>Ресурсы по типам</strong></td></tr>")
+            for rtype, data in sorted(res.items()):
+                count = data.get("count", 0)
+                avg = data.get("avgDuration")
+                mx = data.get("durationMax")
+                kb = (data.get("transferSum") or 0) / 1024
+                metrics_rows.append(
+                    f"<tr><td class=\"sub\">{esc(rtype)}</td><td>n={count}, avg={avg or '—'} мс, max={mx or '—'} мс, {kb:.0f} КБ</td></tr>"
+                )
+                for s in (data.get("slowest") or [])[:2]:
+                    metrics_rows.append(f"<tr><td></td><td class=\"sub\">↳ {esc(str(s.get('duration', 0)))} мс {esc((s.get('name') or '')[-50:])}</td></tr>")
+        resp = m.get("response") or {}
+        if resp.get("xhrFetch"):
+            metrics_rows.append("<tr><td colspan=\"2\"><strong>XHR/fetch отклик</strong></td></tr>")
+            if resp.get("avgMs") is not None:
+                metrics_rows.append(f"<tr><td>Среднее / макс</td><td>{resp['avgMs']} / {resp.get('maxMs', '—')} мс</td></tr>")
+            for x in (resp.get("xhrFetch") or [])[:3]:
+                metrics_rows.append(f"<tr><td></td><td class=\"sub\">↳ {x.get('ms', 0)} мс {esc((x.get('n') or '')[-40:])}</td></tr>")
         if m.get("scrollHeight") is not None:
             metrics_rows.append(f"<tr><td>scrollHeight / scrollWidth</td><td>{m.get('scrollHeight')} / {m.get('scrollWidth', '—')}</td></tr>")
         if m.get("bodyChildren") is not None:
