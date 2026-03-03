@@ -16,6 +16,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
 from datetime import datetime
@@ -81,6 +82,8 @@ from config import (
     TEST_UPLOAD_FILE_PATH,
     ENABLE_SHADOW_DOM,
     BROWSER_ENGINE,
+    BROWSER_SUPPRESS_CERT_PROMPT,
+    BROWSER_CHROMIUM_ARGS,
     PLAYWRIGHT_EXPORT_PATH,
     ENABLE_API_INTERCEPT,
     API_LOG_MAX,
@@ -1625,17 +1628,25 @@ def run_agent(start_url: str = None):
     with sync_playwright() as p:
         browser = None
         engine = getattr(p, BROWSER_ENGINE, p.chromium)
+        # Аргументы Chromium: подавить диалог выбора сертификата в headless/CI
+        chromium_args = list(BROWSER_CHROMIUM_ARGS)
+        if BROWSER_ENGINE == "chromium" and BROWSER_SUPPRESS_CERT_PROMPT:
+            chromium_args.append("--ignore-certificate-errors")
+            if sys.platform == "darwin":
+                chromium_args.append("--use-mock-keychain")
+        launch_kw = {"headless": HEADLESS, "slow_mo": BROWSER_SLOW_MO}
+        if BROWSER_ENGINE == "chromium" and chromium_args:
+            launch_kw["args"] = chromium_args
         if BROWSER_USER_DATA_DIR:
             # Профиль на диске — поддерживается только Chromium
             context = p.chromium.launch_persistent_context(
                 BROWSER_USER_DATA_DIR,
-                headless=HEADLESS,
-                slow_mo=BROWSER_SLOW_MO,
                 viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
                 ignore_https_errors=True,
+                **launch_kw,
             )
         else:
-            browser = engine.launch(headless=HEADLESS, slow_mo=BROWSER_SLOW_MO)
+            browser = engine.launch(**launch_kw)
             ctx_opts = {
                 "viewport": {"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
                 "ignore_https_errors": True,

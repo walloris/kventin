@@ -74,6 +74,18 @@ BROWSER_USER_DATA_DIR = os.getenv("BROWSER_USER_DATA_DIR", "").strip()
 if BROWSER_USER_DATA_DIR and not os.path.isabs(BROWSER_USER_DATA_DIR):
     BROWSER_USER_DATA_DIR = str(Path.cwd() / BROWSER_USER_DATA_DIR)
 
+# Подавить диалог выбора сертификата (чтобы запускать агента в скрытом/headless режиме).
+# Добавляются аргументы Chromium: --ignore-certificate-errors и на macOS --use-mock-keychain.
+# 1=вкл всегда, 0=выкл; при HEADLESS или CI по умолчанию вкл.
+_suppress_cert_env = os.getenv("BROWSER_SUPPRESS_CERT_PROMPT", "").lower()
+BROWSER_SUPPRESS_CERT_PROMPT = _suppress_cert_env in ("1", "true", "yes") or (
+    (HEADLESS or bool(os.getenv("CI") or os.getenv("GITHUB_ACTIONS") or os.getenv("GITLAB_CI")))
+    and _suppress_cert_env not in ("0", "false", "no")
+)
+# Доп. аргументы Chromium через запятую, например: --use-mock-keychain,--ignore-certificate-errors
+BROWSER_CHROMIUM_ARGS_STR = os.getenv("BROWSER_CHROMIUM_ARGS", "").strip()
+BROWSER_CHROMIUM_ARGS = [a.strip() for a in BROWSER_CHROMIUM_ARGS_STR.split(",") if a.strip()]
+
 # Игнорируемые паттерны (флаки, тестовая среда, 404 в консоли и т.д.)
 IGNORE_CONSOLE_PATTERNS = [
     "404",
