@@ -1827,7 +1827,41 @@ def run_agent(start_url: str = None):
                 print(f"[Agent] Тест-план ({len(test_plan_steps)} шагов): " + "; ".join(test_plan_steps[:3]) + "…")
                 update_llm_overlay(page, prompt="Тест-план", response="; ".join(test_plan_steps[:4]), loading=False)
 
+        # Абсолютные пути к отчётам (чтобы знать, куда они пишутся)
+        _report_abs_path = os.path.abspath(SESSION_REPORT_PATH) if SESSION_REPORT_PATH else ""
+        _report_html_abs_path = os.path.abspath(SESSION_REPORT_HTML_PATH) if SESSION_REPORT_HTML_PATH else ""
+        _report_first_save_done = False
+
+        def _save_report_now(step_: int, label: str = "") -> None:
+            """Сохранить HTML и текстовый отчёт на диск (вызывается из разных мест цикла)."""
+            nonlocal _report_first_save_done
+            try:
+                if not page.is_closed():
+                    _collect_browser_metrics(page, memory, step_)
+                report = memory.get_session_report_text()
+                if SESSION_REPORT_PATH:
+                    with open(_report_abs_path, "w", encoding="utf-8") as f:
+                        f.write(report)
+                        f.flush()
+                        os.fsync(f.fileno())
+                if SESSION_REPORT_HTML_PATH:
+                    html_content = _build_html_report(memory, report, start_url or "", video_dir=RECORD_VIDEO_DIR or "")
+                    with open(_report_html_abs_path, "w", encoding="utf-8") as f:
+                        f.write(html_content)
+                        f.flush()
+                        os.fsync(f.fileno())
+                if not _report_first_save_done:
+                    _report_first_save_done = True
+                    if _report_html_abs_path:
+                        print(f"[Agent] HTML-отчёт: {_report_html_abs_path}")
+                    if _report_abs_path:
+                        print(f"[Agent] Текстовый отчёт: {_report_abs_path}")
+            except Exception as e:
+                print(f"[Agent] Ошибка сохранения отчёта ({label}): {e}")
+
         print(f"[Agent] Старт тестирования: {start_url}")
+        if SESSION_REPORT_HTML_PATH:
+            print(f"[Agent] Отчёт будет обновляться в: {_report_html_abs_path}")
         if MAX_STEPS > 0:
             print(f"[Agent] Лимит: {MAX_STEPS} шагов.")
         else:
@@ -1986,26 +2020,9 @@ def run_agent(start_url: str = None):
                     print(f"[Agent] Лимит {MAX_STEPS} шагов. Завершаю.")
                     break
 
-                # Сохранять отчёт в начале каждого шага (файл появляется/обновляется до долгого LLM)
-                if SESSION_REPORT_SAVE_EVERY_N > 0 and step >= 1 and (SESSION_REPORT_PATH or SESSION_REPORT_HTML_PATH):
-                    try:
-                        if not page.is_closed():
-                            _collect_browser_metrics(page, memory, step)
-                        report = memory.get_session_report_text()
-                        if SESSION_REPORT_PATH:
-                            with open(SESSION_REPORT_PATH, "w", encoding="utf-8") as f:
-                                f.write(report)
-                                f.flush()
-                                os.fsync(f.fileno())
-                        if SESSION_REPORT_HTML_PATH:
-                            html_content = _build_html_report(memory, report, start_url or "", video_dir=RECORD_VIDEO_DIR or "")
-                            with open(SESSION_REPORT_HTML_PATH, "w", encoding="utf-8") as f:
-                                f.write(html_content)
-                                f.flush()
-                                os.fsync(f.fileno())
-                        print(f"[Agent] Отчёт обновлён (шаг {step})")
-                    except Exception as e:
-                        LOG.warning("Промежуточный отчёт: %s", e)
+                # Сохранять отчёт в начале каждого шага
+                if SESSION_REPORT_SAVE_EVERY_N > 0 and step >= 1:
+                    _save_report_now(step, f"начало шага {step}")
 
                 current_url = page.url
 
@@ -2045,6 +2062,8 @@ def run_agent(start_url: str = None):
                         _inject_all(page)
                     except Exception as e:
                         LOG.warning("Ошибка возврата: %s", e)
+                    if SESSION_REPORT_SAVE_EVERY_N > 0:
+                        _save_report_now(step, "навигация-возврат")
                     continue
 
                 try:
@@ -2131,6 +2150,8 @@ def run_agent(start_url: str = None):
                 if act_type == "check_defect" and possible_bug:
                     if not page.is_closed():
                         _step_handle_defect(page, action, possible_bug, current_url, checklist_results, console_log, network_failures, memory)
+                    if SESSION_REPORT_SAVE_EVERY_N > 0:
+                        _save_report_now(step, "после дефекта")
                     continue
 
                 # Anti-loop: серия неудач → reset
@@ -2244,26 +2265,9 @@ def run_agent(start_url: str = None):
                     report = memory.get_session_report_text()
                     print(report)
 
-                # Сохранять отчёт после каждого шага (с флушем на диск, чтобы при открытом файле видели обновления)
-                if SESSION_REPORT_SAVE_EVERY_N > 0 and step >= 1 and (SESSION_REPORT_PATH or SESSION_REPORT_HTML_PATH):
-                    try:
-                        if not page.is_closed():
-                            _collect_browser_metrics(page, memory, step)
-                        report = memory.get_session_report_text()
-                        if SESSION_REPORT_PATH:
-                            with open(SESSION_REPORT_PATH, "w", encoding="utf-8") as f:
-                                f.write(report)
-                                f.flush()
-                                os.fsync(f.fileno())
-                        if SESSION_REPORT_HTML_PATH:
-                            html_content = _build_html_report(memory, report, start_url or "", video_dir=RECORD_VIDEO_DIR or "")
-                            with open(SESSION_REPORT_HTML_PATH, "w", encoding="utf-8") as f:
-                                f.write(html_content)
-                                f.flush()
-                                os.fsync(f.fileno())
-                        print(f"[Agent] Отчёт обновлён (шаг {step})")
-                    except Exception as e:
-                        LOG.warning("Промежуточный отчёт: %s", e)
+                # Сохранять отчёт после каждого шага
+                if SESSION_REPORT_SAVE_EVERY_N > 0 and step >= 1:
+                    _save_report_now(step, f"конец шага {step}")
 
                 time.sleep(0.3)
 
