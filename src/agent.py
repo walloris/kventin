@@ -1919,6 +1919,28 @@ def run_agent(start_url: str = None):
                     print(f"[Agent] Лимит {MAX_STEPS} шагов. Завершаю.")
                     break
 
+                # Сразу пишем HTML/текстовый отчёт в начале шага (шаг 1 и каждые N), чтобы файл появился до долгого LLM/действия
+                save_report_now = (
+                    SESSION_REPORT_SAVE_EVERY_N > 0
+                    and step >= 1
+                    and (step == 1 or step % SESSION_REPORT_SAVE_EVERY_N == 0)
+                )
+                if save_report_now and (SESSION_REPORT_PATH or SESSION_REPORT_HTML_PATH):
+                    try:
+                        if not page.is_closed():
+                            _collect_browser_metrics(page, memory, step)
+                        report = memory.get_session_report_text()
+                        if SESSION_REPORT_PATH:
+                            with open(SESSION_REPORT_PATH, "w", encoding="utf-8") as f:
+                                f.write(report)
+                        if SESSION_REPORT_HTML_PATH:
+                            html_content = _build_html_report(memory, report, start_url or "", video_dir=RECORD_VIDEO_DIR or "")
+                            with open(SESSION_REPORT_HTML_PATH, "w", encoding="utf-8") as f:
+                                f.write(html_content)
+                        print(f"[Agent] Отчёт обновлён (шаг {step})")
+                    except Exception as e:
+                        LOG.warning("Промежуточный отчёт: %s", e)
+
                 current_url = page.url
 
                 # Visual regression baseline: один раз на URL — сравнить с baseline или сохранить
