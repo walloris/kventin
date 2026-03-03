@@ -4156,6 +4156,7 @@ def _create_defect(
 
     # Уровень 1: локальная дедупликация (мгновенно)
     if is_local_duplicate(summary, bug_description):
+        print(f"[Agent] Пропуск дефекта (локальный дубль): {summary[:60]}")
         LOG.info("Пропуск дефекта (локальный дубль): %s", summary[:60])
         return
 
@@ -4179,6 +4180,7 @@ def _create_defect(
     )
 
     # Отправка в Jira — В ФОНЕ (семантическая проверка + создание тикета)
+    print(f"[Agent] Отправка дефекта в Jira (фон): {summary[:60]}")
     _bg_submit(
         _create_defect_bg,
         summary, description, bug_description, attachment_paths, memory, severity,
@@ -4199,6 +4201,7 @@ def _create_defect_bg(
     try:
         # Уровень 3: семантическая проверка через GigaChat
         if _is_semantic_duplicate(bug_description, memory):
+            print(f"[Agent] Пропуск дефекта (семантический дубль GigaChat): {summary[:60]}")
             LOG.info("Пропуск (семантический дубль): %s", summary[:60])
             register_local_defect(summary)
             return
@@ -4214,7 +4217,10 @@ def _create_defect_bg(
             print(f"[Agent] Дефект создан: {key} [{severity}]")
             if memory:
                 memory.record_defect_created(key, summary, severity)
+        else:
+            print(f"[Agent] Jira вернула None (тикет не создан): {summary[:60]}")
     except Exception as e:
+        print(f"[Agent] Ошибка фонового создания дефекта: {e}")
         LOG.error("Ошибка фонового создания дефекта: %s", e)
     finally:
         if attachment_paths:

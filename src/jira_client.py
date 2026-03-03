@@ -380,11 +380,13 @@ def create_jira_issue(
         return None
 
     if is_ignorable_issue(summary, description):
+        print(f"[Jira] Пропуск: похоже на флак/тестовую среду — {summary[:80]}")
         LOG.info("Пропуск: похоже на флак/тестовую среду: %s", summary[:80])
         return None
 
     # Уровень 1: локальная дедупликация (в памяти сессии)
     if is_local_duplicate(summary, description):
+        print(f"[Jira] Пропуск (локальный дубль): {summary[:80]}")
         LOG.info("Пропуск (локальный дубль): %s", summary[:80])
         return None
 
@@ -397,6 +399,7 @@ def create_jira_issue(
         project_key=project_key,
     )
     if dup:
+        print(f"[Jira] Дубль в Jira, не создаём — найден {dup}")
         LOG.info("Дубль в Jira: не создаём, найден %s", dup)
         register_local_defect(summary)  # запомнить чтобы не искать повторно
         return dup
@@ -446,8 +449,10 @@ def create_jira_issue(
             )
         return key
     except requests.exceptions.HTTPError as e:
+        print(f"[Jira] Ошибка API {e.response.status_code}: {e.response.text[:200]}")
         LOG.error("Ошибка API: %s — %s", e.response.status_code, e.response.text[:300])
         return None
     except Exception as e:
+        print(f"[Jira] Ошибка при создании тикета: {e}")
         LOG.error("Ошибка: %s", e)
         return None
