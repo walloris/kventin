@@ -86,6 +86,16 @@ BROWSER_SUPPRESS_CERT_PROMPT = _suppress_cert_env in ("1", "true", "yes") or (
 BROWSER_CHROMIUM_ARGS_STR = os.getenv("BROWSER_CHROMIUM_ARGS", "").strip()
 BROWSER_CHROMIUM_ARGS = [a.strip() for a in BROWSER_CHROMIUM_ARGS_STR.split(",") if a.strip()]
 
+# Клиентский сертификат (убирает окно выбора): задать origin и путь к .pfx или к .pem+.key.
+# Браузер сам подставит сертификат — диалог не показывается. Без сертификата на Windows
+# может появляться системное окно выбора (его убрать можно только через указание сертификата).
+BROWSER_CLIENT_CERT_ORIGIN = os.getenv("BROWSER_CLIENT_CERT_ORIGIN", "").strip()  # например https://example.com
+BROWSER_CLIENT_CERT_PFX_PATH = os.getenv("BROWSER_CLIENT_CERT_PFX_PATH", "").strip()
+BROWSER_CLIENT_CERT_PASSPHRASE = os.getenv("BROWSER_CLIENT_CERT_PASSPHRASE", "").strip()
+# Либо PEM: сертификат и ключ (если заданы — приоритет над PFX)
+BROWSER_CLIENT_CERT_CERT_PATH = os.getenv("BROWSER_CLIENT_CERT_CERT_PATH", "").strip()
+BROWSER_CLIENT_CERT_KEY_PATH = os.getenv("BROWSER_CLIENT_CERT_KEY_PATH", "").strip()
+
 # Игнорируемые паттерны (флаки, тестовая среда, 404 в консоли и т.д.)
 IGNORE_CONSOLE_PATTERNS = [
     "404",

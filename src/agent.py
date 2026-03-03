@@ -84,6 +84,11 @@ from config import (
     BROWSER_ENGINE,
     BROWSER_SUPPRESS_CERT_PROMPT,
     BROWSER_CHROMIUM_ARGS,
+    BROWSER_CLIENT_CERT_ORIGIN,
+    BROWSER_CLIENT_CERT_PFX_PATH,
+    BROWSER_CLIENT_CERT_PASSPHRASE,
+    BROWSER_CLIENT_CERT_CERT_PATH,
+    BROWSER_CLIENT_CERT_KEY_PATH,
     PLAYWRIGHT_EXPORT_PATH,
     ENABLE_API_INTERCEPT,
     API_LOG_MAX,
@@ -1629,7 +1634,6 @@ def run_agent(start_url: str = None):
         browser = None
         engine = getattr(p, BROWSER_ENGINE, p.chromium)
         # Аргументы Chromium: подавить диалог выбора сертификата в headless/CI.
-        # Используем Chromium при ENGINE=chromium или при persistent context (USER_DATA_DIR — только Chromium).
         use_chromium = BROWSER_ENGINE == "chromium" or bool(BROWSER_USER_DATA_DIR)
         chromium_args = list(BROWSER_CHROMIUM_ARGS)
         if use_chromium and BROWSER_SUPPRESS_CERT_PROMPT:
@@ -1639,20 +1643,42 @@ def run_agent(start_url: str = None):
         launch_kw = {"headless": HEADLESS, "slow_mo": BROWSER_SLOW_MO}
         if use_chromium and chromium_args:
             launch_kw["args"] = chromium_args
+
+        # Клиентский сертификат: если задан — браузер подставляет его сам, окно выбора не показывается.
+        client_certs = []
+        if BROWSER_CLIENT_CERT_ORIGIN:
+            if BROWSER_CLIENT_CERT_CERT_PATH and BROWSER_CLIENT_CERT_KEY_PATH:
+                cert_path = os.path.abspath(BROWSER_CLIENT_CERT_CERT_PATH)
+                key_path = os.path.abspath(BROWSER_CLIENT_CERT_KEY_PATH)
+                if os.path.isfile(cert_path) and os.path.isfile(key_path):
+                    client_certs.append({
+                        "origin": BROWSER_CLIENT_CERT_ORIGIN,
+                        "certPath": cert_path,
+                        "keyPath": key_path,
+                    })
+            elif BROWSER_CLIENT_CERT_PFX_PATH and os.path.isfile(BROWSER_CLIENT_CERT_PFX_PATH):
+                pfx_path = os.path.abspath(BROWSER_CLIENT_CERT_PFX_PATH)
+                entry = {"origin": BROWSER_CLIENT_CERT_ORIGIN, "pfxPath": pfx_path}
+                if BROWSER_CLIENT_CERT_PASSPHRASE:
+                    entry["passphrase"] = BROWSER_CLIENT_CERT_PASSPHRASE
+                client_certs.append(entry)
+        ctx_common = {
+            "viewport": {"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
+            "ignore_https_errors": True,
+        }
+        if client_certs:
+            ctx_common["client_certificates"] = client_certs
+
         if BROWSER_USER_DATA_DIR:
             # Профиль на диске — поддерживается только Chromium
             context = p.chromium.launch_persistent_context(
                 BROWSER_USER_DATA_DIR,
-                viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
-                ignore_https_errors=True,
+                **ctx_common,
                 **launch_kw,
             )
         else:
             browser = engine.launch(**launch_kw)
-            ctx_opts = {
-                "viewport": {"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
-                "ignore_https_errors": True,
-            }
+            ctx_opts = dict(ctx_common)
             if RECORD_VIDEO_DIR:
                 os.makedirs(RECORD_VIDEO_DIR, exist_ok=True)
                 ctx_opts["record_video_dir"] = RECORD_VIDEO_DIR
