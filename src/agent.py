@@ -288,6 +288,9 @@ class AgentMemory:
         self._visual_baseline_checked: set = set()  # URL уже проверены на baseline
         # Self-healing: кеш успешных селекторов (original -> {strategy, role?, name?})
         self._selector_heal_cache: Dict[str, Dict[str, Any]] = {}
+        # Метрики браузера (последний сбор: timing, document, memory)
+        self._browser_metrics_latest: Dict[str, Any] = {}
+        self._browser_metrics_history: List[Dict[str, Any]] = []
 
     def set_start_url_for_nav(self, url: str) -> None:
         """Задать стартовый URL для подсчёта глубины навигации."""
@@ -595,6 +598,18 @@ class AgentMemory:
                 lines.append(f"  - {d.get('key', '')}: {d.get('summary', '')[:60]}")
         else:
             lines.append("Дефектов не обнаружено.")
+        m = getattr(self, "_browser_metrics_latest", None) or {}
+        if m:
+            lines.append("--- Метрики браузера (последний сбор) ---")
+            lines.append(f"  Шаг: {m.get('step', '—')}, URL: {(m.get('url') or '')[:80]}")
+            for key in ("loadEventEnd", "domContentLoaded", "domComplete", "responseStart"):
+                if m.get(key) is not None:
+                    lines.append(f"  {key}: {m[key]} мс")
+            if m.get("scrollHeight") is not None:
+                lines.append(f"  scrollHeight/scrollWidth: {m.get('scrollHeight')} / {m.get('scrollWidth', '—')}")
+            if m.get("usedJSHeapSize") is not None:
+                used_mb = round(m["usedJSHeapSize"] / 1024 / 1024, 2)
+                lines.append(f"  JS heap: {used_mb} МБ")
         lines.append("=== Конец отчёта ===")
         return "\n".join(lines)
 
@@ -2141,21 +2156,24 @@ def run_agent(start_url: str = None):
                     report = memory.get_session_report_text()
                     print(report)
 
-                # Периодически сохранять отчёт в файл во время работы (агент может крутиться бесконечно)
-                if SESSION_REPORT_SAVE_EVERY_N > 0 and step > 0 and step % SESSION_REPORT_SAVE_EVERY_N == 0:
-                    if SESSION_REPORT_PATH or SESSION_REPORT_HTML_PATH:
-                        try:
-                            report = memory.get_session_report_text()
-                            if SESSION_REPORT_PATH:
-                                with open(SESSION_REPORT_PATH, "w", encoding="utf-8") as f:
-                                    f.write(report)
-                            if SESSION_REPORT_HTML_PATH:
-                                html_content = _build_html_report(memory, report, start_url or "", video_dir=RECORD_VIDEO_DIR or "")
-                                with open(SESSION_REPORT_HTML_PATH, "w", encoding="utf-8") as f:
-                                    f.write(html_content)
-                            print(f"[Agent] Отчёт обновлён (шаг {step})")
-                        except Exception as e:
-                            LOG.warning("Промежуточный отчёт: %s", e)
+                # Периодически сохранять отчёт в файл во время работы (с шага 1 и каждые N шагов)
+                save_report_now = (SESSION_REPORT_SAVE_EVERY_N > 0 and step >= 1 and
+                    (step == 1 or step % SESSION_REPORT_SAVE_EVERY_N == 0))
+                if save_report_now and (SESSION_REPORT_PATH or SESSION_REPORT_HTML_PATH):
+                    try:
+                        if not page.is_closed():
+                            _collect_browser_metrics(page, memory, step)
+                        report = memory.get_session_report_text()
+                        if SESSION_REPORT_PATH:
+                            with open(SESSION_REPORT_PATH, "w", encoding="utf-8") as f:
+                                f.write(report)
+                        if SESSION_REPORT_HTML_PATH:
+                            html_content = _build_html_report(memory, report, start_url or "", video_dir=RECORD_VIDEO_DIR or "")
+                            with open(SESSION_REPORT_HTML_PATH, "w", encoding="utf-8") as f:
+                                f.write(html_content)
+                        print(f"[Agent] Отчёт обновлён (шаг {step})")
+                    except Exception as e:
+                        LOG.warning("Промежуточный отчёт: %s", e)
 
                 time.sleep(0.3)
 
@@ -2285,6 +2303,52 @@ def run_agent(start_url: str = None):
     return result
 
 
+def _collect_browser_metrics(page: Page, memory: AgentMemory, step: int) -> None:
+    """Собрать метрики браузера (timing, document, memory) и сохранить в memory."""
+    try:
+        url = page.url[:200] if page.url else ""
+        metrics = page.evaluate("""() => {
+            const out = { url: window.location.href ? window.location.href.slice(0, 200) : '' };
+            try {
+                const t = performance.timing || {};
+                const nav = performance.getEntriesByType('navigation')[0];
+                if (nav) {
+                    out.loadEventEnd = nav.loadEventEnd > 0 ? Math.round(nav.loadEventEnd - nav.fetchStart) : null;
+                    out.domContentLoaded = nav.domContentLoadedEventEnd > 0 ? Math.round(nav.domContentLoadedEventEnd - nav.fetchStart) : null;
+                    out.domComplete = nav.domComplete > 0 ? Math.round(nav.domComplete - nav.fetchStart) : null;
+                    out.responseStart = nav.responseStart > 0 ? Math.round(nav.responseStart - nav.fetchStart) : null;
+                } else if (t.loadEventEnd) {
+                    out.loadEventEnd = t.loadEventEnd - t.navigationStart;
+                    out.domContentLoaded = t.domContentLoadedEventEnd - t.navigationStart;
+                    out.domComplete = t.domComplete - t.navigationStart;
+                    out.responseStart = t.responseStart - t.navigationStart;
+                }
+            } catch (e) {}
+            try {
+                out.scrollHeight = document.documentElement ? document.documentElement.scrollHeight : 0;
+                out.scrollWidth = document.documentElement ? document.documentElement.scrollWidth : 0;
+                out.bodyChildren = document.body ? document.body.childElementCount : 0;
+                out.readyState = document.readyState || '';
+            } catch (e) {}
+            try {
+                if (performance.memory) {
+                    out.usedJSHeapSize = performance.memory.usedJSHeapSize;
+                    out.totalJSHeapSize = performance.memory.totalJSHeapSize;
+                }
+            } catch (e) {}
+            return out;
+        }""")
+        if isinstance(metrics, dict):
+            metrics["step"] = step
+            metrics["url"] = metrics.get("url") or url
+            memory._browser_metrics_latest = metrics
+            memory._browser_metrics_history.append(dict(metrics))
+            if len(memory._browser_metrics_history) > 50:
+                memory._browser_metrics_history.pop(0)
+    except Exception as e:
+        LOG.debug("collect_browser_metrics: %s", e)
+
+
 def _write_junit_report(memory: AgentMemory, path: str) -> None:
     """Записать отчёт в формате JUnit XML."""
     step_log = getattr(memory, "_step_log", None) or []
@@ -2395,6 +2459,25 @@ def _build_html_report(memory: AgentMemory, report_text: str, start_url: str = "
     for v in visual_regressions:
         vr_rows.append(f"<tr><td class=\"url\">{esc((v.get('url') or '')[:80])}</td><td>{v.get('change_percent', 0)}%</td><td class=\"result\">{esc((v.get('detail') or '')[:100])}</td></tr>")
     vr_body = "\n".join(vr_rows) if vr_rows else "<tr><td colspan=\"3\">Нет</td></tr>"
+
+    browser_metrics = getattr(memory, "_browser_metrics_latest", None) or {}
+    metrics_rows = []
+    if browser_metrics:
+        m = browser_metrics
+        for key in ["loadEventEnd", "domContentLoaded", "domComplete", "responseStart"]:
+            if m.get(key) is not None:
+                metrics_rows.append(f"<tr><td>{esc(str(key))}</td><td>{m[key]} мс</td></tr>")
+        if m.get("scrollHeight") is not None:
+            metrics_rows.append(f"<tr><td>scrollHeight / scrollWidth</td><td>{m.get('scrollHeight')} / {m.get('scrollWidth', '—')}</td></tr>")
+        if m.get("bodyChildren") is not None:
+            metrics_rows.append(f"<tr><td>body child elements</td><td>{m['bodyChildren']}</td></tr>")
+        if m.get("usedJSHeapSize") is not None:
+            used_mb = round(m["usedJSHeapSize"] / 1024 / 1024, 2)
+            total_mb = round(m.get("totalJSHeapSize", 0) / 1024 / 1024, 2)
+            metrics_rows.append(f"<tr><td>JS heap</td><td>{used_mb} / {total_mb} МБ</td></tr>")
+        if m.get("readyState"):
+            metrics_rows.append(f"<tr><td>readyState</td><td>{esc(m['readyState'])}</td></tr>")
+    metrics_body = "\n".join(metrics_rows) if metrics_rows else "<tr><td colspan=\"2\">Не собраны (открой отчёт после шага с загруженной страницей)</td></tr>"
 
     total_steps = len(step_log)
     timeline_bars = ""
@@ -2641,6 +2724,14 @@ strip.querySelectorAll(".replay-thumb").forEach(function(el){{ el.onclick = func
 <thead><tr><th>URL</th><th>Изменение %</th><th>Детали</th></tr></thead>
 <tbody>{vr_body}</tbody>
 </table>
+</section>
+<section>
+<h2>Метрики браузера (последний сбор)</h2>
+<table>
+<thead><tr><th>Метрика</th><th>Значение</th></tr></thead>
+<tbody>{metrics_body}</tbody>
+</table>
+<p class="sub">Шаг: {browser_metrics.get('step', '—')}, URL: {esc((browser_metrics.get('url') or '')[:120])}</p>
 </section>
 <section>
 <h2>API (XHR/fetch)</h2>
