@@ -387,17 +387,20 @@ class AgentMemory:
         if len(self.actions) > self.max_actions:
             self.actions = self.actions[-self.max_actions:]
 
-        # Запоминаем для дедупликации
+        # Запоминаем для дедупликации (только hashable; dict/obj -> str)
+        def _safe_key(x):
+            return x if isinstance(x, str) else str(x) if x is not None else ""
         if act == "click" and sel:
-            self.done_click.add(sel)
+            self.done_click.add(_safe_key(sel))
         elif act == "hover" and sel:
-            self.done_hover.add(sel)
+            self.done_hover.add(_safe_key(sel))
         elif act == "type" and (sel or val):
-            self.done_type.add(sel or val)
+            self.done_type.add(_safe_key(sel or val))
         elif act == "close_modal":
             self.done_close_modal += 1
         elif act == "select_option" and (sel or val):
-            self.done_select_option.add((sel, val) if sel and val else (sel or val,))
+            t = (_safe_key(sel), _safe_key(val)) if sel and val else (_safe_key(sel or val),)
+            self.done_select_option.add(t)
         elif act == "scroll":
             if sel in ("down", "вниз", ""):
                 self.done_scroll_down += 1
@@ -444,14 +447,14 @@ class AgentMemory:
             "",
         ]
         if self.done_click:
-            items = sorted(self.done_click)[-30:]
-            lines.append(f"❌ Кликнуто ({len(self.done_click)}): " + ", ".join(f'"{x[:40]}"' for x in items))
+            items = sorted(self.done_click, key=str)[-30:]
+            lines.append(f"❌ Кликнуто ({len(self.done_click)}): " + ", ".join(f'"{str(x)[:40]}"' for x in items))
         if self.done_hover:
-            items = sorted(self.done_hover)[-20:]
-            lines.append(f"❌ Наведено (hover) ({len(self.done_hover)}): " + ", ".join(f'"{x[:40]}"' for x in items))
+            items = sorted(self.done_hover, key=str)[-20:]
+            lines.append(f"❌ Наведено (hover) ({len(self.done_hover)}): " + ", ".join(f'"{str(x)[:40]}"' for x in items))
         if self.done_type:
-            items = sorted(self.done_type)[-20:]
-            lines.append(f"❌ Ввод в поля ({len(self.done_type)}): " + ", ".join(f'"{x[:40]}"' for x in items))
+            items = sorted(self.done_type, key=str)[-20:]
+            lines.append(f"❌ Ввод в поля ({len(self.done_type)}): " + ", ".join(f'"{str(x)[:40]}"' for x in items))
         if self.done_close_modal:
             lines.append(f"❌ Закрыто модалок: {self.done_close_modal}")
         if self.done_select_option:
@@ -597,7 +600,7 @@ class AgentMemory:
             f"Шагов выполнено: {len(self.actions)}",
             f"Фаза: {self.tester_phase}",
             f"Время: {duration:.0f} с",
-            f"Зоны покрытия: {', '.join(self.coverage_zones) if self.coverage_zones else '—'}",
+            f"Зоны покрытия: {', '.join(str(z) for z in self.coverage_zones) if self.coverage_zones else '—'}",
             f"Кликнуто: {len(self.done_click)}, наведено: {len(self.done_hover)}, ввод: {len(self.done_type)}",
         ]
         if self.test_plan:
@@ -1856,8 +1859,27 @@ def run_agent(start_url: str = None):
                         print(f"[Agent] HTML-отчёт: {_report_html_abs_path}")
                     if _report_abs_path:
                         print(f"[Agent] Текстовый отчёт: {_report_abs_path}")
+            except TypeError as e:
+                if "unhashable" in str(e):
+                    import traceback
+                    print(f"[Agent] Ошибка сохранения отчёта ({label}): unhashable type — возможно dict в set. Попытка упрощённого отчёта.")
+                    traceback.print_exc()
+                    try:
+                        _report_fallback = f"Шаг {step_}\nВремя: {getattr(memory, 'session_start', '')}\nОшибка: {e}"
+                        if SESSION_REPORT_PATH:
+                            with open(_report_abs_path, "w", encoding="utf-8") as f:
+                                f.write(_report_fallback)
+                        if SESSION_REPORT_HTML_PATH:
+                            with open(_report_html_abs_path, "w", encoding="utf-8") as f:
+                                f.write(f"<html><body><pre>{html_module.escape(_report_fallback)}</pre></body></html>")
+                    except Exception:
+                        pass
+                else:
+                    raise
             except Exception as e:
+                import traceback
                 print(f"[Agent] Ошибка сохранения отчёта ({label}): {e}")
+                traceback.print_exc()
 
         print(f"[Agent] Старт тестирования: {start_url}")
         if SESSION_REPORT_HTML_PATH:
@@ -2535,7 +2557,7 @@ def _build_html_report(memory: AgentMemory, report_text: str, start_url: str = "
         duration_sec = (datetime.now() - memory.session_start).total_seconds()
     step_log = getattr(memory, "_step_log", None) or []
     defects = getattr(memory, "defects_created", None) or []
-    coverage = ", ".join(memory.coverage_zones) if memory.coverage_zones else "—"
+    coverage = ", ".join(str(z) for z in memory.coverage_zones) if memory.coverage_zones else "—"
 
     steps_rows = []
     for e in step_log:
@@ -2648,7 +2670,7 @@ def _build_html_report(memory: AgentMemory, report_text: str, start_url: str = "
         res = m.get("resources") or {}
         if res:
             metrics_rows.append("<tr><td colspan=\"2\"><strong>Ресурсы по типам</strong></td></tr>")
-            for rtype, data in sorted(res.items()):
+            for rtype, data in sorted(res.items(), key=lambda x: (str(x[0]),)):
                 count = data.get("count", 0)
                 avg = data.get("avgDuration")
                 mx = data.get("durationMax")
@@ -2687,7 +2709,7 @@ def _build_html_report(memory: AgentMemory, report_text: str, start_url: str = "
         ]:
             val = page.get(key)
             if val is not None:
-                summary_metrics_cards.append(f'<div class="card card-metric"><div class="val">{val}</div><div class="lbl">{esc(label)}</div></div>')
+                summary_metrics_cards.append(f'<div class="card card-metric"><div class="val">{esc(str(val))}</div><div class="lbl">{esc(label)}</div></div>')
         if browser_metrics.get("usedJSHeapSize") is not None:
             used_mb = round(browser_metrics["usedJSHeapSize"] / 1024 / 1024, 1)
             summary_metrics_cards.append(f'<div class="card card-metric"><div class="val">{used_mb}</div><div class="lbl">JS heap МБ</div></div>')
@@ -2957,7 +2979,7 @@ pre {{ margin: 0; font-size: 0.85rem; color: var(--text2); white-space: pre-wrap
 <div class="replay-strip" id="replay-strip"></div>
 <script>
 (function(){{
-var steps = {json.dumps([{{"step": e.get("step"), "thumb": ((e.get("screenshot_path") or "").split("/")[-1] if e.get("screenshot_path") else "")}} for e in step_log])};
+var steps = {json.dumps([{{"step": e.get("step") if not isinstance(e.get("step"), dict) else 0, "thumb": ((e.get("screenshot_path") or "").split("/")[-1] if e.get("screenshot_path") else "")}} for e in step_log], default=str)};
 var idx = 0, total = steps.length, playing = false, t;
 if (!total) {{ document.getElementById("replay-info").textContent = "Нет шагов"; }}
 else {{
