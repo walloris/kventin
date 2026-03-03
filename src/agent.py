@@ -2567,8 +2567,9 @@ def _build_html_report(memory: AgentMemory, report_text: str, start_url: str = "
             img_cell = f'<a href="{esc(sp)}" target="_blank"><img src="{esc(sp)}" alt="шаг" class="step-thumb"/></a>'
         fok, ftot = e.get("flakiness_ok"), e.get("flakiness_total")
         flak_cell = f"{fok}/{ftot}" if (fok is not None and ftot) else "—"
+        step_num = e.get("step", "")
         steps_rows.append(
-            f"<tr><td>{e.get('step')}</td><td class=\"url\">{esc((e.get('url') or '')[:80])}</td>"
+            f"<tr id=\"step-{esc(str(step_num))}\"><td>{step_num}</td><td class=\"url\">{esc((e.get('url') or '')[:80])}</td>"
             f"<td><span class=\"act act-{esc(e.get('action', ''))}\">{esc(e.get('action', ''))}</span></td>"
             f"<td class=\"sel\">{esc((e.get('selector') or '')[:50])}</td>"
             f"<td class=\"result\">{esc((e.get('result') or '')[:80])}</td>"
@@ -2602,53 +2603,60 @@ def _build_html_report(memory: AgentMemory, report_text: str, start_url: str = "
         err = (b.get("error") or "")[:80]
         broken_rows.append(f"<tr><td class=\"url\">{esc(url_short)}</td><td>{status}</td><td class=\"result\">{esc(err)}</td></tr>")
     broken_body = "\n".join(broken_rows) if broken_rows else "<tr><td colspan=\"3\">Нет</td></tr>"
+    broken_section = (
+        "<section><h2>Битые ссылки</h2><table><thead><tr><th>URL</th><th>Статус</th><th>Ошибка</th></tr></thead>"
+        "<tbody>" + broken_body + "</tbody></table></section>"
+    ) if broken_rows else ""
 
     console_warnings = getattr(memory, "_session_console_warnings", None) or []
+    console_errors = [c for c in console_warnings if (c.get("type") or "").lower() == "error"]
     cw_rows = []
-    for c in console_warnings[-50:]:
-        cw_rows.append(f"<tr><td><span class=\"sev sev-{esc(c.get('type', 'log'))}\">{esc(c.get('type', ''))}</span></td><td class=\"result\">{esc((c.get('text') or '')[:150])}</td></tr>")
-    cw_body = "\n".join(cw_rows) if cw_rows else "<tr><td colspan=\"2\">Нет</td></tr>"
+    for c in console_errors[-50:]:
+        cw_rows.append(f"<tr><td><span class=\"sev sev-{esc(c.get('type', 'error'))}\">{esc(c.get('type', ''))}</span></td><td class=\"result\">{esc((c.get('text') or '')[:150])}</td></tr>")
+    cw_body = "\n".join(cw_rows) if cw_rows else "<tr><td colspan=\"2\">Нет ошибок</td></tr>"
+    console_section = (
+        "<section><h2>Консоль (ошибки)</h2><table><thead><tr><th>Тип</th><th>Текст</th></tr></thead>"
+        "<tbody>" + cw_body + "</tbody></table></section>"
+    ) if cw_rows else ""
 
     mixed_content = getattr(memory, "_mixed_content", None) or []
     mc_body = "<br/>".join(esc((m.get("url") or "")[:80]) for m in mixed_content[-20:]) if mixed_content else "—"
     ws_issues = getattr(memory, "_websocket_issues", None) or []
     ws_body = "<br/>".join(f"{esc((w.get('url') or '')[:60])} ({w.get('event', '')})" for w in ws_issues[-20:]) if ws_issues else "—"
+    mixed_section = (
+        "<section><h2>Mixed content / WebSocket</h2>"
+        f"<p><strong>Mixed content:</strong> {mc_body}</p><p><strong>WebSocket:</strong> {ws_body}</p></section>"
+    ) if (mixed_content or ws_issues) else ""
     api_log = getattr(memory, "_api_log", None) or []
-    api_failed = [a for a in api_log if not a.get("ok", True)]
-    api_rows = []
-    for a in api_log[-50:]:
-        method = a.get("method", "")
-        url_short = (a.get("url") or "")[:80]
-        status = a.get("status", "")
-        ok = a.get("ok", True)
-        try:
-            code = int(status) if status else 0
-            if code >= 200 and code < 300:
-                status_class = "2"
-            elif code >= 400 and code < 500:
-                status_class = "4"
-            elif code >= 500:
-                status_class = "5"
-            else:
-                status_class = "other"
-        except (ValueError, TypeError):
-            status_class = "err" if not ok else "other"
-        cls = "result" if ok else "sev sev-major"
-        api_rows.append(f"<tr data-status=\"{status_class}\"><td>{esc(method)}</td><td class=\"url\">{esc(url_short)}</td><td class=\"{cls}\">{status}</td></tr>")
-    api_body = "\n".join(api_rows) if api_rows else "<tr><td colspan=\"3\">Нет XHR/fetch</td></tr>"
     def _status_code(x):
         try:
             return int(x.get("status") or 0)
         except (TypeError, ValueError):
             return 0
-    api_count_2 = sum(1 for a in api_log if 200 <= _status_code(a) < 300)
-    api_count_4 = sum(1 for a in api_log if 400 <= _status_code(a) < 500)
-    api_count_5 = sum(1 for a in api_log if _status_code(a) >= 500)
+    api_failed = [a for a in api_log if _status_code(a) >= 400 or not a.get("ok", True)]
+    api_rows = []
+    for a in api_failed[-50:]:
+        method = a.get("method", "")
+        url_short = (a.get("url") or "")[:80]
+        status = a.get("status", "") or ("—" if not a.get("ok", True) else "")
+        cls = "sev sev-major"
+        api_rows.append(f"<tr><td>{esc(method)}</td><td class=\"url\">{esc(url_short)}</td><td class=\"{cls}\">{esc(str(status))}</td></tr>")
+    api_body = "\n".join(api_rows) if api_rows else "<tr><td colspan=\"3\">Нет запросов с ошибками</td></tr>"
+    api_section = (
+        "<section><details class=\"api-section\" id=\"api-section\">"
+        f"<summary><h2 class=\"api-section-title\">API (XHR/fetch) — только ошибки</h2><span class=\"sub\">{len(api_failed)} запросов с ошибками (4xx, 5xx)</span></summary>"
+        "<table class=\"api-table\"><thead><tr><th>Метод</th><th>URL</th><th>Статус</th></tr></thead>"
+        "<tbody>" + api_body + "</tbody></table></details></section>"
+    ) if api_failed else ""
     visual_regressions = getattr(memory, "_visual_regressions", None) or []
     vr_rows = []
     for v in visual_regressions:
         vr_rows.append(f"<tr><td class=\"url\">{esc((v.get('url') or '')[:80])}</td><td>{v.get('change_percent', 0)}%</td><td class=\"result\">{esc((v.get('detail') or '')[:100])}</td></tr>")
     vr_body = "\n".join(vr_rows) if vr_rows else "<tr><td colspan=\"3\">Нет</td></tr>"
+    vr_section = (
+        "<section><h2>Visual regression (baseline)</h2><table><thead><tr><th>URL</th><th>Изменение %</th><th>Детали</th></tr></thead>"
+        "<tbody>" + vr_body + "</tbody></table></section>"
+    ) if vr_rows else ""
 
     browser_metrics = getattr(memory, "_browser_metrics_latest", None) or {}
     metrics_rows = []
@@ -2973,13 +2981,14 @@ pre {{ margin: 0; font-size: 0.85rem; color: var(--text2); white-space: pre-wrap
 <p>{esc(coverage)}</p>
 </section>
 <section>
-<h2>Навигация</h2>
+<details class="nav-details"><summary><h2>Навигация</h2></summary>
 <table>
 <thead><tr><th>Шаг</th><th>От</th><th>Куда</th></tr></thead>
 <tbody>
 {nav_body}
 </tbody>
 </table>
+</details>
 </section>
 <section>
 <h2>Timeline</h2>
@@ -3014,10 +3023,7 @@ function go(i){{
  strip.querySelectorAll(".replay-thumb").forEach(function(el, j){{ el.classList.toggle("active", j===idx); }});
  document.getElementById("replay-info").textContent = "Шаг " + (steps[idx]&&steps[idx].step) + " / " + total;
  var stepNum = steps[idx] && steps[idx].step;
- if(stepNum) document.querySelectorAll("section h2 + table tbody tr").forEach(function(r){{
-  var n = r.querySelector("td");
-  if(n && n.textContent == String(stepNum)) r.scrollIntoView({{block:"center"}});
- }});
+ if(stepNum) {{ var row = document.getElementById("step-" + stepNum); if(row) row.scrollIntoView({{block:"center"}}); }}
 }}
 document.getElementById("replay-prev").onclick = function(){{ go(idx-1); }};
 document.getElementById("replay-next").onclick = function(){{ go(idx+1); }};
@@ -3032,29 +3038,9 @@ strip.querySelectorAll(".replay-thumb").forEach(function(el){{ el.onclick = func
 }})();
 </script>
 </section>
-<section>
-<h2>Битые ссылки</h2>
-<table>
-<thead><tr><th>URL</th><th>Статус</th><th>Ошибка</th></tr></thead>
-<tbody>
-{broken_body}
-</tbody>
-</table>
-</section>
-<section>
-<h2>Консоль (warnings/errors)</h2>
-<table>
-<thead><tr><th>Тип</th><th>Текст</th></tr></thead>
-<tbody>{cw_body}</tbody>
-</table>
-</section>
-<section>
-<h2>Visual regression (baseline)</h2>
-<table>
-<thead><tr><th>URL</th><th>Изменение %</th><th>Детали</th></tr></thead>
-<tbody>{vr_body}</tbody>
-</table>
-</section>
+{broken_section}
+{console_section}
+{vr_section}
 <section>
 <h2>Метрики браузера (последний сбор)</h2>
 <table>
@@ -3063,52 +3049,11 @@ strip.querySelectorAll(".replay-thumb").forEach(function(el){{ el.onclick = func
 </table>
 <p class="sub">Шаг: {browser_metrics.get('step', '—')}, URL: {esc((browser_metrics.get('url') or '')[:120])}</p>
 </section>
-<section>
-<details class="api-section" id="api-section">
-<summary><h2 class="api-section-title">API (XHR/fetch)</h2><span class="sub">Всего: {len(api_log)}, 2xx: {api_count_2}, 4xx: {api_count_4}, 5xx: {api_count_5}, ошибки: {len(api_failed)}</span></summary>
-<div class="api-filter-wrap">
-<button type="button" class="replay-btn api-filter active" data-filter="all">Все</button>
-<button type="button" class="replay-btn api-filter" data-filter="2">2xx</button>
-<button type="button" class="replay-btn api-filter" data-filter="4">4xx</button>
-<button type="button" class="replay-btn api-filter" data-filter="5">5xx</button>
-<button type="button" class="replay-btn api-filter" data-filter="err">Ошибки</button>
-</div>
-<table class="api-table">
-<thead><tr><th>Метод</th><th>URL</th><th>Статус</th></tr></thead>
-<tbody>{api_body}</tbody>
-</table>
-</details>
-</section>
-<script>
-(function(){{
-var details = document.getElementById("api-section");
-if (details) {{
-  var tbody = details.querySelector("tbody");
-  if (tbody) {{
-    document.querySelectorAll(".api-filter").forEach(function(btn){{
-      btn.onclick = function(){{
-        document.querySelectorAll(".api-filter").forEach(function(b){{ b.classList.remove("active"); }});
-        this.classList.add("active");
-        var filter = this.getAttribute("data-filter");
-        tbody.querySelectorAll("tr[data-status]").forEach(function(row){{
-          var s = row.getAttribute("data-status");
-          var show = filter === "all" || s === filter;
-          row.classList.toggle("hidden", !show);
-        }});
-      }};
-    }});
-  }}
-}}
-}})();
-</script>
-<section>
-<h2>Mixed content / WebSocket</h2>
-<p><strong>Mixed content:</strong> {mc_body}</p>
-<p><strong>WebSocket:</strong> {ws_body}</p>
-</section>
+{api_section}
+{mixed_section}
 <section>
 <h2>Шаги</h2>
-<table>
+<table id="report-steps-table">
 <thead><tr><th>#</th><th>URL</th><th>Действие</th><th>Селектор</th><th>Результат</th><th>Источник</th><th>Flakiness</th><th>Скрин</th></tr></thead>
 <tbody>
 {steps_body}
