@@ -85,10 +85,12 @@ from config import (
     BROWSER_SUPPRESS_CERT_PROMPT,
     BROWSER_CHROMIUM_ARGS,
     BROWSER_CLIENT_CERT_ORIGIN,
+    BROWSER_CLIENT_CERT_ORIGINS,
     BROWSER_CLIENT_CERT_PFX_PATH,
     BROWSER_CLIENT_CERT_PASSPHRASE,
     BROWSER_CLIENT_CERT_CERT_PATH,
     BROWSER_CLIENT_CERT_KEY_PATH,
+    BROWSER_AUTO_SELECT_CERT_PATTERNS,
     PLAYWRIGHT_EXPORT_PATH,
     ENABLE_API_INTERCEPT,
     API_LOG_MAX,
@@ -1644,24 +1646,37 @@ def run_agent(start_url: str = None):
         if use_chromium and chromium_args:
             launch_kw["args"] = chromium_args
 
-        # Клиентский сертификат: если задан — браузер подставляет его сам, окно выбора не показывается.
+        # Клиентский сертификат: один и тот же сертификат для всех origin (браузер подставляет сам).
+        origins = ([BROWSER_CLIENT_CERT_ORIGIN] if BROWSER_CLIENT_CERT_ORIGIN else []) + list(BROWSER_CLIENT_CERT_ORIGINS)
+        origins = [o for o in origins if o]
         client_certs = []
-        if BROWSER_CLIENT_CERT_ORIGIN:
+        if origins:
             if BROWSER_CLIENT_CERT_CERT_PATH and BROWSER_CLIENT_CERT_KEY_PATH:
                 cert_path = os.path.abspath(BROWSER_CLIENT_CERT_CERT_PATH)
                 key_path = os.path.abspath(BROWSER_CLIENT_CERT_KEY_PATH)
                 if os.path.isfile(cert_path) and os.path.isfile(key_path):
-                    client_certs.append({
-                        "origin": BROWSER_CLIENT_CERT_ORIGIN,
-                        "certPath": cert_path,
-                        "keyPath": key_path,
-                    })
+                    for origin in origins:
+                        client_certs.append({"origin": origin, "certPath": cert_path, "keyPath": key_path})
             elif BROWSER_CLIENT_CERT_PFX_PATH and os.path.isfile(BROWSER_CLIENT_CERT_PFX_PATH):
                 pfx_path = os.path.abspath(BROWSER_CLIENT_CERT_PFX_PATH)
-                entry = {"origin": BROWSER_CLIENT_CERT_ORIGIN, "pfxPath": pfx_path}
-                if BROWSER_CLIENT_CERT_PASSPHRASE:
-                    entry["passphrase"] = BROWSER_CLIENT_CERT_PASSPHRASE
-                client_certs.append(entry)
+                for origin in origins:
+                    entry = {"origin": origin, "pfxPath": pfx_path}
+                    if BROWSER_CLIENT_CERT_PASSPHRASE:
+                        entry["passphrase"] = BROWSER_CLIENT_CERT_PASSPHRASE
+                    client_certs.append(entry)
+        # Политика авто-выбора сертификата по URL (без файла сертификата): пишем в профиль при persistent context.
+        if BROWSER_USER_DATA_DIR and BROWSER_AUTO_SELECT_CERT_PATTERNS and use_chromium:
+            try:
+                policy_entries = [json.dumps({"pattern": p, "filter": {}}) for p in BROWSER_AUTO_SELECT_CERT_PATTERNS]
+                policy_json = json.dumps({"AutoSelectCertificateForUrls": policy_entries})
+                policy_dir = os.path.join(BROWSER_USER_DATA_DIR, "Default", "Managed Preferences")
+                os.makedirs(policy_dir, exist_ok=True)
+                policy_file = os.path.join(policy_dir, "auto_select_certificate_for_urls.json")
+                with open(policy_file, "w", encoding="utf-8") as f:
+                    f.write(policy_json)
+                LOG.info("Политика авто-выбора сертификата записана в %s", policy_file)
+            except Exception as e:
+                LOG.debug("Не удалось записать политику сертификата: %s", e)
         ctx_common = {
             "viewport": {"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
             "ignore_https_errors": True,
@@ -2580,9 +2595,29 @@ def _build_html_report(memory: AgentMemory, report_text: str, start_url: str = "
         url_short = (a.get("url") or "")[:80]
         status = a.get("status", "")
         ok = a.get("ok", True)
+        try:
+            code = int(status) if status else 0
+            if code >= 200 and code < 300:
+                status_class = "2"
+            elif code >= 400 and code < 500:
+                status_class = "4"
+            elif code >= 500:
+                status_class = "5"
+            else:
+                status_class = "other"
+        except (ValueError, TypeError):
+            status_class = "err" if not ok else "other"
         cls = "result" if ok else "sev sev-major"
-        api_rows.append(f"<tr><td>{esc(method)}</td><td class=\"url\">{esc(url_short)}</td><td class=\"{cls}\">{status}</td></tr>")
+        api_rows.append(f"<tr data-status=\"{status_class}\"><td>{esc(method)}</td><td class=\"url\">{esc(url_short)}</td><td class=\"{cls}\">{status}</td></tr>")
     api_body = "\n".join(api_rows) if api_rows else "<tr><td colspan=\"3\">Нет XHR/fetch</td></tr>"
+    def _status_code(x):
+        try:
+            return int(x.get("status") or 0)
+        except (TypeError, ValueError):
+            return 0
+    api_count_2 = sum(1 for a in api_log if 200 <= _status_code(a) < 300)
+    api_count_4 = sum(1 for a in api_log if 400 <= _status_code(a) < 500)
+    api_count_5 = sum(1 for a in api_log if _status_code(a) >= 500)
     visual_regressions = getattr(memory, "_visual_regressions", None) or []
     vr_rows = []
     for v in visual_regressions:
@@ -2637,6 +2672,22 @@ def _build_html_report(memory: AgentMemory, report_text: str, start_url: str = "
         if m.get("readyState"):
             metrics_rows.append(f"<tr><td>readyState</td><td>{esc(m['readyState'])}</td></tr>")
     metrics_body = "\n".join(metrics_rows) if metrics_rows else "<tr><td colspan=\"2\">Не собраны (открой отчёт после шага с загруженной страницей)</td></tr>"
+
+    # Карточки метрик для сводки (красивое оформление)
+    summary_metrics_cards = []
+    if browser_metrics:
+        page = browser_metrics.get("page") or {}
+        for key, label in [
+            ("ttfb", "TTFB"), ("domContentLoaded", "DCL"), ("loadComplete", "Load"),
+            ("firstContentfulPaint", "FCP"), ("lcp", "LCP"),
+        ]:
+            val = page.get(key)
+            if val is not None:
+                summary_metrics_cards.append(f'<div class="card card-metric"><div class="val">{val}</div><div class="lbl">{esc(label)}</div></div>')
+        if browser_metrics.get("usedJSHeapSize") is not None:
+            used_mb = round(browser_metrics["usedJSHeapSize"] / 1024 / 1024, 1)
+            summary_metrics_cards.append(f'<div class="card card-metric"><div class="val">{used_mb}</div><div class="lbl">JS heap МБ</div></div>')
+    summary_metrics_html = "\n".join(summary_metrics_cards) if summary_metrics_cards else "<p class=\"sub\">Метрики не собраны</p>"
 
     total_steps = len(step_log)
     timeline_bars = ""
@@ -2831,6 +2882,18 @@ pre {{ margin: 0; font-size: 0.85rem; color: var(--text2); white-space: pre-wrap
 .replay-thumb {{ width: 84px; height: 47px; border-radius: var(--radius-sm); overflow: hidden; border: 2px solid transparent; cursor: pointer; }}
 .replay-thumb.active {{ border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }}
 .replay-thumb img {{ width: 100%; height: 100%; object-fit: cover; display: block; }}
+.metrics-summary-wrap {{ margin-bottom: 1rem; }}
+.cards-inline {{ display: flex; flex-wrap: wrap; gap: 0.75rem; }}
+.card-metric .val {{ font-size: 1.25rem; }}
+.report-full-text {{ margin-top: 1rem; }}
+.report-full-text summary {{ cursor: pointer; color: var(--text2); }}
+.api-section-title {{ display: inline; margin-right: 0.5rem; }}
+.api-section summary {{ cursor: pointer; list-style: none; }}
+.api-section summary::-webkit-details-marker {{ display: none; }}
+.api-filter-wrap {{ display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0.75rem 0; }}
+.api-filter {{ font-size: 0.85rem; }}
+.api-filter.active {{ background: var(--accent); color: #fff; border-color: var(--accent); }}
+.api-table tr[data-status].hidden {{ display: none; }}
 @media (max-width: 768px) {{ .url, .result {{ max-width: 120px; }} .header-bar {{ flex-direction: column; align-items: flex-start; }} }}
 </style>
 </head>
@@ -2854,7 +2917,13 @@ pre {{ margin: 0; font-size: 0.85rem; color: var(--text2); white-space: pre-wrap
 {f'<p class="sub">Видео сессии: <code>{esc(video_dir)}</code></p>' if video_dir else ''}
 <section>
 <h2>Сводка</h2>
+<div class="metrics-summary-wrap">
+<h3 class="sub">Метрики браузера</h3>
+<div class="cards cards-inline">{summary_metrics_html}</div>
+</div>
+<details class="report-full-text"><summary>Полный текст отчёта</summary>
 <pre>{esc(report_text)}</pre>
+</details>
 </section>
 <section>
 <h2>Покрытие</h2>
@@ -2952,13 +3021,43 @@ strip.querySelectorAll(".replay-thumb").forEach(function(el){{ el.onclick = func
 <p class="sub">Шаг: {browser_metrics.get('step', '—')}, URL: {esc((browser_metrics.get('url') or '')[:120])}</p>
 </section>
 <section>
-<h2>API (XHR/fetch)</h2>
-<table>
+<details class="api-section" id="api-section">
+<summary><h2 class="api-section-title">API (XHR/fetch)</h2><span class="sub">Всего: {len(api_log)}, 2xx: {api_count_2}, 4xx: {api_count_4}, 5xx: {api_count_5}, ошибки: {len(api_failed)}</span></summary>
+<div class="api-filter-wrap">
+<button type="button" class="replay-btn api-filter active" data-filter="all">Все</button>
+<button type="button" class="replay-btn api-filter" data-filter="2">2xx</button>
+<button type="button" class="replay-btn api-filter" data-filter="4">4xx</button>
+<button type="button" class="replay-btn api-filter" data-filter="5">5xx</button>
+<button type="button" class="replay-btn api-filter" data-filter="err">Ошибки</button>
+</div>
+<table class="api-table">
 <thead><tr><th>Метод</th><th>URL</th><th>Статус</th></tr></thead>
 <tbody>{api_body}</tbody>
 </table>
-<p class="sub">Всего записей: {len(api_log)}, с ошибкой: {len(api_failed)}</p>
+</details>
 </section>
+<script>
+(function(){{
+var details = document.getElementById("api-section");
+if (details) {{
+  var tbody = details.querySelector("tbody");
+  if (tbody) {{
+    document.querySelectorAll(".api-filter").forEach(function(btn){{
+      btn.onclick = function(){{
+        document.querySelectorAll(".api-filter").forEach(function(b){{ b.classList.remove("active"); }});
+        this.classList.add("active");
+        var filter = this.getAttribute("data-filter");
+        tbody.querySelectorAll("tr[data-status]").forEach(function(row){{
+          var s = row.getAttribute("data-status");
+          var show = filter === "all" || s === filter;
+          row.classList.toggle("hidden", !show);
+        }});
+      }};
+    }});
+  }}
+}}
+}})();
+</script>
 <section>
 <h2>Mixed content / WebSocket</h2>
 <p><strong>Mixed content:</strong> {mc_body}</p>
