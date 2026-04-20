@@ -375,13 +375,19 @@ class AgentMemory:
         self.record_action_key(act, sel)
 
         self.iteration += 1
+        step_ctx = action.get("_step_context") or {}
         entry = {
             "step": self.iteration,
             "time": datetime.now().strftime("%H:%M:%S"),
             "action": act,
             "selector": action.get("selector", ""),
+            "value": action.get("value", ""),
             "reason": action.get("reason", ""),
+            "test_goal": action.get("test_goal", ""),
+            "expected_outcome": action.get("expected_outcome", ""),
             "result": result[:200],
+            "url_before": step_ctx.get("url_before", ""),
+            "element_desc": step_ctx.get("element_desc", ""),
         }
         self.actions.append(entry)
         if len(self.actions) > self.max_actions:
@@ -534,23 +540,74 @@ class AgentMemory:
         self.test_plan = list(steps)[:15]
 
     def get_steps_to_reproduce(self, max_steps: int = 15) -> List[str]:
-        """Шаги для воспроизведения дефекта (последние действия до бага)."""
-        steps = []
+        """
+        Подробные шаги воспроизведения дефекта: действие + URL + локатор + значение + результат.
+        Берём последние max_steps действий. Дополняем переходами, если URL менялся.
+        """
+        steps: List[str] = []
+        prev_url = ""
         for a in self.actions[-max_steps:]:
-            act = a.get("action", "")
+            act = (a.get("action") or "").strip()
             sel = (a.get("selector") or "").strip()
-            if act == "click" and sel:
-                steps.append(f"Клик по элементу: {sel[:60]}")
-            elif act == "type" and sel:
-                steps.append(f"Ввод в поле: {sel[:60]}")
-            elif act == "hover" and sel:
-                steps.append(f"Наведение на: {sel[:60]}")
+            value = (a.get("value") or "").strip()
+            reason = (a.get("reason") or "").strip()
+            elem = (a.get("element_desc") or "").strip()
+            url_before = (a.get("url_before") or "").strip()
+            result = (a.get("result") or "").strip()
+
+            # Переход со страницы на страницу — отдельный шаг
+            if url_before and url_before != prev_url:
+                steps.append(f"Открыть URL: {url_before}")
+                prev_url = url_before
+
+            # Что ввели/кликнули — с локатором
+            locator_part = elem if elem else (sel or "—")
+            verb_map = {
+                "click": "Кликнуть по",
+                "hover": "Навести курсор на",
+                "type": "Ввести в поле",
+                "select_option": "Выбрать опцию в",
+                "press_key": "Нажать клавишу",
+                "close_modal": "Закрыть модальное окно",
+                "scroll": "Прокрутить страницу",
+                "upload_file": "Загрузить файл в",
+                "fill_form": "Заполнить форму",
+                "explore": "Осмотреть страницу",
+            }
+            verb = verb_map.get(act, act or "Действие")
+
+            if act == "scroll":
+                direction = sel or "down"
+                steps.append(f"Прокрутить страницу ({direction})")
             elif act == "close_modal":
-                steps.append("Закрыть модальное окно")
-            elif act == "select_option" and sel:
-                steps.append(f"Выбрать опцию: {sel[:60]}")
-            elif act == "scroll":
-                steps.append("Прокрутка страницы")
+                steps.append("Закрыть модальное окно" + (f" — {locator_part}" if elem else ""))
+            elif act == "press_key":
+                key = value or sel or "Enter"
+                steps.append(f"Нажать клавишу «{key}»")
+            elif act == "fill_form":
+                steps.append("Заполнить форму тестовыми данными")
+            elif act == "type" and (sel or elem):
+                masked_value = value[:80] + ("…" if len(value) > 80 else "") if value else ""
+                tail = f" значение: «{masked_value}»" if masked_value else ""
+                reason_tail = f" (цель: {reason[:80]})" if reason else ""
+                steps.append(f"Ввести в поле {locator_part}.{tail}{reason_tail}")
+            elif act == "select_option" and (sel or elem):
+                tail = f" (значение: «{value[:60]}»)" if value else ""
+                steps.append(f"Выбрать опцию в {locator_part}{tail}")
+            elif act in ("click", "hover", "upload_file") and (sel or elem):
+                reason_tail = f" (цель: {reason[:80]})" if reason else ""
+                steps.append(f"{verb} {locator_part}{reason_tail}")
+            else:
+                # Прочее
+                if sel or elem:
+                    steps.append(f"{verb} {locator_part}")
+                else:
+                    steps.append(verb)
+
+            # Результат — если нестандартный (ошибка или переход)
+            low_res = result.lower()
+            if low_res and any(x in low_res for x in ("error", "not_found", "not found", "5xx", "404", "timeout", "dead_click")):
+                steps.append(f"  └─ результат: {result[:120]}")
         return steps
 
     def record_defect_created(self, key: str, summary: str, severity: str = "major"):
@@ -764,6 +821,78 @@ def parse_llm_action(raw: str) -> Optional[Dict[str, Any]]:
         except json.JSONDecodeError:
             pass
     return None
+
+
+def describe_element_for_report(page: Page, selector: str) -> str:
+    """
+    Построить человекочитаемое описание элемента по селектору (ref:N или CSS)
+    для подробных шагов воспроизведения и описания дефекта.
+    Пример: 'button «Войти» id=#login-btn data-testid="login-submit" aria-label="Вход"'.
+    """
+    if not selector:
+        return ""
+    sel = selector.strip()
+    try:
+        # ref:N — достаём элемент из window.__agentRefs
+        ref = None
+        if sel.startswith("ref:"):
+            try:
+                ref = int(sel[4:])
+            except ValueError:
+                ref = None
+        elif sel.isdigit():
+            ref = int(sel)
+        if ref is not None:
+            desc = page.evaluate(
+                """(ref) => {
+                    const el = (window.__agentRefs && window.__agentRefs[ref])
+                        || document.querySelector('[data-agent-ref="'+ref+'"]');
+                    if (!el) return '';
+                    const tag = el.tagName ? el.tagName.toLowerCase() : '';
+                    const role = el.getAttribute && el.getAttribute('role') || '';
+                    const type = el.type || '';
+                    const text = (el.innerText || el.textContent || el.value || el.placeholder || '')
+                        .trim().replace(/\\s+/g,' ').slice(0, 100);
+                    const aria = (el.getAttribute && el.getAttribute('aria-label')) || '';
+                    const title = (el.getAttribute && el.getAttribute('title')) || '';
+                    const id = el.id || '';
+                    const name = el.name || '';
+                    const href = (el.getAttribute && el.getAttribute('href')) || '';
+                    const placeholder = el.placeholder || '';
+                    const testId = (el.getAttribute && (el.getAttribute('data-testid')
+                        || el.getAttribute('data-test-id')
+                        || el.getAttribute('data-test')
+                        || el.getAttribute('data-qa'))) || '';
+                    const parts = [];
+                    let head = tag + (type ? ':' + type : '');
+                    if (role) head += '[role=' + role + ']';
+                    parts.push(head);
+                    if (text) parts.push('«' + text + '»');
+                    if (testId) parts.push('data-testid="' + testId + '"');
+                    if (id) parts.push('#' + id);
+                    if (name) parts.push('name=' + name);
+                    if (aria) parts.push('aria-label="' + aria.slice(0,80) + '"');
+                    if (title) parts.push('title="' + title.slice(0,60) + '"');
+                    if (placeholder) parts.push('placeholder="' + placeholder.slice(0,60) + '"');
+                    if (href) parts.push('href=' + href.slice(0, 120));
+                    // CSS-локатор как дополнительная подсказка
+                    const css = id ? '#' + id
+                        : (testId ? '[data-testid="' + testId + '"]'
+                        : (name ? tag + '[name="' + name + '"]'
+                        : (aria ? tag + '[aria-label="' + aria.slice(0,60) + '"]'
+                        : (href ? tag + '[href="' + href.slice(0,100) + '"]'
+                        : tag))));
+                    parts.push('css=' + css);
+                    return parts.join(' ');
+                }""",
+                ref,
+            )
+            if desc:
+                return str(desc)[:400]
+    except Exception:
+        pass
+    # Fallback: использовать сам селектор
+    return sel[:120]
 
 
 # --- Выполнение действия ---
@@ -1732,8 +1861,68 @@ def run_agent(start_url: str = None):
         context.on("page", _on_new_page)
 
         def on_console(msg):
-            console_log.append({"type": msg.type, "text": msg.text})
+            entry: Dict[str, Any] = {"type": msg.type, "text": msg.text}
+            try:
+                loc = msg.location or {}
+                if isinstance(loc, dict):
+                    url_l = loc.get("url") or ""
+                    line_l = loc.get("lineNumber")
+                    col_l = loc.get("columnNumber")
+                    if url_l:
+                        entry["source_url"] = url_l
+                    if line_l is not None:
+                        entry["line"] = line_l
+                    if col_l is not None:
+                        entry["column"] = col_l
+            except Exception:
+                pass
+            # Для ошибок — попытаться вытащить стек из аргументов (Error.stack)
+            if msg.type == "error":
+                try:
+                    stacks = []
+                    for arg in (msg.args or [])[:3]:
+                        try:
+                            s = arg.evaluate("e => (e && typeof e === 'object' && e.stack) ? String(e.stack) : ''")
+                            if s:
+                                stacks.append(s)
+                        except Exception:
+                            pass
+                    if stacks:
+                        entry["stack"] = "\n".join(stacks)[:4000]
+                except Exception:
+                    pass
+            console_log.append(entry)
         page.on("console", on_console)
+
+        def on_page_error(err):
+            """Необработанные JS-исключения: всегда содержат полный стек-трейс."""
+            try:
+                name = getattr(err, "name", None) or "Error"
+                message = getattr(err, "message", None) or str(err)
+                stack = getattr(err, "stack", None) or ""
+            except Exception:
+                name, message, stack = "Error", str(err), ""
+            entry = {
+                "type": "pageerror",
+                "text": f"{name}: {message}"[:2000],
+                "stack": str(stack)[:4000],
+                "name": name,
+            }
+            # Попробуем извлечь путь к JS-файлу из первой строки стека
+            try:
+                for line in str(stack).splitlines():
+                    line = line.strip()
+                    m = re.search(r"(https?://\S+?\.js(?:\?\S*)?):(\d+):(\d+)", line)
+                    if m:
+                        entry["source_url"] = m.group(1)
+                        entry["line"] = int(m.group(2))
+                        entry["column"] = int(m.group(3))
+                        break
+            except Exception:
+                pass
+            console_log.append(entry)
+        page.on("pageerror", on_page_error)
+
         page._agent_console_log = console_log
 
         def on_response(response):
@@ -3768,6 +3957,24 @@ def _step_execute(page, action, step, memory, context):
             memory._dom_hash_before = page.evaluate("() => document.body ? document.body.innerHTML.length : 0")
         except Exception:
             memory._dom_hash_before = None
+
+    # Зафиксировать контекст шага ДО выполнения: URL и человекочитаемый локатор элемента.
+    try:
+        url_before = page.url if not page.is_closed() else ""
+    except Exception:
+        url_before = ""
+    element_desc = ""
+    if sel and act_type in ("click", "type", "hover", "select_option", "upload_file", "press_key"):
+        try:
+            element_desc = describe_element_for_report(page, sel)
+        except Exception:
+            element_desc = ""
+    action["_step_context"] = {
+        "url_before": url_before,
+        "element_desc": element_desc,
+        "selector": sel,
+    }
+
     # Передаём стратегию заполнения формы
     if act_type == "type":
         strategy = get_form_fill_strategy(memory.tester_phase, memory.form_strategy_iteration)
@@ -3880,7 +4087,7 @@ def _analyze_in_background(
     Фоновый анализ (без Playwright!): visual diff, оракул, определение багов.
     Возвращает dict с результатами для main thread.
     """
-    findings = {"oracle_error": False, "bug_to_report": None, "five_xx_bug": None}
+    findings = {"oracle_error": False, "bug_to_report": None, "five_xx_bug": None, "new_console_errors": []}
     post_screenshot_b64 = post_data.get("post_screenshot_b64")
 
     # Visual diff
@@ -3888,8 +4095,49 @@ def _analyze_in_background(
     if visual_diff_info.get("changed") and visual_diff_info.get("change_percent", 0) > 0:
         LOG.info("#{step} Visual diff: %s (%.1f%%)", visual_diff_info.get("diff_zone", "?"), visual_diff_info.get("change_percent", 0))
 
-    new_errors = [c for c in console_log_snapshot[-10:] if c.get("type") == "error"]
-    new_network_fails = [n for n in network_snapshot[-5:] if n.get("status") and n.get("status") >= 500]
+    # Берём только новые записи консоли/сети (появившиеся после действия).
+    pre_lens = (action or {}).get("_pre_action_lens") or {}
+    console_before_len = int(pre_lens.get("console") or 0)
+    network_before_len = int(pre_lens.get("network") or 0)
+    new_console = console_log_snapshot[console_before_len:] if console_before_len <= len(console_log_snapshot) else console_log_snapshot[-10:]
+    new_network = network_snapshot[network_before_len:] if network_before_len <= len(network_snapshot) else network_snapshot[-5:]
+    new_errors = [c for c in new_console if (c.get("type") or "").lower() in ("error", "pageerror")]
+    new_network_fails = [n for n in new_network if n.get("status") and n.get("status") >= 500]
+    # Сохраним новые ошибки консоли в finding — пригодится для описания дефекта (стек + путь к JS).
+    findings["new_console_errors"] = new_errors
+
+    # Короткая сводка по новым ошибкам консоли (с путём до JS-файла) — подкладываем в багрепорт
+    def _fmt_console_brief(errs: list) -> str:
+        if not errs:
+            return ""
+        lines = []
+        for e in errs[-5:]:
+            et = (e.get("type") or "log").lower()
+            txt = (e.get("text") or "").strip().replace("\n", " ")[:200]
+            src = e.get("source_url") or e.get("url") or ""
+            line_no = e.get("line")
+            col_no = e.get("column")
+            loc = ""
+            if src:
+                loc = src
+                if line_no is not None and col_no is not None:
+                    loc = f"{src}:{line_no}:{col_no}"
+                elif line_no is not None:
+                    loc = f"{src}:{line_no}"
+            stack = (e.get("stack") or "")
+            first_stack = ""
+            if stack:
+                for s_line in str(stack).splitlines()[:3]:
+                    s_line = s_line.strip()
+                    if s_line:
+                        first_stack = s_line
+                        break
+            extra = f" | at {loc}" if loc else ""
+            stack_line = f"\n    stack: {first_stack}" if first_stack else ""
+            lines.append(f"  - [{et}] {txt}{extra}{stack_line}")
+        return "\n".join(lines)
+
+    console_brief = _fmt_console_brief(new_errors)
 
     # 5xx
     if new_network_fails:
@@ -3901,6 +4149,7 @@ def _analyze_in_background(
             f"HTTP 5xx после действия агента.\n\n"
             f"Действие: {act_type} | selector: {sel[:100]} | value: {val[:50]}\n\n"
             f"Неуспешные запросы:\n{five_xx_detail}"
+            + (f"\n\nНовые ошибки консоли после действия:\n{console_brief}" if console_brief else "")
         )
 
     # Оракул (GigaChat — thread-safe). Lazy: только при изменении экрана или новых ошибках (ORACLE_ON_VISUAL_OR_ERROR)
@@ -3947,7 +4196,10 @@ Visual diff: {visual_diff_info.get('change_percent', 0):.1f}% изменений
         if post_answer:
             post_action = parse_llm_action(post_answer)
             if post_action and post_action.get("action") == "check_defect" and post_action.get("possible_bug"):
-                findings["bug_to_report"] = post_action["possible_bug"]
+                bug_text = post_action["possible_bug"]
+                if console_brief:
+                    bug_text = f"{bug_text}\n\nНовые ошибки консоли после действия:\n{console_brief}"
+                findings["bug_to_report"] = bug_text
 
     return findings
 
@@ -3978,10 +4230,15 @@ def _step_post_analysis(
         )
         return
 
-    # Снимки логов (thread-safe copies)
-    console_snapshot = list(console_log[-20:])
-    network_snapshot = list(network_failures[-10:])
+    # Снимки логов: берём ПОЛНЫЙ срез — в фоне выделим именно новые записи после действия.
+    console_snapshot = list(console_log)
+    network_snapshot = list(network_failures)
     before_screenshot = memory.screenshot_before_action
+    # Запомним границы (сколько записей было ДО действия), чтобы в фоне брать именно «новые».
+    action["_pre_action_lens"] = {
+        "console": memory.console_len_before_action,
+        "network": memory.network_len_before_action,
+    }
 
     # Запускаем анализ В ФОНЕ — main thread свободен для следующего шага
     future = _bg_submit(
