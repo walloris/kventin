@@ -1,6 +1,7 @@
 """
 Сбор и анализ консоли, сети и DOM страницы для передачи агенту и в Jira.
 """
+import base64
 from typing import List, Dict, Any, Optional
 
 from playwright.sync_api import Page
@@ -12,6 +13,17 @@ from config import (
     COOKIE_BANNER_BUTTON_TEXTS,
     OVERLAY_IGNORE_PATTERNS,
 )
+
+
+def take_screenshot_b64(page: Page) -> Optional[str]:
+    """Сделать скриншот страницы и вернуть base64-строку."""
+    try:
+        if page.is_closed():
+            return None
+        raw = page.screenshot(type="png")
+        return base64.b64encode(raw).decode("ascii")
+    except Exception:
+        return None
 
 
 def _should_ignore_console(text: str) -> bool:

@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Optional
 from playwright.sync_api import Page
 
 from src.accessibility import check_accessibility, format_a11y_issues
-from src.config import (
+from config import (
     ENABLE_IFRAME_TESTING,
     ENABLE_RESPONSIVE_TEST,
     ENABLE_SCENARIO_CHAINS,

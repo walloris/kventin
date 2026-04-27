@@ -15,7 +15,7 @@ from concurrent.futures import Future
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from src.config import (
+from config import (
     MAX_ACTIONS_IN_MEMORY,
     MAX_SCROLLS_IN_ROW,
     PHASE_STEPS_TO_ADVANCE,
