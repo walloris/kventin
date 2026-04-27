@@ -325,9 +325,12 @@ NL_ASSERTIONS = [s.strip() for s in os.getenv("NL_ASSERTIONS", "").split(",") if
 # --- Несколько стартовых URL (через запятую; приоритет над START_URL) ---
 START_URLS = [s.strip() for s in os.getenv("START_URLS", "").split(",") if s.strip()]
 
-# Если net::ERR_TOO_MANY_REDIRECTS — попробовать эти URL по очереди (после встроенных
-# эвристик: без хвостового /, корень хоста, родительский path).
-# Пример: START_URL=https://x/platform/  а рабочая точка — https://x/
+# Только при START_URL_TRY_REDIRECT_FALLBACKS=1: при ERR_TOO_MANY_REDIRECTS перебирать
+# URL (см. ниже). По умолчанию выкл. — ведёт себя как раньше: один page.goto(START_URL).
+START_URL_TRY_REDIRECT_FALLBACKS = os.getenv("START_URL_TRY_REDIRECT_FALLBACKS", "0").lower() in (
+    "1", "true", "yes",
+)
+# Запасные URL через запятую (после оригинала и варианта без хвостового /).
 START_URL_FALLBACKS = [s.strip() for s in os.getenv("START_URL_FALLBACKS", "").split(",") if s.strip()]
 
 # --- DOM diff: считать изменение DOM после действия (нет изменения = возможный баг) ---

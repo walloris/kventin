@@ -26,6 +26,7 @@ from playwright.sync_api import sync_playwright, Page
 
 from config import (
     START_URL,
+    START_URL_TRY_REDIRECT_FALLBACKS,
     BROWSER_SLOW_MO,
     HEADLESS,
     BROWSER_USER_DATA_DIR,
@@ -1142,12 +1143,10 @@ def _is_too_many_redirects_error(exc: Exception) -> bool:
 
 def _build_start_url_candidates(primary: str) -> List[str]:
     """
-    URL для поочерёдного page.goto, если петля редиректов.
-    Порядок: исходный, без хвостового /, корень хоста, на один сегмент path вверх,
-    затем START_URL_FALLBACKS из .env.
+    URL для поочерёдного page.goto при петле редиректов.
+    Без сюрпризов: только исходный, вариант без хвостового /, затем START_URL_FALLBACKS.
+    (Автопереход на «корень» хоста убран — на корп. стендах открывалась не та зона.)    
     """
-    from urllib.parse import urlparse, urlunparse
-
     from config import START_URL_FALLBACKS
 
     out: List[str] = []
@@ -1164,20 +1163,6 @@ def _build_start_url_candidates(primary: str) -> List[str]:
     stripped = primary.rstrip("/")
     if stripped and stripped != primary:
         add(stripped)
-    p = urlparse(primary)
-    if p.scheme and p.netloc:
-        add(urlunparse((p.scheme, p.netloc, "/", "", "", "")))
-        path = (p.path or "").rstrip("/")
-        if path and path not in ("/", ""):
-            segs = [x for x in path.split("/") if x]
-            if len(segs) > 1:
-                parent = "/" + "/".join(segs[:-1])
-            elif len(segs) == 1:
-                parent = "/"
-            else:
-                parent = ""
-            if parent is not None:
-                add(urlunparse((p.scheme, p.netloc, parent or "/", "", "", "")))
     for f in START_URL_FALLBACKS:
         add(f)
     return out
@@ -1463,11 +1448,16 @@ def run_agent(start_url: str = None):
             _do_auth_login(page, AUTH_URL, AUTH_USERNAME, AUTH_PASSWORD, AUTH_SUBMIT_SELECTOR)
             time.sleep(1)
 
-        # Загрузка начальной страницы (при петле редиректов — альтернативные URL)
+        # Загрузка начальной страницы
+        # По умолчанию — как раньше: один page.goto(START_URL). Многошаговый обход
+        # петли редиректов — только при START_URL_TRY_REDIRECT_FALLBACKS=1.
         try:
-            effective_start = _goto_start_page_with_redirect_fallbacks(page, start_url)
-            if effective_start != start_url:
-                start_url = effective_start
+            if START_URL_TRY_REDIRECT_FALLBACKS:
+                effective_start = _goto_start_page_with_redirect_fallbacks(page, start_url)
+                if effective_start != start_url:
+                    start_url = effective_start
+            else:
+                page.goto(start_url, wait_until="domcontentloaded", timeout=30000)
             smart_wait_after_goto(page, timeout=15000)
             _inject_all(page)
         except Exception as e:
