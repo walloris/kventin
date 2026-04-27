@@ -106,8 +106,8 @@ from src.gigachat_client import (
     get_test_plan_from_screenshot,
     ask_is_this_really_bug,
     init_gigachat_connection,
-    validate_llm_action,
 )
+from src.llm_parser import parse_llm_action, validate_llm_action
 from src.form_strategies import detect_field_type, get_test_value, get_form_fill_strategy
 from src.accessibility import check_accessibility, format_a11y_issues
 from src.visual_diff import (
@@ -239,30 +239,6 @@ def take_screenshot_b64(page: Page) -> Optional[str]:
                 _show_agent_ui(page)
         except Exception:
             pass
-
-
-# --- Парсинг JSON-ответа от GigaChat ---
-def parse_llm_action(raw: str) -> Optional[Dict[str, Any]]:
-    """Попытаться распарсить JSON-действие из ответа GigaChat."""
-    if not raw:
-        return None
-    # Убираем markdown code block если есть
-    cleaned = re.sub(r'^```(?:json)?\s*', '', raw.strip(), flags=re.MULTILINE)
-    cleaned = re.sub(r'```\s*$', '', cleaned.strip(), flags=re.MULTILINE)
-    try:
-        obj = json.loads(cleaned)
-        if isinstance(obj, dict) and "action" in obj:
-            return obj
-    except json.JSONDecodeError:
-        pass
-    # Попробуем найти JSON в тексте
-    m = re.search(r'\{[^{}]*"action"\s*:\s*"[^"]+?"[^{}]*\}', raw, re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group())
-        except json.JSONDecodeError:
-            pass
-    return None
 
 
 def describe_element_for_report(page: Page, selector: str) -> str:
