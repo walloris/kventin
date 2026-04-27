@@ -27,6 +27,43 @@ if not LOG.handlers:
     LOG.addHandler(h)
 
 
+# Глобальный circuit breaker уровня клиента: если N запросов подряд упали по
+# таймауту/сети — мгновенно возвращаем "" из chat() в течение N секунд, чтобы
+# не блокировать пайплайн анализа агента (раньше каждый шаг висел до 6 минут
+# на retry-цепочке 120с × 3, и фоновый анализ → дефекты не успевали).
+_TRANSIENT_FAILS = 0
+_CIRCUIT_OPEN_UNTIL = 0.0
+
+
+def _circuit_open() -> bool:
+    return time.time() < _CIRCUIT_OPEN_UNTIL
+
+
+def _circuit_record_failure() -> None:
+    global _TRANSIENT_FAILS, _CIRCUIT_OPEN_UNTIL
+    _TRANSIENT_FAILS += 1
+    try:
+        from config import (
+            GIGACHAT_CIRCUIT_BREAKER_AFTER_N_TIMEOUTS as _N,
+            GIGACHAT_CIRCUIT_BREAKER_COOLDOWN_SEC as _CD,
+        )
+    except Exception:
+        _N, _CD = 3, 60
+    if _N > 0 and _TRANSIENT_FAILS >= _N:
+        _CIRCUIT_OPEN_UNTIL = time.time() + _CD
+        LOG.warning(
+            "circuit breaker OPEN: %d таймаутов подряд → %dс игнорируем GigaChat",
+            _TRANSIENT_FAILS, _CD,
+        )
+        _TRANSIENT_FAILS = 0
+
+
+def _circuit_record_success() -> None:
+    global _TRANSIENT_FAILS, _CIRCUIT_OPEN_UNTIL
+    _TRANSIENT_FAILS = 0
+    _CIRCUIT_OPEN_UNTIL = 0.0
+
+
 def _mask(s: str, show_tail: int = 8) -> str:
     """Скрыть середину строки для логов (первые 4 + ... + последние show_tail)."""
     if not s or len(s) <= 12:
@@ -452,6 +489,12 @@ class GigaChatClient:
         return None
 
     def chat(self, messages: List[Dict[str, Any]], max_tokens: Optional[int] = None) -> str:
+        # Circuit breaker: если последние запросы валились — мгновенно отдаём
+        # пусто, не висим на сети. Иначе агент стоит на каждом шаге.
+        if _circuit_open():
+            LOG.info("chat: circuit breaker OPEN — пропуск запроса")
+            return ""
+
         token = self._get_token()
         if not token:
             LOG.error("chat: нет токена, запрос отменён")
@@ -470,8 +513,15 @@ class GigaChatClient:
         last_msg = messages[-1] if messages else {}
         user_len = len(last_msg.get("content", "")) if isinstance(last_msg.get("content"), str) else 0
         has_image = "<img" in (last_msg.get("content", "") if isinstance(last_msg.get("content"), str) else "")
-        timeout = 120
-        LOG.info("chat: POST %s model=%s msgs=%s user_len=%s has_image=%s", self.api_url, model, len(messages), user_len, has_image)
+        try:
+            from config import GIGACHAT_TIMEOUT_SEC as _TO
+        except Exception:
+            _TO = 30
+        timeout = _TO
+        LOG.info(
+            "chat: POST %s model=%s msgs=%s user_len=%s has_image=%s timeout=%ss",
+            self.api_url, model, len(messages), user_len, has_image, timeout,
+        )
 
         def _do_post(tok: str):
             return requests.post(
@@ -497,6 +547,9 @@ class GigaChatClient:
                     LOG.info("chat (retry): ответ %s body_len=%s", r.status_code, len(r.text))
             if r.status_code != 200:
                 LOG.error("chat: ответ %s %s", r.status_code, r.text[:1200])
+                # 5xx/429 считаем «временным» сбоем — открываем breaker
+                if r.status_code >= 500 or r.status_code == 429:
+                    _circuit_record_failure()
                 return ""
             data = r.json()
             choices = data.get("choices") or []
@@ -507,7 +560,12 @@ class GigaChatClient:
             content = (msg.get("content") or "").strip()
             LOG.info("chat: content_len=%s", len(content))
             LOG.debug("chat: content (head 500): %s", content[:500] if content else "(пусто)")
+            _circuit_record_success()
             return content
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            LOG.warning("chat: сеть/таймаут (%s) — открываю circuit breaker", e.__class__.__name__)
+            _circuit_record_failure()
+            return ""
         except Exception as e:
             LOG.exception("chat: ошибка запроса: %s", e)
             return ""

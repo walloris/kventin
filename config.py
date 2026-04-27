@@ -169,13 +169,19 @@ SESSION_REPORT_SAVE_EVERY_N = int(os.getenv("SESSION_REPORT_SAVE_EVERY_N", "1"))
 # Максимальное число шагов агента (0 = бесконечный цикл). При достижении — печатает отчёт и останавливается.
 MAX_STEPS = int(os.getenv("MAX_STEPS", "0"))
 
-# Retry при сбое GigaChat (пустой ответ / не JSON): экспоненциальный backoff
-LLM_RETRY_COUNT = int(os.getenv("LLM_RETRY_COUNT", "3"))
-LLM_RETRY_BASE_DELAY = float(os.getenv("LLM_RETRY_BASE_DELAY", "2.0"))  # секунды
+# Retry при сбое GigaChat (пустой ответ / не JSON): экспоненциальный backoff.
+# По умолчанию ОДИН retry — иначе при таймаутах 30с×3 + backoff каждый шаг анализа
+# зависал бы на минуту-полторы и фоновые findings не успевали к следующему шагу.
+LLM_RETRY_COUNT = int(os.getenv("LLM_RETRY_COUNT", "1"))
+LLM_RETRY_BASE_DELAY = float(os.getenv("LLM_RETRY_BASE_DELAY", "1.0"))  # секунды
+# Жёсткий timeout на ОДИН HTTP-запрос к GigaChat. При плохой сети раньше стояло 120с,
+# и каждый таймаут на стенде HR-DEV блокировал весь пайплайн анализа.
+GIGACHAT_TIMEOUT_SEC = int(os.getenv("GIGACHAT_TIMEOUT_SEC", "30"))
 # Если GigaChat не ответил за N секунд — берём fast action (не зависаем)
 GIGACHAT_RESPONSE_TIMEOUT_SEC = int(os.getenv("GIGACHAT_RESPONSE_TIMEOUT_SEC", "20"))
-# Circuit breaker: после N таймаутов подряд не вызывать GigaChat 60 сек (0 = отключить)
-GIGACHAT_CIRCUIT_BREAKER_AFTER_N_TIMEOUTS = int(os.getenv("GIGACHAT_CIRCUIT_BREAKER_AFTER_N_TIMEOUTS", "3"))
+# Circuit breaker: после N таймаутов подряд не вызывать GigaChat M секунд (0 = отключить).
+# Применяется и к выбору действия, и к фоновому анализу (любой chat()-вызов).
+GIGACHAT_CIRCUIT_BREAKER_AFTER_N_TIMEOUTS = int(os.getenv("GIGACHAT_CIRCUIT_BREAKER_AFTER_N_TIMEOUTS", "2"))
 GIGACHAT_CIRCUIT_BREAKER_COOLDOWN_SEC = int(os.getenv("GIGACHAT_CIRCUIT_BREAKER_COOLDOWN_SEC", "60"))
 # Таймаут на одно действие Playwright (клик, fill, wait), мс
 ACTION_TIMEOUT_MS = int(os.getenv("ACTION_TIMEOUT_MS", "10000"))

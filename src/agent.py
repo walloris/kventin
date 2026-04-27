@@ -3788,6 +3788,62 @@ def _step_post_analysis(
         )
         return
 
+    # ============================================================
+    # СИНХРОННЫЙ FAST-PATH: быстрые правила в main thread.
+    # Если правило сработало — дефект заводится СРАЗУ, не дожидаясь фонового
+    # LLM-оракула. Раньше всё это было только в _analyze_in_background, и
+    # когда GigaChat висел по таймауту 120с, future не успевал к следующему
+    # шагу — _flush_pending_analysis получал пустой findings и дефект терялся.
+    # ============================================================
+    if memory.defects_on_current_step == 0:
+        from src.defect_rules import (
+            is_noise_url, is_noise_console_text,
+            rule_action_failure, rule_pageerror, rule_4xx_on_main, rule_5xx,
+        )
+        pre_lens = {
+            "console": memory.console_len_before_action,
+            "network": memory.network_len_before_action,
+        }
+        new_console = console_log[pre_lens["console"]:] if pre_lens["console"] <= len(console_log) else console_log[-10:]
+        new_network = network_failures[pre_lens["network"]:] if pre_lens["network"] <= len(network_failures) else network_failures[-5:]
+        new_errors_sync = [
+            c for c in new_console
+            if (c.get("type") or "").lower() in ("error", "pageerror")
+            and not is_noise_console_text(c.get("text") or "")
+        ]
+        # Порядок: 5xx (самый громкий) → action_failure (UI клик) → pageerror → 4xx
+        sync_bug = None
+        sync_bug_obj = rule_5xx(new_network)
+        if sync_bug_obj:
+            sync_bug = (
+                f"HTTP 5xx после действия агента.\n\n"
+                f"Действие: {act_type} | selector: {sel[:100]} | value: {val[:50]}\n\n"
+                f"{sync_bug_obj['title']}\n{sync_bug_obj['details']}"
+            )
+            LOG.info("#%s sync rule_5xx → дефект", step)
+        if not sync_bug:
+            sync_bug_obj = rule_action_failure(action, result, current_url)
+            if sync_bug_obj:
+                sync_bug = f"{sync_bug_obj['title']}\n\n{sync_bug_obj['details']}"
+                LOG.info("#%s sync rule_action_failure → дефект (%s)", step, sync_bug_obj.get("severity"))
+        if not sync_bug:
+            sync_bug_obj = rule_pageerror(new_errors_sync)
+            if sync_bug_obj:
+                sync_bug = f"{sync_bug_obj['title']}\n\n{sync_bug_obj['details']}"
+                LOG.info("#%s sync rule_pageerror → дефект", step)
+        if not sync_bug:
+            sync_bug_obj = rule_4xx_on_main(new_network, current_url)
+            if sync_bug_obj:
+                sync_bug = f"{sync_bug_obj['title']}\n\n{sync_bug_obj['details']}"
+                LOG.info("#%s sync rule_4xx_on_main → дефект", step)
+
+        if sync_bug:
+            try:
+                _create_defect(page, sync_bug, current_url, checklist_results, console_log, network_failures, memory)
+                memory.defects_on_current_step += 1
+            except Exception:
+                LOG.exception("#%s sync defect creation: исключение", step)
+
     # Снимки логов: берём ПОЛНЫЙ срез — в фоне выделим именно новые записи после действия.
     console_snapshot = list(console_log)
     network_snapshot = list(network_failures)
@@ -3827,16 +3883,22 @@ def _flush_pending_analysis(page, memory, console_log, network_failures):
 
     future = pending["future"]
     step = pending.get("step", "?")
-    # Сначала проверим, не упало ли исключение в фоне — иначе оно тихо потеряется.
+    # Ждём только до 5с (раньше было 10): если GigaChat где-то висит, circuit
+    # breaker уже должен был сработать. Если future всё ещё в работе — это
+    # ненормально, фиксируем и идём дальше, чтобы main thread не стоял.
+    from concurrent.futures import TimeoutError as _FutureTimeout
     try:
-        exc = future.exception(timeout=10.0)
+        exc = future.exception(timeout=5.0)
+    except _FutureTimeout:
+        LOG.warning("#%s pending analysis ВИСИТ >5с — пропускаю (фон сам завершится)", step)
+        return
     except Exception as e:
         LOG.warning("#%s pending analysis: future.exception() ошибка: %s", step, e)
         exc = None
     if exc is not None:
         LOG.error("#%s pending analysis FAILED: %s", step, exc, exc_info=exc)
         return
-    findings = _bg_result(future, timeout=2.0, default={})
+    findings = _bg_result(future, timeout=1.0, default={})
     if not findings:
         LOG.info("#%s pending analysis: пустой findings", step)
         return
