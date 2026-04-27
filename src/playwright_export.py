@@ -51,13 +51,15 @@ def build_playwright_script(
         if action == "click":
             sel = selector or "unknown"
             if sel.startswith("ref:"):
-                lines.append(f'        page.locator("[data-kventin-ref=\\"{}\"]").first.click()  # was {sel}'.format(sel.replace("ref:", "")))
+                ref = _esc(sel.replace("ref:", "")[:50])
+                lines.append(f'        page.locator("[data-kventin-ref=\\"{ref}\\"]").first.click()  # was {sel}')
             else:
                 lines.append(f'        page.locator("{_esc(sel[:200])}").first.click()')
         elif action == "type" or action == "fill_form":
             sel = selector or "unknown"
             if sel.startswith("ref:"):
-                lines.append(f'        page.locator("[data-kventin-ref=\\"{}\"]").first.fill("{_esc(value[:200])}")'.format(sel.replace("ref:", "")))
+                ref = _esc(sel.replace("ref:", "")[:50])
+                lines.append(f'        page.locator("[data-kventin-ref=\\"{ref}\\"]").first.fill("{_esc(value[:200])}")')
             else:
                 lines.append(f'        page.locator("{_esc(sel[:200])}").first.fill("{_esc(value[:200])}")')
         elif action == "select_option":
