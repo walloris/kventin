@@ -1122,19 +1122,10 @@ def _do_click(page: Page, selector: str, reason: str = "") -> str:
             except Exception:
                 pass
             
-            print(f"[Agent] 🔴 КЛИК: {selector[:50]} ({reason[:30]})")
-            # Показываем курсор и подсказку ДО highlight
-            box = loc.bounding_box()
-            if box:
-                cx = box["x"] + box["width"] / 2
-                cy = box["y"] + box["height"] / 2
-                move_cursor_to(page, cx, cy)
-                show_highlight_label(page, cx, cy, reason[:30] or "КЛИКАЮ!")
-                time.sleep(0.5)  # Пауза чтобы увидеть курсор и подсказку
-            
-            safe_highlight(loc, page, 0.8)  # Увеличиваем время highlight
-            highlight_and_click(loc, page, description=reason[:30] or "КЛИКАЮ!")
-            print(f"[Agent] ✅ Клик выполнен: {selector[:50]}")
+            print(f"[Agent] КЛИК: {selector[:50]} ({reason[:30]})")
+            scroll_to_center(loc, page)
+            loc.click()
+            print(f"[Agent] Клик выполнен: {selector[:50]}")
             return f"clicked: {selector[:50]}"
         except Exception as e:
             print(f"[Agent] ❌ Ошибка клика: {e}")
@@ -1241,21 +1232,10 @@ def _do_type(page: Page, selector: str, value: str, form_strategy: str = "happy"
                 loc = None
     if loc:
         try:
-            print(f"[Agent] ⌨️ ВВОД: {selector[:50]} = {value[:30]}")
-            # Показываем курсор и подсказку ДО highlight
-            box = loc.bounding_box()
-            if box:
-                cx = box["x"] + box["width"] / 2
-                cy = box["y"] + box["height"] / 2
-                move_cursor_to(page, cx, cy)
-                show_highlight_label(page, cx, cy, f"ВВОДЮ: {value[:20]}")
-                time.sleep(0.5)  # Пауза чтобы увидеть курсор и подсказку
-            
-            safe_highlight(loc, page, 0.8)  # Увеличиваем время highlight
+            print(f"[Agent] ВВОД: {selector[:50]} = {value[:30]}")
+            scroll_to_center(loc, page)
             loc.click()
-            time.sleep(0.2)  # Пауза после клика
             loc.fill(value)
-            time.sleep(0.5)  # Пауза после заполнения
             # Верификация: значение действительно попало в поле
             try:
                 current_val = (loc.input_value() or "").strip()
