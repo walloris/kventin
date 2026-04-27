@@ -317,23 +317,25 @@ class GigaChatClient:
         if self.access_token and time.time() < self.token_expires_at - 60:
             LOG.debug("get_token: кэшированный токен до %s", time.strftime("%H:%M:%S", time.localtime(self.token_expires_at)))
             return self.access_token
-        # Keycloak password grant: username + password + client_id + person_id
         if self.username and self.password and self.client_id:
             LOG.debug("get_token: get_gigachat_token(env=%s)...", self.env)
             token = get_gigachat_token(self.env)
             if token:
                 self.access_token = token
-                self.token_expires_at = time.time() + 1800  # 30 мин по умолчанию
+                self.token_expires_at = time.time() + 1800
                 return token
-        LOG.debug("get_token: запрос oauth...")
-        token = self._get_token_oauth()
-        if token:
-            return token
-        LOG.debug("get_token: запрос password_grant (username+password+client_id)...")
-        token = self._get_token_password_grant()
-        if not token:
-            LOG.error("get_token: не удалось получить токен (token_header/get_gigachat_token/oauth/password_grant)")
-        return token
+            LOG.error("get_token: get_gigachat_token вернул None (env=%s, username=%s)", self.env, self.username)
+            return None
+        if self._basic_key():
+            LOG.debug("get_token: пробуем oauth client_credentials (нет username/password)...")
+            token = self._get_token_oauth()
+            if token:
+                return token
+        LOG.error(
+            "get_token: не удалось получить токен. Заполни в .env GIGACHAT_USERNAME и GIGACHAT_PASSWORD "
+            "или передай готовый GIGACHAT_TOKEN_HEADER."
+        )
+        return None
 
     def _files_url(self) -> str:
         """Вычислить URL для загрузки файлов из api_url (/chat/completions → /files)."""
