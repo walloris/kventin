@@ -158,7 +158,7 @@ def _config(key: str, default: str = "") -> str:
     }
     v = m.get(key, default or "")
 
-    env = m.get("ENV", "ift")
+    env = m.get("ENV", "dev")
     if key == "API_URL" and not v:
         v = GIGACHAT_API_URL_IFT if env == "ift" else GIGACHAT_API_URL_DEV
     if key == "TOKEN_URL" and not v:
@@ -171,7 +171,7 @@ class GigaChatClient:
     """Клиент как в твоём проекте: token_header, OAuth, password grant, свой gateway."""
 
     def __init__(self, env: Optional[str] = None):
-        self.env = env or _config("ENV") or "ift"
+        self.env = env or _config("ENV") or "dev"
         try:
             from config import GIGACHAT_VERIFY_SSL
             self.verify_ssl = bool(GIGACHAT_VERIFY_SSL)

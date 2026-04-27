@@ -35,7 +35,7 @@ GIGACHAT_CLIENT_ID = os.getenv("GIGACHAT_CLIENT_ID", "fakeuser")
 GIGACHAT_CLIENT_SECRET = os.getenv("GIGACHAT_CLIENT_SECRET", "")
 GIGACHAT_USERNAME = os.getenv("GIGACHAT_USERNAME", "")
 GIGACHAT_PASSWORD = os.getenv("GIGACHAT_PASSWORD", "")
-GIGACHAT_ENV = os.getenv("GIGACHAT_ENV", "ift").strip().lower()  # "dev" | "ift"
+GIGACHAT_ENV = os.getenv("GIGACHAT_ENV", "dev").strip().lower()  # "dev" | "ift"
 GIGACHAT_VERIFY_SSL = os.getenv("GIGACHAT_VERIFY_SSL", "0") == "1"
 # Person ID для Keycloak (обязательно для password grant через x-hrp-person-id)
 GIGACHAT_PERSON_ID_DEV = os.getenv("GIGACHAT_PERSON_ID_DEV", "4c36eb04-0920-4449-9e07-ca4a68f80eef")
