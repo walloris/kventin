@@ -308,32 +308,63 @@ class GigaChatClient:
             LOG.exception("password_grant: ошибка: %s", e)
             return None
 
-    def _get_token(self) -> Optional[str]:
-        if self.token_header:
-            s = self.token_header.strip()
-            tok = s[7:].strip() if s.lower().startswith("bearer ") else s
-            LOG.debug("get_token: используем token_header, token=%s", _mask(tok, show_tail=6))
-            return tok
-        if self.access_token and time.time() < self.token_expires_at - 60:
-            LOG.debug("get_token: кэшированный токен до %s", time.strftime("%H:%M:%S", time.localtime(self.token_expires_at)))
-            return self.access_token
+    def _get_token(self, force_refresh: bool = False) -> Optional[str]:
+        """
+        Получить access-token.
+
+        Приоритеты:
+        1) Если заданы USERNAME+PASSWORD+CLIENT_ID — идём через get_gigachat_token (свежий токен).
+        2) Иначе используем GIGACHAT_TOKEN_HEADER (готовый Bearer).
+        3) Иначе — basic_key/oauth (старая логика).
+
+        force_refresh=True сбрасывает кэш и заставляет перезапросить токен.
+        """
+        if force_refresh:
+            self.access_token = None
+            self.token_expires_at = 0
+
         if self.username and self.password and self.client_id:
+            if not force_refresh and self.access_token and time.time() < self.token_expires_at - 60:
+                LOG.debug(
+                    "get_token: кэшированный токен до %s",
+                    time.strftime("%H:%M:%S", time.localtime(self.token_expires_at)),
+                )
+                return self.access_token
             LOG.debug("get_token: get_gigachat_token(env=%s)...", self.env)
             token = get_gigachat_token(self.env)
             if token:
                 self.access_token = token
                 self.token_expires_at = time.time() + 1800
                 return token
-            LOG.error("get_token: get_gigachat_token вернул None (env=%s, username=%s)", self.env, self.username)
-            return None
+            if self.token_header:
+                LOG.warning(
+                    "get_token: password grant не сработал, fallback на GIGACHAT_TOKEN_HEADER"
+                )
+            else:
+                LOG.error(
+                    "get_token: get_gigachat_token вернул None (env=%s, username=%s)",
+                    self.env, self.username,
+                )
+                return None
+
+        if self.token_header:
+            s = self.token_header.strip()
+            tok = s[7:].strip() if s.lower().startswith("bearer ") else s
+            LOG.debug("get_token: используем token_header, token=%s", _mask(tok, show_tail=6))
+            return tok
+
+        if not force_refresh and self.access_token and time.time() < self.token_expires_at - 60:
+            return self.access_token
+
         if self._basic_key():
-            LOG.debug("get_token: пробуем oauth client_credentials (нет username/password)...")
+            LOG.debug("get_token: пробуем oauth client_credentials...")
             token = self._get_token_oauth()
             if token:
                 return token
+
         LOG.error(
             "get_token: не удалось получить токен. Заполни в .env GIGACHAT_USERNAME и GIGACHAT_PASSWORD "
-            "или передай готовый GIGACHAT_TOKEN_HEADER."
+            "(основной путь) или передай актуальный GIGACHAT_TOKEN_HEADER."
         )
         return None
 
@@ -397,25 +428,34 @@ class GigaChatClient:
         }
         if max_tokens:
             payload["max_tokens"] = max_tokens
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json",
-        }
         last_msg = messages[-1] if messages else {}
         user_len = len(last_msg.get("content", "")) if isinstance(last_msg.get("content"), str) else 0
         has_image = "<img" in (last_msg.get("content", "") if isinstance(last_msg.get("content"), str) else "")
         timeout = 120
         LOG.info("chat: POST %s model=%s msgs=%s user_len=%s has_image=%s", self.api_url, model, len(messages), user_len, has_image)
-        try:
-            r = requests.post(
+
+        def _do_post(tok: str):
+            return requests.post(
                 self.api_url,
                 json=payload,
-                headers=headers,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {tok}",
+                    "Accept": "application/json",
+                },
                 verify=self.verify_ssl,
                 timeout=timeout,
             )
+
+        try:
+            r = _do_post(token)
             LOG.info("chat: ответ %s body_len=%s", r.status_code, len(r.text))
+            if r.status_code == 401 and (self.username and self.password and self.client_id):
+                LOG.warning("chat: 401 — токен недействителен, обновляю и повторяю запрос")
+                fresh = self._get_token(force_refresh=True)
+                if fresh and fresh != token:
+                    r = _do_post(fresh)
+                    LOG.info("chat (retry): ответ %s body_len=%s", r.status_code, len(r.text))
             if r.status_code != 200:
                 LOG.error("chat: ответ %s %s", r.status_code, r.text[:1200])
                 return ""
