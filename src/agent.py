@@ -1699,7 +1699,7 @@ def run_agent(start_url: str = None):
                 try:
                     _flush_pending_analysis(page, memory, console_log, network_failures)
                 except Exception:
-                    pass
+                    LOG.exception("flush_pending_analysis: исключение проглочено")
 
                 # Лимит логов
                 if len(console_log) > CONSOLE_LOG_LIMIT:
@@ -1894,6 +1894,8 @@ def run_agent(start_url: str = None):
                 # Пост-анализ — в ФОНЕ. Main thread свободен для следующего шага,
                 # но JS-ошибки/5xx/4xx/визуальные регрессии после действия мы по-
                 # прежнему видим (без него дефекты вообще не создаются).
+                # Исключения логируем громко: иначе вся часть с заведением дефектов
+                # будет тихо ломаться, а в выводе будет «всё ок».
                 try:
                     _step_post_analysis(
                         page, step, action, result, act_type, sel, val,
@@ -1901,8 +1903,8 @@ def run_agent(start_url: str = None):
                         has_overlay, current_url, checklist_results,
                         console_log, network_failures, memory,
                     )
-                except Exception as e:
-                    LOG.debug("post-analysis: %s", e)
+                except Exception:
+                    LOG.exception("#%s post-analysis: исключение проглочено", step)
 
                 if SESSION_REPORT_EVERY_N > 0 and step % SESSION_REPORT_EVERY_N == 0:
                     report = memory.get_session_report_text()
@@ -3824,13 +3826,30 @@ def _flush_pending_analysis(page, memory, console_log, network_failures):
     memory._pending_analysis = None
 
     future = pending["future"]
-    findings = _bg_result(future, timeout=10.0, default={})
+    step = pending.get("step", "?")
+    # Сначала проверим, не упало ли исключение в фоне — иначе оно тихо потеряется.
+    try:
+        exc = future.exception(timeout=10.0)
+    except Exception as e:
+        LOG.warning("#%s pending analysis: future.exception() ошибка: %s", step, e)
+        exc = None
+    if exc is not None:
+        LOG.error("#%s pending analysis FAILED: %s", step, exc, exc_info=exc)
+        return
+    findings = _bg_result(future, timeout=2.0, default={})
     if not findings:
+        LOG.info("#%s pending analysis: пустой findings", step)
         return
 
-    step = pending["step"]
     current_url = pending["current_url"]
     checklist_results = pending["checklist_results"]
+    LOG.info(
+        "#%s findings: five_xx=%s bug=%s oracle_err=%s",
+        step,
+        bool(findings.get("five_xx_bug")),
+        bool(findings.get("bug_to_report")),
+        findings.get("oracle_error"),
+    )
 
     # 5xx дефект
     if findings.get("five_xx_bug") and memory.defects_on_current_step == 0:

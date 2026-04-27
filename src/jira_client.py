@@ -17,7 +17,7 @@ try:
 except Exception:
     pass
 
-from config import IGNORE_CONSOLE_PATTERNS, IGNORE_NETWORK_STATUSES, DEFECT_IGNORE_PATTERNS, JIRA_ISSUE_TYPE, JIRA_ASSIGNEE
+from config import DEFECT_IGNORE_PATTERNS, JIRA_ISSUE_TYPE, JIRA_ASSIGNEE
 
 LOG = logging.getLogger("Jira")
 
@@ -229,25 +229,40 @@ def search_duplicates(
 def is_ignorable_issue(summary: str, description: str) -> bool:
     """
     Решение: не создавать тикет, если это типичный флак/тестовая среда.
-    Игнорируем: 404 в консоли, ошибки консоли, сетевые ошибки к сторонним сервисам и т.д.
-    Ошибки 5xx после действий агента не считаем флаком — тикет всегда создаём.
+
+    ВАЖНО: применяется ТОЛЬКО `DEFECT_IGNORE_PATTERNS`. Список
+    `IGNORE_CONSOLE_PATTERNS` — это фильтр для записей console.log
+    (содержит "404", "localhost", "favicon" и т.п.). Применять его к описанию
+    дефекта нельзя: URL стенда часто содержит "localhost", а в любом
+    нормальном баге может встретиться "консоли" / "console" — и тогда
+    тикет молча отбрасывается. Эта ловушка раньше съедала все дефекты.
+
+    5xx ошибки сервера и Playwright-фейлы клика (intercept/timeout) проходят
+    мимо фильтра — это всегда баги.
     """
     text = (summary + " " + description).lower()
-    # Ошибки сервера (5xx) после действий агента — не флак, всегда заводим дефект
+    # Ошибки сервера (5xx) после действий агента — не флак, всегда заводим дефект.
     if any(
         x in text
         for x in (
-            "500", "502", "503", "5xx",
             "ошибка сервера", "server error", "internal server error",
-            "http 5xx", "http 500",
+            "http 5xx", "http 500", "http 502", "http 503",
+        )
+    ):
+        return False
+    # Фейлы клика и таймауты Playwright — реальные UI-баги, не флак.
+    if any(
+        x in text
+        for x in (
+            "intercepts pointer events",
+            "не становится кликабельным",
+            "перекрыта другим элементом",
         )
     ):
         return False
     for pattern in DEFECT_IGNORE_PATTERNS:
         if pattern.lower() in text:
-            return True
-    for pattern in IGNORE_CONSOLE_PATTERNS:
-        if pattern.lower() in text:
+            LOG.info("is_ignorable_issue: совпал паттерн '%s' — пропуск '%s'", pattern, summary[:80])
             return True
     return False
 
@@ -371,17 +386,27 @@ def create_jira_issue(
     project_key = project_key or os.getenv("JIRA_PROJECT_KEY", "")
 
     if not jira_url or not api_token or not project_key:
-        print("[Jira] Не заданы JIRA_URL, JIRA_API_TOKEN или JIRA_PROJECT_KEY — пропуск создания тикета.")
+        missing = []
+        if not jira_url:
+            missing.append("JIRA_URL")
+        if not api_token:
+            missing.append("JIRA_API_TOKEN")
+        if not project_key:
+            missing.append("JIRA_PROJECT_KEY")
+        msg = f"[Jira] Не заданы {', '.join(missing)} — пропуск создания тикета. summary={summary[:80]}"
+        print(msg)
+        LOG.warning(msg)
         return None
     # Bearer: только токен. Basic: нужен ещё логин (username/email)
     use_bearer = len(api_token) > 20
     if not use_bearer and not login:
-        print("[Jira] Для короткого токена нужен JIRA_USERNAME или JIRA_EMAIL — пропуск.")
+        msg = f"[Jira] Для короткого токена нужен JIRA_USERNAME или JIRA_EMAIL — пропуск. summary={summary[:80]}"
+        print(msg)
+        LOG.warning(msg)
         return None
 
     if is_ignorable_issue(summary, description):
         print(f"[Jira] Пропуск: похоже на флак/тестовую среду — {summary[:80]}")
-        LOG.info("Пропуск: похоже на флак/тестовую среду: %s", summary[:80])
         return None
 
     # Уровень 1: локальная дедупликация (в памяти сессии)

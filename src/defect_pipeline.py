@@ -71,10 +71,11 @@ def _create_defect_bg(
     severity: str = "major",
 ) -> None:
     """Фоновое создание дефекта (Jira API + GigaChat дедупликация)."""
+    LOG.info("_create_defect_bg: старт summary=%r severity=%s", summary[:140], severity)
     try:
         if is_semantic_duplicate(bug_description, memory):
             print(f"[Agent] Пропуск дефекта (семантический дубль GigaChat): {summary[:60]}")
-            LOG.info("Пропуск (семантический дубль): %s", summary[:60])
+            LOG.info("_create_defect_bg: отбито is_semantic_duplicate")
             register_local_defect(summary)
             return
 
@@ -86,16 +87,18 @@ def _create_defect_bg(
         )
         if key:
             print(f"[Agent] Дефект создан: {key} [{severity}]")
+            LOG.info("_create_defect_bg: успех key=%s", key)
             if memory:
                 try:
                     memory.record_defect_created(key, summary, severity)
                 except Exception:
-                    pass
+                    LOG.exception("record_defect_created failed")
         else:
             print(f"[Agent] Jira вернула None (тикет не создан): {summary[:60]}")
-    except Exception as e:
-        print(f"[Agent] Ошибка фонового создания дефекта: {e}")
-        LOG.error("Ошибка фонового создания дефекта: %s", e)
+            LOG.warning("_create_defect_bg: create_jira_issue=None — смотри логи Jira выше")
+    except Exception:
+        LOG.exception("_create_defect_bg: исключение при создании дефекта")
+        print(f"[Agent] Ошибка фонового создания дефекта (см. логи)")
     finally:
         if attachment_paths:
             try:
@@ -126,19 +129,27 @@ def create_defect(
       5. infer_defect_severity → уровень критичности.
       6. Отправка в Jira в фоне; Future сохраняем в memory.pending_defect_futures.
     """
+    LOG.info(
+        "create_defect: вход url=%s bug_head=%r",
+        current_url[:80] if current_url else "",
+        (bug_description or "")[:140],
+    )
+
     if not should_create_defect(
         bug_text=bug_description,
         console_log=console_log,
         network_failures=network_failures,
     ):
-        print(f"[Agent] Пропуск дефекта (шум): {bug_description[:80]}")
+        print(f"[Agent] Пропуск дефекта (шум, should_create_defect=False): {bug_description[:80]}")
+        LOG.info("create_defect: отбито should_create_defect")
         return
 
     summary = build_defect_summary(bug_description, current_url)
+    LOG.info("create_defect: summary=%r", summary[:140])
 
     if is_local_duplicate(summary, bug_description):
         print(f"[Agent] Пропуск дефекта (локальный дубль): {summary[:60]}")
-        LOG.info("Пропуск дефекта (локальный дубль): %s", summary[:60])
+        LOG.info("create_defect: отбито is_local_duplicate")
         return
 
     attachment_paths = collect_evidence(page, console_log, network_failures)
@@ -181,12 +192,16 @@ def create_defect(
         network_failures=network_failures,
     )
 
-    print(f"[Agent] Отправка дефекта в Jira (фон): {summary[:60]}")
+    print(f"[Agent] Отправка дефекта в Jira (фон): {summary[:60]} [{severity}]")
+    LOG.info("create_defect: ставим в фон отправку в Jira (severity=%s)", severity)
     fut = bg_submit(
         _create_defect_bg,
         summary, description, bug_description, attachment_paths, memory, severity,
     )
-    if fut is not None and memory is not None:
+    if fut is None:
+        LOG.error("create_defect: bg_submit вернул None — фоновый пул недоступен, дефект ПОТЕРЯН")
+        return
+    if memory is not None:
         try:
             memory.pending_defect_futures.append(fut)
         except AttributeError:
