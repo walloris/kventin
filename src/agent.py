@@ -1135,6 +1135,89 @@ def _handle_new_tabs(
         pass
 
 
+def _is_too_many_redirects_error(exc: Exception) -> bool:
+    s = str(exc).lower()
+    return "err_too_many_redirects" in s or "too many redirects" in s
+
+
+def _build_start_url_candidates(primary: str) -> List[str]:
+    """
+    URL для поочерёдного page.goto, если петля редиректов.
+    Порядок: исходный, без хвостового /, корень хоста, на один сегмент path вверх,
+    затем START_URL_FALLBACKS из .env.
+    """
+    from urllib.parse import urlparse, urlunparse
+
+    from config import START_URL_FALLBACKS
+
+    out: List[str] = []
+    seen = set()
+
+    def add(u: str) -> None:
+        u = (u or "").strip()
+        if not u or u in seen:
+            return
+        seen.add(u)
+        out.append(u)
+
+    add(primary)
+    stripped = primary.rstrip("/")
+    if stripped and stripped != primary:
+        add(stripped)
+    p = urlparse(primary)
+    if p.scheme and p.netloc:
+        add(urlunparse((p.scheme, p.netloc, "/", "", "", "")))
+        path = (p.path or "").rstrip("/")
+        if path and path not in ("/", ""):
+            segs = [x for x in path.split("/") if x]
+            if len(segs) > 1:
+                parent = "/" + "/".join(segs[:-1])
+            elif len(segs) == 1:
+                parent = "/"
+            else:
+                parent = ""
+            if parent is not None:
+                add(urlunparse((p.scheme, p.netloc, parent or "/", "", "", "")))
+    for f in START_URL_FALLBACKS:
+        add(f)
+    return out
+
+
+def _print_redirect_loop_hints() -> None:
+    print(
+        "[Agent] Подсказка по петле редиректов (ERR_TOO_MANY_REDIRECTS):\n"
+        "  — Часто на корп. порталах: нет сессии → SSO крутит A→B→A, или /platform/ "
+        "не для «холодного» браузера.\n"
+        "  — Попробуй: залогиниться вручную в Chrome с BROWSER_USER_DATA_DIR, "
+        "или AUTH_URL + креды, или SESSION_STATE_RESTORE_PATH с валидными cookies,\n"
+        "  или задай другой START_URL / START_URL_FALLBACKS= (корень сайта, /login, и т.д.)."
+    )
+
+
+def _goto_start_page_with_redirect_fallbacks(page: Page, start_url: str) -> str:
+    """
+    Первый удачный page.goto. При только ERR_TOO_MANY_REDIRECTS перебирает кандидатов.
+    Возвращает URL, на котором сработал goto (строка кандидата, не page.url).
+    """
+    candidates = _build_start_url_candidates(start_url)
+    last_exc: Optional[Exception] = None
+    for u in candidates:
+        try:
+            page.goto(u, wait_until="domcontentloaded", timeout=30000)
+            if u != start_url:
+                print(f"[Agent] Старт с альтернативного URL (из-за редиректов): {u}")
+            return u
+        except Exception as e:
+            last_exc = e
+            if not _is_too_many_redirects_error(e):
+                raise
+            LOG.info("goto %r: петля редиректов, следующий вариант…", u[:120])
+    if last_exc:
+        _print_redirect_loop_hints()
+        raise last_exc
+    raise RuntimeError("no candidates for start URL")
+
+
 # --- Основной цикл ---
 def run_agent(start_url: str = None):
     """
@@ -1380,9 +1463,11 @@ def run_agent(start_url: str = None):
             _do_auth_login(page, AUTH_URL, AUTH_USERNAME, AUTH_PASSWORD, AUTH_SUBMIT_SELECTOR)
             time.sleep(1)
 
-        # Загрузка начальной страницы
+        # Загрузка начальной страницы (при петле редиректов — альтернативные URL)
         try:
-            page.goto(start_url, wait_until="domcontentloaded", timeout=30000)
+            effective_start = _goto_start_page_with_redirect_fallbacks(page, start_url)
+            if effective_start != start_url:
+                start_url = effective_start
             smart_wait_after_goto(page, timeout=15000)
             _inject_all(page)
         except Exception as e:
