@@ -203,6 +203,11 @@ NETWORK_LOG_LIMIT = int(os.getenv("NETWORK_LOG_LIMIT", "80"))
 POST_ACTION_DELAY = float(os.getenv("POST_ACTION_DELAY", "1.5"))
 PHASE_STEPS_TO_ADVANCE = int(os.getenv("PHASE_STEPS_TO_ADVANCE", "5"))
 
+# Бюджет на URL: сколько шагов может «сгореть» без новых протестированных
+# элементов на одном паттерне URL, прежде чем агент принудительно вернётся
+# на стартовую страницу (см. AgentMemory.should_force_back_to_start).
+URL_BUDGET_NO_PROGRESS = int(os.getenv("URL_BUDGET_NO_PROGRESS", "25"))
+
 # --- Продвинутые проверки ---
 A11Y_CHECK_EVERY_N = int(os.getenv("A11Y_CHECK_EVERY_N", "10"))
 PERF_CHECK_EVERY_N = int(os.getenv("PERF_CHECK_EVERY_N", "15"))
