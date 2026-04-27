@@ -190,6 +190,13 @@ from src.defect_builder import (
     collect_evidence,
     infer_defect_severity,
 )
+from src.locators import url_pattern as _url_pattern, detect_repeating_pattern
+
+
+# Бюджет на URL: сколько шагов может «сгореть» без новых протестированных
+# элементов на одном паттерне URL, прежде чем мы принудительно вернёмся
+# на стартовую страницу.
+URL_BUDGET_NO_PROGRESS = 25
 
 
 # --- Нормализация ключа для дедупликации ---
@@ -198,6 +205,61 @@ def _norm_key(s: str, max_len: int = 80) -> str:
     if not s:
         return ""
     return s.strip().lower().replace("\n", " ").replace("\r", " ")[:max_len]
+
+
+def resolve_stable_key(page, selector: str) -> str:
+    """
+    Получить стабильный логический ключ элемента по его selector (обычно ref:N).
+
+    Стратегия:
+    1. Если selector — ref:N или просто число, тащим из window.__agentRefMeta.
+    2. Иначе возвращаем сам selector в нормализованном виде (как fallback).
+    """
+    if not selector:
+        return ""
+    sel = selector.strip()
+    ref_num: Optional[int] = None
+    if sel.startswith("ref:"):
+        try:
+            ref_num = int(sel[4:])
+        except ValueError:
+            ref_num = None
+    elif sel.isdigit():
+        ref_num = int(sel)
+    if ref_num is not None and page is not None:
+        try:
+            key = page.evaluate(
+                "(ref) => (window.__agentRefMeta && window.__agentRefMeta[ref]) || ''",
+                ref_num,
+            )
+            if key:
+                return str(key)
+        except Exception:
+            pass
+    return _norm_key(sel)
+
+
+def enrich_action(page, memory: "AgentMemory", action: Dict[str, Any]) -> Dict[str, Any]:
+    """Дописать в action служебные поля _stable_key и _url_pattern.
+
+    Вызывать ПЕРЕД любой проверкой повтора и перед add_action.
+    """
+    if not isinstance(action, dict):
+        return action
+    if not action.get("_stable_key"):
+        sel = (action.get("selector") or "").strip()
+        if sel:
+            try:
+                action["_stable_key"] = resolve_stable_key(page, sel)
+            except Exception:
+                action["_stable_key"] = ""
+    if not action.get("_url_pattern"):
+        try:
+            url = page.url if page and not page.is_closed() else ""
+        except Exception:
+            url = ""
+        action["_url_pattern"] = _url_pattern(url) if url else (memory.current_url_pattern if memory else "")
+    return action
 
 
 # --- Память агента ---
@@ -301,6 +363,17 @@ class AgentMemory:
         # Метрики браузера (последний сбор: timing, document, memory)
         self._browser_metrics_latest: Dict[str, Any] = {}
         self._browser_metrics_history: List[Dict[str, Any]] = []
+        # --- Память по стабильным ключам (этап 2) ---
+        # done_by_url[url_pattern][action_type] = set(stable_keys)
+        self.done_by_url: Dict[str, Dict[str, set]] = {}
+        # Сколько шагов уже сделано на каждом url_pattern без прогресса
+        # (= без новых протестированных элементов и без новых дефектов).
+        self.steps_on_url_no_progress: Dict[str, int] = {}
+        # Текущий url_pattern (обновляется в _step_choose_action_validate)
+        self.current_url_pattern: str = ""
+        # Множество всех stable_keys, по которым агент уже что-то делал на этом
+        # url_pattern (для оценки «прогресса» — появление нового ключа = прогресс).
+        self.touched_keys_on_url: Dict[str, set] = {}
 
     def set_start_url_for_nav(self, url: str) -> None:
         """Задать стартовый URL для подсчёта глубины навигации."""
@@ -371,8 +444,12 @@ class AgentMemory:
         act = (action.get("action") or "").lower()
         sel = _norm_key(action.get("selector", ""))
         val = _norm_key(action.get("value", ""))
-        # Записать ключ для детекции паттернов
-        self.record_action_key(act, sel)
+        stable_key = (action.get("_stable_key") or "").strip()
+        url_pat = (action.get("_url_pattern") or self.current_url_pattern or "").strip()
+        # Ключ для детекции зацикливания: предпочитаем stable_key + action,
+        # иначе fallback на selector + action.
+        loop_key = stable_key or sel
+        self.record_action_key(act, loop_key)
 
         self.iteration += 1
         step_ctx = action.get("_step_context") or {}
@@ -381,6 +458,8 @@ class AgentMemory:
             "time": datetime.now().strftime("%H:%M:%S"),
             "action": act,
             "selector": action.get("selector", ""),
+            "stable_key": stable_key,
+            "url_pattern": url_pat,
             "value": action.get("value", ""),
             "reason": action.get("reason", ""),
             "test_goal": action.get("test_goal", ""),
@@ -393,7 +472,23 @@ class AgentMemory:
         if len(self.actions) > self.max_actions:
             self.actions = self.actions[-self.max_actions:]
 
-        # Запоминаем для дедупликации (только hashable; dict/obj -> str)
+        # ---- Дедупликация по url_pattern + stable_key (новый механизм) ----
+        if url_pat and stable_key and act in (
+            "click", "hover", "type", "select_option", "fill_form", "upload_file",
+        ):
+            self.done_by_url.setdefault(url_pat, {}).setdefault(act, set()).add(stable_key)
+            touched = self.touched_keys_on_url.setdefault(url_pat, set())
+            is_new_key = stable_key not in touched
+            touched.add(stable_key)
+            # Прогресс = появилась новая «коснутая» точка на странице
+            if is_new_key:
+                self.steps_on_url_no_progress[url_pat] = 0
+            else:
+                self.steps_on_url_no_progress[url_pat] = (
+                    self.steps_on_url_no_progress.get(url_pat, 0) + 1
+                )
+
+        # ---- Старый механизм (fallback на случай отсутствия stable_key) ----
         def _safe_key(x):
             return x if isinstance(x, str) else str(x) if x is not None else ""
         if act == "click" and sel:
@@ -417,11 +512,31 @@ class AgentMemory:
         if len(self.last_actions_sequence) > 10:
             self.last_actions_sequence = self.last_actions_sequence[-10:]
 
-    def is_already_done(self, action: str, selector: str = "", value: str = "") -> bool:
-        """Проверить, не делали ли мы уже это действие (чтобы не повторять)."""
+    def is_already_done(
+        self,
+        action: str,
+        selector: str = "",
+        value: str = "",
+        stable_key: str = "",
+        url_pattern: str = "",
+    ) -> bool:
+        """Проверить, не делали ли мы уже это действие (чтобы не повторять).
+
+        Приоритет: (url_pattern, action, stable_key). Если их нет — fallback
+        на старые глобальные множества (по selector).
+        """
         act = (action or "").lower()
         sel = _norm_key(selector)
         val = _norm_key(value)
+
+        # Главный механизм: stable_key в рамках URL-паттерна.
+        if stable_key:
+            url_pat = (url_pattern or self.current_url_pattern or "").strip()
+            if url_pat:
+                bucket = self.done_by_url.get(url_pat, {}).get(act)
+                if bucket and stable_key in bucket:
+                    return True
+
         if act == "click" and sel and sel in self.done_click:
             return True
         if act == "hover" and sel and sel in self.done_hover:
@@ -436,9 +551,37 @@ class AgentMemory:
             if sel and (sel,) in self.done_select_option:
                 return True
         if act == "close_modal" and self.done_close_modal > 0:
-            # Не считаем повторным, если модалка появилась снова — но можно ограничить подряд
             pass
         return False
+
+    def is_already_done_action(self, action: Dict[str, Any]) -> bool:
+        """Удобная обёртка: проверяет повтор по обогащённому action_dict."""
+        if not isinstance(action, dict):
+            return False
+        return self.is_already_done(
+            (action.get("action") or "").lower(),
+            (action.get("selector") or "").strip(),
+            (action.get("value") or "").strip(),
+            stable_key=(action.get("_stable_key") or "").strip(),
+            url_pattern=(action.get("_url_pattern") or "").strip(),
+        )
+
+    def set_current_url_pattern(self, url: str) -> None:
+        """Запомнить url_pattern текущей страницы (для дедупликации/бюджета)."""
+        self.current_url_pattern = _url_pattern(url) if url else ""
+
+    def should_force_back_to_start(self) -> bool:
+        """Бюджет на URL исчерпан — пора возвращаться на старт?"""
+        url_pat = self.current_url_pattern
+        if not url_pat:
+            return False
+        return self.steps_on_url_no_progress.get(url_pat, 0) >= URL_BUDGET_NO_PROGRESS
+
+    def reset_url_budget(self, url_pattern: str = "") -> None:
+        """Сбросить бюджет «без прогресса» для url_pattern (после успешного перехода/дефекта)."""
+        url_pat = url_pattern or self.current_url_pattern
+        if url_pat:
+            self.steps_on_url_no_progress[url_pat] = 0
 
     def should_avoid_scroll(self) -> bool:
         """Не прокручивать бесконечно: если недавно много scroll — предложить другое действие."""
@@ -499,13 +642,16 @@ class AgentMemory:
         """Записать ключ действия для детекции паттернов."""
         key = f"{action}:{_norm_key(selector)}"
         self._recent_action_keys.append(key)
-        if len(self._recent_action_keys) > 5:
+        if len(self._recent_action_keys) > 12:
             self._recent_action_keys.pop(0)
-        # Детекция паттерна: последние 3 действия одинаковые
-        if len(self._recent_action_keys) >= 3:
-            last3 = self._recent_action_keys[-3:]
-            if len(set(last3)) == 1:
-                self._consecutive_repeats += 1
+        # 1) Старая эвристика: 3 одинаковых ключа подряд.
+        if len(self._recent_action_keys) >= 3 and len(set(self._recent_action_keys[-3:])) == 1:
+            self._consecutive_repeats += 1
+            return
+        # 2) Новый детектор: цикл периода 2..4 (A,B,A,B / A,B,C,A,B,C / ...).
+        period = detect_repeating_pattern(self._recent_action_keys, max_period=4)
+        if period >= 2:
+            self._consecutive_repeats += 1
     
     def record_page_element(self, url: str, element_key: str):
         """Записать элемент как протестированный на странице."""
@@ -2243,7 +2389,10 @@ def run_agent(start_url: str = None):
                 # НАВИГАЦИЯ ВКЛЮЧЕНА — агент активно переходит по страницам приложения
                 # Новые вкладки — обрабатываем
                 _handle_new_tabs(new_tabs_queue, page, start_url, step, console_log, network_failures, memory)
-                
+
+                # Обновить URL-паттерн (для дедупликации и бюджета)
+                memory.set_current_url_pattern(page.url if not page.is_closed() else current_url)
+
                 # Если ушли на другой домен — возвращаемся на start_url
                 if not _same_page(start_url, page.url):
                     print(f"[Agent] #{step} Навигация на {page.url[:60]}. Возврат на {start_url[:60]}")
@@ -2251,10 +2400,28 @@ def run_agent(start_url: str = None):
                         page.goto(start_url, wait_until="domcontentloaded", timeout=20000)
                         smart_wait_after_goto(page, timeout=5000)
                         _inject_all(page)
+                        memory.set_current_url_pattern(start_url)
                     except Exception as e:
                         LOG.warning("Ошибка возврата: %s", e)
                     if SESSION_REPORT_SAVE_EVERY_N > 0:
                         _save_report_now(step, "навигация-возврат")
+                    continue
+
+                # Бюджет: если на текущем url_pattern много шагов без новых
+                # элементов и без дефектов — принудительно вернуться на старт.
+                if memory.should_force_back_to_start() and not page.is_closed():
+                    pat = memory.current_url_pattern
+                    print(f"[Agent] #{step} Бюджет исчерпан (≥{URL_BUDGET_NO_PROGRESS} шагов без прогресса) на {pat[:80]}. Возврат на {start_url[:60]}.")
+                    try:
+                        page.goto(start_url, wait_until="domcontentloaded", timeout=20000)
+                        smart_wait_after_goto(page, timeout=5000)
+                        _inject_all(page)
+                        memory.reset_url_budget(pat)
+                        memory.set_current_url_pattern(start_url)
+                    except Exception as e:
+                        LOG.warning("Бюджет: возврат на start_url: %s", e)
+                    if SESSION_REPORT_SAVE_EVERY_N > 0:
+                        _save_report_now(step, "бюджет URL — возврат")
                     continue
 
                 try:
@@ -2318,6 +2485,9 @@ def run_agent(start_url: str = None):
                     action = _get_fast_action(page, memory, has_overlay)
                     screenshot_b64 = None
                     source = "Fast"
+
+                # Обогащаем action stable_key + url_pattern для надёжной памяти
+                enrich_action(page, memory, action)
 
                 # Circuit breaker: не вызывать GigaChat пока открыт контур
                 if _gigachat_future is None and not page.is_closed():
@@ -3620,16 +3790,39 @@ def _get_fast_action(
             return result;
         }""") or []
 
-        # Фильтруем: убираем уже протестированные элементы
+        # Резолвим stable_key для всех refs одним evaluate (для устойчивой дедупликации).
+        # Возвращает {ref_str_without_prefix: stable_key}
+        try:
+            ref_keys = page.evaluate(
+                "() => { const out = {}; const m = window.__agentRefMeta || {}; for (const k of Object.keys(m)) out[k] = m[k] || ''; return out; }"
+            ) or {}
+        except Exception:
+            ref_keys = {}
+        url_pat = memory.current_url_pattern or _url_pattern(current_url)
+
+        def _stable_key_for(elem_ref: str) -> str:
+            r = elem_ref or ""
+            if r.startswith("ref:"):
+                r = r[4:]
+            return str(ref_keys.get(r, "") or "")
+
+        def _is_already_done_in_memory(act_type: str, stable_key: str) -> bool:
+            if not (url_pat and stable_key):
+                return False
+            return stable_key in memory.done_by_url.get(url_pat, {}).get(act_type, set())
+
+        # Фильтруем: убираем уже протестированные элементы (по stable_key + url_pattern)
         for elem in elements:
             ref = elem.get("ref", "")
             etype = elem.get("type", "")
             if etype == "file":
                 continue  # file уже обработан выше (TEST_UPLOAD_FILE_PATH) или пропускаем
             act = "click" if etype in ("click", "link", "tab") else ("type" if etype == "input" else "select_option")
-            key = f"{act}:{ref}"
-            if not memory.is_element_tested(current_url, key):
-                text = elem.get("text", "?")[:30]
+            stable_key = _stable_key_for(ref)
+            if _is_already_done_in_memory(act, stable_key):
+                continue
+            text = elem.get("text", "?")[:30]
+            if True:
                 if etype == "input":
                     from src.form_strategies import detect_field_type, get_test_value
                     ftype = detect_field_type(placeholder=text, name=text)
@@ -3639,6 +3832,8 @@ def _get_fast_action(
                         "reason": f"Ввод в '{text}'",
                         "test_goal": f"Заполнить поле {text}",
                         "expected_outcome": "Поле принимает значение",
+                        "_stable_key": stable_key,
+                        "_url_pattern": url_pat,
                     }
                 elif etype == "select":
                     return {
@@ -3646,6 +3841,8 @@ def _get_fast_action(
                         "reason": "Выбор опции",
                         "test_goal": "Выбрать опцию в дропдауне",
                         "expected_outcome": "Опция выбирается",
+                        "_stable_key": stable_key,
+                        "_url_pattern": url_pat,
                     }
                 else:
                     return {
@@ -3653,6 +3850,8 @@ def _get_fast_action(
                         "reason": f"Клик: {text}",
                         "test_goal": f"Проверить '{text}'",
                         "expected_outcome": "Элемент реагирует",
+                        "_stable_key": stable_key,
+                        "_url_pattern": url_pat,
                     }
 
         # Не уходить в бесконечный скролл: если уже много скроллов подряд — тыкать первый элемент (даже повторно)
@@ -3816,15 +4015,17 @@ def _step_get_action(page, step, memory, console_log, network_failures, checklis
     # Проверить, есть ли действия из scenario chain в очереди
     if hasattr(memory, '_scenario_queue') and memory._scenario_queue:
         action = memory._scenario_queue[0]  # Не pop пока не проверим
+        enrich_action(page, memory, action)
         act_check = (action.get("action") or "").lower()
         sel_check = (action.get("selector") or "").strip()
         # Если это повтор — очистить очередь и запросить новое действие
-        if act_check != "check_defect" and memory.is_already_done(act_check, sel_check, ""):
+        if act_check != "check_defect" and memory.is_already_done_action(action):
             print(f"[Agent] #{step} ⚠️ Scenario chain содержит повтор: {act_check} -> {sel_check[:40]}. Очищаю очередь.")
             memory._scenario_queue = []
             # Продолжить к обычному запросу к GigaChat
         else:
             action = memory._scenario_queue.pop(0)
+            enrich_action(page, memory, action)
             print(f"[Agent] #{step} Scenario chain (из очереди): {action.get('action')} -> {action.get('selector', '')[:40]}")
             return action, has_overlay, screenshot_b64
 
@@ -3854,13 +4055,13 @@ def _step_get_action(page, step, memory, console_log, network_failures, checklis
         action = _get_fast_action(page, memory, has_overlay)
     # Валидация и нормализация
     action = validate_llm_action(action)
-    
+    enrich_action(page, memory, action)
+
     # ПРЕДВАРИТЕЛЬНАЯ проверка повтора ПЕРЕД выполнением
     act_precheck = (action.get("action") or "").lower()
     sel_precheck = (action.get("selector") or "").strip()
-    val_precheck = (action.get("value") or "").strip()
-    if act_precheck != "check_defect" and memory.is_already_done(act_precheck, sel_precheck, val_precheck):
-        print(f"[Agent] #{step} ⚠️ GigaChat предложил повтор: {act_precheck} -> {sel_precheck[:40]}. Игнорирую и выбираю альтернативу.")
+    if act_precheck != "check_defect" and memory.is_already_done_action(action):
+        print(f"[Agent] #{step} ⚠️ GigaChat предложил повтор: {act_precheck} -> {sel_precheck[:40]} (key={action.get('_stable_key', '')[:40]}). Игнорирую и выбираю альтернативу.")
         memory.record_repeat()
         # Выбрать альтернативное действие
         if has_overlay:
@@ -3869,6 +4070,7 @@ def _step_get_action(page, step, memory, console_log, network_failures, checklis
             action = {"action": "scroll", "selector": "down", "reason": "GigaChat предложил повтор — прокрутка"}
         else:
             action = {"action": "hover", "selector": "body", "reason": "GigaChat предложил повтор — hover для поиска"}
+        enrich_action(page, memory, action)
     # layout_issue → possible_bug
     if action.get("layout_issue") and not action.get("possible_bug"):
         action["possible_bug"] = action.get("layout_issue")
@@ -3878,7 +4080,7 @@ def _step_get_action(page, step, memory, console_log, network_failures, checklis
     val = (action.get("value") or "").strip()
 
     # Дедупликация действий: строгая проверка
-    is_repeat = act_type != "check_defect" and memory.is_already_done(act_type, sel, val)
+    is_repeat = act_type != "check_defect" and memory.is_already_done_action(action)
     if is_repeat:
         memory.record_repeat()
         print(f"[Agent] #{step} ⚠️ ПОВТОР: {act_type} -> {sel[:40]} (повторов подряд: {memory._consecutive_repeats})")
@@ -4619,13 +4821,13 @@ def _self_heal(page: Page, memory: AgentMemory, console_log, network_failures):
         action = parse_llm_action(answer)
         if action:
             action = validate_llm_action(action)
-            # Проверить, что это не повтор
+            enrich_action(page, memory, action)
             act = (action.get("action") or "").lower()
             sel = (action.get("selector") or "").strip()
-            if act != "check_defect" and memory.is_already_done(act, sel, ""):
+            if act != "check_defect" and memory.is_already_done_action(action):
                 print(f"[Agent] Self-heal предложил повтор: {act} -> {sel[:40]}. Игнорирую.")
-                # Принудительно прокрутка
                 action = {"action": "scroll", "selector": "up", "reason": "Self-heal: прокрутка для поиска новых элементов"}
+                enrich_action(page, memory, action)
             execute_action(page, action, memory)
             memory.add_action(action, result="self_heal")
     

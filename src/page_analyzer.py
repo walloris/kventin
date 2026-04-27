@@ -198,6 +198,7 @@ def detect_form_fields(page: Page) -> List[Dict[str, Any]]:
             const result = [];
             const seen = new WeakSet();
             if (!window.__agentRefs) window.__agentRefs = {};
+            if (!window.__agentRefMeta) window.__agentRefMeta = {};
             // Находим текущий максимальный ref
             let maxRef = 0;
             for (const k of Object.keys(window.__agentRefs)) {
@@ -214,6 +215,24 @@ def detect_form_fields(page: Page) -> List[Dict[str, Any]]:
                 return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
             };
 
+            const norm = (s) => (s || '').toString().replace(/\\s+/g, ' ').trim().toLowerCase().slice(0, 60);
+            const stableKey = (el) => {
+                if (!el || !el.tagName) return '';
+                const tag = el.tagName.toLowerCase();
+                const tid = (el.getAttribute && (el.getAttribute('data-testid')
+                    || el.getAttribute('data-test-id')
+                    || el.getAttribute('data-test')
+                    || el.getAttribute('data-qa'))) || '';
+                if (tid) return 'tid:' + tid;
+                if (el.id) return 'id:' + el.id;
+                if (el.name) return 'name:' + tag + ':' + el.name;
+                const aria = (el.getAttribute && el.getAttribute('aria-label')) || '';
+                if (aria) return 'aria:' + tag + ':' + norm(aria);
+                const ph = el.placeholder || '';
+                if (ph) return 'ph:' + tag + ':' + norm(ph);
+                return 'css:' + tag;
+            };
+
             const processInput = (inp) => {
                 if (!inp || !vis(inp) || inp.disabled || seen.has(inp)) return;
                 seen.add(inp);
@@ -224,6 +243,7 @@ def detect_form_fields(page: Page) -> List[Dict[str, Any]]:
                     inp.setAttribute('data-agent-ref', ref);
                     window.__agentRefs[parseInt(ref)] = inp;
                 }
+                try { window.__agentRefMeta[parseInt(ref)] = stableKey(inp); } catch (e) {}
                 const field = {
                     type: inp.type || inp.tagName.toLowerCase(),
                     name: inp.name || '',
@@ -290,7 +310,37 @@ def get_dom_summary(page: Page, max_length: int = 8000, include_shadow_dom: bool
                     document.querySelectorAll('[data-agent-ref]').forEach(el => el.removeAttribute('data-agent-ref'));
                 }
                 window.__agentRefs = {};
+                window.__agentRefMeta = {}; // ref -> stable_key
                 let refCounter = 1;
+
+                // --- Стабильный ключ элемента (одинаковый между перерисовками DOM) ---
+                // Должен совпадать со stable_key_from_attrs в src/locators.py.
+                const norm = (s) => (s || '').toString().replace(/\\s+/g, ' ').trim().toLowerCase().slice(0, 60);
+                const stableKey = (el) => {
+                    if (!el || !el.tagName) return '';
+                    const tag = el.tagName.toLowerCase();
+                    const tid = (el.getAttribute && (el.getAttribute('data-testid')
+                        || el.getAttribute('data-test-id')
+                        || el.getAttribute('data-test')
+                        || el.getAttribute('data-qa'))) || '';
+                    if (tid) return 'tid:' + tid;
+                    if (el.id) return 'id:' + el.id;
+                    const name = el.name || '';
+                    if (name) return 'name:' + tag + ':' + name;
+                    const aria = (el.getAttribute && el.getAttribute('aria-label')) || '';
+                    if (aria) return 'aria:' + tag + ':' + norm(aria);
+                    const role = (el.getAttribute && el.getAttribute('role')) || '';
+                    const text = norm(el.innerText || el.textContent || el.value || el.placeholder || '');
+                    if (role && text) return 'role:' + role + ':' + text;
+                    if (text) return 'text:' + tag + ':' + text;
+                    const ph = el.placeholder || '';
+                    if (ph) return 'ph:' + tag + ':' + norm(ph);
+                    let cls = '';
+                    if (typeof el.className === 'string') {
+                        cls = el.className.trim().split(/\\s+/).filter(Boolean).slice(0, 2).join('.');
+                    }
+                    return cls ? ('css:' + tag + '.' + cls) : ('css:' + tag);
+                };
 
                 const result = [];
 
@@ -346,6 +396,7 @@ def get_dom_summary(page: Page, max_length: int = 8000, include_shadow_dom: bool
                     const ref = refCounter++;
                     el.setAttribute('data-agent-ref', String(ref));
                     window.__agentRefs[ref] = el;
+                    try { window.__agentRefMeta[ref] = stableKey(el); } catch (e) { window.__agentRefMeta[ref] = ''; }
                     return ref;
                 };
 
