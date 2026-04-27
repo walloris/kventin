@@ -3570,7 +3570,7 @@ def _analyze_in_background(
     new_console = console_log_snapshot[console_before_len:] if console_before_len <= len(console_log_snapshot) else console_log_snapshot[-10:]
     new_network = network_snapshot[network_before_len:] if network_before_len <= len(network_snapshot) else network_snapshot[-5:]
     # Применяем шумовой фильтр (favicon, аналитика, расширения, ResizeObserver…)
-    from src.defect_rules import is_noise_url, is_noise_console_text
+    from src.defect_rules import is_noise_url, is_noise_console_text, rule_pageerror, rule_4xx_on_main
     new_errors = [
         c for c in new_console
         if (c.get("type") or "").lower() in ("error", "pageerror")
@@ -3678,6 +3678,37 @@ Visual diff: {visual_diff_info.get('change_percent', 0):.1f}% изменений
                 if console_brief:
                     bug_text = f"{bug_text}\n\nНовые ошибки консоли после действия:\n{console_brief}"
                 findings["bug_to_report"] = bug_text
+        else:
+            LOG.warning(
+                "#%s оракул не ответил (LLM пуст) — fallback на правила без LLM",
+                step,
+            )
+
+    # Фолбэк: даже если LLM ничего не вернул — pageerror и 4xx на основном/API
+    # это надёжный сигнал, заводим дефект независимо.
+    if not findings["bug_to_report"] and not findings["five_xx_bug"]:
+        rule_bug = rule_pageerror(new_errors)
+        if rule_bug:
+            findings["bug_to_report"] = (
+                f"{rule_bug['title']}\n\n{rule_bug['details']}"
+                + (f"\n\nНовые ошибки консоли после действия:\n{console_brief}" if console_brief else "")
+            )
+            LOG.info("#%s правило rule_pageerror → дефект", step)
+        else:
+            rule_bug4 = rule_4xx_on_main(new_network, current_url)
+            if rule_bug4:
+                findings["bug_to_report"] = (
+                    f"{rule_bug4['title']}\n\n{rule_bug4['details']}"
+                    + (f"\n\nНовые ошибки консоли после действия:\n{console_brief}" if console_brief else "")
+                )
+                LOG.info("#%s правило rule_4xx_on_main → дефект", step)
+
+    if not findings["bug_to_report"] and not findings["five_xx_bug"]:
+        LOG.debug(
+            "#%s дефекта нет: new_errors=%d, new_network=%d, oracle_error=%s, possible_bug=%s",
+            step, len(new_errors), len(new_network),
+            findings["oracle_error"], bool(possible_bug),
+        )
 
     return findings
 
@@ -3854,6 +3885,17 @@ def _step_post_analysis_LEGACY(
                     return
                 _create_defect(page, pbug, current_url, checklist_results, console_log, network_failures, memory)
                 memory.defects_on_current_step += 1
+                return
+        else:
+            LOG.warning("#%s оракул не ответил (LLM пуст) — fallback на правила", step)
+
+        from src.defect_rules import rule_pageerror as _rule_pe
+        rb = _rule_pe(new_errors)
+        if rb and memory.defects_on_current_step == 0:
+            pbug = f"{rb['title']}\n\n{rb['details']}"
+            print(f"[Agent] #{step} Дефект по правилу rule_pageerror (LLM не ответил)")
+            _create_defect(page, pbug, current_url, checklist_results, console_log, network_failures, memory)
+            memory.defects_on_current_step += 1
 
 
 # Создание дефекта вынесено в src/defect_pipeline.py (вместе с фоновой
