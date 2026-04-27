@@ -57,6 +57,13 @@ JIRA_PROJECT_KEY = os.getenv("JIRA_PROJECT_KEY", "")
 JIRA_ISSUE_TYPE = os.getenv("JIRA_ISSUE_TYPE", "Task")
 # Assignee (назначить дефект на пользователя): username для Server, accountId для Cloud, или пусто = текущий пользователь
 JIRA_ASSIGNEE = os.getenv("JIRA_ASSIGNEE", "").strip()
+# Имена приоритетов в Jira: должны в точности совпадать с схемой проекта
+# (Jira / Project settings / Priorities). На Jira Server/Data Center часто
+# НЕТ "Highest" / "High" / "Medium" от Cloud — тогда Jira отвечает 400.
+# Пусто = не передавать priority (используется приоритет по умолчанию в проекте).
+JIRA_PRIORITY_CRITICAL = os.getenv("JIRA_PRIORITY_CRITICAL", "").strip()
+JIRA_PRIORITY_MAJOR = os.getenv("JIRA_PRIORITY_MAJOR", "").strip()
+JIRA_PRIORITY_MINOR = os.getenv("JIRA_PRIORITY_MINOR", "").strip()
 
 # Видимость действий
 BROWSER_SLOW_MO = int(os.getenv("BROWSER_SLOW_MO", "300"))

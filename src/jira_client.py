@@ -4,6 +4,7 @@
 Поддержка вложений (скриншоты, логи). Bearer или Basic, X-Atlassian-Token, verify=False.
 Многоуровневая дедупликация: локальная (память сессии) → Jira (JQL) → GigaChat (семантика).
 """
+import copy
 import os
 import re
 import logging
@@ -17,7 +18,14 @@ try:
 except Exception:
     pass
 
-from config import DEFECT_IGNORE_PATTERNS, JIRA_ISSUE_TYPE, JIRA_ASSIGNEE
+from config import (
+    DEFECT_IGNORE_PATTERNS,
+    JIRA_ASSIGNEE,
+    JIRA_ISSUE_TYPE,
+    JIRA_PRIORITY_CRITICAL,
+    JIRA_PRIORITY_MAJOR,
+    JIRA_PRIORITY_MINOR,
+)
 
 LOG = logging.getLogger("Jira")
 
@@ -354,12 +362,21 @@ def _attach_files(
             print(f"[Jira] Ошибка вложения {path}: {e}")
 
 
-# Маппинг severity (Kventin) -> priority name в Jira (стандартные имена)
-SEVERITY_TO_JIRA_PRIORITY = {
-    "critical": "Highest",
-    "major": "High",
-    "minor": "Medium",
-}
+def _jira_priority_name_for_severity(severity: Optional[str]) -> Optional[str]:
+    """
+    Вернуть имя приоритета из config или None, если priority не задан/не маппится.
+    None — поле priority в payload не кладём (переносимо между Jira-инсталляциями).
+    """
+    s = (severity or "").lower().strip()
+    if s not in ("critical", "major", "minor"):
+        return None
+    m = {
+        "critical": JIRA_PRIORITY_CRITICAL,
+        "major": JIRA_PRIORITY_MAJOR,
+        "minor": JIRA_PRIORITY_MINOR,
+    }
+    name = (m.get(s) or "").strip()
+    return name or None
 
 
 def create_jira_issue(
@@ -378,7 +395,9 @@ def create_jira_issue(
     Создать дефект в Jira с описанием и вложениями (фактура).
     Возвращает ключ задачи (PROJ-123) или None.
     attachment_paths: список путей к файлам (скриншот, console.log, network.log и т.д.).
-    severity: critical | major | minor — задаёт priority в Jira (Highest/High/Medium).
+    severity: critical | major | minor — если заданы JIRA_PRIORITY_* в config, в поле
+    priority кладётся соответствующее имя; иначе priority не передаётся. При 400
+    из-за неверного имени — один повтор без поля priority.
     """
     jira_url = (jira_url or os.getenv("JIRA_URL", "")).rstrip("/")
     login = username or os.getenv("JIRA_USERNAME", "") or email or os.getenv("JIRA_EMAIL", "")
@@ -440,6 +459,7 @@ def create_jira_issue(
     # Assignee: если задан JIRA_ASSIGNEE — используем его, иначе — текущего пользователя (login)
     assignee_value = JIRA_ASSIGNEE if JIRA_ASSIGNEE else login
 
+    priority_name = _jira_priority_name_for_severity(severity)
     payload = {
         "fields": {
             "project": {"key": project_key},
@@ -449,11 +469,29 @@ def create_jira_issue(
             "labels": [JIRA_DEFECT_LABEL],
         }
     }
-    if severity and severity.lower() in SEVERITY_TO_JIRA_PRIORITY:
-        payload["fields"]["priority"] = {"name": SEVERITY_TO_JIRA_PRIORITY[severity.lower()]}
+    if priority_name:
+        payload["fields"]["priority"] = {"name": priority_name}
+        LOG.debug("create issue: priority.name=%r", priority_name)
+    else:
+        LOG.debug("create issue: priority не передаётся (JIRA_PRIORITY_* пусто или нет severity)")
 
     try:
         r = requests.post(url, json=payload, headers=headers, auth=auth, verify=False, timeout=30)
+        if r.status_code == 400 and "priority" in (payload.get("fields") or {}):
+            err_json: dict = {}
+            try:
+                err_json = r.json() or {}
+            except Exception:
+                pass
+            if (err_json.get("errors") or {}).get("priority"):
+                print(
+                    f"[Jira] Неверный priority «{priority_name}» — "
+                    f"укажи JIRA_PRIORITY_* в .env (как в проекте). Повтор без priority…"
+                )
+                LOG.warning("Jira 400: invalid priority, retrying without priority field")
+                payload2 = copy.deepcopy(payload)
+                payload2["fields"].pop("priority", None)
+                r = requests.post(url, json=payload2, headers=headers, auth=auth, verify=False, timeout=30)
         r.raise_for_status()
         key = r.json().get("key")
         LOG.info("Создан дефект: %s", key)

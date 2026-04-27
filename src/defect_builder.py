@@ -11,7 +11,7 @@ from playwright.sync_api import Page
 
 DEFECT_SUMMARY_PREFIX = "[Kventin]"
 
-# Уровни серьёзности для приоритизации (Critical -> Highest, Major -> High, Minor -> Medium в Jira)
+# Уровни серьёзности в Kventin; соответствие имён приоритета в Jira — JIRA_PRIORITY_* в config (опционально).
 SEVERITY_CRITICAL = "critical"
 SEVERITY_MAJOR = "major"
 SEVERITY_MINOR = "minor"
