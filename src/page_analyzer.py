@@ -199,6 +199,7 @@ def detect_form_fields(page: Page) -> List[Dict[str, Any]]:
             const seen = new WeakSet();
             if (!window.__agentRefs) window.__agentRefs = {};
             if (!window.__agentRefMeta) window.__agentRefMeta = {};
+            if (!window.__agentLocator) window.__agentLocator = {};
             // Находим текущий максимальный ref
             let maxRef = 0;
             for (const k of Object.keys(window.__agentRefs)) {
@@ -216,6 +217,7 @@ def detect_form_fields(page: Page) -> List[Dict[str, Any]]:
             };
 
             const norm = (s) => (s || '').toString().replace(/\\s+/g, ' ').trim().toLowerCase().slice(0, 60);
+            const escAttr = (s) => String(s).replace(/\\\\/g, '\\\\\\\\').replace(/"/g, '\\\\"');
             const stableKey = (el) => {
                 if (!el || !el.tagName) return '';
                 const tag = el.tagName.toLowerCase();
@@ -232,6 +234,22 @@ def detect_form_fields(page: Page) -> List[Dict[str, Any]]:
                 if (ph) return 'ph:' + tag + ':' + norm(ph);
                 return 'css:' + tag;
             };
+            const canonicalLocator = (el) => {
+                if (!el || !el.tagName) return '';
+                const tag = el.tagName.toLowerCase();
+                const tid = (el.getAttribute && (el.getAttribute('data-testid')
+                    || el.getAttribute('data-test-id')
+                    || el.getAttribute('data-test')
+                    || el.getAttribute('data-qa'))) || '';
+                if (tid) return '[data-testid="' + escAttr(tid) + '"]';
+                if (el.id) return '#' + el.id;
+                if (el.name) return tag + '[name="' + escAttr(el.name) + '"]';
+                const aria = (el.getAttribute && el.getAttribute('aria-label')) || '';
+                if (aria) return tag + '[aria-label="' + escAttr(aria.slice(0, 80)) + '"]';
+                const ph = el.placeholder || '';
+                if (ph) return tag + '[placeholder="' + escAttr(ph.slice(0, 60)) + '"]';
+                return tag;
+            };
 
             const processInput = (inp) => {
                 if (!inp || !vis(inp) || inp.disabled || seen.has(inp)) return;
@@ -244,6 +262,7 @@ def detect_form_fields(page: Page) -> List[Dict[str, Any]]:
                     window.__agentRefs[parseInt(ref)] = inp;
                 }
                 try { window.__agentRefMeta[parseInt(ref)] = stableKey(inp); } catch (e) {}
+                try { window.__agentLocator[parseInt(ref)] = canonicalLocator(inp); } catch (e) {}
                 const field = {
                     type: inp.type || inp.tagName.toLowerCase(),
                     name: inp.name || '',
@@ -311,11 +330,43 @@ def get_dom_summary(page: Page, max_length: int = 8000, include_shadow_dom: bool
                 }
                 window.__agentRefs = {};
                 window.__agentRefMeta = {}; // ref -> stable_key
+                window.__agentLocator = {}; // ref -> canonical locator (Playwright-friendly)
                 let refCounter = 1;
 
                 // --- Стабильный ключ элемента (одинаковый между перерисовками DOM) ---
                 // Должен совпадать со stable_key_from_attrs в src/locators.py.
                 const norm = (s) => (s || '').toString().replace(/\\s+/g, ' ').trim().toLowerCase().slice(0, 60);
+                const escAttr = (s) => String(s).replace(/\\\\/g, '\\\\\\\\').replace(/"/g, '\\\\"');
+
+                // --- Канонический локатор (для записи в дефект Jira) ---
+                // Возвращает читаемый Playwright-совместимый селектор.
+                const canonicalLocator = (el) => {
+                    if (!el || !el.tagName) return '';
+                    const tag = el.tagName.toLowerCase();
+                    const tid = (el.getAttribute && (el.getAttribute('data-testid')
+                        || el.getAttribute('data-test-id')
+                        || el.getAttribute('data-test')
+                        || el.getAttribute('data-qa'))) || '';
+                    if (tid) return '[data-testid="' + escAttr(tid) + '"]';
+                    if (el.id) return '#' + el.id;
+                    if (el.name) return tag + '[name="' + escAttr(el.name) + '"]';
+                    const aria = (el.getAttribute && el.getAttribute('aria-label')) || '';
+                    if (aria) return tag + '[aria-label="' + escAttr(aria.slice(0, 80)) + '"]';
+                    const role = (el.getAttribute && el.getAttribute('role')) || '';
+                    const text = (el.innerText || el.textContent || '').replace(/\\s+/g,' ').trim().slice(0, 60);
+                    if (role && text) return 'role=' + role + '[name="' + escAttr(text) + '"]';
+                    if (tag === 'button' && text) return 'role=button[name="' + escAttr(text) + '"]';
+                    if (tag === 'a' && text) return 'role=link[name="' + escAttr(text) + '"]';
+                    if (text && text.length <= 40) return tag + ':has-text("' + escAttr(text) + '")';
+                    const ph = el.placeholder || '';
+                    if (ph) return tag + '[placeholder="' + escAttr(ph.slice(0, 60)) + '"]';
+                    if (typeof el.className === 'string') {
+                        const cls = el.className.trim().split(/\\s+/).filter(Boolean).slice(0, 2).join('.');
+                        if (cls) return tag + '.' + cls;
+                    }
+                    return tag;
+                };
+
                 const stableKey = (el) => {
                     if (!el || !el.tagName) return '';
                     const tag = el.tagName.toLowerCase();
@@ -397,6 +448,7 @@ def get_dom_summary(page: Page, max_length: int = 8000, include_shadow_dom: bool
                     el.setAttribute('data-agent-ref', String(ref));
                     window.__agentRefs[ref] = el;
                     try { window.__agentRefMeta[ref] = stableKey(el); } catch (e) { window.__agentRefMeta[ref] = ''; }
+                    try { window.__agentLocator[ref] = canonicalLocator(el); } catch (e) { window.__agentLocator[ref] = ''; }
                     return ref;
                 };
 

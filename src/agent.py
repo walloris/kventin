@@ -239,20 +239,93 @@ def resolve_stable_key(page, selector: str) -> str:
     return _norm_key(sel)
 
 
+def resolve_canonical_locator(page, selector: str) -> str:
+    """
+    Получить «канонический» селектор элемента (то, что не стыдно записать в дефект).
+
+    Стратегия:
+    1. ref:N → window.__agentLocator[N] (его пишет page_analyzer.py).
+    2. Иначе пробуем достать атрибуты у самого элемента и сами строим селектор.
+    3. В последнем варианте — возвращаем исходный selector как есть.
+    """
+    if not selector:
+        return ""
+    sel = selector.strip()
+    ref_num: Optional[int] = None
+    if sel.startswith("ref:"):
+        try:
+            ref_num = int(sel[4:])
+        except ValueError:
+            ref_num = None
+    elif sel.isdigit():
+        ref_num = int(sel)
+    if ref_num is not None and page is not None:
+        try:
+            loc = page.evaluate(
+                "(ref) => (window.__agentLocator && window.__agentLocator[ref]) || ''",
+                ref_num,
+            )
+            if loc:
+                return str(loc)
+        except Exception:
+            pass
+    if page is not None:
+        try:
+            l = page.locator(sel).first
+            attrs = l.evaluate(
+                "(el) => ({"
+                "tag: el.tagName ? el.tagName.toLowerCase() : '',"
+                "tid: el.getAttribute && (el.getAttribute('data-testid')||el.getAttribute('data-test-id')||el.getAttribute('data-test')||el.getAttribute('data-qa')||''),"
+                "id: el.id || '',"
+                "name: el.name || '',"
+                "aria: (el.getAttribute && el.getAttribute('aria-label')) || '',"
+                "ph: el.placeholder || '',"
+                "txt: ((el.innerText||el.textContent||'').replace(/\\s+/g,' ').trim().slice(0,60))"
+                "})",
+                timeout=500,
+            )
+            if attrs:
+                if attrs.get("tid"):
+                    return f'[data-testid="{attrs["tid"]}"]'
+                if attrs.get("id"):
+                    return f'#{attrs["id"]}'
+                tag = attrs.get("tag") or ""
+                if attrs.get("name"):
+                    return f'{tag}[name="{attrs["name"]}"]'
+                if attrs.get("aria"):
+                    return f'{tag}[aria-label="{attrs["aria"][:80]}"]'
+                if tag in ("button", "a") and attrs.get("txt"):
+                    role = "button" if tag == "button" else "link"
+                    return f'role={role}[name="{attrs["txt"]}"]'
+                if attrs.get("ph"):
+                    return f'{tag}[placeholder="{attrs["ph"][:60]}"]'
+                if tag and attrs.get("txt") and len(attrs["txt"]) <= 40:
+                    return f'{tag}:has-text("{attrs["txt"]}")'
+                if tag:
+                    return tag
+        except Exception:
+            pass
+    return sel
+
+
 def enrich_action(page, memory: "AgentMemory", action: Dict[str, Any]) -> Dict[str, Any]:
-    """Дописать в action служебные поля _stable_key и _url_pattern.
+    """Дописать в action служебные поля _stable_key, _canonical_locator, _url_pattern.
 
     Вызывать ПЕРЕД любой проверкой повтора и перед add_action.
     """
     if not isinstance(action, dict):
         return action
-    if not action.get("_stable_key"):
-        sel = (action.get("selector") or "").strip()
-        if sel:
-            try:
-                action["_stable_key"] = resolve_stable_key(page, sel)
-            except Exception:
-                action["_stable_key"] = ""
+    sel = (action.get("selector") or "").strip()
+    if sel and not action.get("_stable_key"):
+        try:
+            action["_stable_key"] = resolve_stable_key(page, sel)
+        except Exception:
+            action["_stable_key"] = ""
+    if sel and not action.get("_canonical_locator"):
+        try:
+            action["_canonical_locator"] = resolve_canonical_locator(page, sel)
+        except Exception:
+            action["_canonical_locator"] = ""
     if not action.get("_url_pattern"):
         try:
             url = page.url if page and not page.is_closed() else ""
@@ -374,6 +447,9 @@ class AgentMemory:
         # Множество всех stable_keys, по которым агент уже что-то делал на этом
         # url_pattern (для оценки «прогресса» — появление нового ключа = прогресс).
         self.touched_keys_on_url: Dict[str, set] = {}
+        # Future-ы фоновой отправки дефектов в Jira: их обязательно дожидаемся
+        # перед завершением сессии, иначе тикеты могут потеряться.
+        self.pending_defect_futures: List[Future] = []
 
     def set_start_url_for_nav(self, url: str) -> None:
         """Задать стартовый URL для подсчёта глубины навигации."""
@@ -459,6 +535,7 @@ class AgentMemory:
             "action": act,
             "selector": action.get("selector", ""),
             "stable_key": stable_key,
+            "canonical_locator": (action.get("_canonical_locator") or "").strip(),
             "url_pattern": url_pat,
             "value": action.get("value", ""),
             "reason": action.get("reason", ""),
@@ -758,6 +835,33 @@ class AgentMemory:
 
     def record_defect_created(self, key: str, summary: str, severity: str = "major"):
         self.defects_created.append({"key": key, "summary": summary[:200], "severity": severity})
+
+    def last_canonical_locator(self) -> str:
+        """
+        Канонический локатор последнего действия с явным локатором.
+        Используется в описании дефекта (раздел «Затронутый элемент»).
+        """
+        for a in reversed(self.actions):
+            loc = (a.get("canonical_locator") or "").strip()
+            if loc:
+                return loc
+        return ""
+
+    def last_action_summary(self) -> str:
+        """Краткое описание последнего действия — для подмешивания в дефект."""
+        if not self.actions:
+            return ""
+        a = self.actions[-1]
+        act = (a.get("action") or "").strip() or "—"
+        loc = (a.get("canonical_locator") or a.get("selector") or "").strip()
+        val = (a.get("value") or "").strip()
+        parts = [act]
+        if loc:
+            parts.append(loc)
+        if val:
+            v = val[:60] + ("…" if len(val) > 60 else "")
+            parts.append(f"value={v!r}")
+        return " | ".join(parts)
 
     def advance_tester_phase(self, force: bool = False) -> str:
         """
@@ -2649,8 +2753,26 @@ def run_agent(start_url: str = None):
             except Exception:
                 pass
             
+            # КРИТИЧНО: дождаться отправки всех дефектов в Jira (иначе будут теряться).
+            try:
+                pending = list(getattr(memory, "pending_defect_futures", []) or [])
+                if pending:
+                    print(f"[Agent] Дожидаемся отправки в Jira: {len(pending)} дефектов…")
+                    for fut in pending:
+                        try:
+                            fut.result(timeout=60)
+                        except Exception as e:
+                            print(f"[Agent] Дефект не доставлен: {e}")
+                    print("[Agent] Все Jira-задачи завершены.")
+            except Exception as e:
+                print(f"[Agent] Ошибка ожидания фоновых дефектов: {e}")
+
             if _bg_pool:
-                _bg_pool.shutdown(wait=False)
+                # wait=True — гарантируем, что воркеры успели завершить отправки.
+                try:
+                    _bg_pool.shutdown(wait=True)
+                except Exception:
+                    _bg_pool.shutdown(wait=False)
             
             if ENABLE_CONSOLE_WARNINGS_IN_REPORT:
                 try:
@@ -4283,8 +4405,18 @@ def _analyze_in_background(
     network_before_len = int(pre_lens.get("network") or 0)
     new_console = console_log_snapshot[console_before_len:] if console_before_len <= len(console_log_snapshot) else console_log_snapshot[-10:]
     new_network = network_snapshot[network_before_len:] if network_before_len <= len(network_snapshot) else network_snapshot[-5:]
-    new_errors = [c for c in new_console if (c.get("type") or "").lower() in ("error", "pageerror")]
-    new_network_fails = [n for n in new_network if n.get("status") and n.get("status") >= 500]
+    # Применяем шумовой фильтр (favicon, аналитика, расширения, ResizeObserver…)
+    from src.defect_rules import is_noise_url, is_noise_console_text
+    new_errors = [
+        c for c in new_console
+        if (c.get("type") or "").lower() in ("error", "pageerror")
+        and not is_noise_console_text(c.get("text") or "")
+    ]
+    new_network_fails = [
+        n for n in new_network
+        if n.get("status") and n.get("status") >= 500
+        and not is_noise_url(n.get("url") or "")
+    ]
     # Сохраним новые ошибки консоли в finding — пригодится для описания дефекта (стек + путь к JS).
     findings["new_console_errors"] = new_errors
 
@@ -4499,8 +4631,15 @@ def _step_post_analysis_LEGACY(
         if diff_pct > 0:
             LOG.info("#{step} Visual diff: %s (%.1f%%)", diff_zone, diff_pct)
 
-    new_errors = [c for c in console_log[-10:] if c.get("type") == "error"]
-    new_network_fails = [n for n in network_failures[-5:] if n.get("status") and n.get("status") >= 500]
+    from src.defect_rules import is_noise_url, is_noise_console_text
+    new_errors = [
+        c for c in console_log[-10:]
+        if c.get("type") == "error" and not is_noise_console_text(c.get("text") or "")
+    ]
+    new_network_fails = [
+        n for n in network_failures[-5:]
+        if n.get("status") and n.get("status") >= 500 and not is_noise_url(n.get("url") or "")
+    ]
 
     if new_network_fails and memory.defects_on_current_step == 0:
         five_xx_detail = "\n".join(
@@ -4589,7 +4728,17 @@ def _create_defect(
     memory: Optional[AgentMemory] = None,
 ):
     """Создать дефект: быстрые проверки в main thread, Jira — в фоне."""
-    from src.jira_client import is_local_duplicate, register_local_defect
+    from src.jira_client import is_local_duplicate
+    from src.defect_rules import should_create_defect
+
+    # Шумовой фильтр перед всем остальным
+    if not should_create_defect(
+        bug_text=bug_description,
+        console_log=console_log,
+        network_failures=network_failures,
+    ):
+        print(f"[Agent] Пропуск дефекта (шум): {bug_description[:80]}")
+        return
 
     summary = build_defect_summary(bug_description, current_url)
 
@@ -4602,6 +4751,11 @@ def _create_defect(
     # Собрать evidence из Playwright (main thread — быстро)
     attachment_paths = collect_evidence(page, console_log, network_failures)
     steps_to_reproduce = memory.get_steps_to_reproduce() if memory else None
+
+    # Канонический локатор + краткое описание последнего действия — в шапку описания
+    canonical_locator = memory.last_canonical_locator() if memory else ""
+    last_action_summary = memory.last_action_summary() if memory else ""
+
     description = build_defect_description(
         bug_description, current_url,
         checklist_results=checklist_results,
@@ -4609,6 +4763,20 @@ def _create_defect(
         network_failures=network_failures,
         steps_to_reproduce=steps_to_reproduce,
     )
+    # Дописываем секцию «Затронутый элемент» — в Jira-wiki, перед окружением.
+    if canonical_locator or last_action_summary:
+        affected_block = "h3. Затронутый элемент\n"
+        if canonical_locator:
+            affected_block += f"Канонический локатор: {{{{{canonical_locator}}}}}\n"
+        if last_action_summary:
+            affected_block += f"Последнее действие: {{{{{last_action_summary}}}}}\n"
+        # Вставляем сразу после блока «Описание проблемы»
+        anchor = "h3. Шаги воспроизведения"
+        if anchor in description:
+            description = description.replace(anchor, affected_block + "\n" + anchor, 1)
+        else:
+            description = affected_block + "\n" + description
+
     if memory and getattr(memory, "_last_step_flakiness", None):
         ok, total = memory._last_step_flakiness
         description += f"\n\nFlakiness: {ok}/{total} повторных прогонов успешны."
@@ -4618,12 +4786,18 @@ def _create_defect(
         network_failures=network_failures,
     )
 
-    # Отправка в Jira — В ФОНЕ (семантическая проверка + создание тикета)
+    # Отправка в Jira — В ФОНЕ (семантическая проверка + создание тикета).
+    # Future сохраняем в memory, чтобы дождаться при завершении сессии.
     print(f"[Agent] Отправка дефекта в Jira (фон): {summary[:60]}")
-    _bg_submit(
+    fut = _bg_submit(
         _create_defect_bg,
         summary, description, bug_description, attachment_paths, memory, severity,
     )
+    if fut is not None and memory is not None:
+        try:
+            memory.pending_defect_futures.append(fut)
+        except AttributeError:
+            memory.pending_defect_futures = [fut]
 
 
 def _create_defect_bg(
