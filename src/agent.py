@@ -3592,7 +3592,13 @@ def _analyze_in_background(
     new_console = console_log_snapshot[console_before_len:] if console_before_len <= len(console_log_snapshot) else console_log_snapshot[-10:]
     new_network = network_snapshot[network_before_len:] if network_before_len <= len(network_snapshot) else network_snapshot[-5:]
     # Применяем шумовой фильтр (favicon, аналитика, расширения, ResizeObserver…)
-    from src.defect_rules import is_noise_url, is_noise_console_text, rule_pageerror, rule_4xx_on_main
+    from src.defect_rules import (
+        is_noise_url,
+        is_noise_console_text,
+        rule_pageerror,
+        rule_4xx_on_main,
+        rule_action_failure,
+    )
     new_errors = [
         c for c in new_console
         if (c.get("type") or "").lower() in ("error", "pageerror")
@@ -3706,24 +3712,34 @@ Visual diff: {visual_diff_info.get('change_percent', 0):.1f}% изменений
                 step,
             )
 
-    # Фолбэк: pageerror/4xx — надёжный сигнал, заводим дефект независимо от LLM
-    # и независимо от типа действия (даже на close_modal/scroll).
+    # Фолбэк: action_failure / pageerror / 4xx — надёжные сигналы, заводим дефект
+    # независимо от LLM и независимо от типа действия (даже на close_modal/scroll).
+    # Порядок: сначала самый специфичный (UI: клик не прошёл из-за overlay/timeout),
+    # потом JS-ошибки в консоли, потом 4xx на ключевых эндпоинтах.
     if not findings["bug_to_report"] and not findings["five_xx_bug"]:
-        rule_bug = rule_pageerror(new_errors)
-        if rule_bug:
+        rule_bug_act = rule_action_failure(action, result, current_url)
+        if rule_bug_act:
             findings["bug_to_report"] = (
-                f"{rule_bug['title']}\n\n{rule_bug['details']}"
+                f"{rule_bug_act['title']}\n\n{rule_bug_act['details']}"
                 + (f"\n\nНовые ошибки консоли после действия:\n{console_brief}" if console_brief else "")
             )
-            LOG.info("#%s правило rule_pageerror → дефект", step)
+            LOG.info("#%s правило rule_action_failure → дефект (%s)", step, rule_bug_act.get("severity"))
         else:
-            rule_bug4 = rule_4xx_on_main(new_network, current_url)
-            if rule_bug4:
+            rule_bug = rule_pageerror(new_errors)
+            if rule_bug:
                 findings["bug_to_report"] = (
-                    f"{rule_bug4['title']}\n\n{rule_bug4['details']}"
+                    f"{rule_bug['title']}\n\n{rule_bug['details']}"
                     + (f"\n\nНовые ошибки консоли после действия:\n{console_brief}" if console_brief else "")
                 )
-                LOG.info("#%s правило rule_4xx_on_main → дефект", step)
+                LOG.info("#%s правило rule_pageerror → дефект", step)
+            else:
+                rule_bug4 = rule_4xx_on_main(new_network, current_url)
+                if rule_bug4:
+                    findings["bug_to_report"] = (
+                        f"{rule_bug4['title']}\n\n{rule_bug4['details']}"
+                        + (f"\n\nНовые ошибки консоли после действия:\n{console_brief}" if console_brief else "")
+                    )
+                    LOG.info("#%s правило rule_4xx_on_main → дефект", step)
 
     if not findings["bug_to_report"] and not findings["five_xx_bug"]:
         LOG.debug(
@@ -3752,8 +3768,17 @@ def _step_post_analysis(
             return
         raise
 
-    # Новый оверлей — обработать сразу
-    if post_data["new_overlay"]:
+    # Новый оверлей — обработать сразу.
+    # ИСКЛЮЧЕНИЕ: если действие провалилось с признаком "intercepts pointer events" /
+    # таймаута клика — это и есть сам инцидент (overlay-перехватчик мешает клику),
+    # и его надо довести до фонового анализа, чтобы завести дефект через rule_action_failure.
+    res_str = result if isinstance(result, str) else ""
+    is_action_failure = (
+        res_str.startswith("click_error")
+        or res_str.startswith("type_error")
+        or res_str.startswith("hover_error")
+    )
+    if post_data["new_overlay"] and not is_action_failure:
         print(f"[Agent] #{step} Появился оверлей: {', '.join(post_data['overlay_types'])}")
         memory.add_action(
             {"action": "overlay_detected", "selector": ", ".join(post_data["overlay_types"])},
