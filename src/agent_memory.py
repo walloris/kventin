@@ -106,6 +106,10 @@ class AgentMemory:
         self.touched_keys_on_url: Dict[str, set] = {}
         # Future-ы фоновой отправки дефектов в Jira: дожидаемся в финале сессии.
         self.pending_defect_futures: List[Future] = []
+        # «Упрямый оверлей»: серия подряд close_modal без полезного действия между ними.
+        # Если она достигнет порога — игнорируем оверлей, пока агент не сделает что-то ещё.
+        self._consecutive_close_modal: int = 0
+        self.ignore_overlay: bool = False
 
     # ------------------------------------------------------------------ navigation
 
@@ -240,6 +244,25 @@ class AgentMemory:
                 self.done_scroll_down += 1
             elif sel in ("up", "вверх"):
                 self.done_scroll_up += 1
+
+        # Учёт «упрямого оверлея»: серия close_modal (scroll между ними не сбрасывает,
+        # потому что anti-loop сам ставит scroll ровно для разрядки).
+        if act == "close_modal":
+            self._consecutive_close_modal += 1
+            if self._consecutive_close_modal >= 3 and not self.ignore_overlay:
+                self.ignore_overlay = True
+                LOG.info(
+                    "Оверлей не закрывается (close_modal x%d) — игнорирую и работаю под ним",
+                    self._consecutive_close_modal,
+                )
+        elif act != "scroll":
+            if self._consecutive_close_modal or self.ignore_overlay:
+                LOG.debug(
+                    "Полезное действие %r — сбрасываю флаг ignore_overlay (было close_modal x%d)",
+                    act, self._consecutive_close_modal,
+                )
+            self._consecutive_close_modal = 0
+            self.ignore_overlay = False
 
         self.last_actions_sequence.append(act)
         if len(self.last_actions_sequence) > 10:

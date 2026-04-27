@@ -1891,8 +1891,18 @@ def run_agent(start_url: str = None):
 
                 _track_test_plan(memory, action)
 
-                # Пост-анализ ОТКЛЮЧЕН — агент должен активно кликать
-                # Периодические проверки ОТКЛЮЧЕНЫ — только клики!
+                # Пост-анализ — в ФОНЕ. Main thread свободен для следующего шага,
+                # но JS-ошибки/5xx/4xx/визуальные регрессии после действия мы по-
+                # прежнему видим (без него дефекты вообще не создаются).
+                try:
+                    _step_post_analysis(
+                        page, step, action, result, act_type, sel, val,
+                        expected_outcome, possible_bug,
+                        has_overlay, current_url, checklist_results,
+                        console_log, network_failures, memory,
+                    )
+                except Exception as e:
+                    LOG.debug("post-analysis: %s", e)
 
                 if SESSION_REPORT_EVERY_N > 0 and step % SESSION_REPORT_EVERY_N == 0:
                     report = memory.get_session_report_text()
@@ -2855,8 +2865,8 @@ def _get_fast_action(
     try:
         if page.is_closed():
             return {"action": "scroll", "selector": "down", "reason": "Страница закрыта"}
-        
-        if has_overlay:
+
+        if has_overlay and not getattr(memory, "ignore_overlay", False):
             return {"action": "close_modal", "selector": "", "reason": "Закрываю оверлей"}
 
         current_url = page.url
@@ -3343,6 +3353,18 @@ def _step_get_action(page, step, memory, console_log, network_failures, checklis
     action = validate_llm_action(action)
     enrich_action(page, memory, action)
 
+    # Если оверлей помечен как «не закрываемый», игнорируем повторное предложение его закрыть
+    if (
+        (action.get("action") or "").lower() == "close_modal"
+        and getattr(memory, "ignore_overlay", False)
+    ):
+        print(f"[Agent] #{step} Оверлей помечен как не закрываемый — игнорирую close_modal от LLM")
+        if not memory.should_avoid_scroll():
+            action = {"action": "scroll", "selector": "down", "reason": "Игнорирую упрямый оверлей — прокрутка"}
+        else:
+            action = {"action": "hover", "selector": "body", "reason": "Игнорирую упрямый оверлей — hover"}
+        enrich_action(page, memory, action)
+
     # ПРЕДВАРИТЕЛЬНАЯ проверка повтора ПЕРЕД выполнением
     act_precheck = (action.get("action") or "").lower()
     sel_precheck = (action.get("selector") or "").strip()
@@ -3350,7 +3372,7 @@ def _step_get_action(page, step, memory, console_log, network_failures, checklis
         print(f"[Agent] #{step} ⚠️ GigaChat предложил повтор: {act_precheck} -> {sel_precheck[:40]} (key={action.get('_stable_key', '')[:40]}). Игнорирую и выбираю альтернативу.")
         memory.record_repeat()
         # Выбрать альтернативное действие
-        if has_overlay:
+        if has_overlay and not getattr(memory, "ignore_overlay", False):
             action = {"action": "close_modal", "selector": "", "reason": "GigaChat предложил повтор — закрываю оверлей"}
         elif not memory.should_avoid_scroll():
             action = {"action": "scroll", "selector": "down", "reason": "GigaChat предложил повтор — прокрутка"}
@@ -3378,7 +3400,7 @@ def _step_get_action(page, step, memory, console_log, network_failures, checklis
             memory.reset_repeats()  # Сбросить после смены фазы
             # Попробовать прокрутку вверх или переход на другую часть страницы
             action = {"action": "scroll", "selector": "up", "reason": "Зацикливание — смена фазы, прокрутка вверх"}
-        elif has_overlay:
+        elif has_overlay and not getattr(memory, "ignore_overlay", False):
             action = {"action": "close_modal", "selector": "", "reason": "Повтор — закрываю оверлей"}
         elif not memory.should_avoid_scroll():
             action = {"action": "scroll", "selector": "down", "reason": "Повтор — прокрутка вниз"}
@@ -3684,8 +3706,8 @@ Visual diff: {visual_diff_info.get('change_percent', 0):.1f}% изменений
                 step,
             )
 
-    # Фолбэк: даже если LLM ничего не вернул — pageerror и 4xx на основном/API
-    # это надёжный сигнал, заводим дефект независимо.
+    # Фолбэк: pageerror/4xx — надёжный сигнал, заводим дефект независимо от LLM
+    # и независимо от типа действия (даже на close_modal/scroll).
     if not findings["bug_to_report"] and not findings["five_xx_bug"]:
         rule_bug = rule_pageerror(new_errors)
         if rule_bug:
