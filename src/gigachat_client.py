@@ -216,8 +216,8 @@ class GigaChatClient:
 
     def _normalize_model(self, model: str) -> str:
         if not model:
-            return self.model or "GigaChat-2-Max:latest"
-        return model if ":latest" in model else f"{model}:latest"
+            return self.model or "GigaChat-2-Max"
+        return model
 
     def _basic_key(self) -> str:
         if self.authorization_key:
@@ -391,8 +391,6 @@ class GigaChatClient:
             "messages": messages,
             "temperature": 0.2,
             "top_p": 0.9,
-            "safe_mode": False,
-            "profanity_check": False,
             "stream": False,
         }
         if max_tokens:
