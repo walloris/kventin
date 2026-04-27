@@ -85,8 +85,8 @@ def get_gigachat_token(env: str) -> Optional[str]:
     if not url:
         LOG.warning("get_gigachat_token: не задан token_url для env=%s", env)
         return None
-    if not GIGACHAT_USERNAME or not GIGACHAT_PASSWORD or not GIGACHAT_CLIENT_ID:
-        LOG.warning("get_gigachat_token: не заданы username, password или client_id")
+    if not GIGACHAT_CLIENT_ID:
+        LOG.warning("get_gigachat_token: не задан client_id (по умолчанию должен быть 'fakeuser')")
         return None
 
     headers = {
@@ -98,8 +98,8 @@ def get_gigachat_token(env: str) -> Optional[str]:
     cookies = {"KEYCLOAK_LOCALE": "ru"}
     payload = {
         "grant_type": "password",
-        "username": GIGACHAT_USERNAME,
-        "password": GIGACHAT_PASSWORD,
+        "username": GIGACHAT_USERNAME or "",
+        "password": GIGACHAT_PASSWORD or "",
         "client_id": GIGACHAT_CLIENT_ID,
     }
 
@@ -215,16 +215,20 @@ class GigaChatClient:
         self.token_expires_at: float = 0
         self.scope = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
 
-        if self.token_header:
-            primary = "token_header"
-        elif self.username and self.password and self.client_id:
+        if self.token_url and self.client_id:
             primary = "password_grant"
+        elif self.token_header:
+            primary = "token_header"
         elif self._basic_key():
             primary = "oauth"
         else:
             primary = "none"
-        has_pw_fallback = bool(self.username and self.password and self.client_id) and primary == "token_header"
-        auth_type = primary + ("(+password_grant fallback)" if has_pw_fallback else "")
+        fallbacks = []
+        if primary != "token_header" and self.token_header:
+            fallbacks.append("token_header")
+        if primary != "oauth" and self._basic_key():
+            fallbacks.append("oauth")
+        auth_type = primary + (f"(+fallback: {','.join(fallbacks)})" if fallbacks else "")
         LOG.debug(
             "config: api_url=%s token_url=%s model=%s env=%s auth=%s verify_ssl=%s",
             self.api_url[:60] + "..." if len(self.api_url) > 60 else self.api_url,
@@ -235,25 +239,10 @@ class GigaChatClient:
             self.verify_ssl,
         )
         if self.token_header:
-            raw = self.token_header.strip()
-            tok = raw[7:].strip() if raw.lower().startswith("bearer ") else raw
-            LOG.debug("token_header: %s", _mask(raw[:80], show_tail=6))
-            exp = _jwt_expiry(tok)
-            if exp is not None:
-                now = time.time()
-                if exp < now:
-                    LOG.error(
-                        "GIGACHAT_TOKEN_HEADER ИСТЁК (exp=%s, %.1f дн назад). "
-                        "Сервер вернёт 401. Обнови Bearer в .env%s.",
-                        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(exp)),
-                        (now - exp) / 86400,
-                        " (или заполни USERNAME/PASSWORD для авто-обновления)" if not has_pw_fallback else "",
-                    )
-                else:
-                    LOG.info(
-                        "token_header: валиден до %s",
-                        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(exp)),
-                    )
+            LOG.debug(
+                "token_header (fallback): %s",
+                _mask(self.token_header.strip()[:80], show_tail=6),
+            )
         if self._basic_key() and not self.token_header:
             LOG.debug("basic_key (oauth): %s", _mask(self._basic_key(), show_tail=4))
 
@@ -355,24 +344,41 @@ class GigaChatClient:
         """
         Получить access-token.
 
-        Приоритеты (как в эталонной реализации):
-        1) GIGACHAT_TOKEN_HEADER (готовый Bearer) — основной путь.
-        2) Если есть USERNAME+PASSWORD+CLIENT_ID — fallback через get_gigachat_token (Keycloak password grant).
-        3) Иначе — basic_key/oauth (старая логика).
+        ОСНОВНОЙ ПУТЬ — POST в Keycloak (get_gigachat_token):
+        получаем свежий Bearer-токен по запросу и подставляем его в Authorization.
 
-        force_refresh=True сбрасывает кэш и заставляет перезапросить токен (минуя token_header,
-        потому что обычно его не получится «обновить»).
+        Кэшируем полученный токен на ~25 мин, чтобы не дёргать Keycloak на каждый chat-запрос.
+        Раз в это окно (или при 401 → force_refresh=True) перезапрашиваем.
+
+        Fallback (если запрос не удался) — GIGACHAT_TOKEN_HEADER, basic_key/oauth.
         """
         if force_refresh:
             self.access_token = None
             self.token_expires_at = 0
-            if self.username and self.password and self.client_id:
-                LOG.debug("get_token(force_refresh): get_gigachat_token(env=%s)...", self.env)
-                token = get_gigachat_token(self.env)
-                if token:
-                    self.access_token = token
-                    self.token_expires_at = time.time() + 1800
-                    return token
+
+        if not force_refresh and self.access_token and time.time() < self.token_expires_at - 60:
+            LOG.debug(
+                "get_token: кэш, действует до %s",
+                time.strftime("%H:%M:%S", time.localtime(self.token_expires_at)),
+            )
+            return self.access_token
+
+        LOG.debug("get_token: запрашиваю свежий токен через get_gigachat_token(env=%s)...", self.env)
+        token = get_gigachat_token(self.env)
+        if token:
+            self.access_token = token
+            exp = _jwt_expiry(token)
+            if exp is not None:
+                self.token_expires_at = exp
+                LOG.info(
+                    "get_token: свежий токен получен, действует до %s",
+                    time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(exp)),
+                )
+            else:
+                self.token_expires_at = time.time() + 1500
+            return token
+
+        LOG.warning("get_token: запрос токена не вернул access_token (см. логи выше).")
 
         if self.token_header:
             s = self.token_header.strip()
@@ -380,58 +386,24 @@ class GigaChatClient:
             exp = _jwt_expiry(tok)
             now = time.time()
             if exp is not None and exp < now:
-                age_days = (now - exp) / 86400
                 LOG.error(
-                    "get_token: GIGACHAT_TOKEN_HEADER ИСТЁК (exp=%s, %.1f дн назад). "
-                    "Запроси новый Bearer и обнови .env.",
+                    "get_token: GIGACHAT_TOKEN_HEADER (fallback) тоже истёк (exp=%s, %.1f дн назад).",
                     time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(exp)),
-                    age_days,
+                    (now - exp) / 86400,
                 )
-                if self.username and self.password and self.client_id:
-                    LOG.warning("get_token: пытаюсь получить новый токен через password grant...")
-                    fresh = get_gigachat_token(self.env)
-                    if fresh:
-                        self.access_token = fresh
-                        self.token_expires_at = time.time() + 1800
-                        return fresh
             else:
-                if exp is not None:
-                    LOG.debug(
-                        "get_token: token_header валиден до %s",
-                        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(exp)),
-                    )
-            LOG.debug("get_token: используем token_header, token=%s", _mask(tok, show_tail=6))
-            return tok
-
-        if not force_refresh and self.access_token and time.time() < self.token_expires_at - 60:
-            LOG.debug(
-                "get_token: кэшированный токен до %s",
-                time.strftime("%H:%M:%S", time.localtime(self.token_expires_at)),
-            )
-            return self.access_token
-
-        if self.username and self.password and self.client_id:
-            LOG.debug("get_token: get_gigachat_token(env=%s)...", self.env)
-            token = get_gigachat_token(self.env)
-            if token:
-                self.access_token = token
-                self.token_expires_at = time.time() + 1800
-                return token
-            LOG.error(
-                "get_token: get_gigachat_token вернул None (env=%s, username=%s)",
-                self.env, self.username,
-            )
-            return None
+                LOG.warning("get_token: fallback на GIGACHAT_TOKEN_HEADER")
+                return tok
 
         if self._basic_key():
-            LOG.debug("get_token: пробуем oauth client_credentials...")
-            token = self._get_token_oauth()
-            if token:
-                return token
+            LOG.debug("get_token: fallback на oauth client_credentials...")
+            tok = self._get_token_oauth()
+            if tok:
+                return tok
 
         LOG.error(
-            "get_token: не удалось получить токен. Заполни в .env GIGACHAT_TOKEN_HEADER "
-            "(актуальный Bearer) или GIGACHAT_USERNAME/PASSWORD (для password grant)."
+            "get_token: не удалось получить токен. Проверь GIGACHAT_TOKEN_URL_DEV/IFT, "
+            "GIGACHAT_PERSON_ID_DEV/IFT, GIGACHAT_CLIENT_ID и креды USERNAME/PASSWORD в .env."
         )
         return None
 
@@ -518,18 +490,11 @@ class GigaChatClient:
             r = _do_post(token)
             LOG.info("chat: ответ %s body_len=%s", r.status_code, len(r.text))
             if r.status_code == 401:
-                if self.username and self.password and self.client_id:
-                    LOG.warning("chat: 401 — пробую обновить токен через password grant и повторить запрос")
-                    fresh = self._get_token(force_refresh=True)
-                    if fresh and fresh != token:
-                        r = _do_post(fresh)
-                        LOG.info("chat (retry): ответ %s body_len=%s", r.status_code, len(r.text))
-                else:
-                    LOG.error(
-                        "chat: 401 — GIGACHAT_TOKEN_HEADER невалиден/истёк, "
-                        "а username/password не заданы → обновить токен нечем. "
-                        "Возьми свежий Bearer и обнови GIGACHAT_TOKEN_HEADER в .env."
-                    )
+                LOG.warning("chat: 401 — токен отвергнут, запрашиваю свежий и повторяю")
+                fresh = self._get_token(force_refresh=True)
+                if fresh and fresh != token:
+                    r = _do_post(fresh)
+                    LOG.info("chat (retry): ответ %s body_len=%s", r.status_code, len(r.text))
             if r.status_code != 200:
                 LOG.error("chat: ответ %s %s", r.status_code, r.text[:1200])
                 return ""
