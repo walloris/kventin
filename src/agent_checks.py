@@ -37,12 +37,86 @@ from config import (
     VIEWPORT_WIDTH,
 )
 from src.defect_pipeline import create_defect
+from src.defect_rules import rule_page_load_errors
 from src.gigachat_client import consult_agent_with_screenshot
 from src.llm_parser import parse_llm_action, validate_llm_action
 from src.performance import check_performance, format_performance_issues
 from src.page_analyzer import take_screenshot_b64
 
 LOG = logging.getLogger("kventin.checks")
+
+
+def check_page_load_and_report(
+    page: Page,
+    memory: Any,
+    current_url: str,
+    console_log,
+    network_failures,
+    *,
+    settle_seconds: float = 1.5,
+) -> bool:
+    """
+    Проверить состояние страницы СРАЗУ ПОСЛЕ загрузки/навигации (без привязки к
+    действию агента) и завести «дефект загрузки страницы», если есть значимые
+    JS-ошибки и/или 4xx-5xx на ключевых запросах.
+
+    Это отдельный класс дефектов от продуктовых: причина — сама загрузка/инициализация,
+    а не результат пользовательского действия. Дедупликация — по URL-паттерну,
+    чтобы не плодить копии при возвратах на ту же страницу.
+
+    Возвращает True, если дефект был заведён (или однажды уже заводился для этой страницы).
+    """
+    if not current_url:
+        return False
+    try:
+        if page.is_closed():
+            return False
+    except Exception:
+        return False
+
+    # Дать странице короткое окно стабилизации (не блокируем основной цикл надолго)
+    try:
+        time.sleep(max(0.0, float(settle_seconds)))
+    except Exception:
+        pass
+
+    from src.locators import url_pattern as _url_pattern  # локально, без циклов
+    pattern = _url_pattern(current_url)
+    if not hasattr(memory, "_page_load_defects_by_pattern"):
+        memory._page_load_defects_by_pattern = set()
+    if pattern in memory._page_load_defects_by_pattern:
+        return False
+
+    # Собрать «новое окно после загрузки» — берём небольшой хвост, этого достаточно
+    # для on-load диагностики.
+    cons = list(console_log or [])[-150:]
+    nets = list(network_failures or [])[-100:]
+
+    finding = rule_page_load_errors(current_url, cons, nets)
+    if not finding:
+        return False
+
+    # Метим страницу заранее — чтобы при возврате на неё не плодить дубль,
+    # даже если фоновая отправка ещё не завершилась.
+    memory._page_load_defects_by_pattern.add(pattern)
+
+    summary = finding["title"]
+    severity = finding.get("severity", "major")
+    es = finding.get("errors_summary") or {}
+    bug_text = (
+        f"[Загрузка страницы] {summary}\n\n"
+        f"{finding['details']}\n\n"
+        f"Сводка: pageerror/severe console.error: {es.get('js_count', 0)}, "
+        f"5xx: {es.get('net_5xx', 0)}, 4xx (документ/API): {es.get('net_4xx', 0)}.\n"
+        f"Причина — сама загрузка/инициализация страницы (не действие агента)."
+    )
+    LOG.info("page_load defect (%s): %s", severity, summary[:120])
+    try:
+        create_defect(page, bug_text, current_url, [], cons, nets, memory)
+    except Exception:
+        LOG.exception("check_page_load_and_report: ошибка create_defect")
+        return False
+    return True
 
 
 def run_a11y_check(
@@ -236,6 +310,7 @@ def request_scenario_chain(
 
 
 __all__ = [
+    "check_page_load_and_report",
     "run_a11y_check",
     "run_perf_check",
     "run_responsive_check",

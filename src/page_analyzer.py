@@ -253,13 +253,15 @@ def detect_form_fields(page: Page) -> List[Dict[str, Any]]:
                     || el.getAttribute('data-test-id')
                     || el.getAttribute('data-test')
                     || el.getAttribute('data-qa'))) || '';
-                if (tid) return '[data-testid="' + escAttr(tid) + '"]';
-                if (el.id) return '#' + el.id;
+                if (tid) return "getByTestId('" + escAttr(tid) + "')";
+                if (el.id && el.id.length <= 64 && !/^[a-f0-9]{8,}$/i.test(el.id) && !/[0-9]{6,}/.test(el.id)) {
+                    return '#' + el.id;
+                }
                 if (el.name) return tag + '[name="' + escAttr(el.name) + '"]';
                 const aria = (el.getAttribute && el.getAttribute('aria-label')) || '';
-                if (aria) return tag + '[aria-label="' + escAttr(aria.slice(0, 80)) + '"]';
+                if (aria) return "getByLabel('" + escAttr(aria.slice(0, 80)) + "')";
                 const ph = el.placeholder || '';
-                if (ph) return tag + '[placeholder="' + escAttr(ph.slice(0, 60)) + '"]';
+                if (ph) return "getByPlaceholder('" + escAttr(ph.slice(0, 60)) + "')";
                 return tag;
             };
 
@@ -351,7 +353,81 @@ def get_dom_summary(page: Page, max_length: int = 8000, include_shadow_dom: bool
                 const escAttr = (s) => String(s).replace(/\\\\/g, '\\\\\\\\').replace(/"/g, '\\\\"');
 
                 // --- Канонический локатор (для записи в дефект Jira) ---
-                // Возвращает читаемый Playwright-совместимый селектор.
+                // Возвращает ЧИТАЕМЫЙ Playwright-совместимый селектор.
+                // Приоритет:
+                //   1) data-testid → getByTestId('...')
+                //   2) #id → #foo (стабильный id)
+                //   3) name=...[type=...] → input[name=...]
+                //   4) aria-label → getByLabel('...')
+                //   5) role + accessible name → getByRole('button',{name:'...'})
+                //   6) placeholder → getByPlaceholder('...')
+                //   7) видимый текст (короткий) → getByText('...')
+                //   8) CSS-fallback ТОЛЬКО из «осмысленных» классов; иначе — tag.
+                //
+                // Ключевая фишка: фильтруем «случайные» CSS-классы из CSS-in-JS
+                // (styled-components, emotion): sc-fEcDHC, jsx-1234567890, css-1abc23.
+                const RANDOM_CLASS_RE = /^(?:sc-[a-z0-9]+|jsx-[0-9]+|css-[a-z0-9]+|emotion-[0-9a-z]+|tw-[0-9a-z]+|[A-Z][a-zA-Z]*__[A-Za-z0-9-]+|.{2,}-[a-z0-9]{5,})$/;
+                const isMeaningfulClass = (c) => {
+                    if (!c) return false;
+                    if (c.length < 3 || c.length > 40) return false;
+                    if (RANDOM_CLASS_RE.test(c)) return false;
+                    if (/^[A-Z][a-zA-Z]*-[a-z]+$/.test(c)) return false;  // BEM-подобный с хвостом
+                    if (/^_/.test(c)) return false;
+                    return true;
+                };
+                const isStableId = (id) => {
+                    if (!id) return false;
+                    if (id.length > 64) return false;
+                    if (/^[a-f0-9]{8,}$/i.test(id)) return false;          // hex-id
+                    if (/[0-9]{6,}/.test(id)) return false;                // длинные числа
+                    if (/^uid-|^_uid-|^id-[0-9]+|^.*--[a-z0-9]{6,}$/.test(id)) return false;
+                    if (/:r[0-9a-z]+:/i.test(id)) return false;            // React useId
+                    return true;
+                };
+                const accessibleName = (el) => {
+                    const aria = (el.getAttribute && el.getAttribute('aria-label')) || '';
+                    if (aria) return aria.replace(/\\s+/g, ' ').trim();
+                    const labelledby = (el.getAttribute && el.getAttribute('aria-labelledby')) || '';
+                    if (labelledby) {
+                        try {
+                            const ids = labelledby.split(/\\s+/);
+                            const txt = ids.map(i => (document.getElementById(i) || {}).innerText || '').join(' ').trim();
+                            if (txt) return txt.replace(/\\s+/g,' ').slice(0, 80);
+                        } catch (e) {}
+                    }
+                    if (el.tagName === 'INPUT' && el.id) {
+                        try {
+                            const lbl = document.querySelector('label[for="' + escAttr(el.id) + '"]');
+                            if (lbl && lbl.innerText) return lbl.innerText.replace(/\\s+/g,' ').trim().slice(0, 80);
+                        } catch (e) {}
+                    }
+                    return '';
+                };
+                const implicitRole = (el) => {
+                    const tag = el.tagName.toLowerCase();
+                    const explicit = (el.getAttribute && el.getAttribute('role')) || '';
+                    if (explicit) return explicit;
+                    if (tag === 'button') return 'button';
+                    if (tag === 'a' && el.getAttribute('href')) return 'link';
+                    if (tag === 'input') {
+                        const t = (el.type || 'text').toLowerCase();
+                        if (t === 'checkbox') return 'checkbox';
+                        if (t === 'radio') return 'radio';
+                        if (t === 'submit' || t === 'button') return 'button';
+                        if (t === 'search') return 'searchbox';
+                        return 'textbox';
+                    }
+                    if (tag === 'textarea') return 'textbox';
+                    if (tag === 'select') return 'combobox';
+                    if (tag === 'img') return 'img';
+                    if (tag === 'nav') return 'navigation';
+                    if (/^h[1-6]$/.test(tag)) return 'heading';
+                    return '';
+                };
+                const visibleText = (el) => {
+                    const t = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                    return t;
+                };
                 const canonicalLocator = (el) => {
                     if (!el || !el.tagName) return '';
                     const tag = el.tagName.toLowerCase();
@@ -359,22 +435,29 @@ def get_dom_summary(page: Page, max_length: int = 8000, include_shadow_dom: bool
                         || el.getAttribute('data-test-id')
                         || el.getAttribute('data-test')
                         || el.getAttribute('data-qa'))) || '';
-                    if (tid) return '[data-testid="' + escAttr(tid) + '"]';
-                    if (el.id) return '#' + el.id;
+                    if (tid) return 'getByTestId(\\'' + escAttr(tid) + '\\')';
+                    if (el.id && isStableId(el.id)) return '#' + el.id;
                     if (el.name) return tag + '[name="' + escAttr(el.name) + '"]';
-                    const aria = (el.getAttribute && el.getAttribute('aria-label')) || '';
-                    if (aria) return tag + '[aria-label="' + escAttr(aria.slice(0, 80)) + '"]';
-                    const role = (el.getAttribute && el.getAttribute('role')) || '';
-                    const text = (el.innerText || el.textContent || '').replace(/\\s+/g,' ').trim().slice(0, 60);
-                    if (role && text) return 'role=' + role + '[name="' + escAttr(text) + '"]';
-                    if (tag === 'button' && text) return 'role=button[name="' + escAttr(text) + '"]';
-                    if (tag === 'a' && text) return 'role=link[name="' + escAttr(text) + '"]';
-                    if (text && text.length <= 40) return tag + ':has-text("' + escAttr(text) + '")';
+
+                    const aname = accessibleName(el);
+                    if (aname) return 'getByLabel(\\'' + escAttr(aname.slice(0, 80)) + '\\')';
+
+                    const role = implicitRole(el);
+                    const text = visibleText(el);
+                    const shortText = text.length <= 60 ? text : '';
+                    if (role && shortText) {
+                        return "getByRole('" + role + "', { name: '" + escAttr(shortText) + "' })";
+                    }
                     const ph = el.placeholder || '';
-                    if (ph) return tag + '[placeholder="' + escAttr(ph.slice(0, 60)) + '"]';
+                    if (ph) return 'getByPlaceholder(\\'' + escAttr(ph.slice(0, 60)) + '\\')';
+                    if (shortText && shortText.length >= 2) {
+                        return 'getByText(\\'' + escAttr(shortText) + '\\')';
+                    }
+
+                    // CSS fallback: только осмысленные классы.
                     if (typeof el.className === 'string') {
-                        const cls = el.className.trim().split(/\\s+/).filter(Boolean).slice(0, 2).join('.');
-                        if (cls) return tag + '.' + cls;
+                        const meaningful = el.className.trim().split(/\\s+/).filter(isMeaningfulClass);
+                        if (meaningful.length) return tag + '.' + meaningful.slice(0, 2).join('.');
                     }
                     return tag;
                 };

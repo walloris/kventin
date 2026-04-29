@@ -288,6 +288,107 @@ def rule_action_failure(
     return None
 
 
+def rule_page_load_errors(
+    page_url: str,
+    console_entries: List[Dict[str, Any]],
+    network_entries: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Дефект «при открытии страницы» — без привязки к действию агента.
+
+    Что считаем багом загрузки:
+      • `pageerror` или серьёзный `console.error` в окне после goto
+        (TypeError/ReferenceError/Uncaught/…)
+      • 5xx на любом запросе
+      • 4xx на ключевых запросах: HTML-документ или API того же хоста
+        (401/403 не считаем — часто легитимная авторизация).
+
+    Возвращает {title, details, severity, kind, errors_summary}, где
+    `kind = "page_load"` помогает на стороне create_defect отделить класс дефекта.
+    """
+    page_url = page_url or ""
+    page_host = ""
+    try:
+        page_host = (urlparse(page_url).hostname or "").lower()
+    except Exception:
+        pass
+
+    # 1) JS-ошибки
+    js_hits: List[Dict[str, Any]] = []
+    for c in console_entries[-200:]:
+        ctype = (c.get("type") or "").lower()
+        text = (c.get("text") or "").strip()
+        if not text or is_noise_console_text(text):
+            continue
+        if ctype == "pageerror" or (ctype == "error" and _looks_like_severe_js_error(text)):
+            js_hits.append(c)
+
+    # 2) Сетевые
+    net_5xx: List[Dict[str, Any]] = []
+    net_4xx: List[Dict[str, Any]] = []
+    for n in network_entries[-200:]:
+        url = n.get("url") or ""
+        status = n.get("status") or 0
+        if not isinstance(status, int) or status < 400 or status == 0:
+            continue
+        if is_noise_url(url):
+            continue
+        try:
+            n_host = (urlparse(url).hostname or "").lower()
+        except Exception:
+            n_host = ""
+        is_main_doc = url.split("?")[0].rstrip("/") == page_url.split("?")[0].rstrip("/")
+        is_same_host = bool(page_host and n_host == page_host)
+        is_api = any(seg in url for seg in ("/api/", "/v1/", "/v2/", "/graphql"))
+        if status >= 500:
+            net_5xx.append(n)
+            continue
+        if 400 <= status < 500 and status not in (401, 403):
+            if is_main_doc or (is_same_host and is_api):
+                net_4xx.append(n)
+
+    if not js_hits and not net_5xx and not net_4xx:
+        return None
+
+    # Severity: 5xx → critical; pageerror/severe → major; 4xx → major
+    severity = "major"
+    if net_5xx:
+        severity = "critical"
+    elif any((c.get("type") or "").lower() == "pageerror" for c in js_hits):
+        severity = "major"
+
+    # Заголовок и детали
+    if net_5xx:
+        worst = net_5xx[-1]
+        title = f"Страница не работает корректно при открытии: {worst.get('status')} {worst.get('method', 'GET')} {(urlparse(worst.get('url') or '').path or '/')[:80]}"
+    elif js_hits:
+        first = js_hits[0]
+        title = f"Ошибки в консоли при открытии страницы: {(first.get('text') or '')[:120]}"
+    else:
+        worst = net_4xx[-1]
+        title = f"Ошибка ресурса при открытии страницы: {worst.get('status')} {(urlparse(worst.get('url') or '').path or '/')[:80]}"
+
+    details_parts: List[str] = [f"URL: {page_url}"]
+    if js_hits:
+        details_parts.append(f"JS-ошибок в консоли: {len(js_hits)} (см. вложение console.log и блок «Ошибки консоли»).")
+    if net_5xx:
+        details_parts.append(f"5xx-ответов: {len(net_5xx)}.")
+    if net_4xx:
+        details_parts.append(f"4xx на ключевых запросах: {len(net_4xx)}.")
+    details = "\n".join(details_parts)
+
+    return {
+        "title": title[:200],
+        "details": details,
+        "severity": severity,
+        "kind": "page_load",
+        "errors_summary": {
+            "js_count": len(js_hits),
+            "net_5xx": len(net_5xx),
+            "net_4xx": len(net_4xx),
+        },
+    }
+
+
 def rule_blank_page(page_text: str) -> Optional[Dict[str, Any]]:
     """Подозрение на «белый экран»: содержимое body — пусто или совсем мало."""
     if not isinstance(page_text, str):
@@ -338,6 +439,7 @@ __all__ = [
     "rule_4xx_on_main",
     "rule_pageerror",
     "rule_action_failure",
+    "rule_page_load_errors",
     "rule_blank_page",
     "should_create_defect",
 ]

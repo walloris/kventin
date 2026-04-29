@@ -227,7 +227,9 @@ def build_defect_description(
         "h3. Вложения (фактура)\n"
         "* screenshot.png — скриншот страницы на момент обнаружения\n"
         "* console.log — полные логи консоли браузера (включая стек-трейсы и путь до JS)\n"
-        "* network.log — неуспешные сетевые запросы"
+        "* network.log — неуспешные сетевые запросы\n"
+        "* network.har — полный HAR (HTTP Archive) на момент дефекта: запросы, "
+        "ответы, заголовки, тайминги. Открывается в Chrome DevTools (Network → Import HAR)."
     )
 
     return "\n\n".join(sections)
@@ -238,10 +240,16 @@ def collect_evidence(
     console_log: List[Dict[str, Any]],
     network_failures: List[Dict[str, Any]],
     temp_dir: Optional[str] = None,
+    *,
+    har_window_seconds: float = 60.0,
+    har_last_n: int = 200,
 ) -> List[str]:
     """
-    Собрать фактуру во временные файлы: скриншот, console.log, network.log.
-    Возвращает список путей к созданным файлам.
+    Собрать фактуру во временные файлы: скриншот, console.log, network.log, network.har.
+
+    HAR прикрепляется, если на странице есть `_agent_net_capture` (NetworkCapture).
+    Берём «окно момента» — последние har_window_seconds секунд и не больше har_last_n
+    записей, чтобы вложение было компактным и релевантным.
     """
     if temp_dir is None:
         temp_dir = tempfile.mkdtemp(prefix="kventin_defect_")
@@ -294,5 +302,23 @@ def collect_evidence(
         paths.append(network_path)
     except Exception as e:
         print(f"[Defect] Не удалось сохранить network.log: {e}")
+
+    # HAR на момент дефекта (окно времени + ограничение по числу записей)
+    try:
+        net_cap = getattr(page, "_agent_net_capture", None)
+        if net_cap is not None and hasattr(net_cap, "dump_har_to"):
+            import time as _time
+            har_path = os.path.join(temp_dir, "network.har")
+            since = _time.time() - max(1.0, float(har_window_seconds))
+            ok = net_cap.dump_har_to(
+                har_path,
+                page_url=page.url,
+                since_ts=since,
+                last_n=int(har_last_n) if har_last_n else None,
+            )
+            if ok:
+                paths.append(har_path)
+    except Exception as e:
+        print(f"[Defect] Не удалось сохранить network.har: {e}")
 
     return paths

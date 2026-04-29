@@ -173,6 +173,7 @@ from src.defect_builder import (
     infer_defect_severity,
 )
 from src.locators import url_pattern as _url_pattern
+from src.network_capture import NetworkCapture
 
 # Бюджет на URL — единый источник правды в config.py.
 from config import URL_BUDGET_NO_PROGRESS  # noqa: E402,F401
@@ -1423,6 +1424,31 @@ def run_agent(start_url: str = None):
         page.on("response", on_response)
         page._agent_network_failures = network_failures
 
+        # HAR: захватываем все запросы (request+response+timing+headers/sizes),
+        # чтобы прикреплять к дефекту окно по времени или последние N запросов.
+        net_capture = NetworkCapture()
+        net_capture.attach(page)
+        page._agent_net_capture = net_capture
+        memory.net_capture = net_capture
+
+        # On-load диагностика для каждой смены URL:
+        # помечаем флаг при framenavigated → проверяем в начале следующего шага.
+        memory._pending_page_load_check_url = ""
+
+        def _on_main_frame_navigated(frame):
+            try:
+                if frame == page.main_frame:
+                    new_url = frame.url or ""
+                    if new_url:
+                        memory._pending_page_load_check_url = new_url
+            except Exception:
+                pass
+
+        try:
+            page.on("framenavigated", _on_main_frame_navigated)
+        except Exception:
+            LOG.debug("framenavigated подписка не установлена", exc_info=True)
+
         if ENABLE_WEBSOCKET_MONITOR:
             def on_websocket(ws):
                 url_ws = ws.url or ""
@@ -1475,6 +1501,15 @@ def run_agent(start_url: str = None):
         if try_accept_cookie_banner(page):
             time.sleep(1.5)
             smart_wait_after_goto(page, timeout=3000)
+
+        # On-load диагностика: ошибки в консоли/сети при ОТКРЫТИИ страницы
+        # заводятся отдельным дефектом (kind=page_load) — без привязки к действию.
+        try:
+            _check_page_load_and_report(
+                page, memory, page.url or start_url, console_log, network_failures,
+            )
+        except Exception:
+            LOG.exception("check_page_load_and_report (start): ошибка")
 
         # Спецификация теста (YAML): выполнить сценарии до автономного прохода
         if TEST_SPEC_YAML_PATH:
@@ -1775,6 +1810,19 @@ def run_agent(start_url: str = None):
                     _flush_pending_analysis(page, memory, console_log, network_failures)
                 except Exception:
                     LOG.exception("flush_pending_analysis: исключение проглочено")
+
+                # On-load: если за последний шаг произошла навигация — проверим
+                # консоль/сеть на дефекты ЗАГРУЗКИ страницы (отдельный класс).
+                pending_url = getattr(memory, "_pending_page_load_check_url", "") or ""
+                if pending_url:
+                    memory._pending_page_load_check_url = ""
+                    try:
+                        _check_page_load_and_report(
+                            page, memory, pending_url, console_log, network_failures,
+                            settle_seconds=1.0,
+                        )
+                    except Exception:
+                        LOG.exception("check_page_load_and_report (navigation): ошибка")
 
                 # Лимит логов
                 if len(console_log) > CONSOLE_LOG_LIMIT:
@@ -4116,6 +4164,7 @@ from src.defect_pipeline import (
 # Self-heal остаётся здесь — он использует execute_action из этого же файла
 # и слишком сильно завязан на внутренний state.
 from src.agent_checks import (
+    check_page_load_and_report as _check_page_load_and_report,
     request_scenario_chain as _request_scenario_chain,
     run_a11y_check as _run_a11y_check,
     run_iframe_check as _run_iframe_check,

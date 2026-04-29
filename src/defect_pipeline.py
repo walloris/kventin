@@ -173,7 +173,9 @@ def create_defect(
     if canonical_locator or last_action_summary:
         affected_block = "h3. Затронутый элемент\n"
         if canonical_locator:
-            affected_block += f"Канонический локатор: {{{{{canonical_locator}}}}}\n"
+            affected_block += (
+                f"Локатор (Playwright-стиль, читаемый): {{{{{canonical_locator}}}}}\n"
+            )
         if last_action_summary:
             affected_block += f"Последнее действие: {{{{{last_action_summary}}}}}\n"
         anchor = "h3. Шаги воспроизведения"
