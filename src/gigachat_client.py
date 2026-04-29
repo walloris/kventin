@@ -870,6 +870,93 @@ def get_test_plan_from_screenshot(screenshot_b64: Optional[str], url: str) -> Li
     return steps[:10]
 
 
+def get_structured_test_plan(
+    screenshot_b64: Optional[str],
+    url: str,
+    *,
+    page_summary: str = "",
+    modules: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Структурированный тест-план: список объектов вместо плоских строк.
+
+    Каждый пункт:
+      {
+        "id": "smoke-1",
+        "area": "header" | "main" | "form" | ...,
+        "module": "Главное меню" | "",        # имя модуля, если есть
+        "title": "Открыть карточку клиента из списка",
+        "intent": "Убедиться, что список открывает карточку",
+        "expected": "Открывается страница карточки с данными клиента",
+        "priority": "smoke" | "critical" | "exploratory"
+      }
+
+    LLM просим вернуть JSON. При ошибке парсинга падаем обратно на плоский план,
+    превращая каждую строку в минимальный пункт plan-shape.
+    """
+    modules = modules or []
+    modules_block = ""
+    if modules:
+        names = "; ".join(m.get("name", "")[:40] for m in modules[:10] if m.get("name"))
+        if names:
+            modules_block = f"\nМодули, доступные на странице (используй их имена в поле module): {names}"
+
+    system = (
+        "Ты — старший тест-аналитик. Получив скриншот и краткое описание страницы, "
+        "составь рабочий тест-план в виде JSON-массива объектов. Никаких пояснений, "
+        "никакого markdown — только массив. Каждый объект содержит поля: id (строка, "
+        "уникальная в пределах массива), area (короткий тег), module (имя модуля или ''), "
+        "title (что делаем), intent (зачем), expected (ожидаемый результат), "
+        "priority (smoke|critical|exploratory). Длина массива 6–10. Сначала smoke, "
+        "потом critical, потом exploratory. Не выдумывай элементов, опирайся на скриншот."
+    )
+    prompt = (
+        f"URL: {url}\n"
+        f"Описание страницы: {page_summary[:600] if page_summary else '—'}{modules_block}\n\n"
+        "Выдай тест-план в виде JSON-массива (6–10 пунктов)."
+    )
+    raw = _get_client().chat_with_screenshot(prompt, screenshot_b64=screenshot_b64, system=system) or ""
+    cleaned = re.sub(r"^```(?:json)?\s*", "", raw.strip(), flags=re.MULTILINE)
+    cleaned = re.sub(r"```\s*$", "", cleaned.strip(), flags=re.MULTILINE)
+    items: List[Dict[str, Any]] = []
+    try:
+        import json
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, list):
+            for i, raw_item in enumerate(parsed[:12]):
+                if not isinstance(raw_item, dict):
+                    continue
+                item = {
+                    "id": str(raw_item.get("id") or f"plan-{i+1}")[:40],
+                    "area": str(raw_item.get("area") or "")[:30],
+                    "module": str(raw_item.get("module") or "")[:60],
+                    "title": str(raw_item.get("title") or "")[:200],
+                    "intent": str(raw_item.get("intent") or "")[:200],
+                    "expected": str(raw_item.get("expected") or "")[:300],
+                    "priority": str(raw_item.get("priority") or "exploratory").lower()[:20],
+                }
+                if item["title"]:
+                    items.append(item)
+    except (json.JSONDecodeError, ValueError):
+        items = []
+    if items:
+        return items
+    # Fallback: попросим обычный плоский план и обернём.
+    flat = get_test_plan_from_screenshot(screenshot_b64, url)
+    return [
+        {
+            "id": f"plan-{i+1}",
+            "area": "",
+            "module": "",
+            "title": s,
+            "intent": "",
+            "expected": "",
+            "priority": "smoke" if i < 3 else ("critical" if i < 6 else "exploratory"),
+        }
+        for i, s in enumerate(flat)
+    ]
+
+
 def ask_is_this_really_bug(bug_description: str, screenshot_b64: Optional[str]) -> bool:
     """
     Второй проход: GigaChat смотрит описание и скриншот и решает — это точно баг приложения?

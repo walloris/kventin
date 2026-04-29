@@ -104,6 +104,7 @@ from config import (
 from src.gigachat_client import (
     consult_agent_with_screenshot,
     consult_agent,
+    get_structured_test_plan,
     get_test_plan_from_screenshot,
     ask_is_this_really_bug,
     init_gigachat_connection,
@@ -1517,15 +1518,34 @@ def run_agent(start_url: str = None):
             _run_test_spec_yaml(page, memory, TEST_SPEC_YAML_PATH)
             time.sleep(1)
 
-        # Тест-план в начале сессии (GigaChat по скриншоту предлагает 5–7 шагов)
+        # Тест-план в начале сессии: пытаемся получить структурированный план;
+        # если LLM вернул кривой JSON — фоллбек уже встроен (плоский → обёрнут в dict).
         if ENABLE_TEST_PLAN_START:
             plan_screenshot = take_screenshot_b64(page)
-            test_plan_steps = get_test_plan_from_screenshot(plan_screenshot, start_url)
-            if test_plan_steps:
-                memory.set_test_plan(test_plan_steps)
-                memory.set_test_plan_tracking()
-                print(f"[Agent] Тест-план ({len(test_plan_steps)} шагов): " + "; ".join(test_plan_steps[:3]) + "…")
-                update_llm_overlay(page, prompt="Тест-план", response="; ".join(test_plan_steps[:4]), loading=False)
+            try:
+                plan_modules = get_page_modules(page)
+            except Exception:
+                plan_modules = []
+            structured_plan = get_structured_test_plan(
+                plan_screenshot,
+                start_url,
+                modules=plan_modules,
+            )
+            if structured_plan:
+                memory.set_structured_test_plan(structured_plan)
+                titles = [it.get("title", "") for it in structured_plan]
+                print(
+                    f"[Agent] Тест-план структурированный ({len(structured_plan)} пунктов): "
+                    + "; ".join(t[:50] for t in titles[:3]) + "…"
+                )
+                update_llm_overlay(page, prompt="Тест-план", response="; ".join(titles[:4]), loading=False)
+            else:
+                test_plan_steps = get_test_plan_from_screenshot(plan_screenshot, start_url)
+                if test_plan_steps:
+                    memory.set_test_plan(test_plan_steps)
+                    memory.set_test_plan_tracking()
+                    print(f"[Agent] Тест-план ({len(test_plan_steps)} шагов): " + "; ".join(test_plan_steps[:3]) + "…")
+                    update_llm_overlay(page, prompt="Тест-план", response="; ".join(test_plan_steps[:4]), loading=False)
 
         # Абсолютные пути к отчётам (чтобы знать, куда они пишутся)
         _report_abs_path = os.path.abspath(SESSION_REPORT_PATH) if SESSION_REPORT_PATH else ""
@@ -1654,8 +1674,24 @@ def run_agent(start_url: str = None):
 Используй selector="ref:N". Тестируй оверлей или закрой (close_modal)."""
             else:
                 plan_hint = ""
-                if memory_.test_plan:
-                    plan_hint = memory_.get_test_plan_progress() + "\n"
+                if memory_.test_plan or getattr(memory_, "structured_test_plan", None):
+                    next_focus = memory_.get_next_plan_focus()
+                    if next_focus:
+                        prio = next_focus.get("priority", "")
+                        title = next_focus.get("title", "")[:120]
+                        intent = next_focus.get("intent", "")[:140]
+                        expected = next_focus.get("expected", "")[:140]
+                        module = next_focus.get("module") or next_focus.get("area") or ""
+                        mod_part = f" (модуль: {module})" if module else ""
+                        plan_hint = (
+                            f"СЛЕДУЮЩИЙ ПУНКТ ПЛАНА [{prio}]{mod_part}: {title}\n"
+                        )
+                        if intent:
+                            plan_hint += f"  Зачем: {intent}\n"
+                        if expected:
+                            plan_hint += f"  Ожидаемый результат: {expected}\n"
+                    else:
+                        plan_hint = memory_.get_test_plan_progress() + "\n"
                 critical_hint = ""
                 if CRITICAL_FLOW_STEPS:
                     critical_hint = f"\nКритический сценарий (сделай в первую очередь): {', '.join(CRITICAL_FLOW_STEPS[:5])}.\n"
@@ -1811,6 +1847,56 @@ def run_agent(start_url: str = None):
                 except Exception:
                     LOG.exception("flush_pending_analysis: исключение проглочено")
 
+                # ===== Anti-Loop Guard =====
+                # Реакция на «застой» сессии: лестница diversify → goto_start → hard_stop.
+                # Подробности в AgentMemory.loop_guard_action / config.LOOP_GUARD_*.
+                guard = memory.loop_guard_action()
+                if guard == "hard_stop":
+                    print(
+                        f"[Agent] #{step} Anti-loop: HARD STOP — {memory.session_stop_reason}"
+                    )
+                    LOG.warning("loop-guard hard_stop: %s", memory.session_stop_reason)
+                    break
+                if guard == "goto_start" and not page.is_closed():
+                    print(
+                        f"[Agent] #{step} Anti-loop: GOTO_START "
+                        f"({memory.steps_without_progress} шагов без прогресса)"
+                    )
+                    try:
+                        page.goto(start_url, wait_until="domcontentloaded", timeout=20000)
+                        smart_wait_after_goto(page, timeout=5000)
+                        _inject_all(page)
+                        memory.set_current_url_pattern(start_url)
+                        memory.advance_tester_phase(force=True)
+                        memory.reset_repeats()
+                        memory.reset_session_progress()
+                    except Exception:
+                        LOG.exception("loop-guard goto_start failed")
+                    if SESSION_REPORT_SAVE_EVERY_N > 0:
+                        _save_report_now(step, "anti-loop: возврат на старт")
+                    continue
+                if guard == "diversify":
+                    print(
+                        f"[Agent] #{step} Anti-loop: DIVERSIFY "
+                        f"({memory.steps_without_progress} шагов без прогресса)"
+                    )
+                    if memory.advance_module():
+                        m = memory.get_current_module()
+                        print(f"[Agent] Anti-loop: смена модуля: {(m or {}).get('name', '')[:50]}")
+                    memory.advance_tester_phase(force=True)
+                    memory.reset_repeats()
+                    # Подменяем «следующее действие» на разнообразящее: либо назад в
+                    # истории, либо просто scroll вниз — это и сбивает паттерн повторов,
+                    # и часто открывает невидимые ранее модули.
+                    forced_diversify_action = {
+                        "action": "scroll",
+                        "selector": "down",
+                        "reason": "anti-loop diversify",
+                    }
+                    # Помечаем флагом, чтобы не давать LLM перебивать решение в этом шаге.
+                    memory._diversify_step = step
+                    memory._forced_action = forced_diversify_action
+
                 # On-load: если за последний шаг произошла навигация — проверим
                 # консоль/сеть на дефекты ЗАГРУЗКИ страницы (отдельный класс).
                 pending_url = getattr(memory, "_pending_page_load_check_url", "") or ""
@@ -1870,7 +1956,18 @@ def run_agent(start_url: str = None):
 
                 gc_action = _poll_gigachat()
 
-                if gc_action is not None:
+                forced = getattr(memory, "_forced_action", None)
+                if forced and getattr(memory, "_diversify_step", -1) == step:
+                    action = forced
+                    memory._forced_action = None
+                    screenshot_b64 = None
+                    source = "AntiLoop"
+                    if gc_action is not None:
+                        # GigaChat предложил действие, но мы под антилупом — игнорируем
+                        # его на этом шаге и не теряем зря: сбрасываем future, а не кладём
+                        # «отложенное решение для потом» (контекст ушёл).
+                        _gigachat_action = None
+                elif gc_action is not None:
                     action = gc_action
                     _gigachat_action = None
                     has_overlay = _gigachat_meta.get("has_overlay", has_overlay)
@@ -4253,18 +4350,47 @@ def _check_network_after_action(page: Page, memory: AgentMemory, action: Dict, n
 
 
 def _track_test_plan(memory: AgentMemory, action: Dict):
-    """Отследить, какой пункт тест-плана закрыт текущим действием."""
-    if not memory.test_plan or not memory.test_plan_completed:
-        return
+    """Отследить, какой пункт тест-плана закрыт текущим действием.
+
+    Поддерживает оба формата плана:
+      • структурированный (memory.structured_test_plan: {title, intent, module, ...})
+      • плоский (memory.test_plan: List[str])
+    Совпадение определяем простой эвристикой: ≥2 «значимых» слова (>3 символов) из
+    title/intent встречаются в reason/test_goal/element_desc/selector текущего действия.
+    """
     reason = (action.get("reason") or "").lower()
     test_goal = (action.get("test_goal") or "").lower()
     sel = (action.get("selector") or "").lower()
-    combined = f"{reason} {test_goal} {sel}"
+    elem_desc = ""
+    step_ctx = action.get("_step_context") or {}
+    if isinstance(step_ctx, dict):
+        elem_desc = (step_ctx.get("element_desc") or "").lower()
+    combined = f"{reason} {test_goal} {sel} {elem_desc}"
+
+    structured = getattr(memory, "structured_test_plan", None) or []
+    if structured:
+        for i, item in enumerate(structured):
+            if item.get("done"):
+                continue
+            haystack = " ".join([
+                (item.get("title") or "").lower(),
+                (item.get("intent") or "").lower(),
+                (item.get("module") or "").lower(),
+                (item.get("area") or "").lower(),
+            ])
+            words = [w for w in haystack.split() if len(w) > 3]
+            matches = sum(1 for w in words if w in combined)
+            if matches >= 2 or (len(words) <= 2 and matches >= 1):
+                memory.mark_structured_test_plan_step(i, result=action.get("expected_outcome", ""))
+                print(f"[Agent] Тест-план: закрыт пункт {i+1}: {(item.get('title') or '')[:50]}")
+                return
+
+    if not memory.test_plan or not memory.test_plan_completed:
+        return
     for i, step in enumerate(memory.test_plan):
         if memory.test_plan_completed[i]:
             continue
         step_lower = step.lower()
-        # Простая эвристика: если 2+ слова из пункта плана встречаются в действии
         words = [w for w in step_lower.split() if len(w) > 3]
         matches = sum(1 for w in words if w in combined)
         if matches >= 2 or (len(words) <= 2 and matches >= 1):

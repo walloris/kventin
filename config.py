@@ -218,6 +218,18 @@ PHASE_STEPS_TO_ADVANCE = int(os.getenv("PHASE_STEPS_TO_ADVANCE", "5"))
 # на стартовую страницу (см. AgentMemory.should_force_back_to_start).
 URL_BUDGET_NO_PROGRESS = int(os.getenv("URL_BUDGET_NO_PROGRESS", "25"))
 
+# --- Anti-Loop Guard на уровне сессии ---
+# Эскалация при зацикливании. Реагируем не только на «3 одинаковых ключа подряд»
+# (это уже есть в AgentMemory), но и на «N шагов подряд без полезного прогресса»:
+# нет ни одного нового stable_key, ни одного нового URL, ни одного нового дефекта.
+# Лестница реакций (по нарастанию):
+#   stage 1 — диверсия: scroll/back/нерассмотренный модуль (LOOP_GUARD_DIVERSIFY_AFTER)
+#   stage 2 — назад на стартовую страницу (LOOP_GUARD_GOTO_START_AFTER)
+#   stage 3 — завершить сессию (LOOP_GUARD_HARD_STOP_AFTER, 0 = не останавливать)
+LOOP_GUARD_DIVERSIFY_AFTER = int(os.getenv("LOOP_GUARD_DIVERSIFY_AFTER", "12"))
+LOOP_GUARD_GOTO_START_AFTER = int(os.getenv("LOOP_GUARD_GOTO_START_AFTER", "30"))
+LOOP_GUARD_HARD_STOP_AFTER = int(os.getenv("LOOP_GUARD_HARD_STOP_AFTER", "80"))
+
 # --- Продвинутые проверки ---
 A11Y_CHECK_EVERY_N = int(os.getenv("A11Y_CHECK_EVERY_N", "10"))
 PERF_CHECK_EVERY_N = int(os.getenv("PERF_CHECK_EVERY_N", "15"))

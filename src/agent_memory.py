@@ -16,6 +16,9 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from config import (
+    LOOP_GUARD_DIVERSIFY_AFTER,
+    LOOP_GUARD_GOTO_START_AFTER,
+    LOOP_GUARD_HARD_STOP_AFTER,
     MAX_ACTIONS_IN_MEMORY,
     MAX_SCROLLS_IN_ROW,
     PHASE_STEPS_TO_ADVANCE,
@@ -54,6 +57,7 @@ class AgentMemory:
         self.defects_on_current_step: int = 0
         self.coverage_zones: List[str] = []
         self.test_plan: List[str] = []
+        self.structured_test_plan: List[Dict[str, Any]] = []
         self.critical_flow_done: set = set()
         self.defects_created: List[Dict[str, Any]] = []
         self.session_start: Optional[datetime] = None
@@ -110,6 +114,17 @@ class AgentMemory:
         # Если она достигнет порога — игнорируем оверлей, пока агент не сделает что-то ещё.
         self._consecutive_close_modal: int = 0
         self.ignore_overlay: bool = False
+        # --- Anti-Loop Guard на уровне сессии ---
+        # Сколько шагов прошло БЕЗ полезного прогресса (новый stable_key / новый URL /
+        # новый дефект). Сбрасывается на каждом «полезном» шаге.
+        self.steps_without_progress: int = 0
+        self._all_touched_keys: set = set()
+        self._all_visited_url_patterns: set = set()
+        self._defects_count_at_last_progress: int = 0
+        self._last_session_diversify_step: int = -1
+        self._last_session_goto_start_step: int = -1
+        self.session_should_stop: bool = False
+        self.session_stop_reason: str = ""
 
     # ------------------------------------------------------------------ navigation
 
@@ -210,6 +225,11 @@ class AgentMemory:
             self.actions = self.actions[-self.max_actions:]
 
         # Дедупликация по url_pattern + stable_key (главный механизм).
+        progress_made = False
+        if url_pat:
+            if url_pat not in self._all_visited_url_patterns:
+                self._all_visited_url_patterns.add(url_pat)
+                progress_made = True
         if url_pat and stable_key and act in (
             "click", "hover", "type", "select_option", "fill_form", "upload_file",
         ):
@@ -217,12 +237,33 @@ class AgentMemory:
             touched = self.touched_keys_on_url.setdefault(url_pat, set())
             is_new_key = stable_key not in touched
             touched.add(stable_key)
+            global_key = f"{url_pat}#{stable_key}"
+            if global_key not in self._all_touched_keys:
+                self._all_touched_keys.add(global_key)
+                progress_made = True
             if is_new_key:
                 self.steps_on_url_no_progress[url_pat] = 0
             else:
                 self.steps_on_url_no_progress[url_pat] = (
                     self.steps_on_url_no_progress.get(url_pat, 0) + 1
                 )
+
+        # Глобальный счётчик прогресса для anti-loop guard. Новый дефект тоже считается
+        # прогрессом — даже если позже окажется дублем, на шаге создания мы видим, что
+        # «что-то нашлось», и не глушим агента.
+        if not progress_made and len(self.defects_created) > self._defects_count_at_last_progress:
+            progress_made = True
+        if progress_made:
+            self._defects_count_at_last_progress = len(self.defects_created)
+            self.steps_without_progress = 0
+        else:
+            # scroll/close_modal сами по себе не прогресс, но и не «окончательный простой» —
+            # учитываем чуть мягче: один scroll = 0.5 шага, чтобы скроллинг не выдавил
+            # агент в hard-stop за пару экранов.
+            if act in ("scroll", "close_modal"):
+                self.steps_without_progress += 1 if (self.iteration % 2 == 0) else 0
+            else:
+                self.steps_without_progress += 1
 
         # Старый механизм (fallback на случай отсутствия stable_key).
         def _safe_key(x):
@@ -405,6 +446,49 @@ class AgentMemory:
     def is_stuck(self) -> bool:
         return self._consecutive_repeats >= 3
 
+    # --- Anti-Loop Guard на уровне сессии ----------------------------------
+
+    def loop_guard_action(self) -> str:
+        """
+        Решить, какую эскалацию запустить из-за «застоя» сессии.
+
+        Возвращает один из строковых статусов:
+          ""             — всё нормально, продолжаем
+          "diversify"    — пора разнообразить (scroll/back/смена модуля)
+          "goto_start"   — пора вернуться на стартовую страницу
+          "hard_stop"    — пора аккуратно завершить сессию
+
+        Каждая эскалация выдаётся НЕ чаще одного раза на серию: если агент уже
+        получил «diversify» на шаге 14, повторно «diversify» придёт только после
+        того, как счётчик ещё раз вырастет на LOOP_GUARD_DIVERSIFY_AFTER. Так
+        мы не залипнем, давая одну и ту же команду каждый шаг.
+        """
+        n = self.steps_without_progress
+        step = self.iteration
+
+        if LOOP_GUARD_HARD_STOP_AFTER and n >= LOOP_GUARD_HARD_STOP_AFTER:
+            self.session_should_stop = True
+            self.session_stop_reason = (
+                f"loop-guard: {n} шагов без прогресса (порог HARD_STOP={LOOP_GUARD_HARD_STOP_AFTER})"
+            )
+            return "hard_stop"
+
+        if LOOP_GUARD_GOTO_START_AFTER and n >= LOOP_GUARD_GOTO_START_AFTER:
+            if step - self._last_session_goto_start_step >= LOOP_GUARD_DIVERSIFY_AFTER:
+                self._last_session_goto_start_step = step
+                return "goto_start"
+
+        if LOOP_GUARD_DIVERSIFY_AFTER and n >= LOOP_GUARD_DIVERSIFY_AFTER:
+            if step - self._last_session_diversify_step >= max(3, LOOP_GUARD_DIVERSIFY_AFTER // 2):
+                self._last_session_diversify_step = step
+                return "diversify"
+        return ""
+
+    def reset_session_progress(self) -> None:
+        """Сбросить счётчик «без прогресса» (например, после смены URL/модуля)."""
+        self.steps_without_progress = 0
+        self._defects_count_at_last_progress = len(self.defects_created)
+
     def record_action_key(self, action: str, selector: str) -> None:
         key = f"{action}:{_norm_key(selector)}"
         self._recent_action_keys.append(key)
@@ -448,6 +532,82 @@ class AgentMemory:
 
     def set_test_plan(self, steps: List[str]) -> None:
         self.test_plan = list(steps)[:15]
+
+    # --- Структурированный тест-план ----------------------------------------
+    # Каждый пункт = dict со схемой, которую возвращает get_structured_test_plan.
+    # Храним рядом со старым плоским test_plan, чтобы постепенно мигрировать UI.
+
+    def set_structured_test_plan(self, items: List[Dict[str, Any]]) -> None:
+        """Сохранить структурированный план и синхронизировать плоский test_plan."""
+        clean: List[Dict[str, Any]] = []
+        for raw in items[:15]:
+            if not isinstance(raw, dict):
+                continue
+            title = str(raw.get("title") or "").strip()
+            if not title:
+                continue
+            clean.append({
+                "id": str(raw.get("id") or f"plan-{len(clean)+1}")[:40],
+                "area": str(raw.get("area") or "")[:30],
+                "module": str(raw.get("module") or "")[:60],
+                "title": title[:200],
+                "intent": str(raw.get("intent") or "")[:200],
+                "expected": str(raw.get("expected") or "")[:300],
+                "priority": str(raw.get("priority") or "exploratory").lower()[:20],
+                "done": False,
+                "result": "",
+            })
+        # Стабильный порядок: smoke → critical → exploratory → остальные.
+        prio_rank = {"smoke": 0, "critical": 1, "exploratory": 2}
+        clean.sort(key=lambda x: prio_rank.get(x.get("priority", ""), 9))
+        self.structured_test_plan: List[Dict[str, Any]] = clean
+        self.test_plan = [item["title"] for item in clean]
+        self.test_plan_completed = [False] * len(clean)
+
+    def get_structured_test_plan(self) -> List[Dict[str, Any]]:
+        return list(getattr(self, "structured_test_plan", []) or [])
+
+    def mark_structured_test_plan_step(
+        self, step_index: int, *, result: str = ""
+    ) -> None:
+        plan = getattr(self, "structured_test_plan", None) or []
+        if 0 <= step_index < len(plan):
+            plan[step_index]["done"] = True
+            if result:
+                plan[step_index]["result"] = result[:300]
+        if 0 <= step_index < len(self.test_plan_completed):
+            self.test_plan_completed[step_index] = True
+
+    def get_structured_plan_progress_text(self) -> str:
+        plan = getattr(self, "structured_test_plan", None) or []
+        if not plan:
+            return ""
+        done = sum(1 for it in plan if it.get("done"))
+        lines = [f"Тест-план (структ.): {done}/{len(plan)}"]
+        for it in plan:
+            mark = "[x]" if it.get("done") else "[ ]"
+            prio = it.get("priority", "")
+            mod = it.get("module") or it.get("area") or ""
+            mod_part = f" «{mod[:30]}»" if mod else ""
+            title = (it.get("title") or "")[:90]
+            line = f"  {mark} [{prio}]{mod_part} {title}"
+            if it.get("done") and it.get("result"):
+                line += f" → {it['result'][:60]}"
+            lines.append(line)
+        return "\n".join(lines)
+
+    def get_next_plan_focus(self) -> Dict[str, Any]:
+        """Вернуть следующий невыполненный пункт плана (или {}).
+
+        Используется в промпте LLM, чтобы направлять выбор действий: «двигайся к
+        этой цели». Приоритет уже отражён в порядке списка (smoke → critical →
+        exploratory).
+        """
+        plan = getattr(self, "structured_test_plan", None) or []
+        for item in plan:
+            if not item.get("done"):
+                return dict(item)
+        return {}
 
     def get_steps_to_reproduce(self, max_steps: int = 15) -> List[str]:
         steps: List[str] = []
@@ -588,7 +748,10 @@ class AgentMemory:
             f"Зоны покрытия: {', '.join(str(z) for z in self.coverage_zones) if self.coverage_zones else '—'}",
             f"Кликнуто: {len(self.done_click)}, наведено: {len(self.done_hover)}, ввод: {len(self.done_type)}",
         ]
-        if self.test_plan:
+        struct_progress = self.get_structured_plan_progress_text()
+        if struct_progress:
+            lines.append(struct_progress)
+        elif self.test_plan:
             lines.append("Тест-план: " + "; ".join(self.test_plan[:5]))
         if self.defects_created:
             lines.append(f"Создано дефектов: {len(self.defects_created)}")
@@ -635,6 +798,10 @@ class AgentMemory:
             self.test_plan_completed[step_index] = True
 
     def get_test_plan_progress(self) -> str:
+        # Если есть структурированный план — выводим его (богаче, с приоритетом и модулями).
+        struct_text = self.get_structured_plan_progress_text()
+        if struct_text:
+            return struct_text
         if not self.test_plan:
             return ""
         done = sum(self.test_plan_completed)

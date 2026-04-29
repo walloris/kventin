@@ -20,6 +20,8 @@ from typing import Any, Dict, List, Optional
 
 from playwright.sync_api import Page
 
+import re
+
 from src.bg_pool import bg_submit
 from src.defect_builder import (
     build_defect_description,
@@ -30,12 +32,98 @@ from src.defect_builder import (
 from src.defect_rules import should_create_defect
 from src.gigachat_client import consult_agent
 from src.jira_client import (
+    build_defect_signature,
     create_jira_issue,
     is_local_duplicate,
     register_local_defect,
 )
+from src.locators import url_pattern as _url_pattern
 
 LOG = logging.getLogger("kventin.defect")
+
+
+_SIG_HEADERS = (
+    ("page_load", r"\[Загрузка страницы\]"),
+    ("action_failure", r"кнопка/элемент недоступна для клика|перекрыта другим элементом|не становится кликабельным"),
+    ("pageerror", r"JS pageerror|JS error в консоли"),
+    ("network_5xx", r"HTTP 5xx|http\s*5\d\d"),
+    ("network_4xx", r"HTTP\s*4\d\d|http\s*4\d\d"),
+    ("a11y", r"\[A11y\]|Accessibility"),
+    ("perf", r"\[Perf\]|Performance"),
+    ("responsive", r"\[Responsive"),
+)
+
+
+def _classify_kind(bug_text: str) -> str:
+    t = (bug_text or "").lower()
+    for kind, pat in _SIG_HEADERS:
+        if re.search(pat, t, re.IGNORECASE):
+            return kind
+    return ""
+
+
+_RULE_FRAGMENTS = (
+    ("intercept", r"intercepts? pointer events|перекрыта другим элементом"),
+    ("timeout_ui", r"не становится кликабельным|exceeded while waiting"),
+    ("rule_5xx", r"\b5\d\d\b"),
+    ("rule_4xx_main", r"\b4\d\d\b"),
+    ("typeerror", r"\bTypeError\b"),
+    ("referenceerror", r"\bReferenceError\b"),
+    ("syntaxerror", r"\bSyntaxError\b"),
+    ("uncaught", r"\bUncaught\b"),
+)
+
+
+def _classify_rule(bug_text: str) -> str:
+    t = (bug_text or "")
+    for rule, pat in _RULE_FRAGMENTS:
+        if re.search(pat, t, re.IGNORECASE):
+            return rule
+    return ""
+
+
+def _extract_error_signature(bug_text: str) -> str:
+    """Достать стабильный «отпечаток ошибки» из текста дефекта.
+
+    Что ищем:
+      • первый кадр стека вида «at https://x.test/static/app.js:12:34» / «foo.js:12»
+      • строку «STATUS METHOD path» из 5xx/4xx-описаний
+      • первую сигнальную строку «TypeError: …», «ReferenceError: …»
+    """
+    if not bug_text:
+        return ""
+    m = re.search(r"\b(\d{3})\s+(GET|POST|PUT|DELETE|PATCH|HEAD)\s+([^\s\)]+)", bug_text)
+    if m:
+        path = re.sub(r"\?.*$", "", m.group(3))
+        # обрезать query/fragment, нормализовать числовые сегменты
+        return f"{m.group(1)} {m.group(2)} {path[:120]}"
+    m = re.search(r"\bat\s+(https?://\S+|\S+\.js):(\d+)(?::(\d+))?", bug_text)
+    if m:
+        return f"at {m.group(1)}:{m.group(2)}"
+    m = re.search(r"\b(TypeError|ReferenceError|SyntaxError|RangeError)\b[:\s]+([^\n]{0,140})", bug_text)
+    if m:
+        head = re.sub(r"\s+", " ", m.group(2)).strip()
+        return f"{m.group(1)}: {head[:120]}"
+    return ""
+
+
+def _compute_defect_signature(
+    *,
+    bug_description: str,
+    current_url: str,
+    canonical_locator: str = "",
+) -> str:
+    kind = _classify_kind(bug_description)
+    rule = _classify_rule(bug_description)
+    err_sig = _extract_error_signature(bug_description)
+    pat = _url_pattern(current_url) if current_url else ""
+    return build_defect_signature(
+        kind=kind,
+        rule=rule,
+        url_pattern=pat,
+        locator=canonical_locator or "",
+        error_signature=err_sig,
+    )
 
 
 def is_semantic_duplicate(bug_description: str, memory: Any) -> bool:
@@ -69,14 +157,18 @@ def _create_defect_bg(
     attachment_paths: Optional[list],
     memory: Optional[Any],
     severity: str = "major",
+    signature: str = "",
 ) -> None:
     """Фоновое создание дефекта (Jira API + GigaChat дедупликация)."""
-    LOG.info("_create_defect_bg: старт summary=%r severity=%s", summary[:140], severity)
+    LOG.info(
+        "_create_defect_bg: старт summary=%r severity=%s sig=%r",
+        summary[:140], severity, signature[:120],
+    )
     try:
         if is_semantic_duplicate(bug_description, memory):
             print(f"[Agent] Пропуск дефекта (семантический дубль GigaChat): {summary[:60]}")
             LOG.info("_create_defect_bg: отбито is_semantic_duplicate")
-            register_local_defect(summary)
+            register_local_defect(summary, signature=signature)
             return
 
         key = create_jira_issue(
@@ -88,6 +180,7 @@ def _create_defect_bg(
         if key:
             print(f"[Agent] Дефект создан: {key} [{severity}]")
             LOG.info("_create_defect_bg: успех key=%s", key)
+            register_local_defect(summary, signature=signature)
             if memory:
                 try:
                     memory.record_defect_created(key, summary, severity)
@@ -147,17 +240,29 @@ def create_defect(
     summary = build_defect_summary(bug_description, current_url)
     LOG.info("create_defect: summary=%r", summary[:140])
 
-    if is_local_duplicate(summary, bug_description):
+    canonical_locator = (
+        memory.last_canonical_locator() if memory and hasattr(memory, "last_canonical_locator") else ""
+    )
+    signature = _compute_defect_signature(
+        bug_description=bug_description,
+        current_url=current_url,
+        canonical_locator=canonical_locator,
+    )
+    if signature:
+        LOG.info("create_defect: signature=%r", signature[:160])
+
+    if is_local_duplicate(summary, bug_description, signature=signature):
         print(f"[Agent] Пропуск дефекта (локальный дубль): {summary[:60]}")
         LOG.info("create_defect: отбито is_local_duplicate")
         return
 
+    # Регистрируем сигнатуру СРАЗУ (до отправки в фон) — иначе пока Jira отвечает,
+    # тот же баг может попасть на повторное заведение со следующего шага.
+    register_local_defect(summary, signature=signature)
+
     attachment_paths = collect_evidence(page, console_log, network_failures)
     steps_to_reproduce = (
         memory.get_steps_to_reproduce() if memory and hasattr(memory, "get_steps_to_reproduce") else None
-    )
-    canonical_locator = (
-        memory.last_canonical_locator() if memory and hasattr(memory, "last_canonical_locator") else ""
     )
     last_action_summary = (
         memory.last_action_summary() if memory and hasattr(memory, "last_action_summary") else ""
@@ -198,7 +303,7 @@ def create_defect(
     LOG.info("create_defect: ставим в фон отправку в Jira (severity=%s)", severity)
     fut = bg_submit(
         _create_defect_bg,
-        summary, description, bug_description, attachment_paths, memory, severity,
+        summary, description, bug_description, attachment_paths, memory, severity, signature,
     )
     if fut is None:
         LOG.error("create_defect: bg_submit вернул None — фоновый пул недоступен, дефект ПОТЕРЯН")

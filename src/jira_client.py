@@ -35,7 +35,14 @@ JIRA_DEFECT_LABEL = "kventin"
 # =============================================
 # Локальная дедупликация (в памяти процесса)
 # =============================================
-_session_defect_keys: Set[str] = set()  # нормализованные ключи дефектов за сессию
+# Многоуровневая дедупликация:
+#   Уровень A — структурная сигнатура (signature_key):
+#       (kind, rule, url_pattern, locator_or_message_signature)
+#       Точное совпадение ⇒ дубль. Это самый надёжный путь — не зависит от
+#       текста summary, который у LLM «плавает».
+#   Уровень B — нормализованный summary (как раньше): для случаев без сигнатуры.
+_session_defect_keys: Set[str] = set()        # уровень B: нормализованный summary
+_session_signatures: Set[str] = set()         # уровень A: компактная сигнатура
 
 
 def _normalize_defect_key(text: str) -> str:
@@ -68,19 +75,63 @@ def _similarity(a: str, b: str) -> float:
     return len(intersection) / len(union) if union else 0.0
 
 
-def is_local_duplicate(summary: str, description: str = "") -> bool:
+def build_defect_signature(
+    *,
+    kind: str = "",
+    rule: str = "",
+    url_pattern: str = "",
+    locator: str = "",
+    error_signature: str = "",
+) -> str:
+    """
+    Скомпоновать стабильную сигнатуру дефекта.
+
+    Идея: один и тот же реальный баг должен давать ОДНУ сигнатуру вне зависимости
+    от того, как LLM сформулировал summary. Поля, которые мы кладём:
+      - kind:           page_load / action_failure / pageerror / network / a11y / ...
+      - rule:           конкретное правило-источник (intercept / 5xx / 4xx_main / ...)
+      - url_pattern:    URL без query, с :id/:uuid вместо динамики
+      - locator:        канонический локатор, если применимо
+      - error_signature: «топовый кадр стека» / 'STATUS METHOD path' / типа того
+
+    Для сравнения нормализуем каждое поле и склеиваем через '|'. Если поля пусты —
+    сигнатура считается слабой и НЕ кладётся в _session_signatures (чтобы не
+    блокировать совершенно разные дефекты с одинаково пустыми полями).
+    """
+    def _n(s: str) -> str:
+        s = (s or "").strip().lower()
+        s = re.sub(r"\s+", " ", s)
+        return s[:200]
+    parts = [_n(kind), _n(rule), _n(url_pattern), _n(locator), _n(error_signature)]
+    sig = "|".join(parts)
+    # Минимальная «интересность»: должно быть хотя бы 2 непустых поля.
+    if sum(1 for p in parts if p) < 2:
+        return ""
+    return sig
+
+
+def is_local_duplicate(
+    summary: str,
+    description: str = "",
+    *,
+    signature: str = "",
+) -> bool:
     """
     Проверить дедупликацию внутри текущей сессии.
-    Если summary/description похожи на уже созданный дефект — дубль.
+
+    Сначала — структурная сигнатура (если задана). Совпадение ⇒ дубль.
+    Затем — нормализованный summary (точное совпадение или Jaccard > 0.6).
     """
+    if signature and signature in _session_signatures:
+        LOG.info("Локальный дубль (сигнатура): %s", summary[:80])
+        return True
+
     key = _normalize_defect_key(summary)
     if not key:
         return False
-    # Точное совпадение ключа
     if key in _session_defect_keys:
         LOG.info("Локальный дубль (точный): %s", summary[:60])
         return True
-    # Нечёткое: Jaccard > 0.6
     for existing in _session_defect_keys:
         sim = _similarity(key, existing)
         if sim > 0.6:
@@ -89,16 +140,19 @@ def is_local_duplicate(summary: str, description: str = "") -> bool:
     return False
 
 
-def register_local_defect(summary: str):
-    """Запомнить дефект в памяти сессии для дедупликации."""
+def register_local_defect(summary: str, *, signature: str = "") -> None:
+    """Запомнить дефект в памяти сессии для дедупликации (summary + сигнатура)."""
     key = _normalize_defect_key(summary)
     if key:
         _session_defect_keys.add(key)
+    if signature:
+        _session_signatures.add(signature)
 
 
-def reset_session_defects():
+def reset_session_defects() -> None:
     """Сбросить локальный кеш (при перезапуске агента)."""
     _session_defect_keys.clear()
+    _session_signatures.clear()
 
 
 def _jira_request(
