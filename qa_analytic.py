@@ -307,8 +307,10 @@ def inject_cache_history(cache_payload, unified_data, by_project_data, author_pr
     def story_before_recalc(story):
         dates = str(story.get("worklog_dates", "")).split(",")
         dates = [d.strip() for d in dates if d.strip() and d.strip() != "Нет данных"]
+        # Если даты не разобрались, не выбрасываем задачу из состояния:
+        # так мы сохраняем полную историю времени с базовой даты отчёта.
         if not dates:
-            return False
+            return True
         return max(dates) < recalc_start
 
     old_projects = cache_payload.get("by_project", {})
