@@ -9,7 +9,6 @@ import html
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
-from pathlib import Path
 
 import numpy as np
 import urllib3
@@ -74,8 +73,10 @@ REQUEST_DELAY = 1.0
 MAX_RETRIES = 5
 BATCH_SIZE = 50
 INCREMENTAL_WEEKS = 8
+REPORT_WEEKS = 8
 SPECIAL_ACTIVITY_ISSUE = "HRC-3630"
-CACHE_FILE = Path(".qa_analytics_cache.json")
+STATE_START = "QA_ANALYTICS_STATE_V1_START"
+STATE_END = "QA_ANALYTICS_STATE_V1_END"
 
 _REGRESS_KE_IDS_RAW = (
     2298599, 3589425, 3304476, 3303802, 3191860, 2288712, 2257858, 2935717,
@@ -107,6 +108,7 @@ TEAM_BY_LASTNAME = {
     "канаев": "Профиль",
     "меркуленков": "Профиль",
     "синица": "ЛюдиСбера",
+    "симиник": "Поиск",
 }
 
 _ALLOWED_FULL_NORM = set()
@@ -230,24 +232,63 @@ def nested_to_dict(obj):
     return obj
 
 
-def load_cache():
-    if not CACHE_FILE.exists():
+def fetch_confluence_page(page_id, expand="version,space,title,ancestors,body.storage"):
+    page_id_str = str(page_id)
+    path = "rest/api/content/{0}".format(page_id_str)
+    if hasattr(confluence_client, "get_page_by_id"):
+        return confluence_client.get_page_by_id(page_id_str, expand=expand)
+    return confluence_client.get(path, params={"expand": expand})
+
+
+def extract_page_state(storage_body):
+    if not storage_body:
         return None
+    start_idx = storage_body.find(STATE_START)
+    end_idx = storage_body.find(STATE_END)
+    if start_idx == -1 or end_idx == -1 or end_idx <= start_idx:
+        return None
+    raw = storage_body[start_idx + len(STATE_START):end_idx].strip()
     try:
-        return json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+        return json.loads(html.unescape(raw))
     except Exception:
-        logger.exception("Не удалось прочитать кэш %s", CACHE_FILE)
+        logger.exception("Не удалось разобрать служебное состояние из Confluence")
         return None
 
 
-def save_cache(unified_data, by_project_data, author_project_stats):
-    payload = {
+def load_page_state(page_id):
+    try:
+        page = fetch_confluence_page(page_id)
+        storage = (page.get("body", {}).get("storage", {}) or {}).get("value", "")
+        return extract_page_state(storage)
+    except Exception:
+        logger.exception("Не удалось прочитать состояние из Confluence")
+        return None
+
+
+def build_page_state(unified_data, by_project_data, author_project_stats):
+    return {
         "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "source": "confluence-page-storage",
         "weekly_data": nested_to_dict(unified_data),
         "by_project": nested_to_dict(by_project_data),
         "author_project_stats": nested_to_dict(author_project_stats),
     }
-    CACHE_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def render_page_state(state_payload):
+    raw = json.dumps(state_payload, ensure_ascii=False, separators=(",", ":"))
+    escaped_raw = html.escape(raw)
+    return f"""
+    <ac:structured-macro ac:name="expand">
+      <ac:parameter ac:name="title">Служебное состояние отчёта</ac:parameter>
+      <ac:rich-text-body>
+        <p>Не редактировать вручную: этот блок нужен Jenkins-джобе для инкрементального обновления.</p>
+        <pre>{STATE_START}
+{escaped_raw}
+{STATE_END}</pre>
+      </ac:rich-text-body>
+    </ac:structured-macro>
+    """
 
 
 def inject_cache_history(cache_payload, unified_data, by_project_data, author_project_stats, recalc_start):
@@ -510,19 +551,56 @@ def determine_team(author, author_project_stats):
     if not stats: return "Вне команды / Релиз"
     return max(stats, key=stats.get)
 
+
+def ordered_report_weeks(unified_data, limit=REPORT_WEEKS, ref_date=None):
+    current_week_key = calendar_week_monday_key(ref_date)
+    all_weeks = set()
+    for auth_data in unified_data.values():
+        all_weeks.update(auth_data.keys())
+    all_weeks.add(current_week_key)
+    return sorted(all_weeks, reverse=True)[:limit]
+
+
+def sum_week_metric(unified_data, week, metric):
+    return sum(week_bucket(unified_data[auth], week)[metric] for auth in unified_data)
+
+
+def sum_author_week(author_weeks, week):
+    wb = week_bucket(author_weeks, week)
+    return wb["features"] + wb["regression"] + wb["activities"]
+
+
+def format_delta(current, previous):
+    cur_h = seconds_to_hours(current)
+    prev_h = seconds_to_hours(previous)
+    delta = round(cur_h - prev_h, 2)
+    if delta > 0:
+        return f"+{delta}"
+    return str(delta)
+
+
+def story_touches_weeks(story, weeks):
+    target_weeks = set(weeks)
+    dates = str(story.get("worklog_dates", "")).split(",")
+    for raw in dates:
+        raw = raw.strip()
+        if not raw or raw == "Нет данных":
+            continue
+        try:
+            if get_week_start(raw) in target_weeks:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
 def generate_weekly_report(unified_data, author_project_stats, ref_date=None):
     if not unified_data: return ""
 
     ref_date = ref_date or datetime.now()
     current_week_key = calendar_week_monday_key(ref_date)
 
-    # Все недели из данных + текущая календарная (чтобы отчёт «догонял» сегодняшнюю неделю)
-    all_weeks = set()
-    for auth_data in unified_data.values():
-        all_weeks.update(auth_data.keys())
-    all_weeks.add(current_week_key)
-    # Сортируем от НОВЫХ к СТАРЫМ (reverse=True)
-    sorted_weeks = sorted(list(all_weeks), reverse=True)
+    sorted_weeks = ordered_report_weeks(unified_data, REPORT_WEEKS, ref_date)
 
     # Определяем команды
     teams_map = defaultdict(list)
@@ -536,7 +614,7 @@ def generate_weekly_report(unified_data, author_project_stats, ref_date=None):
     style_td = "border: 1px solid #ddd; padding: 4px; text-align: center;"
     style_team = "background: #deebff; font-weight: bold; padding: 8px; text-align: left;"
 
-    full_html = "<h3>📊 Нагрузка по неделям</h3>"
+    full_html = f"<h3>📊 Нагрузка по неделям (последние {REPORT_WEEKS})</h3>"
 
     for week in sorted_weeks:
         monday = datetime.strptime(week, '%Y-%m-%d')
@@ -634,54 +712,113 @@ def generate_weekly_report(unified_data, author_project_stats, ref_date=None):
     return full_html
 
 def generate_html_report(unified_data, by_project_data, author_project_stats, chart_b64):
-    total_ft = sum(sum(d['features'] for d in unified_data[a].values()) for a in unified_data)
-    total_reg = sum(sum(d['regression'] for d in unified_data[a].values()) for a in unified_data)
-    total_act = sum(sum(d['activities'] for d in unified_data[a].values()) for a in unified_data)
-    total_h = seconds_to_hours(total_ft + total_reg + total_act)
+    report_weeks = ordered_report_weeks(unified_data, REPORT_WEEKS)
+    current_week = calendar_week_monday_key()
+    previous_week = get_week_start((datetime.strptime(current_week, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d"))
+    rolling_weeks = report_weeks[:4]
 
-    team_totals = defaultdict(lambda: {"features": 0, "regression": 0, "activities": 0})
-    for author, weeks in unified_data.items():
-        team = determine_team(author, author_project_stats)
-        for w in weeks.values():
-            team_totals[team]["features"] += w["features"]
-            team_totals[team]["regression"] += w["regression"]
-            team_totals[team]["activities"] += w["activities"]
+    current_total = sum_week_metric(unified_data, current_week, "features") + sum_week_metric(unified_data, current_week, "regression") + sum_week_metric(unified_data, current_week, "activities")
+    previous_total = sum_week_metric(unified_data, previous_week, "features") + sum_week_metric(unified_data, previous_week, "regression") + sum_week_metric(unified_data, previous_week, "activities")
+    current_features = sum_week_metric(unified_data, current_week, "features")
+    current_regression = sum_week_metric(unified_data, current_week, "regression")
+    current_activities = sum_week_metric(unified_data, current_week, "activities")
+    rolling_total = sum(
+        sum_week_metric(unified_data, week, "features")
+        + sum_week_metric(unified_data, week, "regression")
+        + sum_week_metric(unified_data, week, "activities")
+        for week in rolling_weeks
+    )
+    rolling_avg = rolling_total / max(len(rolling_weeks), 1)
 
+    team_map = defaultdict(list)
+    for author in unified_data.keys():
+        team_map[determine_team(author, author_project_stats)].append(author)
+
+    metric_table_style = "padding:7px; border:1px solid #dfe1e6; text-align:center;"
     report_html = f"""
     <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif; color:#172b4d;">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
         <div>
           <h2 style="margin:0; font-size:24px;">QA Analytics Dashboard</h2>
-          <div style="color:#6b778c; margin-top:4px;">Обновлено: {datetime.now().strftime('%d.%m.%Y %H:%M')}</div>
+          <div style="color:#6b778c; margin-top:4px;">Обновлено: {datetime.now().strftime('%d.%m.%Y %H:%M')} · срез: текущая неделя + rolling {REPORT_WEEKS} недель</div>
         </div>
-        <div style="padding:8px 12px; border-radius:16px; background:#deebff; color:#0747a6; font-weight:600;">Auto refresh</div>
+        <div style="padding:8px 12px; border-radius:16px; background:#deebff; color:#0747a6; font-weight:600;">Инкремент из Confluence</div>
       </div>
       <div style="display:grid; grid-template-columns:repeat(4,minmax(160px,1fr)); gap:12px; margin:16px 0 18px;">
-        <div style="padding:14px; border-radius:12px; background:#e3fcef;"><div style="font-size:24px; font-weight:700; color:#006644;">{total_h} ч</div><div style="font-size:12px; color:#42526e;">Итого</div></div>
-        <div style="padding:14px; border-radius:12px; background:#deebff;"><div style="font-size:24px; font-weight:700; color:#0747a6;">{seconds_to_hours(total_ft)} ч</div><div style="font-size:12px; color:#42526e;">Фичи</div></div>
-        <div style="padding:14px; border-radius:12px; background:#ffebe6;"><div style="font-size:24px; font-weight:700; color:#bf2600;">{seconds_to_hours(total_reg)} ч</div><div style="font-size:12px; color:#42526e;">Регресс</div></div>
-        <div style="padding:14px; border-radius:12px; background:#f3e8ff;"><div style="font-size:24px; font-weight:700; color:#5b2c83;">{seconds_to_hours(total_act)} ч</div><div style="font-size:12px; color:#42526e;">Активности ({SPECIAL_ACTIVITY_ISSUE})</div></div>
+        <div style="padding:14px; border-radius:12px; background:#e3fcef;"><div style="font-size:24px; font-weight:700; color:#006644;">{seconds_to_hours(current_total)} ч</div><div style="font-size:12px; color:#42526e;">Текущая неделя</div></div>
+        <div style="padding:14px; border-radius:12px; background:#deebff;"><div style="font-size:24px; font-weight:700; color:#0747a6;">{seconds_to_hours(previous_total)} ч</div><div style="font-size:12px; color:#42526e;">Прошлая неделя · Δ {format_delta(current_total, previous_total)} ч</div></div>
+        <div style="padding:14px; border-radius:12px; background:#ffebe6;"><div style="font-size:24px; font-weight:700; color:#bf2600;">{seconds_to_hours(current_regression)} ч</div><div style="font-size:12px; color:#42526e;">Регресс сейчас</div></div>
+        <div style="padding:14px; border-radius:12px; background:#f3e8ff;"><div style="font-size:24px; font-weight:700; color:#5b2c83;">{seconds_to_hours(current_activities)} ч</div><div style="font-size:12px; color:#42526e;">Активности {SPECIAL_ACTIVITY_ISSUE}</div></div>
       </div>
+      <p style="margin:0 0 12px; color:#42526e;">Фичи сейчас: <strong>{seconds_to_hours(current_features)} ч</strong> · Среднее за последние {len(rolling_weeks)} недели: <strong>{seconds_to_hours(rolling_avg)} ч/нед</strong>. Ниже — раскрываемые команды и сотрудники.</p>
     """
     if chart_b64:
         report_html += f'<div style="margin-bottom:16px;"><img src="data:image/png;base64,{chart_b64}" style="max-width:100%; border:1px solid #dfe1e6; border-radius:10px;"/></div>'
 
-    report_html += "<h3 style='margin:14px 0 8px;'>Сводка по командам</h3>"
-    report_html += "<table style='border-collapse:collapse; width:100%; margin-bottom:14px;'><thead><tr><th style='padding:7px; border:1px solid #dfe1e6; background:#f4f5f7; text-align:left;'>Команда</th><th style='padding:7px; border:1px solid #dfe1e6; background:#f4f5f7;'>Фичи</th><th style='padding:7px; border:1px solid #dfe1e6; background:#f4f5f7;'>Регресс</th><th style='padding:7px; border:1px solid #dfe1e6; background:#f4f5f7;'>Активности</th><th style='padding:7px; border:1px solid #dfe1e6; background:#f4f5f7;'>Итого</th></tr></thead><tbody>"
-    for team, vals in sorted(team_totals.items(), key=lambda x: -(x[1]["features"] + x[1]["regression"] + x[1]["activities"])):
-        ft = seconds_to_hours(vals["features"])
-        rg = seconds_to_hours(vals["regression"])
-        ac = seconds_to_hours(vals["activities"])
-        tt = round(ft + rg + ac, 2)
-        report_html += f"<tr><td style='padding:7px; border:1px solid #dfe1e6; text-align:left;'>{html.escape(team)}</td><td style='padding:7px; border:1px solid #dfe1e6; text-align:center;'>{ft if ft else '-'}</td><td style='padding:7px; border:1px solid #dfe1e6; text-align:center;'>{rg if rg else '-'}</td><td style='padding:7px; border:1px solid #dfe1e6; text-align:center;'>{ac if ac else '-'}</td><td style='padding:7px; border:1px solid #dfe1e6; text-align:center; font-weight:600;'>{tt}</td></tr>"
-    report_html += "</tbody></table>"
+    report_html += "<h3 style='margin:14px 0 8px;'>Команды: текущая неделя, дельта и состав</h3>"
+    for team, authors in sorted(team_map.items()):
+        team_current = sum(sum_author_week(unified_data[a], current_week) for a in authors)
+        team_previous = sum(sum_author_week(unified_data[a], previous_week) for a in authors)
+        team_ft = sum(week_bucket(unified_data[a], current_week)["features"] for a in authors)
+        team_reg = sum(week_bucket(unified_data[a], current_week)["regression"] for a in authors)
+        team_act = sum(week_bucket(unified_data[a], current_week)["activities"] for a in authors)
+        if team_current == 0 and team_previous == 0:
+            continue
+        title = f"{team}: {seconds_to_hours(team_current)} ч сейчас · Δ {format_delta(team_current, team_previous)} ч"
+        report_html += f"""
+        <ac:structured-macro ac:name="expand">
+          <ac:parameter ac:name="title">{html.escape(title)}</ac:parameter>
+          <ac:rich-text-body>
+            <table style="border-collapse:collapse; width:100%; margin-bottom:10px;">
+              <thead><tr>
+                <th style="{metric_table_style} background:#f4f5f7; text-align:left;">Сотрудник</th>
+                <th style="{metric_table_style} background:#f4f5f7;">Текущая</th>
+                <th style="{metric_table_style} background:#f4f5f7;">Прошлая</th>
+                <th style="{metric_table_style} background:#f4f5f7;">Δ</th>
+                <th style="{metric_table_style} background:#f4f5f7;">Фичи</th>
+                <th style="{metric_table_style} background:#f4f5f7;">Регресс</th>
+                <th style="{metric_table_style} background:#f4f5f7;">Активности</th>
+              </tr></thead><tbody>
+              <tr>
+                <td style="{metric_table_style} text-align:left; font-weight:600;">Итого команда</td>
+                <td style="{metric_table_style} font-weight:600;">{seconds_to_hours(team_current)}</td>
+                <td style="{metric_table_style}">{seconds_to_hours(team_previous)}</td>
+                <td style="{metric_table_style}">{format_delta(team_current, team_previous)}</td>
+                <td style="{metric_table_style}">{seconds_to_hours(team_ft)}</td>
+                <td style="{metric_table_style}">{seconds_to_hours(team_reg)}</td>
+                <td style="{metric_table_style}">{seconds_to_hours(team_act)}</td>
+              </tr>
+        """
+        for author in sorted(authors):
+            cur = sum_author_week(unified_data[author], current_week)
+            prev = sum_author_week(unified_data[author], previous_week)
+            wb = week_bucket(unified_data[author], current_week)
+            if cur == 0 and prev == 0:
+                continue
+            report_html += f"""
+              <tr>
+                <td style="{metric_table_style} text-align:left;">{html.escape(author)}</td>
+                <td style="{metric_table_style}">{seconds_to_hours(cur)}</td>
+                <td style="{metric_table_style}">{seconds_to_hours(prev)}</td>
+                <td style="{metric_table_style}">{format_delta(cur, prev)}</td>
+                <td style="{metric_table_style}">{seconds_to_hours(wb["features"])}</td>
+                <td style="{metric_table_style}">{seconds_to_hours(wb["regression"])}</td>
+                <td style="{metric_table_style}">{seconds_to_hours(wb["activities"])}</td>
+              </tr>
+            """
+        report_html += "</tbody></table></ac:rich-text-body></ac:structured-macro>"
 
     report_html += generate_weekly_report(unified_data, author_project_stats)
 
-    report_html += '<ac:structured-macro ac:name="expand"><ac:parameter ac:name="title">📂 Детализация задач</ac:parameter><ac:rich-text-body>'
-    for pk, pdata in sorted(by_project_data.items(), key=lambda x: sum(x[1]['times']), reverse=True):
-        ph = seconds_to_hours(sum(pdata['times']))
-        stories = sorted(pdata['stories'], key=lambda x: x['total_time'], reverse=True)
+    report_html += f'<ac:structured-macro ac:name="expand"><ac:parameter ac:name="title">📂 Детализация задач за последние {REPORT_WEEKS} недель</ac:parameter><ac:rich-text-body>'
+    recent_projects = []
+    for pk, pdata in by_project_data.items():
+        stories = [s for s in pdata['stories'] if story_touches_weeks(s, report_weeks)]
+        if stories:
+            recent_projects.append((pk, stories))
+    for pk, stories in sorted(recent_projects, key=lambda x: sum(s['total_time'] for s in x[1]), reverse=True):
+        ph = seconds_to_hours(sum(s['total_time'] for s in stories))
+        stories = sorted(stories, key=lambda x: x['total_time'], reverse=True)
         pk_esc = html.escape(pk)
         report_html += f"<h4>{pk_esc} ({ph}ч)</h4><table><thead><tr><th>Key</th><th>Type</th><th>Summary</th><th>Time</th><th>Authors</th></tr></thead><tbody>"
         for s in stories[:200]:
@@ -700,7 +837,11 @@ def create_charts(data):
         fig = plt.figure(figsize=(18, 12))
         gs = fig.add_gridspec(2, 2)
         ax1 = fig.add_subplot(gs[0, :])
-        authors = sorted(data['weekly_data'].keys(), key=lambda a: sum(d['features'] + d['regression'] for d in data['weekly_data'][a].values()), reverse=True)[:15]
+        authors = sorted(
+            data['weekly_data'].keys(),
+            key=lambda a: sum(d['features'] + d['regression'] + d['activities'] for d in data['weekly_data'][a].values()),
+            reverse=True,
+        )[:15]
         short_names = [n.split()[0] for n in authors]
         ft_times = [seconds_to_hours(sum(d['features'] for d in data['weekly_data'][a].values())) for a in authors]
         reg_times = [seconds_to_hours(sum(d['regression'] for d in data['weekly_data'][a].values())) for a in authors]
@@ -713,7 +854,7 @@ def create_charts(data):
         all_weeks = set()
         for d in data['weekly_data'].values(): all_weeks.update(d.keys())
         all_weeks.add(calendar_week_monday_key())
-        sorted_weeks = sorted(list(all_weeks))
+        sorted_weeks = sorted(list(all_weeks))[-REPORT_WEEKS:]
         ft_w = [seconds_to_hours(sum(week_bucket(data['weekly_data'][a], w)['features'] for a in data['weekly_data'])) for w in sorted_weeks]
         reg_w = [seconds_to_hours(sum(week_bucket(data['weekly_data'][a], w)['regression'] for a in data['weekly_data'])) for w in sorted_weeks]
         act_w = [seconds_to_hours(sum(week_bucket(data['weekly_data'][a], w)['activities'] for a in data['weekly_data'])) for w in sorted_weeks]
@@ -724,13 +865,20 @@ def create_charts(data):
         ax2.bar(x, act_w, bottom=np.array(ft_w) + np.array(reg_w), label='Активности', color='#8e44ad')
         ax2.set_xticks(x); ax2.set_xticklabels(disp_weeks); ax2.legend(); ax2.set_title('Динамика команды', fontweight='bold')
         ax3 = fig.add_subplot(gs[1, 1])
-        projs = list(data['by_project'].keys())
-        times = [seconds_to_hours(sum(data['by_project'][p]['times'])) for p in projs]
+        project_totals = []
+        for p, pdata in data['by_project'].items():
+            total = sum(s['total_time'] for s in pdata['stories'] if story_touches_weeks(s, sorted_weeks))
+            if total > 0:
+                project_totals.append((p, seconds_to_hours(total)))
+        project_totals.sort(key=lambda x: x[1])
+        projs = [p for p, _ in project_totals]
+        times = [t for _, t in project_totals]
         if projs:
-            idx = np.argsort(times)
-            projs = [projs[i] for i in idx]; times = [times[i] for i in idx]
-        bars = ax3.barh(projs, times, color=plt.cm.Paired(np.linspace(0, 1, len(projs))))
-        ax3.bar_label(bars, fmt='%.0f', padding=3); ax3.set_title('Фичи по проектам', fontweight='bold')
+            bars = ax3.barh(projs, times, color=plt.cm.Paired(np.linspace(0, 1, len(projs))))
+            ax3.bar_label(bars, fmt='%.0f', padding=3)
+        else:
+            ax3.text(0.5, 0.5, 'Нет данных за период', ha='center', va='center')
+        ax3.set_title(f'Фичи по проектам ({REPORT_WEEKS} нед.)', fontweight='bold')
         buffer = BytesIO()
         plt.savefig(buffer, format='png', dpi=100, bbox_inches='tight')
         buffer.seek(0)
@@ -744,14 +892,11 @@ def create_charts(data):
 def update_confluence_manual(page_id, new_html):
     """Полностью заменяет storage-тело страницы (не дописывает к старому контенту)."""
     page_id_str = str(page_id)
-    full_html = f"<h2>Отчет {datetime.now().strftime('%d.%m %H:%M')}</h2>{new_html}"
+    full_html = new_html
     path = "rest/api/content/{0}".format(page_id_str)
 
     try:
-        if hasattr(confluence_client, "get_page_by_id"):
-            page = confluence_client.get_page_by_id(page_id_str, expand="version,space,title,ancestors")
-        else:
-            page = confluence_client.get(path, params={"expand": "version,space,title,ancestors"})
+        page = fetch_confluence_page(page_id_str, expand="version,space,title,ancestors")
         title = page["title"]
         space_key = page["space"]["key"]
         ver = page["version"]["number"]
@@ -825,30 +970,30 @@ def main():
     logger.info("%s\nАнализ времени (Final Fixed v2)\n%s", "=" * 60, "=" * 60)
     unified_data, by_project_data, author_project_stats = create_data_store()
     fixed_start = datetime.strptime(FIXED_START_DATE, "%Y-%m-%d")
-    cache = load_cache()
+    page_state = load_page_state(PAGE_ID)
 
-    if cache:
+    if page_state:
         recalc_start = max(
             fixed_start,
             datetime.now() - timedelta(weeks=INCREMENTAL_WEEKS),
         )
         recalc_start_key = recalc_start.strftime("%Y-%m-%d")
-        inject_cache_history(cache, unified_data, by_project_data, author_project_stats, recalc_start_key)
+        inject_cache_history(page_state, unified_data, by_project_data, author_project_stats, recalc_start_key)
         query_start = (recalc_start - timedelta(days=7)).strftime("%Y-%m-%d")
-        logger.info("Инкрементальный режим: пересчёт с %s (JQL updated >= %s)", recalc_start_key, query_start)
+        logger.info("Инкрементальный режим из Confluence: пересчёт с %s (JQL updated >= %s)", recalc_start_key, query_start)
     else:
         recalc_start = fixed_start
         recalc_start_key = FIXED_START_DATE
         query_start = FIXED_START_DATE
-        logger.info("Полный пересчёт: с %s", FIXED_START_DATE)
+        logger.info("Полный пересчёт: служебное состояние на странице не найдено, старт с %s", FIXED_START_DATE)
 
     analyze_features(recalc_start, query_start, unified_data, by_project_data, author_project_stats)
     analyze_regression(recalc_start, query_start, unified_data, author_project_stats)
     analyze_special_activity(SPECIAL_ACTIVITY_ISSUE, recalc_start, unified_data, by_project_data, author_project_stats)
     chart = create_charts({'weekly_data': unified_data, 'by_project': by_project_data})
     html_content = generate_html_report(unified_data, by_project_data, author_project_stats, chart)
+    html_content += render_page_state(build_page_state(unified_data, by_project_data, author_project_stats))
     update_confluence_manual(PAGE_ID, html_content)
-    save_cache(unified_data, by_project_data, author_project_stats)
 
 if __name__ == "__main__":
     main()
