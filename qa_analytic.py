@@ -3,11 +3,13 @@ import logging
 import sys
 import warnings
 import time
+import json
 from io import BytesIO
 import html
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
+from pathlib import Path
 
 import numpy as np
 import urllib3
@@ -71,6 +73,9 @@ MAX_WORKERS = 4
 REQUEST_DELAY = 1.0
 MAX_RETRIES = 5
 BATCH_SIZE = 50
+INCREMENTAL_WEEKS = 8
+SPECIAL_ACTIVITY_ISSUE = "HRC-3630"
+CACHE_FILE = Path(".qa_analytics_cache.json")
 
 _REGRESS_KE_IDS_RAW = (
     2298599, 3589425, 3304476, 3303802, 3191860, 2288712, 2257858, 2935717,
@@ -91,6 +96,19 @@ ALLOWED_TESTERS = {
     "Чиж Мария Михайловна"
 }
 
+TEAM_BY_LASTNAME = {
+    "приколотина": "Perftracker",
+    "чиж": "Perftracker",
+    "метляев": "CoreTech",
+    "абдуллаев": "Core UI 2.0",
+    "калашников": "Core UI 2.0",
+    "петрунин": "Core UI",
+    "годунова": "Core UI",
+    "канаев": "Профиль",
+    "меркуленков": "Профиль",
+    "синица": "ЛюдиСбера",
+}
+
 _ALLOWED_FULL_NORM = set()
 _ALLOWED_FIRST_TWO = set()
 for _a in ALLOWED_TESTERS:
@@ -99,7 +117,7 @@ for _a in ALLOWED_TESTERS:
     if len(_tok) >= 2:
         _ALLOWED_FIRST_TWO.add((_tok[0], _tok[1]))
 
-_EMPTY_WEEK = {"features": 0, "regression": 0}
+_EMPTY_WEEK = {"features": 0, "regression": 0, "activities": 0}
 
 print_lock = Lock()
 request_time_lock = Lock()
@@ -190,8 +208,78 @@ def week_has_any_activity(unified_data, week):
     return any(
         week_bucket(unified_data[auth], week)["features"] > 0
         or week_bucket(unified_data[auth], week)["regression"] > 0
+        or week_bucket(unified_data[auth], week)["activities"] > 0
         for auth in unified_data
     )
+
+
+def create_data_store():
+    unified = defaultdict(lambda: defaultdict(lambda: {"features": 0, "regression": 0, "activities": 0}))
+    by_project = defaultdict(lambda: {"times": [], "stories": []})
+    author_stats = defaultdict(lambda: defaultdict(int))
+    return unified, by_project, author_stats
+
+
+def nested_to_dict(obj):
+    if isinstance(obj, defaultdict):
+        obj = dict(obj)
+    if isinstance(obj, dict):
+        return {k: nested_to_dict(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [nested_to_dict(v) for v in obj]
+    return obj
+
+
+def load_cache():
+    if not CACHE_FILE.exists():
+        return None
+    try:
+        return json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        logger.exception("Не удалось прочитать кэш %s", CACHE_FILE)
+        return None
+
+
+def save_cache(unified_data, by_project_data, author_project_stats):
+    payload = {
+        "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "weekly_data": nested_to_dict(unified_data),
+        "by_project": nested_to_dict(by_project_data),
+        "author_project_stats": nested_to_dict(author_project_stats),
+    }
+    CACHE_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def inject_cache_history(cache_payload, unified_data, by_project_data, author_project_stats, recalc_start):
+    if not cache_payload:
+        return
+    old_weekly = cache_payload.get("weekly_data", {})
+    for author, weeks in old_weekly.items():
+        for week, metrics in weeks.items():
+            if week >= recalc_start:
+                continue
+            dst = unified_data[author][week]
+            dst["features"] = metrics.get("features", 0)
+            dst["regression"] = metrics.get("regression", 0)
+            dst["activities"] = metrics.get("activities", 0)
+
+    def story_before_recalc(story):
+        dates = str(story.get("worklog_dates", "")).split(",")
+        dates = [d.strip() for d in dates if d.strip() and d.strip() != "Нет данных"]
+        if not dates:
+            return False
+        return max(dates) < recalc_start
+
+    old_projects = cache_payload.get("by_project", {})
+    for proj, pdata in old_projects.items():
+        old_stories = [s for s in pdata.get("stories", []) if story_before_recalc(s)]
+        if not old_stories:
+            continue
+        by_project_data[proj]["stories"].extend(old_stories)
+        by_project_data[proj]["times"].extend([s.get("total_time", 0) for s in old_stories])
+
+    # Проектную статистику по авторам пересчитываем на лету из свежей выборки,
+    # чтобы в инкрементальном режиме не накапливать дубли по окну пересчёта.
 
 def get_week_start(date_str):
     dt = datetime.strptime(date_str, '%Y-%m-%d')
@@ -242,12 +330,12 @@ def fetch_linked_tasks_bulk(parent_issues):
             logger.exception("Не загрузился батч связанных задач JQL от %s ключей", len(batch_keys))
     return linked_tasks_map
 
-def analyze_features(start_date_obj, unified_data, by_project_data, author_project_stats):
+def analyze_features(start_date_obj, query_start_date, unified_data, by_project_data, author_project_stats):
     logger.info("--- Этап 1: Анализ Feature (Story/Bug) ---")
     jql = f"""
         project in (HRM, HRC, PERFREVIEW, HRPASSIST, SFILE, NEUROUI, SEARCHCS)
         AND issuetype in (Story, Bug)
-        AND updated >= "{FIXED_START_DATE}"
+        AND updated >= "{query_start_date}"
     """
     all_issues = []
     start_at = 0
@@ -324,10 +412,10 @@ def process_single_feature(issue, start_date_obj, linked_map):
         logger.exception("Ошибка разбора фичи %s", getattr(issue, "key", "?"))
         return None
 
-def analyze_regression(start_date_obj, unified_data, author_project_stats):
+def analyze_regression(start_date_obj, query_start_date, unified_data, author_project_stats):
     logger.info("--- Этап 2: Анализ Регресса (HRPRELEASE) ---")
     ke_ids_str = ",".join(map(str, REGRESS_KE_IDS))
-    jql = f"project = HRPRELEASE AND type = \"Release 2.0\" AND \"КЭ\" in ({ke_ids_str}) AND updated >= \"{FIXED_START_DATE}\""
+    jql = f"project = HRPRELEASE AND type = \"Release 2.0\" AND \"КЭ\" in ({ke_ids_str}) AND updated >= \"{query_start_date}\""
     issues = []
     start_at = 0
     while True:
@@ -366,7 +454,55 @@ def process_regress_subtasks(keys, start_date_obj):
         logger.exception("Ошибка загрузки подзадач регресса (%s ключей)", len(keys))
     return results
 
+
+def analyze_special_activity(issue_key, start_date_obj, unified_data, by_project_data, author_project_stats):
+    logger.info("--- Этап 3: Активности из %s ---", issue_key)
+    try:
+        issue = rate_limited_request(jira_client.issue, issue_key, fields="summary,worklog,project,issuetype")
+    except Exception:
+        logger.exception("Не удалось загрузить задачу активностей %s", issue_key)
+        return 0
+
+    worklogs = issue.fields.worklog.worklogs if hasattr(issue.fields, "worklog") else []
+    valid_wls, _ = parse_worklogs_local(worklogs, start_date_obj)
+    if not valid_wls:
+        return 0
+
+    project_key = issue.fields.project.key if hasattr(issue.fields, "project") else "HRC"
+    total = 0
+    by_week = defaultdict(int)
+    by_author = set()
+    for wl in valid_wls:
+        sec = wl["timeSpentSeconds"]
+        total += sec
+        by_week[wl["week_start"]] += sec
+        by_author.add(wl["author_name"])
+        unified_data[wl["author_name"]][wl["week_start"]]["activities"] += sec
+        author_project_stats[wl["author_name"]][project_key] += sec
+
+    by_project_data[project_key]["times"].append(total)
+    by_project_data[project_key]["stories"].append(
+        {
+            "key": issue.key,
+            "issuetype": issue.fields.issuetype.name if hasattr(issue.fields, "issuetype") else "Task",
+            "summary": f"{issue.fields.summary} (активности)",
+            "source": "Activity",
+            "total_time": total,
+            "worklog_dates": ", ".join(sorted(by_week.keys())),
+            "authors": sorted(by_author),
+            "linked_tasks": [],
+            "ke": "n/a",
+        }
+    )
+    logger.info("  %s: добавлено %s ч активностей", issue.key, seconds_to_hours(total))
+    return total
+
 def determine_team(author, author_project_stats):
+    lastname = (author or "").strip().lower().split()
+    if lastname:
+        mapped = TEAM_BY_LASTNAME.get(lastname[0])
+        if mapped:
+            return mapped
     if author not in author_project_stats or not author_project_stats[author]: return "Вне команды / Релиз"
     stats = author_project_stats[author].copy()
     # Время по HRPRELEASE не относим к «команде» проекта — только релизный поток.
@@ -411,12 +547,12 @@ def generate_weekly_report(unified_data, author_project_stats, ref_date=None):
 
         # Генерация таблицы для конкретной недели
         week_table = f"<table style='{style_table}'><thead>"
-        week_table += f"<tr><th style='{style_th} width: 200px;'>Сотрудник</th>"
-        week_table += f"<th style='{style_th}'>Фичи</th><th style='{style_th}'>Регресс</th><th style='{style_th}'>Сумма</th></tr></thead><tbody>"
+        week_table += f"<tr><th style='{style_th} width: 220px;'>Сотрудник</th>"
+        week_table += f"<th style='{style_th}'>Фичи</th><th style='{style_th}'>Регресс</th><th style='{style_th}'>Активности</th><th style='{style_th}'>Сумма</th></tr></thead><tbody>"
 
         if is_calendar_current and not week_has_any_activity(unified_data, week):
             week_table += (
-                f"<tr><td colspan='4' style='{style_td} text-align:left; color:#666;'>"
+                f"<tr><td colspan='5' style='{style_td} text-align:left; color:#666;'>"
                 "Списаний за текущую календарную неделю в выборке Jira пока нет.</td></tr>"
             )
 
@@ -428,50 +564,58 @@ def generate_weekly_report(unified_data, author_project_stats, ref_date=None):
             team_active = False
             for auth in teams_map[team]:
                 wb = week_bucket(unified_data[auth], week)
-                if wb['features'] > 0 or wb['regression'] > 0:
+                if wb['features'] > 0 or wb['regression'] > 0 or wb['activities'] > 0:
                     team_active = True
                     break
 
             if not team_active: continue
 
-            week_table += f"<tr><td colspan='4' style='{style_team}'>{html.escape(team)}</td></tr>"
+            week_table += f"<tr><td colspan='5' style='{style_team}'>{html.escape(team)}</td></tr>"
 
             for auth in sorted(teams_map[team]):
                 wb = week_bucket(unified_data[auth], week)
                 ft = seconds_to_hours(wb['features'])
                 reg = seconds_to_hours(wb['regression'])
+                act = seconds_to_hours(wb['activities'])
 
                 # Если у сотрудника 0 часов за неделю - пропускаем его, чтобы таблица была чище
-                if ft == 0 and reg == 0: continue
+                if ft == 0 and reg == 0 and act == 0: continue
 
-                total = round(ft + reg, 2)
+                total = round(ft + reg + act, 2)
                 st_ft = "color:#ccc;" if ft == 0 else ""
                 st_reg = "color:#ccc;" if reg == 0 else "color:#e74c3c;"
+                st_act = "color:#ccc;" if act == 0 else "color:#8e44ad;"
                 st_tot = "background:#e3fcef; font-weight:bold;" if total > 30 else ("background:#fff;" if total > 0 else "color:#eee;")
 
                 week_table += f"<tr><td style='{style_td} text-align:left;'>{html.escape(auth)}</td>"
                 week_table += f"<td style='{style_td} {st_ft}'>{ft if ft > 0 else '-'}</td>"
                 week_table += f"<td style='{style_td} {st_reg}'>{reg if reg > 0 else '-'}</td>"
+                week_table += f"<td style='{style_td} {st_act}'>{act if act > 0 else '-'}</td>"
                 week_table += f"<td style='{style_td} {st_tot}'>{total}</td></tr>"
 
         # Обработка "Вне команды" отдельно в конце
         if "Вне команды / Релиз" in teams_map:
             team = "Вне команды / Релиз"
             team_active = any(
-                (week_bucket(unified_data[auth], week)['features'] > 0 or week_bucket(unified_data[auth], week)['regression'] > 0)
+                (
+                    week_bucket(unified_data[auth], week)['features'] > 0
+                    or week_bucket(unified_data[auth], week)['regression'] > 0
+                    or week_bucket(unified_data[auth], week)['activities'] > 0
+                )
                 for auth in teams_map[team]
             )
 
             if team_active:
-                week_table += f"<tr><td colspan='4' style='{style_team} background:#f4f5f7; color:#666;'>{html.escape(team)}</td></tr>"
+                week_table += f"<tr><td colspan='5' style='{style_team} background:#f4f5f7; color:#666;'>{html.escape(team)}</td></tr>"
                 for auth in sorted(teams_map[team]):
                     wb = week_bucket(unified_data[auth], week)
                     ft = seconds_to_hours(wb['features'])
                     reg = seconds_to_hours(wb['regression'])
-                    if ft == 0 and reg == 0: continue
-                    total = round(ft + reg, 2)
+                    act = seconds_to_hours(wb['activities'])
+                    if ft == 0 and reg == 0 and act == 0: continue
+                    total = round(ft + reg + act, 2)
                     week_table += f"<tr><td style='{style_td} text-align:left;'>{html.escape(auth)}</td>"
-                    week_table += f"<td style='{style_td}'>{ft if ft>0 else '-'}</td><td style='{style_td}'>{reg if reg>0 else '-'}</td><td style='{style_td}'>{total}</td></tr>"
+                    week_table += f"<td style='{style_td}'>{ft if ft>0 else '-'}</td><td style='{style_td}'>{reg if reg>0 else '-'}</td><td style='{style_td}'>{act if act>0 else '-'}</td><td style='{style_td}'>{total}</td></tr>"
 
         week_table += "</tbody></table>"
 
@@ -492,29 +636,61 @@ def generate_weekly_report(unified_data, author_project_stats, ref_date=None):
 def generate_html_report(unified_data, by_project_data, author_project_stats, chart_b64):
     total_ft = sum(sum(d['features'] for d in unified_data[a].values()) for a in unified_data)
     total_reg = sum(sum(d['regression'] for d in unified_data[a].values()) for a in unified_data)
-    total_h = seconds_to_hours(total_ft + total_reg)
-    card_style = "padding: 15px; border-radius: 8px; flex: 1; text-align: center; font-family: sans-serif;"
-    report_html = f"""<div style="display: flex; gap: 20px; margin-bottom: 20px;">
-        <div style="{card_style} background: #e3fcef;"><div style="font-size: 24px; font-weight: bold; color: #006644;">{total_h} ч</div><div style="font-size: 12px; color: #5e6c84;">ОБЩЕЕ ВРЕМЯ</div></div>
-        <div style="{card_style} background: #deebff;"><div style="font-size: 24px; font-weight: bold; color: #0747a6;">{seconds_to_hours(total_ft)} ч</div><div style="font-size: 12px; color: #5e6c84;">ФИЧИ</div></div>
-        <div style="{card_style} background: #ffebe6;"><div style="font-size: 24px; font-weight: bold; color: #bf2600;">{seconds_to_hours(total_reg)} ч</div><div style="font-size: 12px; color: #5e6c84;">РЕГРЕСС</div></div></div>"""
-    if chart_b64: report_html += f'<p><img src="data:image/png;base64,{chart_b64}" style="max-width:100%; border: 1px solid #eee;"/></p>'
+    total_act = sum(sum(d['activities'] for d in unified_data[a].values()) for a in unified_data)
+    total_h = seconds_to_hours(total_ft + total_reg + total_act)
 
-    # Вставляем новую логику таблиц
+    team_totals = defaultdict(lambda: {"features": 0, "regression": 0, "activities": 0})
+    for author, weeks in unified_data.items():
+        team = determine_team(author, author_project_stats)
+        for w in weeks.values():
+            team_totals[team]["features"] += w["features"]
+            team_totals[team]["regression"] += w["regression"]
+            team_totals[team]["activities"] += w["activities"]
+
+    report_html = f"""
+    <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif; color:#172b4d;">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+        <div>
+          <h2 style="margin:0; font-size:24px;">QA Analytics Dashboard</h2>
+          <div style="color:#6b778c; margin-top:4px;">Обновлено: {datetime.now().strftime('%d.%m.%Y %H:%M')}</div>
+        </div>
+        <div style="padding:8px 12px; border-radius:16px; background:#deebff; color:#0747a6; font-weight:600;">Auto refresh</div>
+      </div>
+      <div style="display:grid; grid-template-columns:repeat(4,minmax(160px,1fr)); gap:12px; margin:16px 0 18px;">
+        <div style="padding:14px; border-radius:12px; background:#e3fcef;"><div style="font-size:24px; font-weight:700; color:#006644;">{total_h} ч</div><div style="font-size:12px; color:#42526e;">Итого</div></div>
+        <div style="padding:14px; border-radius:12px; background:#deebff;"><div style="font-size:24px; font-weight:700; color:#0747a6;">{seconds_to_hours(total_ft)} ч</div><div style="font-size:12px; color:#42526e;">Фичи</div></div>
+        <div style="padding:14px; border-radius:12px; background:#ffebe6;"><div style="font-size:24px; font-weight:700; color:#bf2600;">{seconds_to_hours(total_reg)} ч</div><div style="font-size:12px; color:#42526e;">Регресс</div></div>
+        <div style="padding:14px; border-radius:12px; background:#f3e8ff;"><div style="font-size:24px; font-weight:700; color:#5b2c83;">{seconds_to_hours(total_act)} ч</div><div style="font-size:12px; color:#42526e;">Активности ({SPECIAL_ACTIVITY_ISSUE})</div></div>
+      </div>
+    """
+    if chart_b64:
+        report_html += f'<div style="margin-bottom:16px;"><img src="data:image/png;base64,{chart_b64}" style="max-width:100%; border:1px solid #dfe1e6; border-radius:10px;"/></div>'
+
+    report_html += "<h3 style='margin:14px 0 8px;'>Сводка по командам</h3>"
+    report_html += "<table style='border-collapse:collapse; width:100%; margin-bottom:14px;'><thead><tr><th style='padding:7px; border:1px solid #dfe1e6; background:#f4f5f7; text-align:left;'>Команда</th><th style='padding:7px; border:1px solid #dfe1e6; background:#f4f5f7;'>Фичи</th><th style='padding:7px; border:1px solid #dfe1e6; background:#f4f5f7;'>Регресс</th><th style='padding:7px; border:1px solid #dfe1e6; background:#f4f5f7;'>Активности</th><th style='padding:7px; border:1px solid #dfe1e6; background:#f4f5f7;'>Итого</th></tr></thead><tbody>"
+    for team, vals in sorted(team_totals.items(), key=lambda x: -(x[1]["features"] + x[1]["regression"] + x[1]["activities"])):
+        ft = seconds_to_hours(vals["features"])
+        rg = seconds_to_hours(vals["regression"])
+        ac = seconds_to_hours(vals["activities"])
+        tt = round(ft + rg + ac, 2)
+        report_html += f"<tr><td style='padding:7px; border:1px solid #dfe1e6; text-align:left;'>{html.escape(team)}</td><td style='padding:7px; border:1px solid #dfe1e6; text-align:center;'>{ft if ft else '-'}</td><td style='padding:7px; border:1px solid #dfe1e6; text-align:center;'>{rg if rg else '-'}</td><td style='padding:7px; border:1px solid #dfe1e6; text-align:center;'>{ac if ac else '-'}</td><td style='padding:7px; border:1px solid #dfe1e6; text-align:center; font-weight:600;'>{tt}</td></tr>"
+    report_html += "</tbody></table>"
+
     report_html += generate_weekly_report(unified_data, author_project_stats)
 
-    report_html += '<ac:structured-macro ac:name="expand"><ac:parameter ac:name="title">📂 Детализация по Фичам</ac:parameter><ac:rich-text-body>'
+    report_html += '<ac:structured-macro ac:name="expand"><ac:parameter ac:name="title">📂 Детализация задач</ac:parameter><ac:rich-text-body>'
     for pk, pdata in sorted(by_project_data.items(), key=lambda x: sum(x[1]['times']), reverse=True):
         ph = seconds_to_hours(sum(pdata['times']))
         stories = sorted(pdata['stories'], key=lambda x: x['total_time'], reverse=True)
         pk_esc = html.escape(pk)
         report_html += f"<h4>{pk_esc} ({ph}ч)</h4><table><thead><tr><th>Key</th><th>Type</th><th>Summary</th><th>Time</th><th>Authors</th></tr></thead><tbody>"
-        for s in stories:
+        for s in stories[:200]:
             key_esc = html.escape(s['key'])
             browse = f"{JIRA_URL}/browse/{key_esc}"
-            report_html += f"""<tr><td><a href="{browse}">{key_esc}</a></td><td>{html.escape(s['issuetype'])}</td><td>{html.escape(s['summary'][:60])}</td><td><strong>{seconds_to_hours(s['total_time'])}</strong></td><td>{html.escape(", ".join(s['authors']))}</td></tr>"""
+            report_html += f"""<tr><td><a href="{browse}">{key_esc}</a></td><td>{html.escape(s['issuetype'])}</td><td>{html.escape(s['summary'][:90])}</td><td><strong>{seconds_to_hours(s['total_time'])}</strong></td><td>{html.escape(", ".join(s['authors']))}</td></tr>"""
         report_html += "</tbody></table>"
-    report_html += "</ac:rich-text-body></ac:structured-macro><hr/>"
+    report_html += "</ac:rich-text-body></ac:structured-macro>"
+    report_html += "</div>"
     return report_html
 
 def create_charts(data):
@@ -528,9 +704,11 @@ def create_charts(data):
         short_names = [n.split()[0] for n in authors]
         ft_times = [seconds_to_hours(sum(d['features'] for d in data['weekly_data'][a].values())) for a in authors]
         reg_times = [seconds_to_hours(sum(d['regression'] for d in data['weekly_data'][a].values())) for a in authors]
+        act_times = [seconds_to_hours(sum(d['activities'] for d in data['weekly_data'][a].values())) for a in authors]
         ax1.bar(short_names, ft_times, label='Фичи', color='#3498db', alpha=0.8)
         ax1.bar(short_names, reg_times, bottom=ft_times, label='Регресс', color='#e74c3c', alpha=0.8)
-        ax1.set_title('Топ-15: Фичи vs Регресс', fontweight='bold'); ax1.legend()
+        ax1.bar(short_names, act_times, bottom=np.array(ft_times) + np.array(reg_times), label='Активности', color='#8e44ad', alpha=0.8)
+        ax1.set_title('Топ-15: Фичи / Регресс / Активности', fontweight='bold'); ax1.legend()
         ax2 = fig.add_subplot(gs[1, 0])
         all_weeks = set()
         for d in data['weekly_data'].values(): all_weeks.update(d.keys())
@@ -538,10 +716,12 @@ def create_charts(data):
         sorted_weeks = sorted(list(all_weeks))
         ft_w = [seconds_to_hours(sum(week_bucket(data['weekly_data'][a], w)['features'] for a in data['weekly_data'])) for w in sorted_weeks]
         reg_w = [seconds_to_hours(sum(week_bucket(data['weekly_data'][a], w)['regression'] for a in data['weekly_data'])) for w in sorted_weeks]
+        act_w = [seconds_to_hours(sum(week_bucket(data['weekly_data'][a], w)['activities'] for a in data['weekly_data'])) for w in sorted_weeks]
         x = np.arange(len(sorted_weeks))
         disp_weeks = [datetime.strptime(w, '%Y-%m-%d').strftime('%d.%m') for w in sorted_weeks]
         ax2.bar(x, ft_w, label='Фичи', color='#3498db')
         ax2.bar(x, reg_w, bottom=ft_w, label='Регресс', color='#e74c3c')
+        ax2.bar(x, act_w, bottom=np.array(ft_w) + np.array(reg_w), label='Активности', color='#8e44ad')
         ax2.set_xticks(x); ax2.set_xticklabels(disp_weeks); ax2.legend(); ax2.set_title('Динамика команды', fontweight='bold')
         ax3 = fig.add_subplot(gs[1, 1])
         projs = list(data['by_project'].keys())
@@ -643,15 +823,32 @@ def update_confluence_manual(page_id, new_html):
 
 def main():
     logger.info("%s\nАнализ времени (Final Fixed v2)\n%s", "=" * 60, "=" * 60)
-    unified_data = defaultdict(lambda: defaultdict(lambda: {'features': 0, 'regression': 0}))
-    by_project_data = defaultdict(lambda: {'times': [], 'stories': []})
-    author_project_stats = defaultdict(lambda: defaultdict(int))
-    start_date = datetime.strptime(FIXED_START_DATE, "%Y-%m-%d")
-    analyze_features(start_date, unified_data, by_project_data, author_project_stats)
-    analyze_regression(start_date, unified_data, author_project_stats)
+    unified_data, by_project_data, author_project_stats = create_data_store()
+    fixed_start = datetime.strptime(FIXED_START_DATE, "%Y-%m-%d")
+    cache = load_cache()
+
+    if cache:
+        recalc_start = max(
+            fixed_start,
+            datetime.now() - timedelta(weeks=INCREMENTAL_WEEKS),
+        )
+        recalc_start_key = recalc_start.strftime("%Y-%m-%d")
+        inject_cache_history(cache, unified_data, by_project_data, author_project_stats, recalc_start_key)
+        query_start = (recalc_start - timedelta(days=7)).strftime("%Y-%m-%d")
+        logger.info("Инкрементальный режим: пересчёт с %s (JQL updated >= %s)", recalc_start_key, query_start)
+    else:
+        recalc_start = fixed_start
+        recalc_start_key = FIXED_START_DATE
+        query_start = FIXED_START_DATE
+        logger.info("Полный пересчёт: с %s", FIXED_START_DATE)
+
+    analyze_features(recalc_start, query_start, unified_data, by_project_data, author_project_stats)
+    analyze_regression(recalc_start, query_start, unified_data, author_project_stats)
+    analyze_special_activity(SPECIAL_ACTIVITY_ISSUE, recalc_start, unified_data, by_project_data, author_project_stats)
     chart = create_charts({'weekly_data': unified_data, 'by_project': by_project_data})
     html_content = generate_html_report(unified_data, by_project_data, author_project_stats, chart)
     update_confluence_manual(PAGE_ID, html_content)
+    save_cache(unified_data, by_project_data, author_project_stats)
 
 if __name__ == "__main__":
     main()
