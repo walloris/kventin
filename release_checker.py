@@ -906,12 +906,53 @@ class ReleaseValidator:
             total_time = sum(wl.timeSpentSeconds for wl in worklogs)
             self._log_issue(full_subtask, "success", f"Затрекано {total_time / 3600:.2f}ч")
 
-    def _get_author_name(self, author_obj):
+    def _get_author_name(self, author_obj: object) -> str:
+        """Нормализует автора Jira/Zephyr объекта к строковому имени."""
         if hasattr(author_obj, 'displayName'):
             return author_obj.displayName
         elif hasattr(author_obj, 'name'):
             return author_obj.name
         return str(author_obj)
+
+    def _get_tester_worklog_authors(self, issue: object) -> set[str]:
+        """Возвращает множество тестировщиков со списанием времени > 0 в задаче."""
+        authors: set[str] = set()
+        try:
+            worklogs = self.jira_main.worklogs(issue.key)
+        except Exception:
+            return authors
+
+        for wl in worklogs:
+            author_name = self._get_author_name(wl.author)
+            if is_allowed_tester(author_name) and wl.timeSpentSeconds > 0:
+                authors.add(author_name)
+        return authors
+
+    def _get_linked_testing_tasks(self, issue: object) -> list[str]:
+        """
+        Возвращает ключи связанных Task с признаком тестирования.
+        Нужны для кейса, когда время списано не в Story, а в тестовой Task.
+        """
+        task_keys: list[str] = []
+        if not hasattr(issue.fields, 'issuelinks') or not issue.fields.issuelinks:
+            return task_keys
+
+        for link in issue.fields.issuelinks:
+            linked_issue = getattr(link, 'outwardIssue', None) or getattr(link, 'inwardIssue', None)
+            if not linked_issue:
+                continue
+            try:
+                linked_full = self.jira_main.issue(linked_issue.key, fields='summary,issuetype')
+            except Exception:
+                continue
+
+            issue_type = linked_full.fields.issuetype.name.lower() if linked_full.fields.issuetype else ''
+            if issue_type != 'task':
+                continue
+            summary = (linked_full.fields.summary or '').lower()
+            if 'тестирован' in summary:
+                task_keys.append(linked_full.key)
+        return task_keys
 
     def _get_consist_of_issues(self, release_key):
         consist_of_issues = []
@@ -929,7 +970,13 @@ class ReleaseValidator:
             self._log_issue("GENERAL", "error", f"Ошибка получения связей: {str(e)}")
         return consist_of_issues
 
-    def _check_artifacts(self, release_key):
+    def _check_artifacts(self, release_key: str) -> None:
+        """
+        Проверяет артефакты релиза:
+          1) есть комментарии от тестировщиков;
+          2) у каждого тестировщика из комментариев есть списание времени.
+        Для Story время может быть как в самой Story, так и в связанной тестовой Task.
+        """
         artifact_keys = self._get_consist_of_issues(release_key)
         if not artifact_keys:
             self._log_issue("GENERAL", "error", "Нет задач со связью 'consist of' / 'is part of'")
@@ -939,7 +986,7 @@ class ReleaseValidator:
             try:
                 artifact = self.jira_main.issue(artifact_key)
                 comments = self.jira_main.comments(artifact.key)
-                comment_authors = set()
+                comment_authors: set[str] = set()
                 for comment in comments:
                     author_name = self._get_author_name(comment.author)
                     if is_allowed_tester(author_name):
@@ -949,6 +996,36 @@ class ReleaseValidator:
                     self._log_issue(artifact, "error", "Нет комментариев от тестировщика")
                 else:
                     self._log_issue(artifact, "success", f"Есть комментарии от: {', '.join(comment_authors)}")
+
+                # Обязательная проверка:
+                # у тестировщика, оставившего комментарий, должно быть списанное время
+                # либо в самой Story/Bug, либо (для Story) в связанной тестовой Task.
+                direct_worklog_authors = self._get_tester_worklog_authors(artifact)
+                worklog_authors = set(direct_worklog_authors)
+
+                issue_type = artifact.fields.issuetype.name.lower() if artifact.fields.issuetype else ''
+                if issue_type == 'story':
+                    for task_key in self._get_linked_testing_tasks(artifact):
+                        try:
+                            task_issue = self.jira_main.issue(task_key)
+                        except Exception:
+                            continue
+                        worklog_authors.update(self._get_tester_worklog_authors(task_issue))
+
+                missing_time_authors = sorted(comment_authors - worklog_authors)
+                if missing_time_authors:
+                    self._log_issue(
+                        artifact,
+                        "error",
+                        "Нет затреканного времени от тестировщиков с комментариями: "
+                        + ", ".join(missing_time_authors)
+                    )
+                else:
+                    self._log_issue(
+                        artifact,
+                        "success",
+                        "У всех тестировщиков с комментариями есть списанное время ✓"
+                    )
             except Exception as e:
                 self._log_issue(artifact_key, "error", f"Ошибка проверки артефактов: {e}")
 
