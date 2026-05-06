@@ -78,6 +78,8 @@ STATE_START = "QA_ANALYTICS_STATE_V1_START"
 STATE_END = "QA_ANALYTICS_STATE_V1_END"
 AVG_TABLE_SORT_METRIC = "total_avg"  # total_avg | median_week | ft_avg | rg_avg | act_avg | regression_share
 TOP_HIGHLIGHT_COUNT = 3
+ANOMALY_GROWTH_THRESHOLD_PCT = 40
+TEAM_ALERT_HOURS = 30
 
 _REGRESS_KE_IDS_RAW = (
     2298599, 3589425, 3304476, 3303802, 3191860, 2288712, 2257858, 2935717,
@@ -585,6 +587,19 @@ def format_delta(current, previous):
     return str(delta)
 
 
+def format_delta_pct(current, previous):
+    cur_h = seconds_to_hours(current)
+    prev_h = seconds_to_hours(previous)
+    if prev_h <= 0:
+        return "n/a"
+    return f"{round(((cur_h - prev_h) / prev_h) * 100, 1)}%"
+
+
+def weekly_total_series(unified_data, author):
+    weeks = ordered_report_weeks(unified_data, limit=None)
+    return [sum_author_week(unified_data[author], w) for w in weeks]
+
+
 def story_touches_weeks(story, weeks):
     target_weeks = set(weeks)
     dates = str(story.get("worklog_dates", "")).split(",")
@@ -605,7 +620,7 @@ def generate_average_by_author_table(unified_data, author_project_stats):
     week_count = max(len(all_weeks), 1)
     rows = []
     for author in sorted(unified_data.keys()):
-        weekly_totals = [sum_author_week(unified_data[author], w) for w in all_weeks]
+        weekly_totals = weekly_total_series(unified_data, author)
         ft = sum(week_bucket(unified_data[author], w)["features"] for w in all_weeks)
         rg = sum(week_bucket(unified_data[author], w)["regression"] for w in all_weeks)
         act = sum(week_bucket(unified_data[author], w)["activities"] for w in all_weeks)
@@ -615,6 +630,8 @@ def generate_average_by_author_table(unified_data, author_project_stats):
         active_weeks = sum(1 for w in all_weeks if sum_author_week(unified_data[author], w) > 0)
         regression_share = round((rg / total) * 100, 1) if total > 0 else 0
         median_week = seconds_to_hours(float(np.median(weekly_totals)))
+        std_dev = seconds_to_hours(float(np.std(weekly_totals)))
+        stability_idx = round(100 / (1 + std_dev), 1)
         rows.append(
             {
                 "author": author,
@@ -625,11 +642,13 @@ def generate_average_by_author_table(unified_data, author_project_stats):
                 "total_avg": seconds_to_hours(total / week_count),
                 "median_week": median_week,
                 "regression_share": regression_share,
+                "std_dev": std_dev,
+                "stability_idx": stability_idx,
                 "active_weeks": active_weeks,
             }
         )
 
-    sort_key = AVG_TABLE_SORT_METRIC if AVG_TABLE_SORT_METRIC in {"total_avg", "median_week", "ft_avg", "rg_avg", "act_avg", "regression_share"} else "total_avg"
+    sort_key = AVG_TABLE_SORT_METRIC if AVG_TABLE_SORT_METRIC in {"total_avg", "median_week", "ft_avg", "rg_avg", "act_avg", "regression_share", "stability_idx"} else "total_avg"
     rows.sort(key=lambda x: x[sort_key], reverse=True)
     top_people = {r["author"] for r in rows[:TOP_HIGHLIGHT_COUNT]}
     bottom_people = {r["author"] for r in rows[-TOP_HIGHLIGHT_COUNT:]} if len(rows) > TOP_HIGHLIGHT_COUNT else set()
@@ -647,6 +666,7 @@ def generate_average_by_author_table(unified_data, author_project_stats):
         "<th style='padding:7px; border:1px solid #dfe1e6; background:#f4f5f7;'>Итого (ср/нед)</th>"
         "<th style='padding:7px; border:1px solid #dfe1e6; background:#f4f5f7;'>Медиана (ч/нед)</th>"
         "<th style='padding:7px; border:1px solid #dfe1e6; background:#f4f5f7;'>Доля регресса, %</th>"
+        "<th style='padding:7px; border:1px solid #dfe1e6; background:#f4f5f7;'>Стабильность, %</th>"
         "<th style='padding:7px; border:1px solid #dfe1e6; background:#f4f5f7;'>Активных недель</th>"
         "</tr></thead><tbody>"
     )
@@ -666,6 +686,7 @@ def generate_average_by_author_table(unified_data, author_project_stats):
             f"<td style='padding:7px; border:1px solid #dfe1e6; text-align:center; font-weight:600;'>{r['total_avg']}</td>"
             f"<td style='padding:7px; border:1px solid #dfe1e6; text-align:center;'>{r['median_week']}</td>"
             f"<td style='padding:7px; border:1px solid #dfe1e6; text-align:center; {reg_share_style}'>{r['regression_share']}</td>"
+            f"<td style='padding:7px; border:1px solid #dfe1e6; text-align:center;'>{r['stability_idx']}</td>"
             f"<td style='padding:7px; border:1px solid #dfe1e6; text-align:center;'>{r['active_weeks']}</td></tr>"
         )
     table += "</tbody></table>"
@@ -824,6 +845,17 @@ def generate_html_report(unified_data, by_project_data, author_project_stats, ch
     author_now.sort(key=lambda x: x[1], reverse=True)
     overloaded = author_now[:3]
     high_reg_share = [a for a in author_now if a[2] >= 40][:3]
+    anomalies = []
+    for author in unified_data.keys():
+        cur = sum_author_week(unified_data[author], current_week)
+        prev = sum_author_week(unified_data[author], previous_week)
+        if prev <= 0:
+            continue
+        growth = ((cur - prev) / prev) * 100
+        if growth >= ANOMALY_GROWTH_THRESHOLD_PCT:
+            anomalies.append((author, seconds_to_hours(cur), seconds_to_hours(prev), round(growth, 1)))
+    anomalies.sort(key=lambda x: x[3], reverse=True)
+    anomalies = anomalies[:5]
 
     metric_table_style = "padding:7px; border:1px solid #dfe1e6; text-align:center;"
     report_html = f"""
@@ -847,7 +879,7 @@ def generate_html_report(unified_data, by_project_data, author_project_stats, ch
         report_html += f'<div style="margin-bottom:16px;"><img src="data:image/png;base64,{chart_b64}" style="max-width:100%; border:1px solid #dfe1e6; border-radius:10px;"/></div>'
 
     report_html += "<h3 style='margin:14px 0 8px;'>Инсайты текущей недели</h3>"
-    report_html += "<div style='display:grid; grid-template-columns:repeat(2,minmax(240px,1fr)); gap:10px; margin-bottom:12px;'>"
+    report_html += "<div style='display:grid; grid-template-columns:repeat(3,minmax(220px,1fr)); gap:10px; margin-bottom:12px;'>"
     if overloaded:
         report_html += "<div style='padding:10px; border:1px solid #dfe1e6; border-radius:8px;'><div style='font-weight:700; margin-bottom:6px;'>Топ по нагрузке</div>"
         for name, hours, _ in overloaded:
@@ -857,6 +889,11 @@ def generate_html_report(unified_data, by_project_data, author_project_stats, ch
         report_html += "<div style='padding:10px; border:1px solid #dfe1e6; border-radius:8px;'><div style='font-weight:700; margin-bottom:6px;'>Высокая доля регресса</div>"
         for name, hours, share in high_reg_share:
             report_html += f"<div style='color:#172b4d;'>{html.escape(name)} — {hours} ч, <strong>{share}% регресса</strong></div>"
+        report_html += "</div>"
+    if anomalies:
+        report_html += f"<div style='padding:10px; border:1px solid #dfe1e6; border-radius:8px;'><div style='font-weight:700; margin-bottom:6px;'>Аномалии (рост &gt; {ANOMALY_GROWTH_THRESHOLD_PCT}%)</div>"
+        for name, cur_h, prev_h, growth in anomalies:
+            report_html += f"<div style='color:#172b4d;'>{html.escape(name)} — {prev_h} → <strong>{cur_h} ч</strong> ({growth}%)</div>"
         report_html += "</div>"
     report_html += "</div>"
 
@@ -869,7 +906,8 @@ def generate_html_report(unified_data, by_project_data, author_project_stats, ch
         team_act = sum(week_bucket(unified_data[a], current_week)["activities"] for a in authors)
         if team_current == 0 and team_previous == 0:
             continue
-        title = f"{team}: {seconds_to_hours(team_current)} ч сейчас · Δ {format_delta(team_current, team_previous)} ч"
+        alert = " ⚠" if seconds_to_hours(team_current) >= TEAM_ALERT_HOURS else ""
+        title = f"{team}: {seconds_to_hours(team_current)} ч сейчас · Δ {format_delta(team_current, team_previous)} ч ({format_delta_pct(team_current, team_previous)}){alert}"
         report_html += f"""
         <ac:structured-macro ac:name="expand">
           <ac:parameter ac:name="title">{html.escape(title)}</ac:parameter>
