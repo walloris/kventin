@@ -82,6 +82,7 @@ ANOMALY_GROWTH_THRESHOLD_PCT = 40
 TEAM_ALERT_HOURS = 30
 STATE_PROPERTY_KEY = "qa-analytics-state-v1"
 FULL_RECONCILE_EVERY_N_RUNS = 10
+ENABLE_CONTENT_PROPERTY_STATE = True
 
 _REGRESS_KE_IDS_RAW = (
     2298599, 3589425, 3304476, 3303802, 3191860, 2288712, 2257858, 2935717,
@@ -326,6 +327,23 @@ def set_content_property(page_id, key, value):
             last_err = e
     if last_err is not None:
         raise last_err
+
+
+def save_state_to_confluence(page_id, key, state_payload, report_html):
+    """Пытается сохранить state в content property; при несовместимости тихо уходит в fallback страницы."""
+    if not ENABLE_CONTENT_PROPERTY_STATE:
+        fallback_html = report_html + render_page_state(state_payload)
+        update_confluence_manual(page_id, fallback_html)
+        return "page_fallback"
+    try:
+        set_content_property(page_id, key, state_payload)
+        logger.info("Состояние отчёта сохранено в content property %s", key)
+        return "content_property"
+    except Exception as e:
+        logger.warning("Content property недоступен (%s). Используем fallback в странице.", e)
+        fallback_html = report_html + render_page_state(state_payload)
+        update_confluence_manual(page_id, fallback_html)
+        return "page_fallback"
 
 
 def extract_page_state(storage_body):
@@ -1270,13 +1288,7 @@ def main():
     state_payload = build_page_state(unified_data, by_project_data, author_project_stats)
     state_payload["run_seq"] = run_seq
     update_confluence_manual(PAGE_ID, html_content)
-    try:
-        set_content_property(PAGE_ID, STATE_PROPERTY_KEY, state_payload)
-        logger.info("Состояние отчёта сохранено в content property %s", STATE_PROPERTY_KEY)
-    except Exception:
-        logger.exception("Не удалось сохранить состояние в content property, оставляем fallback в странице")
-        fallback_html = html_content + render_page_state(state_payload)
-        update_confluence_manual(PAGE_ID, fallback_html)
+    save_state_to_confluence(PAGE_ID, STATE_PROPERTY_KEY, state_payload, html_content)
 
 if __name__ == "__main__":
     main()
