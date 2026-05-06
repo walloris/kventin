@@ -271,21 +271,61 @@ def fetch_confluence_page(page_id, expand="version,space,title,ancestors,body.st
 
 
 def get_content_property(page_id, key):
-    path = f"rest/api/content/{page_id}/property/{key}"
-    try:
-        return confluence_client.get(path)
-    except Exception:
-        return None
+    candidates = [
+        f"rest/api/content/{page_id}/property/{key}",
+        f"rest/api/latest/content/{page_id}/property/{key}",
+    ]
+    for path in candidates:
+        try:
+            return confluence_client.get(path)
+        except Exception:
+            continue
+    return None
 
 
 def set_content_property(page_id, key, value):
-    path = f"rest/api/content/{page_id}/property/{key}"
+    update_candidates = [
+        f"rest/api/content/{page_id}/property/{key}",
+        f"rest/api/latest/content/{page_id}/property/{key}",
+    ]
+    create_candidates = [
+        f"rest/api/content/{page_id}/property",
+        f"rest/api/latest/content/{page_id}/property",
+    ]
+
+    def _send_json(method_name, path, payload):
+        method = getattr(confluence_client, method_name)
+        try:
+            return method(path, json=payload)
+        except TypeError:
+            return method(path, data=payload)
+
     existing = get_content_property(page_id, key)
     if existing and "id" in existing:
-        payload = {"id": existing["id"], "key": key, "value": value, "version": {"number": existing["version"]["number"] + 1}}
-        return confluence_client.put(path, data=payload)
+        payload = {
+            "id": existing["id"],
+            "key": key,
+            "value": value,
+            "version": {"number": existing["version"]["number"] + 1},
+        }
+        last_err = None
+        for path in update_candidates:
+            try:
+                return _send_json("put", path, payload)
+            except Exception as e:
+                last_err = e
+        if last_err is not None:
+            raise last_err
+
     payload = {"key": key, "value": value}
-    return confluence_client.post(f"rest/api/content/{page_id}/property", data=payload)
+    last_err = None
+    for path in create_candidates:
+        try:
+            return _send_json("post", path, payload)
+        except Exception as e:
+            last_err = e
+    if last_err is not None:
+        raise last_err
 
 
 def extract_page_state(storage_body):
