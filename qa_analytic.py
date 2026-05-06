@@ -80,6 +80,8 @@ AVG_TABLE_SORT_METRIC = "total_avg"  # total_avg | median_week | ft_avg | rg_avg
 TOP_HIGHLIGHT_COUNT = 3
 ANOMALY_GROWTH_THRESHOLD_PCT = 40
 TEAM_ALERT_HOURS = 30
+STATE_PROPERTY_KEY = "qa-analytics-state-v1"
+FULL_RECONCILE_EVERY_N_RUNS = 10
 
 _REGRESS_KE_IDS_RAW = (
     2298599, 3589425, 3304476, 3303802, 3191860, 2288712, 2257858, 2935717,
@@ -243,6 +245,24 @@ def fetch_confluence_page(page_id, expand="version,space,title,ancestors,body.st
     return confluence_client.get(path, params={"expand": expand})
 
 
+def get_content_property(page_id, key):
+    path = f"rest/api/content/{page_id}/property/{key}"
+    try:
+        return confluence_client.get(path)
+    except Exception:
+        return None
+
+
+def set_content_property(page_id, key, value):
+    path = f"rest/api/content/{page_id}/property/{key}"
+    existing = get_content_property(page_id, key)
+    if existing and "id" in existing:
+        payload = {"id": existing["id"], "key": key, "value": value, "version": {"number": existing["version"]["number"] + 1}}
+        return confluence_client.put(path, data=payload)
+    payload = {"key": key, "value": value}
+    return confluence_client.post(f"rest/api/content/{page_id}/property", data=payload)
+
+
 def extract_page_state(storage_body):
     if not storage_body:
         return None
@@ -260,6 +280,9 @@ def extract_page_state(storage_body):
 
 def load_page_state(page_id):
     try:
+        prop = get_content_property(page_id, STATE_PROPERTY_KEY)
+        if prop and "value" in prop:
+            return prop["value"]
         page = fetch_confluence_page(page_id)
         storage = (page.get("body", {}).get("storage", {}) or {}).get("value", "")
         return extract_page_state(storage)
@@ -272,6 +295,7 @@ def build_page_state(unified_data, by_project_data, author_project_stats):
     return {
         "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "source": "confluence-page-storage",
+        "schema_version": 2,
         "weekly_data": nested_to_dict(unified_data),
         "by_project": nested_to_dict(by_project_data),
         "author_project_stats": nested_to_dict(author_project_stats),
@@ -326,6 +350,37 @@ def inject_cache_history(cache_payload, unified_data, by_project_data, author_pr
 
     # Проектную статистику по авторам пересчитываем на лету из свежей выборки,
     # чтобы в инкрементальном режиме не накапливать дубли по окну пересчёта.
+
+
+def normalize_recalc_week_start(weeks_back):
+    base = datetime.now() - timedelta(weeks=weeks_back)
+    monday = base - timedelta(days=base.weekday())
+    return monday.strftime("%Y-%m-%d")
+
+
+def historical_weeks_set(unified_data, before_week):
+    result = set()
+    for author in unified_data:
+        for week in unified_data[author].keys():
+            if week < before_week:
+                result.add(week)
+    return result
+
+
+def validate_incremental_integrity(prev_state, unified_data, recalc_start_key):
+    if not prev_state:
+        return True
+    prev_weeks = set()
+    for _, weeks in (prev_state.get("weekly_data", {}) or {}).items():
+        for week in weeks.keys():
+            if week < recalc_start_key:
+                prev_weeks.add(week)
+    now_weeks = historical_weeks_set(unified_data, recalc_start_key)
+    missing = prev_weeks - now_weeks
+    if missing:
+        logger.error("Инвариант нарушен: потерялись исторические недели до окна инкремента: %s", sorted(missing)[:10])
+        return False
+    return True
 
 def get_week_start(date_str):
     dt = datetime.strptime(date_str, '%Y-%m-%d')
@@ -1115,12 +1170,12 @@ def main():
     unified_data, by_project_data, author_project_stats = create_data_store()
     fixed_start = datetime.strptime(FIXED_START_DATE, "%Y-%m-%d")
     page_state = load_page_state(PAGE_ID)
+    run_seq = int((page_state or {}).get("run_seq", 0)) + 1
+    force_full = (run_seq % FULL_RECONCILE_EVERY_N_RUNS == 0)
 
-    if page_state:
-        recalc_start = max(
-            fixed_start,
-            datetime.now() - timedelta(weeks=INCREMENTAL_WEEKS),
-        )
+    if page_state and not force_full:
+        recalc_start_key = normalize_recalc_week_start(INCREMENTAL_WEEKS)
+        recalc_start = max(fixed_start, datetime.strptime(recalc_start_key, "%Y-%m-%d"))
         recalc_start_key = recalc_start.strftime("%Y-%m-%d")
         inject_cache_history(page_state, unified_data, by_project_data, author_project_stats, recalc_start_key)
         query_start = (recalc_start - timedelta(days=7)).strftime("%Y-%m-%d")
@@ -1129,15 +1184,34 @@ def main():
         recalc_start = fixed_start
         recalc_start_key = FIXED_START_DATE
         query_start = FIXED_START_DATE
-        logger.info("Полный пересчёт: служебное состояние на странице не найдено, старт с %s", FIXED_START_DATE)
+        if force_full:
+            logger.info("Периодический full reconcile (каждый %s запуск)", FULL_RECONCILE_EVERY_N_RUNS)
+        else:
+            logger.info("Полный пересчёт: служебное состояние на странице не найдено, старт с %s", FIXED_START_DATE)
 
     analyze_features(recalc_start, query_start, unified_data, by_project_data, author_project_stats)
     analyze_regression(recalc_start, query_start, unified_data, author_project_stats)
     analyze_special_activity(SPECIAL_ACTIVITY_ISSUE, recalc_start, unified_data, by_project_data, author_project_stats)
+
+    if page_state and not force_full and not validate_incremental_integrity(page_state, unified_data, recalc_start_key):
+        logger.warning("Переход на full reconcile из-за нарушения инвариантов")
+        unified_data, by_project_data, author_project_stats = create_data_store()
+        analyze_features(fixed_start, FIXED_START_DATE, unified_data, by_project_data, author_project_stats)
+        analyze_regression(fixed_start, FIXED_START_DATE, unified_data, author_project_stats)
+        analyze_special_activity(SPECIAL_ACTIVITY_ISSUE, fixed_start, unified_data, by_project_data, author_project_stats)
+
     chart = create_charts({'weekly_data': unified_data, 'by_project': by_project_data})
     html_content = generate_html_report(unified_data, by_project_data, author_project_stats, chart)
-    html_content += render_page_state(build_page_state(unified_data, by_project_data, author_project_stats))
+    state_payload = build_page_state(unified_data, by_project_data, author_project_stats)
+    state_payload["run_seq"] = run_seq
     update_confluence_manual(PAGE_ID, html_content)
+    try:
+        set_content_property(PAGE_ID, STATE_PROPERTY_KEY, state_payload)
+        logger.info("Состояние отчёта сохранено в content property %s", STATE_PROPERTY_KEY)
+    except Exception:
+        logger.exception("Не удалось сохранить состояние в content property, оставляем fallback в странице")
+        fallback_html = html_content + render_page_state(state_payload)
+        update_confluence_manual(PAGE_ID, fallback_html)
 
 if __name__ == "__main__":
     main()
