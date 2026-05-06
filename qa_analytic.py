@@ -148,10 +148,32 @@ def _is_retryable_server_error(exc):
         return getattr(exc, "status_code", None) in (502, 503, 504)
     return False
 
+
+def _is_unauthorized_error(exc):
+    if JIRAError is not None and isinstance(exc, JIRAError):
+        return getattr(exc, "status_code", None) in (401, 403)
+    txt = str(exc).lower()
+    return "401" in txt or "403" in txt or "unauthorized" in txt
+
+
+def _reset_jira_session_cookies():
+    """Сбрасывает протухшие cookies Jira-сессии, не трогая токен."""
+    try:
+        session = getattr(jira_client, "_session", None)
+        if session is not None and hasattr(session, "cookies"):
+            session.cookies.clear()
+            logger.warning("Jira cookies очищены, повторяем запрос с token_auth")
+            return True
+    except Exception:
+        logger.exception("Не удалось очистить cookies Jira-сессии")
+    return False
+
+
 def rate_limited_request(func, *args, **kwargs):
     """Один активный запрос к API за раз; пауза REQUEST_DELAY между успешными вызовами."""
     global last_request_time
     last_err = None
+    unauthorized_retried = False
     for attempt in range(MAX_RETRIES):
         try:
             with request_time_lock:
@@ -165,6 +187,11 @@ def rate_limited_request(func, *args, **kwargs):
             last_err = e
             if "SSL" in str(e):
                 raise
+            if _is_unauthorized_error(e) and not unauthorized_retried:
+                unauthorized_retried = True
+                if _reset_jira_session_cookies():
+                    time.sleep(1)
+                    continue
             if _is_rate_limit_error(e):
                 logger.warning("Лимит запросов (429), пауза 60 с (попытка %s/%s)", attempt + 1, MAX_RETRIES)
                 time.sleep(60)
@@ -177,11 +204,9 @@ def rate_limited_request(func, *args, **kwargs):
                 )
                 time.sleep(wait)
                 continue
-            if JIRAError is not None and isinstance(e, JIRAError):
-                sc = getattr(e, "status_code", None)
-                if sc in (401, 403):
-                    logger.error("Jira: доступ запрещён или неверная авторизация: %s", e)
-                    raise
+            if _is_unauthorized_error(e):
+                logger.error("Jira: 401/403 после повторной аутентификации. Проверьте token/cookie/SSO: %s", e)
+                raise
             logger.exception("Запрос не выполнен (попытка %s/%s)", attempt + 1, MAX_RETRIES)
             raise
     raise RuntimeError("Запрос не удался после всех повторов") from last_err
