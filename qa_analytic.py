@@ -73,7 +73,6 @@ REQUEST_DELAY = 1.0
 MAX_RETRIES = 5
 BATCH_SIZE = 50
 INCREMENTAL_WEEKS = 8
-REPORT_WEEKS = 8
 SPECIAL_ACTIVITY_ISSUE = "HRC-3630"
 STATE_START = "QA_ANALYTICS_STATE_V1_START"
 STATE_END = "QA_ANALYTICS_STATE_V1_END"
@@ -554,13 +553,16 @@ def determine_team(author, author_project_stats):
     return max(stats, key=stats.get)
 
 
-def ordered_report_weeks(unified_data, limit=REPORT_WEEKS, ref_date=None):
+def ordered_report_weeks(unified_data, limit=None, ref_date=None):
     current_week_key = calendar_week_monday_key(ref_date)
     all_weeks = set()
     for auth_data in unified_data.values():
         all_weeks.update(auth_data.keys())
     all_weeks.add(current_week_key)
-    return sorted(all_weeks, reverse=True)[:limit]
+    ordered = sorted(all_weeks, reverse=True)
+    if limit is None:
+        return ordered
+    return ordered[:limit]
 
 
 def sum_week_metric(unified_data, week, metric):
@@ -596,13 +598,66 @@ def story_touches_weeks(story, weeks):
     return False
 
 
+def generate_average_by_author_table(unified_data, author_project_stats):
+    all_weeks = ordered_report_weeks(unified_data, limit=None)
+    week_count = max(len(all_weeks), 1)
+    rows = []
+    for author in sorted(unified_data.keys()):
+        ft = sum(week_bucket(unified_data[author], w)["features"] for w in all_weeks)
+        rg = sum(week_bucket(unified_data[author], w)["regression"] for w in all_weeks)
+        act = sum(week_bucket(unified_data[author], w)["activities"] for w in all_weeks)
+        total = ft + rg + act
+        if total == 0:
+            continue
+        active_weeks = sum(1 for w in all_weeks if sum_author_week(unified_data[author], w) > 0)
+        rows.append(
+            {
+                "author": author,
+                "team": determine_team(author, author_project_stats),
+                "ft_avg": seconds_to_hours(ft / week_count),
+                "rg_avg": seconds_to_hours(rg / week_count),
+                "act_avg": seconds_to_hours(act / week_count),
+                "total_avg": seconds_to_hours(total / week_count),
+                "active_weeks": active_weeks,
+            }
+        )
+
+    rows.sort(key=lambda x: x["total_avg"], reverse=True)
+    table = "<h3 style='margin:14px 0 8px;'>Среднее время по сотрудникам (за весь период)</h3>"
+    table += (
+        "<table style='border-collapse:collapse; width:100%; margin-bottom:14px;'>"
+        "<thead><tr>"
+        "<th style='padding:7px; border:1px solid #dfe1e6; background:#f4f5f7; text-align:left;'>Сотрудник</th>"
+        "<th style='padding:7px; border:1px solid #dfe1e6; background:#f4f5f7; text-align:left;'>Команда</th>"
+        "<th style='padding:7px; border:1px solid #dfe1e6; background:#f4f5f7;'>Фичи (ср/нед)</th>"
+        "<th style='padding:7px; border:1px solid #dfe1e6; background:#f4f5f7;'>Регресс (ср/нед)</th>"
+        "<th style='padding:7px; border:1px solid #dfe1e6; background:#f4f5f7;'>Активности (ср/нед)</th>"
+        "<th style='padding:7px; border:1px solid #dfe1e6; background:#f4f5f7;'>Итого (ср/нед)</th>"
+        "<th style='padding:7px; border:1px solid #dfe1e6; background:#f4f5f7;'>Активных недель</th>"
+        "</tr></thead><tbody>"
+    )
+    for r in rows:
+        table += (
+            f"<tr><td style='padding:7px; border:1px solid #dfe1e6; text-align:left;'>{html.escape(r['author'])}</td>"
+            f"<td style='padding:7px; border:1px solid #dfe1e6; text-align:left;'>{html.escape(r['team'])}</td>"
+            f"<td style='padding:7px; border:1px solid #dfe1e6; text-align:center;'>{r['ft_avg']}</td>"
+            f"<td style='padding:7px; border:1px solid #dfe1e6; text-align:center;'>{r['rg_avg']}</td>"
+            f"<td style='padding:7px; border:1px solid #dfe1e6; text-align:center;'>{r['act_avg']}</td>"
+            f"<td style='padding:7px; border:1px solid #dfe1e6; text-align:center; font-weight:600;'>{r['total_avg']}</td>"
+            f"<td style='padding:7px; border:1px solid #dfe1e6; text-align:center;'>{r['active_weeks']}</td></tr>"
+        )
+    table += "</tbody></table>"
+    table += f"<p style='margin:-4px 0 14px; color:#6b778c;'>Период расчёта: {len(all_weeks)} недель (с {FIXED_START_DATE}).</p>"
+    return table
+
+
 def generate_weekly_report(unified_data, author_project_stats, ref_date=None):
     if not unified_data: return ""
 
     ref_date = ref_date or datetime.now()
     current_week_key = calendar_week_monday_key(ref_date)
 
-    sorted_weeks = ordered_report_weeks(unified_data, REPORT_WEEKS, ref_date)
+    sorted_weeks = ordered_report_weeks(unified_data, limit=None, ref_date=ref_date)
 
     # Определяем команды
     teams_map = defaultdict(list)
@@ -616,7 +671,7 @@ def generate_weekly_report(unified_data, author_project_stats, ref_date=None):
     style_td = "border: 1px solid #ddd; padding: 4px; text-align: center;"
     style_team = "background: #deebff; font-weight: bold; padding: 8px; text-align: left;"
 
-    full_html = f"<h3>📊 Нагрузка по неделям (последние {REPORT_WEEKS})</h3>"
+    full_html = "<h3>📊 Нагрузка по неделям (весь период)</h3>"
 
     for week in sorted_weeks:
         monday = datetime.strptime(week, '%Y-%m-%d')
@@ -714,7 +769,7 @@ def generate_weekly_report(unified_data, author_project_stats, ref_date=None):
     return full_html
 
 def generate_html_report(unified_data, by_project_data, author_project_stats, chart_b64):
-    report_weeks = ordered_report_weeks(unified_data, REPORT_WEEKS)
+    report_weeks = ordered_report_weeks(unified_data, limit=None)
     current_week = calendar_week_monday_key()
     previous_week = get_week_start((datetime.strptime(current_week, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d"))
     rolling_weeks = report_weeks[:4]
@@ -742,7 +797,7 @@ def generate_html_report(unified_data, by_project_data, author_project_stats, ch
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
         <div>
           <h2 style="margin:0; font-size:24px;">QA Analytics Dashboard</h2>
-          <div style="color:#6b778c; margin-top:4px;">Обновлено: {datetime.now().strftime('%d.%m.%Y %H:%M')} · срез: текущая неделя + rolling {REPORT_WEEKS} недель</div>
+          <div style="color:#6b778c; margin-top:4px;">Обновлено: {datetime.now().strftime('%d.%m.%Y %H:%M')} · данные хранятся и считаются с {FIXED_START_DATE}</div>
         </div>
         <div style="padding:8px 12px; border-radius:16px; background:#deebff; color:#0747a6; font-weight:600;">Инкремент из Confluence</div>
       </div>
@@ -752,7 +807,7 @@ def generate_html_report(unified_data, by_project_data, author_project_stats, ch
         <div style="padding:14px; border-radius:12px; background:#ffebe6;"><div style="font-size:24px; font-weight:700; color:#bf2600;">{seconds_to_hours(current_regression)} ч</div><div style="font-size:12px; color:#42526e;">Регресс сейчас</div></div>
         <div style="padding:14px; border-radius:12px; background:#f3e8ff;"><div style="font-size:24px; font-weight:700; color:#5b2c83;">{seconds_to_hours(current_activities)} ч</div><div style="font-size:12px; color:#42526e;">Активности {SPECIAL_ACTIVITY_ISSUE}</div></div>
       </div>
-      <p style="margin:0 0 12px; color:#42526e;">Фичи сейчас: <strong>{seconds_to_hours(current_features)} ч</strong> · Среднее за последние {len(rolling_weeks)} недели: <strong>{seconds_to_hours(rolling_avg)} ч/нед</strong>. Ниже — раскрываемые команды и сотрудники.</p>
+      <p style="margin:0 0 12px; color:#42526e;">Фичи сейчас: <strong>{seconds_to_hours(current_features)} ч</strong> · Среднее за последние {len(rolling_weeks)} недели: <strong>{seconds_to_hours(rolling_avg)} ч/нед</strong>. Ниже — команды, средние по сотрудникам и недельная история.</p>
     """
     if chart_b64:
         report_html += f'<div style="margin-bottom:16px;"><img src="data:image/png;base64,{chart_b64}" style="max-width:100%; border:1px solid #dfe1e6; border-radius:10px;"/></div>'
@@ -810,9 +865,10 @@ def generate_html_report(unified_data, by_project_data, author_project_stats, ch
             """
         report_html += "</tbody></table></ac:rich-text-body></ac:structured-macro>"
 
+    report_html += generate_average_by_author_table(unified_data, author_project_stats)
     report_html += generate_weekly_report(unified_data, author_project_stats)
 
-    report_html += f'<ac:structured-macro ac:name="expand"><ac:parameter ac:name="title">📂 Детализация задач за последние {REPORT_WEEKS} недель</ac:parameter><ac:rich-text-body>'
+    report_html += '<ac:structured-macro ac:name="expand"><ac:parameter ac:name="title">📂 Детализация задач (весь период)</ac:parameter><ac:rich-text-body>'
     recent_projects = []
     for pk, pdata in by_project_data.items():
         stories = [s for s in pdata['stories'] if story_touches_weeks(s, report_weeks)]
@@ -856,7 +912,7 @@ def create_charts(data):
         all_weeks = set()
         for d in data['weekly_data'].values(): all_weeks.update(d.keys())
         all_weeks.add(calendar_week_monday_key())
-        sorted_weeks = sorted(list(all_weeks))[-REPORT_WEEKS:]
+        sorted_weeks = sorted(list(all_weeks))
         ft_w = [seconds_to_hours(sum(week_bucket(data['weekly_data'][a], w)['features'] for a in data['weekly_data'])) for w in sorted_weeks]
         reg_w = [seconds_to_hours(sum(week_bucket(data['weekly_data'][a], w)['regression'] for a in data['weekly_data'])) for w in sorted_weeks]
         act_w = [seconds_to_hours(sum(week_bucket(data['weekly_data'][a], w)['activities'] for a in data['weekly_data'])) for w in sorted_weeks]
@@ -880,7 +936,7 @@ def create_charts(data):
             ax3.bar_label(bars, fmt='%.0f', padding=3)
         else:
             ax3.text(0.5, 0.5, 'Нет данных за период', ha='center', va='center')
-        ax3.set_title(f'Фичи по проектам ({REPORT_WEEKS} нед.)', fontweight='bold')
+        ax3.set_title('Фичи по проектам (весь период)', fontweight='bold')
         buffer = BytesIO()
         plt.savefig(buffer, format='png', dpi=100, bbox_inches='tight')
         buffer.seek(0)
