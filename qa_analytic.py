@@ -76,6 +76,8 @@ INCREMENTAL_WEEKS = 8
 SPECIAL_ACTIVITY_ISSUE = "HRC-3630"
 STATE_START = "QA_ANALYTICS_STATE_V1_START"
 STATE_END = "QA_ANALYTICS_STATE_V1_END"
+AVG_TABLE_SORT_METRIC = "total_avg"  # total_avg | median_week | ft_avg | rg_avg | act_avg | regression_share
+TOP_HIGHLIGHT_COUNT = 3
 
 _REGRESS_KE_IDS_RAW = (
     2298599, 3589425, 3304476, 3303802, 3191860, 2288712, 2257858, 2935717,
@@ -603,6 +605,7 @@ def generate_average_by_author_table(unified_data, author_project_stats):
     week_count = max(len(all_weeks), 1)
     rows = []
     for author in sorted(unified_data.keys()):
+        weekly_totals = [sum_author_week(unified_data[author], w) for w in all_weeks]
         ft = sum(week_bucket(unified_data[author], w)["features"] for w in all_weeks)
         rg = sum(week_bucket(unified_data[author], w)["regression"] for w in all_weeks)
         act = sum(week_bucket(unified_data[author], w)["activities"] for w in all_weeks)
@@ -610,6 +613,8 @@ def generate_average_by_author_table(unified_data, author_project_stats):
         if total == 0:
             continue
         active_weeks = sum(1 for w in all_weeks if sum_author_week(unified_data[author], w) > 0)
+        regression_share = round((rg / total) * 100, 1) if total > 0 else 0
+        median_week = seconds_to_hours(float(np.median(weekly_totals)))
         rows.append(
             {
                 "author": author,
@@ -618,12 +623,19 @@ def generate_average_by_author_table(unified_data, author_project_stats):
                 "rg_avg": seconds_to_hours(rg / week_count),
                 "act_avg": seconds_to_hours(act / week_count),
                 "total_avg": seconds_to_hours(total / week_count),
+                "median_week": median_week,
+                "regression_share": regression_share,
                 "active_weeks": active_weeks,
             }
         )
 
-    rows.sort(key=lambda x: x["total_avg"], reverse=True)
+    sort_key = AVG_TABLE_SORT_METRIC if AVG_TABLE_SORT_METRIC in {"total_avg", "median_week", "ft_avg", "rg_avg", "act_avg", "regression_share"} else "total_avg"
+    rows.sort(key=lambda x: x[sort_key], reverse=True)
+    top_people = {r["author"] for r in rows[:TOP_HIGHLIGHT_COUNT]}
+    bottom_people = {r["author"] for r in rows[-TOP_HIGHLIGHT_COUNT:]} if len(rows) > TOP_HIGHLIGHT_COUNT else set()
+
     table = "<h3 style='margin:14px 0 8px;'>Среднее время по сотрудникам (за весь период)</h3>"
+    table += f"<p style='margin:0 0 8px; color:#6b778c;'>Сортировка: <strong>{html.escape(sort_key)}</strong>. Топ-{TOP_HIGHLIGHT_COUNT} и нижние-{TOP_HIGHLIGHT_COUNT} подсвечены.</p>"
     table += (
         "<table style='border-collapse:collapse; width:100%; margin-bottom:14px;'>"
         "<thead><tr>"
@@ -633,17 +645,27 @@ def generate_average_by_author_table(unified_data, author_project_stats):
         "<th style='padding:7px; border:1px solid #dfe1e6; background:#f4f5f7;'>Регресс (ср/нед)</th>"
         "<th style='padding:7px; border:1px solid #dfe1e6; background:#f4f5f7;'>Активности (ср/нед)</th>"
         "<th style='padding:7px; border:1px solid #dfe1e6; background:#f4f5f7;'>Итого (ср/нед)</th>"
+        "<th style='padding:7px; border:1px solid #dfe1e6; background:#f4f5f7;'>Медиана (ч/нед)</th>"
+        "<th style='padding:7px; border:1px solid #dfe1e6; background:#f4f5f7;'>Доля регресса, %</th>"
         "<th style='padding:7px; border:1px solid #dfe1e6; background:#f4f5f7;'>Активных недель</th>"
         "</tr></thead><tbody>"
     )
     for r in rows:
+        row_bg = ""
+        if r["author"] in top_people:
+            row_bg = "background:#e3fcef;"
+        elif r["author"] in bottom_people:
+            row_bg = "background:#ffebe6;"
+        reg_share_style = "color:#bf2600; font-weight:600;" if r["regression_share"] >= 40 else ""
         table += (
-            f"<tr><td style='padding:7px; border:1px solid #dfe1e6; text-align:left;'>{html.escape(r['author'])}</td>"
+            f"<tr style='{row_bg}'><td style='padding:7px; border:1px solid #dfe1e6; text-align:left;'>{html.escape(r['author'])}</td>"
             f"<td style='padding:7px; border:1px solid #dfe1e6; text-align:left;'>{html.escape(r['team'])}</td>"
             f"<td style='padding:7px; border:1px solid #dfe1e6; text-align:center;'>{r['ft_avg']}</td>"
             f"<td style='padding:7px; border:1px solid #dfe1e6; text-align:center;'>{r['rg_avg']}</td>"
             f"<td style='padding:7px; border:1px solid #dfe1e6; text-align:center;'>{r['act_avg']}</td>"
             f"<td style='padding:7px; border:1px solid #dfe1e6; text-align:center; font-weight:600;'>{r['total_avg']}</td>"
+            f"<td style='padding:7px; border:1px solid #dfe1e6; text-align:center;'>{r['median_week']}</td>"
+            f"<td style='padding:7px; border:1px solid #dfe1e6; text-align:center; {reg_share_style}'>{r['regression_share']}</td>"
             f"<td style='padding:7px; border:1px solid #dfe1e6; text-align:center;'>{r['active_weeks']}</td></tr>"
         )
     table += "</tbody></table>"
@@ -791,6 +813,18 @@ def generate_html_report(unified_data, by_project_data, author_project_stats, ch
     for author in unified_data.keys():
         team_map[determine_team(author, author_project_stats)].append(author)
 
+    # Быстрые инсайты для руководителя: кто перегружен, где много регресса.
+    author_now = []
+    for author in unified_data.keys():
+        wb = week_bucket(unified_data[author], current_week)
+        total = wb["features"] + wb["regression"] + wb["activities"]
+        if total > 0:
+            reg_share = (wb["regression"] / total) * 100 if total else 0
+            author_now.append((author, seconds_to_hours(total), round(reg_share, 1)))
+    author_now.sort(key=lambda x: x[1], reverse=True)
+    overloaded = author_now[:3]
+    high_reg_share = [a for a in author_now if a[2] >= 40][:3]
+
     metric_table_style = "padding:7px; border:1px solid #dfe1e6; text-align:center;"
     report_html = f"""
     <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif; color:#172b4d;">
@@ -811,6 +845,20 @@ def generate_html_report(unified_data, by_project_data, author_project_stats, ch
     """
     if chart_b64:
         report_html += f'<div style="margin-bottom:16px;"><img src="data:image/png;base64,{chart_b64}" style="max-width:100%; border:1px solid #dfe1e6; border-radius:10px;"/></div>'
+
+    report_html += "<h3 style='margin:14px 0 8px;'>Инсайты текущей недели</h3>"
+    report_html += "<div style='display:grid; grid-template-columns:repeat(2,minmax(240px,1fr)); gap:10px; margin-bottom:12px;'>"
+    if overloaded:
+        report_html += "<div style='padding:10px; border:1px solid #dfe1e6; border-radius:8px;'><div style='font-weight:700; margin-bottom:6px;'>Топ по нагрузке</div>"
+        for name, hours, _ in overloaded:
+            report_html += f"<div style='color:#172b4d;'>{html.escape(name)} — <strong>{hours} ч</strong></div>"
+        report_html += "</div>"
+    if high_reg_share:
+        report_html += "<div style='padding:10px; border:1px solid #dfe1e6; border-radius:8px;'><div style='font-weight:700; margin-bottom:6px;'>Высокая доля регресса</div>"
+        for name, hours, share in high_reg_share:
+            report_html += f"<div style='color:#172b4d;'>{html.escape(name)} — {hours} ч, <strong>{share}% регресса</strong></div>"
+        report_html += "</div>"
+    report_html += "</div>"
 
     report_html += "<h3 style='margin:14px 0 8px;'>Команды: текущая неделя, дельта и состав</h3>"
     for team, authors in sorted(team_map.items()):
