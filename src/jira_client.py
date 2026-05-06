@@ -25,6 +25,10 @@ from config import (
     JIRA_PRIORITY_CRITICAL,
     JIRA_PRIORITY_MAJOR,
     JIRA_PRIORITY_MINOR,
+    JIRA_RETEST_RESOLUTION_FIXED,
+    JIRA_RETEST_STATUS_IN_PROGRESS,
+    JIRA_RETEST_STATUS_QA,
+    JIRA_RETEST_STATUS_RESOLVED,
 )
 
 LOG = logging.getLogger("Jira")
@@ -573,3 +577,348 @@ def create_jira_issue(
         print(f"[Jira] Ошибка при создании тикета: {e}")
         LOG.error("Ошибка: %s", e)
         return None
+
+
+# =============================================
+# Ретест: поиск, changelog, переходы, комментарии
+# =============================================
+
+
+def _jira_connection_from_env() -> Optional[dict]:
+    """
+    Параметры REST для операций с задачами (поиск, переходы, комментарии).
+    Возвращает dict или None, если не хватает JIRA_URL / токена / проекта.
+    """
+    jira_url = (os.getenv("JIRA_URL", "") or "").rstrip("/")
+    login = (os.getenv("JIRA_USERNAME", "") or os.getenv("JIRA_EMAIL", "") or "").strip()
+    api_token = (os.getenv("JIRA_API_TOKEN", "") or "").strip()
+    project_key = (os.getenv("JIRA_PROJECT_KEY", "") or "").strip()
+    use_bearer = len(api_token) > 20
+    if not jira_url or not api_token or not project_key:
+        return None
+    if not use_bearer and not login:
+        return None
+    headers = {"Content-Type": "application/json", "X-Atlassian-Token": "no-check"}
+    if use_bearer:
+        headers["Authorization"] = f"Bearer {api_token}"
+        auth = None
+    else:
+        auth = (login, api_token)
+    return {
+        "jira_url": jira_url,
+        "login": login,
+        "project_key": project_key,
+        "use_bearer": use_bearer,
+        "headers": headers,
+        "auth": auth,
+    }
+
+
+def is_jira_rest_configured() -> bool:
+    """True, если заданы параметры для Jira REST (поиск, переходы, комментарии)."""
+    return _jira_connection_from_env() is not None
+
+
+def _jira_rest(
+    method: str,
+    path: str,
+    *,
+    params: Optional[dict] = None,
+    json_body: Optional[dict] = None,
+) -> tuple[int, Optional[dict], str]:
+    """Низкоуровневый REST. Возвращает (status_code, json|None, raw_text_slice)."""
+    conn = _jira_connection_from_env()
+    if not conn:
+        return 0, None, "Jira: не заданы JIRA_URL / JIRA_API_TOKEN / JIRA_PROJECT_KEY"
+    url = f"{conn['jira_url']}/rest/api/2/{path.lstrip('/')}"
+    try:
+        r = requests.request(
+            method,
+            url,
+            params=params,
+            json=json_body,
+            headers=conn["headers"],
+            auth=None if conn["use_bearer"] else conn["auth"],
+            verify=False,
+            timeout=45,
+        )
+        text = (r.text or "")[:800]
+        if r.status_code in (200, 201):
+            try:
+                return r.status_code, r.json() if r.text else {}, text
+            except Exception:
+                return r.status_code, {}, text
+        try:
+            return r.status_code, r.json() if r.text else None, text
+        except Exception:
+            return r.status_code, None, text
+    except Exception as e:
+        LOG.exception("_jira_rest %s %s", method, path)
+        return 0, None, str(e)[:400]
+
+
+def search_kventin_issues_by_status(
+    status_name: str,
+    *,
+    max_results: int = 50,
+) -> List[dict]:
+    """
+    Найти открытые задачи проекта с лейблом kventin в указанном статусе.
+    Возвращает элементы issues из /search (каждый с key, fields).
+    """
+    conn = _jira_connection_from_env()
+    if not conn:
+        LOG.warning("search_kventin_issues_by_status: нет подключения к Jira")
+        return []
+    status_escaped = (status_name or "").replace('"', '\\"')
+    jql = (
+        f'project = {conn["project_key"]} AND labels = {JIRA_DEFECT_LABEL} '
+        f'AND status = "{status_escaped}"'
+    )
+    code, data, _ = _jira_rest(
+        "GET",
+        "search",
+        params={"jql": jql, "fields": "summary,status", "maxResults": max_results},
+    )
+    if code != 200 or not data:
+        LOG.warning("search_kventin: JQL search failed code=%s", code)
+        return []
+    return list(data.get("issues") or [])
+
+
+def get_issue_with_changelog(issue_key: str) -> tuple[int, Optional[dict], str]:
+    """GET issue с expand=changelog, полями description, summary, status, assignee."""
+    return _jira_rest(
+        "GET",
+        f"issue/{issue_key}",
+        params={
+            "expand": "changelog",
+            "fields": "description,summary,status,assignee,reporter",
+        },
+    )
+
+
+def find_author_who_moved_to_status(
+    changelog: Optional[dict],
+    target_status_name: str,
+) -> Optional[dict]:
+    """
+    Последний (по времени changelog) автор, который перевёл задачу В статус target_status_name.
+
+    Jira отдаёт histories в порядке от старых к новым — берём последнее совпадение toString.
+    """
+    if not changelog or not target_status_name:
+        return None
+    histories = changelog.get("histories") or []
+    target_lower = target_status_name.strip().lower()
+    last_author: Optional[dict] = None
+    for h in histories:
+        author = h.get("author") or h.get("updateAuthor")
+        for item in h.get("items") or []:
+            if (item.get("field") or "").lower() != "status":
+                continue
+            to_s = (item.get("toString") or item.get("to") or "").strip()
+            if to_s.lower() == target_lower:
+                if isinstance(author, dict):
+                    last_author = author
+    return last_author
+
+
+def author_to_assignee_value(author: Optional[dict]) -> str:
+    """Из объекта автора Jira сделать строку для _assign_issue (accountId / name / email)."""
+    if not author:
+        return ""
+    if author.get("accountId"):
+        return str(author["accountId"])
+    if author.get("name"):
+        return str(author["name"])
+    if author.get("key"):
+        return str(author["key"])
+    if author.get("emailAddress"):
+        return str(author["emailAddress"])
+    return ""
+
+
+def list_issue_transitions(issue_key: str) -> List[dict]:
+    code, data, _ = _jira_rest("GET", f"issue/{issue_key}/transitions")
+    if code != 200 or not data:
+        return []
+    return list(data.get("transitions") or [])
+
+
+def find_transition_id_to_status(
+    transitions: List[dict],
+    target_status_name: str,
+) -> Optional[str]:
+    """Подобрать id перехода, у которого to.name совпадает с target_status_name (без учёта регистра)."""
+    want = (target_status_name or "").strip().lower()
+    if not want:
+        return None
+    best: Optional[str] = None
+    for t in transitions:
+        to_name = ((t.get("to") or {}).get("name") or "").strip().lower()
+        if to_name == want:
+            tid = t.get("id")
+            if tid:
+                best = str(tid)
+    return best
+
+
+def transition_issue(
+    issue_key: str,
+    transition_id: str,
+    *,
+    fields: Optional[dict] = None,
+) -> tuple[bool, str]:
+    """
+    Выполнить переход workflow. fields — опционально (например resolution при закрытии).
+    """
+    body: dict = {"transition": {"id": str(transition_id)}}
+    if fields:
+        body["fields"] = fields
+    code, data, text = _jira_rest("POST", f"issue/{issue_key}/transitions", json_body=body)
+    if code in (200, 204):
+        return True, ""
+    err = text
+    if isinstance(data, dict):
+        em = data.get("errorMessages") or []
+        if em:
+            err = "; ".join(str(x) for x in em)
+        errs = data.get("errors") or {}
+        if errs:
+            err = err + " " + str(errs)
+    LOG.warning("transition_issue %s failed: %s %s", issue_key, code, err[:300])
+    return False, err or f"HTTP {code}"
+
+
+def add_issue_comment(issue_key: str, body: str) -> bool:
+    """Добавить комментарий (wiki-текст)."""
+    code, _, text = _jira_rest(
+        "POST",
+        f"issue/{issue_key}/comment",
+        json_body={"body": body[:100000]},
+    )
+    if code in (200, 201):
+        return True
+    LOG.warning("add_issue_comment %s: %s — %s", issue_key, code, text[:200])
+    return False
+
+
+def reopen_or_move_to_in_progress(
+    issue_key: str,
+    *,
+    assignee_value: str,
+) -> bool:
+    """
+    Перевести задачу в In Progress и назначить assignee_value (если непусто).
+    """
+    trans = list_issue_transitions(issue_key)
+    tid = find_transition_id_to_status(trans, JIRA_RETEST_STATUS_IN_PROGRESS)
+    if not tid:
+        # иногда переход называется "Reopen" но ведёт в In Progress — перебираем
+        for t in trans:
+            tname = (t.get("name") or "").lower()
+            to_name = ((t.get("to") or {}).get("name") or "").lower()
+            if "progress" in to_name or "reopen" in tname:
+                tid = str(t.get("id") or "")
+                if tid:
+                    break
+    if not tid:
+        LOG.error("Нет перехода в статус «%s» для %s", JIRA_RETEST_STATUS_IN_PROGRESS, issue_key)
+        return False
+    ok, err = transition_issue(issue_key, tid)
+    if not ok:
+        print(f"[Jira] Не удалось перевести {issue_key} в In Progress: {err}")
+        return False
+    conn = _jira_connection_from_env()
+    if assignee_value and conn:
+        _assign_issue(
+            conn["jira_url"],
+            issue_key,
+            assignee_value,
+            headers=conn["headers"],
+            auth=conn["auth"],
+            use_bearer=conn["use_bearer"],
+        )
+    return True
+
+
+def resolve_issue_fixed(issue_key: str) -> bool:
+    """Перевести в Resolved с resolution = JIRA_RETEST_RESOLUTION_FIXED."""
+    trans = list_issue_transitions(issue_key)
+    tid = find_transition_id_to_status(trans, JIRA_RETEST_STATUS_RESOLVED)
+    if not tid:
+        # fallback: ищем переход с «resolve» в имени
+        for t in trans:
+            n = (t.get("name") or "").lower()
+            to_n = ((t.get("to") or {}).get("name") or "").lower()
+            if "resolv" in n or to_n == (JIRA_RETEST_STATUS_RESOLVED or "").lower():
+                tid = str(t.get("id") or "")
+                if tid:
+                    break
+    if not tid:
+        LOG.error("Нет перехода в «%s» для %s", JIRA_RETEST_STATUS_RESOLVED, issue_key)
+        return False
+    fields = {}
+    if JIRA_RETEST_RESOLUTION_FIXED:
+        fields["resolution"] = {"name": JIRA_RETEST_RESOLUTION_FIXED}
+    ok, err = transition_issue(issue_key, tid, fields=fields if fields else None)
+    if ok:
+        return True
+    # повтор без resolution (если в workflow резолюция не требуется или другое имя)
+    if fields:
+        ok2, err2 = transition_issue(issue_key, tid, fields=None)
+        if ok2:
+            LOG.warning("resolve %s: без поля resolution (было: %s)", issue_key, err[:120])
+            return True
+        err = err2
+    print(f"[Jira] Не удалось закрыть {issue_key} как Fixed: {err}")
+    return False
+
+
+def start_qa_transition(issue_key: str) -> bool:
+    """Перевести из текущего статуса в QA (статус назначения JIRA_RETEST_STATUS_QA)."""
+    trans = list_issue_transitions(issue_key)
+    tid = find_transition_id_to_status(trans, JIRA_RETEST_STATUS_QA)
+    if not tid:
+        LOG.error(
+            "Нет перехода в статус «%s» для %s. Доступно: %s",
+            JIRA_RETEST_STATUS_QA,
+            issue_key,
+            [((t.get("to") or {}).get("name"), t.get("name")) for t in trans[:8]],
+        )
+        return False
+    ok, err = transition_issue(issue_key, tid)
+    if not ok:
+        print(f"[Jira] Не удалось перевести {issue_key} в QA: {err}")
+        return False
+    return True
+
+
+def extract_description_text(fields: Optional[dict]) -> str:
+    """Достать текст описания из fields (строка wiki или простой текст)."""
+    if not fields:
+        return ""
+    d = fields.get("description")
+    if isinstance(d, str):
+        return d
+    if isinstance(d, dict):
+        # ADF (Cloud): очень упрощённо — ищем text в content
+        try:
+            parts: List[str] = []
+
+            def walk(node: object) -> None:
+                if isinstance(node, dict):
+                    if node.get("text"):
+                        parts.append(str(node["text"]))
+                    for c in node.get("content") or []:
+                        walk(c)
+                elif isinstance(node, list):
+                    for c in node:
+                        walk(c)
+
+            walk(d.get("content"))
+            return "\n".join(parts)
+        except Exception:
+            return str(d)[:20000]
+    return ""

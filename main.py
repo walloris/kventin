@@ -61,7 +61,17 @@ def main():
         action="store_true",
         help="В конце вывести JSON-сводку в stdout (defects, steps, error)",
     )
+    parser.add_argument(
+        "--retest-kventin",
+        action="store_true",
+        help="Ретест задач Kventin в Jira (статус Ready for QA → QA, шаги из описания, Resolved/In Progress)",
+    )
     args = parser.parse_args()
+
+    if args.retest_kventin:
+        from src.defect_retest import run_kventin_defect_retests
+
+        sys.exit(run_kventin_defect_retests())
 
     urls = _collect_urls(args)
     if not urls:

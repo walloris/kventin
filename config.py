@@ -65,6 +65,20 @@ JIRA_PRIORITY_CRITICAL = os.getenv("JIRA_PRIORITY_CRITICAL", "").strip()
 JIRA_PRIORITY_MAJOR = os.getenv("JIRA_PRIORITY_MAJOR", "").strip()
 JIRA_PRIORITY_MINOR = os.getenv("JIRA_PRIORITY_MINOR", "").strip()
 
+# --- Ретест тикетов Kventin (Jira + Playwright): статусы и переходы ---
+# Имена должны совпадать с workflow в вашем проекте Jira.
+JIRA_RETEST_STATUS_READY_FOR_QA = os.getenv("JIRA_RETEST_STATUS_READY_FOR_QA", "Ready for QA").strip()
+# Целевой статус после перевода на QA/ретест (to.name перехода «взять в QA»).
+JIRA_RETEST_STATUS_QA = os.getenv("JIRA_RETEST_STATUS_QA", "QA").strip()
+JIRA_RETEST_STATUS_IN_PROGRESS = os.getenv("JIRA_RETEST_STATUS_IN_PROGRESS", "In Progress").strip()
+JIRA_RETEST_STATUS_RESOLVED = os.getenv("JIRA_RETEST_STATUS_RESOLVED", "Resolved").strip()
+# Резолюция при успешном ретесте (имя в Jira).
+JIRA_RETEST_RESOLUTION_FIXED = os.getenv("JIRA_RETEST_RESOLUTION_FIXED", "Fixed").strip()
+# Сколько тикетов обработать за один запуск (0 = без лимита).
+JIRA_RETEST_MAX_ISSUES = int(os.getenv("JIRA_RETEST_MAX_ISSUES", "20"))
+# Если из changelog не удалось извлечь автора перехода в Ready for QA — кого назначить (username / accountId / email).
+JIRA_RETEST_FALLBACK_ASSIGNEE = os.getenv("JIRA_RETEST_FALLBACK_ASSIGNEE", "").strip()
+
 # Видимость действий
 BROWSER_SLOW_MO = int(os.getenv("BROWSER_SLOW_MO", "300"))
 HIGHLIGHT_DURATION_MS = int(os.getenv("HIGHLIGHT_DURATION_MS", "800"))
