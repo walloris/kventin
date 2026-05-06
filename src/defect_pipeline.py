@@ -27,7 +27,9 @@ from src.defect_builder import (
     build_defect_description,
     build_defect_summary,
     collect_evidence,
+    format_retest_spec_wiki,
     infer_defect_severity,
+    memory_actions_to_retest_plan,
 )
 from src.defect_rules import should_create_defect
 from src.gigachat_client import consult_agent
@@ -268,12 +270,23 @@ def create_defect(
         memory.last_action_summary() if memory and hasattr(memory, "last_action_summary") else ""
     )
 
+    retest_wiki = ""
+    if memory:
+        plan_dict = memory_actions_to_retest_plan(memory, current_url)
+        if plan_dict and plan_dict.get("steps"):
+            try:
+                retest_wiki = format_retest_spec_wiki(plan_dict)
+                LOG.info("create_defect: retest plan steps=%d", len(plan_dict.get("steps") or []))
+            except Exception:
+                LOG.exception("create_defect: format_retest_spec_wiki failed")
+
     description = build_defect_description(
         bug_description, current_url,
         checklist_results=checklist_results,
         console_log=console_log,
         network_failures=network_failures,
         steps_to_reproduce=steps_to_reproduce,
+        retest_spec_wiki=retest_wiki or None,
     )
     if canonical_locator or last_action_summary:
         affected_block = "h3. Затронутый элемент\n"

@@ -8,7 +8,8 @@
 4. Успех → Resolved + resolution Fixed.
 5. Неуспех → In Progress + назначение на автора перевода в Ready for QA (из changelog).
 
-Описание тикета ожидается в формате, который пишет defect_builder (wiki, блок h3. Шаги воспроизведения).
+Описание тикета: машинный блок *KVENTIN_RETEST_JSON_V1* (если заводил агент сессии с
+действиями) либо текстовый блок «Шаги воспроизведения» (эвристический ретест).
 """
 from __future__ import annotations
 
@@ -57,6 +58,10 @@ from src.jira_client import (
     start_qa_transition,
     is_jira_rest_configured,
 )
+from src.defect_builder import (
+    parse_retest_plan_from_description,
+    playwright_canonical_to_exec_selector,
+)
 from src.page_analyzer import get_dom_summary
 
 LOG = logging.getLogger("kventin.retest")
@@ -71,41 +76,9 @@ def extract_canonical_locator(description: str) -> str:
         if "локатор" in low and ":" in line:
             part = line.split(":", 1)[1].strip()
             part = re.sub(r"^\{\{\s*|\s*\}\}$", "", part).strip()
-            return part[:600]
+            # преобразуем в exec-селектор для эвристического пути
+            return playwright_canonical_to_exec_selector(part) or part[:600]
     return ""
-
-
-def canonical_to_selector_hint(canon: str) -> str:
-    """
-    Превратить человекочитаемый canonical (getByTestId('x'), #id, …) в строку,
-    которую поймёт _find_element (CSS / текст / ref).
-    """
-    c = (canon or "").strip()
-    c = re.sub(r"^\{\{\s*|\s*\}\}$", "", c).strip()
-    if not c:
-        return ""
-    m = re.match(r"getByTestId\(['\"]([^'\"]+)['\"]\)", c, re.I)
-    if m:
-        return f'[data-testid="{m.group(1)}"]'
-    m = re.match(
-        r"getByRole\(['\"]([^'\"]+)['\"]\s*,\s*\{\s*name:\s*['\"]([^'\"]+)['\"]",
-        c,
-        re.I,
-    )
-    if m:
-        return m.group(2).strip()
-    m = re.match(r"getByLabel\(['\"]([^'\"]+)['\"]\)", c, re.I)
-    if m:
-        return m.group(1).strip()
-    m = re.match(r"getByPlaceholder\(['\"]([^'\"]+)['\"]\)", c, re.I)
-    if m:
-        return m.group(1).strip()
-    m = re.match(r"getByText\(['\"]([^'\"]+)['\"]\)", c, re.I)
-    if m:
-        return m.group(1).strip()
-    if c.startswith("#") or c.startswith("[") or c.startswith("."):
-        return c
-    return c
 
 
 def parse_reproduction_steps(description: str) -> Tuple[str, List[str]]:
@@ -223,16 +196,105 @@ def _retest_launch_browser(p: Playwright) -> Tuple[BrowserContext, Page, Optiona
     return context, page, browser
 
 
+def _apply_plan_step(
+    page: Page,
+    memory: AgentMemory,
+    step: Dict[str, Any],
+    primary_locator: str,
+) -> Tuple[bool, str]:
+    """Один шаг из JSON-плана defect_builder."""
+    op = (step.get("op") or "").lower()
+    pl = (primary_locator or "").strip()
+
+    if op == "navigate":
+        url = (step.get("url") or "").strip()
+        if not url:
+            return True, "skip empty navigate"
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=25000)
+            smart_wait_after_goto(page, timeout=5000)
+            _inject_all(page)
+            get_dom_summary(page, max_length=4000, include_shadow_dom=ENABLE_SHADOW_DOM)
+        except Exception as exc:
+            return False, f"navigate {url[:80]}: {exc}"
+        return True, "ok"
+
+    act: Dict[str, Any]
+    if op == "click":
+        sel = (step.get("selector") or pl).strip()
+        if not sel:
+            return False, "click: нет selector"
+        act = {"action": "click", "selector": sel, "reason": "retest"}
+    elif op == "hover":
+        sel = (step.get("selector") or pl).strip()
+        if not sel:
+            return False, "hover: нет selector"
+        act = {"action": "hover", "selector": sel, "reason": "retest"}
+    elif op == "type":
+        sel = (step.get("selector") or pl).strip()
+        val = step.get("value", "")
+        if not sel:
+            return False, "type: нет selector"
+        act = {"action": "type", "selector": sel, "value": str(val), "reason": "retest"}
+    elif op == "scroll":
+        direction = (step.get("direction") or "down").lower()
+        if direction in ("up", "вверх"):
+            direction = "up"
+        else:
+            direction = "down"
+        act = {"action": "scroll", "selector": direction, "reason": "retest"}
+    elif op == "close_modal":
+        act = {"action": "close_modal", "selector": "", "reason": "retest"}
+    elif op == "press_key":
+        key = (step.get("key") or "Escape").strip()
+        act = {"action": "press_key", "selector": "", "value": key, "reason": "retest"}
+    elif op == "select_option":
+        sel = (step.get("selector") or pl).strip()
+        val = step.get("value", "")
+        if not sel:
+            return False, "select_option: нет selector"
+        act = {"action": "select_option", "selector": sel, "value": str(val), "reason": "retest"}
+    elif op == "fill_form":
+        act = {"action": "fill_form", "selector": "", "reason": "retest"}
+    elif op == "upload_file":
+        sel = (step.get("selector") or pl).strip()
+        path = (step.get("path") or "").strip()
+        if not sel:
+            return False, "upload_file: нет selector"
+        if not path:
+            return False, "upload_file: нет path"
+        act = {"action": "upload_file", "selector": sel, "value": path, "reason": "retest"}
+    else:
+        return True, f"skip unknown op={op!r}"
+
+    result = execute_action(page, act, memory)
+    low_res = (result or "").lower()
+    if any(x in low_res for x in ("error", "not_found", "not found", "click_error", "no_action")):
+        return False, f"{op} → {result}"
+    return True, "ok"
+
+
+def _run_loaded_plan_steps(page: Page, memory: AgentMemory, plan: Dict[str, Any]) -> Tuple[bool, str]:
+    primary = (plan.get("primary_locator") or "").strip()
+    steps = plan.get("steps") or []
+    for idx, st in enumerate(steps):
+        if not isinstance(st, dict):
+            continue
+        ok, msg = _apply_plan_step(page, memory, st, primary)
+        if not ok:
+            return False, f"План шаг {idx + 1}: {msg}"
+        time.sleep(0.28)
+    return True, "ok"
+
+
 def run_retest_playwright(description: str, fallback_start_url: str) -> Tuple[bool, str]:
     """
     Открыть браузер и выполнить шаги из описания. Возвращает (успех, сообщение).
+
+    Приоритет: JSON *KVENTIN_RETEST_JSON_V1* из defect_builder; иначе эвристика по тексту шагов.
     """
-    canon_raw = extract_canonical_locator(description)
-    canon_sel = canonical_to_selector_hint(canon_raw)
-    start_url, steps = parse_reproduction_steps(description)
-    base_url = start_url or fallback_start_url or START_URL
-    if not base_url.startswith("http"):
-        base_url = "https://" + base_url
+    plan = parse_retest_plan_from_description(description or "")
+    use_plan = bool(plan and plan.get("steps"))
 
     memory = AgentMemory()
     agent_mod._current_agent_memory = memory
@@ -242,6 +304,31 @@ def run_retest_playwright(description: str, fallback_start_url: str) -> Tuple[bo
         try:
             if AUTH_URL and AUTH_USERNAME and AUTH_PASSWORD:
                 _do_auth_login(page, AUTH_URL, AUTH_USERNAME, AUTH_PASSWORD, AUTH_SUBMIT_SELECTOR)
+
+            if use_plan:
+                LOG.info("retest: режим JSON-плана (%d шагов)", len(plan.get("steps") or []))
+                base_url = (plan.get("start_url") or fallback_start_url or START_URL or "").strip()
+                if not base_url:
+                    return False, (
+                        "В плане ретеста нет start_url; задайте START_URL в .env или корректный первый navigate."
+                    )
+                if not base_url.startswith("http"):
+                    base_url = "https://" + base_url
+                page.goto(base_url, wait_until="domcontentloaded", timeout=30000)
+                smart_wait_after_goto(page, timeout=5000)
+                _inject_all(page)
+                get_dom_summary(page, max_length=4000, include_shadow_dom=ENABLE_SHADOW_DOM)
+                return _run_loaded_plan_steps(page, memory, plan)
+
+            # --- эвристический путь (старые тикеты без JSON) ---
+            LOG.info("retest: режим текстовых шагов (без KVENTIN_RETEST_JSON_V1)")
+            canon_sel = extract_canonical_locator(description)
+            start_url, steps = parse_reproduction_steps(description)
+            base_url = (start_url or fallback_start_url or START_URL or "").strip()
+            if not base_url:
+                return False, "Нет стартового URL в описании и не задан START_URL."
+            if not base_url.startswith("http"):
+                base_url = "https://" + base_url
 
             page.goto(base_url, wait_until="domcontentloaded", timeout=30000)
             smart_wait_after_goto(page, timeout=5000)

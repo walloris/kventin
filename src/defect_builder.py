@@ -1,15 +1,24 @@
 """
 Сбор дефекта по канонам: нормальное название, структурированное описание, фактура во вложениях.
 """
+import json
 import os
+import re
 import tempfile
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import Any, List, Dict, Optional, Tuple
 
 from playwright.sync_api import Page
 
 
 DEFECT_SUMMARY_PREFIX = "[Kventin]"
+
+# Версия машинного сценария в описании тикета (для main.py --retest-kventin).
+RETEST_SPEC_VERSION = 1
+RETEST_JSON_MARKER = "KVENTIN_RETEST_JSON_V1"
+# Ограничение размера JSON в поле Description Jira.
+RETEST_PLAN_MAX_STEPS = 28
+RETEST_JSON_MAX_CHARS = 26000
 
 # Уровни серьёзности в Kventin; соответствие имён приоритета в Jira — JIRA_PRIORITY_* в config (опционально).
 SEVERITY_CRITICAL = "critical"
@@ -73,6 +82,217 @@ def infer_defect_severity(
         return SEVERITY_MINOR
 
     return SEVERITY_MAJOR  # по умолчанию — major
+
+
+def playwright_canonical_to_exec_selector(canon: str) -> str:
+    """
+    Строка канонического локатора (Playwright-стиль в тексте дефекта) → то, что понимает _find_element:
+    CSS, атрибут, короткий текст для getByText/getByRole-name.
+    """
+    c = (canon or "").strip()
+    c = re.sub(r"^\{\{\s*|\s*\}\}$", "", c).strip()
+    if not c:
+        return ""
+    m = re.match(r"getByTestId\(['\"]([^'\"]+)['\"]\)", c, re.I)
+    if m:
+        return f'[data-testid="{m.group(1)}"]'
+    m = re.match(
+        r"getByRole\(['\"]([^'\"]+)['\"]\s*,\s*\{\s*name:\s*['\"]([^'\"]+)['\"]",
+        c,
+        re.I,
+    )
+    if m:
+        return m.group(2).strip()
+    m = re.match(r"getByLabel\(['\"]([^'\"]+)['\"]\)", c, re.I)
+    if m:
+        return m.group(1).strip()
+    m = re.match(r"getByPlaceholder\(['\"]([^'\"]+)['\"]\)", c, re.I)
+    if m:
+        return m.group(1).strip()
+    m = re.match(r"getByText\(['\"]([^'\"]+)['\"]\)", c, re.I)
+    if m:
+        return m.group(1).strip()
+    if c.startswith("#") or c.startswith("[") or c.startswith("."):
+        return c
+    return c
+
+
+def _selector_for_retest_step(canonical_locator: str, selector: str) -> str:
+    c = (canonical_locator or "").strip()
+    if c:
+        return playwright_canonical_to_exec_selector(c) or c
+    return (selector or "").strip()
+
+
+def memory_actions_to_retest_plan(
+    memory: Any,
+    current_url: str,
+    *,
+    max_steps: int = RETEST_PLAN_MAX_STEPS,
+) -> Optional[Dict[str, Any]]:
+    """
+    Собрать машинный сценарий ретеста из журнала действий AgentMemory.
+
+    Селекторы по возможности — стабильные (data-testid, #id, текст роли), без ref:N,
+    если в шаге был заполнен canonical_locator.
+    """
+    if memory is None or not hasattr(memory, "actions"):
+        return None
+    actions = getattr(memory, "actions") or []
+    if not actions:
+        return None
+    cap = max(5, min(max_steps, RETEST_PLAN_MAX_STEPS))
+    recent = list(actions)[-cap:]
+
+    start_nav = (getattr(memory, "_start_url_nav", None) or "").strip()
+    start_url = start_nav or (current_url or "").strip()
+    primary = ""
+    try:
+        primary = memory.last_canonical_locator() if hasattr(memory, "last_canonical_locator") else ""
+    except Exception:
+        primary = ""
+
+    steps_out: List[Dict[str, Any]] = []
+    last_emit_url = ""
+
+    for entry in recent:
+        if not isinstance(entry, dict):
+            continue
+        act = (entry.get("action") or "").lower().strip()
+        if act in ("explore", "check_defect", ""):
+            continue
+
+        url_b = (entry.get("url_before") or "").strip()
+        if url_b and url_b != last_emit_url:
+            steps_out.append({"op": "navigate", "url": url_b[:2000]})
+            last_emit_url = url_b
+            if not start_url:
+                start_url = url_b
+
+        canon = (entry.get("canonical_locator") or "").strip()
+        sel_raw = (entry.get("selector") or "").strip()
+        sel = _selector_for_retest_step(canon, sel_raw)
+        val = entry.get("value")
+        val_str = "" if val is None else str(val)
+
+        if act == "click":
+            if not sel:
+                continue
+            steps_out.append({"op": "click", "selector": sel[:500]})
+        elif act == "hover":
+            if not sel:
+                continue
+            steps_out.append({"op": "hover", "selector": sel[:500]})
+        elif act == "type":
+            if not sel:
+                continue
+            steps_out.append({
+                "op": "type",
+                "selector": sel[:500],
+                "value": val_str[:500],
+            })
+        elif act == "scroll":
+            direction = (sel_raw or "down").lower()
+            if direction not in ("up", "down", "вверх", "вниз"):
+                direction = "down"
+            if direction in ("вверх", "up"):
+                steps_out.append({"op": "scroll", "direction": "up"})
+            else:
+                steps_out.append({"op": "scroll", "direction": "down"})
+        elif act == "close_modal":
+            steps_out.append({"op": "close_modal"})
+        elif act == "press_key":
+            key = val_str or sel_raw or "Escape"
+            steps_out.append({"op": "press_key", "key": key[:40]})
+        elif act == "select_option":
+            if not sel:
+                continue
+            steps_out.append({
+                "op": "select_option",
+                "selector": sel[:500],
+                "value": val_str[:300],
+            })
+        elif act == "fill_form":
+            steps_out.append({"op": "fill_form"})
+        elif act == "upload_file":
+            if not sel:
+                continue
+            steps_out.append({
+                "op": "upload_file",
+                "selector": sel[:500],
+                "path": val_str[:500],
+            })
+
+    if not steps_out:
+        return None
+
+    if not start_url:
+        start_url = (current_url or "").strip()
+    if start_url and not start_url.startswith("http"):
+        start_url = "https://" + start_url
+
+    plan: Dict[str, Any] = {
+        "kventin_retest_version": RETEST_SPEC_VERSION,
+        "start_url": start_url[:2000],
+        "primary_locator": playwright_canonical_to_exec_selector(primary) or primary[:600],
+        "steps": steps_out,
+    }
+    return plan
+
+
+def _shrink_retest_plan_for_jira(plan: Dict[str, Any]) -> Dict[str, Any]:
+    """Укоротить steps, пока сериализованный JSON не влезает в лимит."""
+    p = dict(plan)
+    steps = list(p.get("steps") or [])
+    while steps:
+        raw = json.dumps({**p, "steps": steps}, ensure_ascii=False)
+        if len(raw) <= RETEST_JSON_MAX_CHARS:
+            p["steps"] = steps
+            return p
+        if len(steps) <= 8:
+            p["steps"] = steps
+            return p
+        steps = steps[len(steps) // 4 :]  # отбросить начало (обычно менее релевантно)
+    p["steps"] = []
+    return p
+
+
+def format_retest_spec_wiki(plan: Dict[str, Any]) -> str:
+    """
+    Вики-блок для Jira: маркер + JSON в monospaced code (удобно копировать и парсить ретестом).
+
+    Не заменяет человекочитаемые шаги — дополняет их для автоматизации.
+    """
+    slim = _shrink_retest_plan_for_jira(plan)
+    payload = json.dumps(slim, ensure_ascii=False, indent=2)
+    return (
+        "h3. Сценарий автоматического ретеста (Kventin)\n"
+        "Ниже — машиночитаемый сценарий для автоматического ретеста "
+        "(из корня проекта: {code}python main.py --retest-kventin{code}). "
+        "Строка маркера KVENTIN_RETEST_JSON_V1 и JSON не удаляются: без них ретест "
+        "опирается только на текстовые шаги в разделе «Шаги воспроизведения».\n\n"
+        f"{RETEST_JSON_MARKER}\n"
+        f"{{code}}\n{payload}\n{{code}}"
+    )
+
+
+def parse_retest_plan_from_description(description: str) -> Optional[Dict[str, Any]]:
+    """Извлечь dict сценария ретеста из описания задачи (после маркера)."""
+    if not description or RETEST_JSON_MARKER not in description:
+        return None
+    idx = description.find(RETEST_JSON_MARKER)
+    chunk = description[idx + len(RETEST_JSON_MARKER):].strip()
+    chunk = re.sub(r"^\{code\}\s*", "", chunk, flags=re.IGNORECASE)
+    chunk = re.sub(r"\s*\{code\}\s*\Z", "", chunk, flags=re.IGNORECASE).strip()
+    try:
+        plan = json.loads(chunk)
+    except json.JSONDecodeError:
+        return None
+    if int(plan.get("kventin_retest_version", 0)) != RETEST_SPEC_VERSION:
+        return None
+    if not isinstance(plan.get("steps"), list):
+        return None
+    return plan
 
 
 def build_defect_summary(llm_answer: str, url: str) -> str:
@@ -147,11 +367,13 @@ def build_defect_description(
     console_log: Optional[List[Dict[str, Any]]] = None,
     network_failures: Optional[List[Dict[str, Any]]] = None,
     steps_to_reproduce: Optional[List[str]] = None,
+    retest_spec_wiki: Optional[str] = None,
 ) -> str:
     """
     Описание по канонам: шаги воспроизведения, ожидаемый/фактический результат,
     ошибки консоли со стеком и путём к JS-файлу, окружение, фактура.
     steps_to_reproduce: список шагов от агента (путь к багу) для точного воспроизведения.
+    retest_spec_wiki: опциональный блок «KVENTIN_RETEST_JSON_V1» для автоматического ретеста.
     """
     sections = []
 
@@ -174,6 +396,9 @@ def build_defect_description(
             "# Выполнить действия на странице (или дождаться загрузки)\n"
             "# Наблюдать консоль/сеть (см. вложения и раздел «Ошибки консоли» ниже)"
         )
+
+    if retest_spec_wiki and retest_spec_wiki.strip():
+        sections.append(retest_spec_wiki.strip())
 
     sections.append(
         "h3. Ожидаемый результат\n"
