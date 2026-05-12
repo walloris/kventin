@@ -84,6 +84,7 @@ TEAM_ALERT_HOURS = 30
 STATE_PROPERTY_KEY = "qa-analytics-state-v1"
 FULL_RECONCILE_EVERY_N_RUNS = 10
 ENABLE_CONTENT_PROPERTY_STATE = True
+SCHEMA_VERSION = 3  # инкрементальный кэш Confluence; меняйте при правках агрегации
 
 _REGRESS_KE_IDS_RAW = (
     2298599, 3589425, 3304476, 3303802, 3191860, 2288712, 2257858, 2935717,
@@ -254,6 +255,75 @@ def create_data_store():
     return unified, by_project, author_stats
 
 
+def compact_weekly_stats(stats: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Свертывает worklog-записи к одной записи на (автор, неделя). Источник истины для таблиц."""
+    bucket: dict[tuple[str, str], int] = defaultdict(int)
+    for entry in stats or []:
+        author = entry.get("author") or ""
+        week = entry.get("week") or ""
+        if not author or not week:
+            continue
+        bucket[(author, week)] += int(entry.get("time", 0) or 0)
+    return [
+        {"author": a, "week": w, "time": t}
+        for (a, w), t in sorted(bucket.items())
+        if t > 0
+    ]
+
+
+def add_weekly_stats_to_unified(unified_data, stats: list[dict[str, Any]], category: str) -> None:
+    """Раскидывает worklog-записи в недельные ведра отчёта, неделя = дате списания."""
+    for ws in stats or []:
+        author = ws.get("author")
+        week = ws.get("week")
+        time_spent = int(ws.get("time", 0) or 0)
+        if not author or not week or time_spent <= 0:
+            continue
+        unified_data[author][week][category] += time_spent
+
+
+def merge_stories_by_key(by_project_data) -> None:
+    """Склеивает несколько записей одной задачи (например, кэш + свежий прогон) по факту worklog."""
+    for pk, pdata in by_project_data.items():
+        merged: dict[str, dict[str, Any]] = {}
+        for story in pdata.get("stories", []):
+            key = story.get("key")
+            if not key:
+                continue
+            if key not in merged:
+                merged[key] = dict(story)
+                merged[key]["weekly_stats"] = list(story.get("weekly_stats", []) or [])
+                merged[key]["authors"] = list(story.get("authors", []) or [])
+                merged[key]["linked_tasks"] = list(story.get("linked_tasks", []) or [])
+                continue
+            existing = merged[key]
+            combined = compact_weekly_stats(
+                list(existing.get("weekly_stats", []) or []) + list(story.get("weekly_stats", []) or [])
+            )
+            existing["weekly_stats"] = combined
+            existing["total_time"] = sum(ws["time"] for ws in combined)
+            existing["worklog_weeks"] = ", ".join(sorted({ws["week"] for ws in combined}))
+            existing["authors"] = sorted(
+                set(existing.get("authors") or []) | set(story.get("authors") or [])
+            )
+            fresh_links = story.get("linked_tasks") or []
+            if fresh_links:
+                existing["linked_tasks"] = fresh_links
+            for field in ("summary", "issuetype", "source", "ke", "worklog_dates"):
+                if story.get(field):
+                    existing[field] = story[field]
+        final_stories = []
+        for story in merged.values():
+            story["weekly_stats"] = compact_weekly_stats(story.get("weekly_stats", []) or [])
+            story["total_time"] = sum(ws["time"] for ws in story["weekly_stats"])
+            story["worklog_weeks"] = ", ".join(sorted({ws["week"] for ws in story["weekly_stats"]}))
+            if story["total_time"] <= 0:
+                continue
+            final_stories.append(story)
+        pdata["stories"] = final_stories
+        pdata["times"] = [s.get("total_time", 0) for s in final_stories]
+
+
 def nested_to_dict(obj):
     if isinstance(obj, defaultdict):
         obj = dict(obj)
@@ -375,14 +445,15 @@ def load_page_state(page_id):
         return None
 
 
-def build_page_state(unified_data, by_project_data, author_project_stats):
+def build_page_state(unified_data, by_project_data, author_project_stats, regression_weekly_stats=None):
     return {
         "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "source": "confluence-page-storage",
-        "schema_version": 2,
+        "schema_version": SCHEMA_VERSION,
         "weekly_data": nested_to_dict(unified_data),
         "by_project": nested_to_dict(by_project_data),
         "author_project_stats": nested_to_dict(author_project_stats),
+        "regression_weekly": compact_weekly_stats(list(regression_weekly_stats or [])),
     }
 
 
@@ -403,43 +474,41 @@ def render_page_state(state_payload):
 
 
 def inject_cache_history(cache_payload, unified_data, by_project_data, author_project_stats, recalc_start):
+    """Загружает из Confluence-кэша «старые» worklog-записи (неделя < recalc_start).
+
+    Все таблицы строятся из этих per-worklog записей, чтобы цифра в ячейке всегда
+    соответствовала календарной неделе, в которую время было затрекано.
+    """
     if not cache_payload:
         return
-    old_weekly = cache_payload.get("weekly_data", {})
-    for author, weeks in old_weekly.items():
-        for week, metrics in weeks.items():
-            if week >= recalc_start:
+
+    cached_projects = cache_payload.get("by_project", {}) or {}
+    for proj, pdata in cached_projects.items():
+        for story in pdata.get("stories", []) or []:
+            raw_ws = story.get("weekly_stats") or []
+            old_ws = [
+                ws for ws in raw_ws
+                if isinstance(ws, dict) and ws.get("week") and ws["week"] < recalc_start
+            ]
+            old_ws = compact_weekly_stats(old_ws)
+            if not old_ws:
                 continue
-            dst = unified_data[author][week]
-            dst["features"] = metrics.get("features", 0)
-            dst["regression"] = metrics.get("regression", 0)
-            dst["activities"] = metrics.get("activities", 0)
+            category = "activities" if story.get("source") == "Activity" else "features"
+            add_weekly_stats_to_unified(unified_data, old_ws, category)
 
-    def story_before_recalc(story):
-        wk_field = str(story.get("worklog_weeks", "")).strip()
-        if wk_field:
-            weeks_list = [w.strip() for w in wk_field.split(",") if w.strip()]
-            if not weeks_list:
-                return True
-            return max(weeks_list) < recalc_start
-        dates = str(story.get("worklog_dates", "")).split(",")
-        dates = [d.strip() for d in dates if d.strip() and d.strip() != "Нет данных"]
-        # Если даты не разобрались, не выбрасываем задачу из состояния:
-        # так мы сохраняем полную историю времени с базовой даты отчёта.
-        if not dates:
-            return True
-        return max(dates) < recalc_start
+            old_story = dict(story)
+            old_story["weekly_stats"] = old_ws
+            old_story["total_time"] = sum(ws["time"] for ws in old_ws)
+            old_story["worklog_weeks"] = ", ".join(sorted({ws["week"] for ws in old_ws}))
+            by_project_data[proj]["stories"].append(old_story)
+            by_project_data[proj]["times"].append(old_story["total_time"])
 
-    old_projects = cache_payload.get("by_project", {})
-    for proj, pdata in old_projects.items():
-        old_stories = [s for s in pdata.get("stories", []) if story_before_recalc(s)]
-        if not old_stories:
-            continue
-        by_project_data[proj]["stories"].extend(old_stories)
-        by_project_data[proj]["times"].extend([s.get("total_time", 0) for s in old_stories])
-
-    # Проектную статистику по авторам пересчитываем на лету из свежей выборки,
-    # чтобы в инкрементальном режиме не накапливать дубли по окну пересчёта.
+    raw_regression = cache_payload.get("regression_weekly") or []
+    old_regression = [
+        ws for ws in raw_regression
+        if isinstance(ws, dict) and ws.get("week") and ws["week"] < recalc_start
+    ]
+    add_weekly_stats_to_unified(unified_data, compact_weekly_stats(old_regression), "regression")
 
 
 def normalize_recalc_week_start(weeks_back):
@@ -590,8 +659,7 @@ def analyze_features(start_date_obj, query_start_date, unified_data, by_project_
         futures = [executor.submit(process_feature_batch, batch, start_date_obj) for batch in batches]
         for future in as_completed(futures):
             for res in future.result():
-                for w_stat in res['weekly_stats']:
-                    unified_data[w_stat['author']][w_stat['week']]['features'] += w_stat['time']
+                add_weekly_stats_to_unified(unified_data, res['story_data']['weekly_stats'], 'features')
                 for auth, time_spent in res['project_stats'].items():
                     author_project_stats[auth][res['project_key']] += time_spent
                 pk = res['project_key']
@@ -614,9 +682,14 @@ def process_single_feature(issue, start_date_obj, linked_map):
         story_wls = get_full_worklogs_list(issue)
         valid_story_wls, _ = parse_worklogs_local(story_wls, start_date_obj)
         story_time = sum(w['timeSpentSeconds'] for w in valid_story_wls)
-        linked_time, linked_tasks_info, weekly_stats, all_dates, all_authors, project_stats = 0, [], [], set(), set(), defaultdict(int)
+        raw_weekly_stats: list[dict[str, Any]] = []
+        linked_time = 0
+        linked_tasks_info: list[dict[str, Any]] = []
+        all_dates: set[str] = set()
+        all_authors: set[str] = set()
+        project_stats: dict[str, int] = defaultdict(int)
         for wl in valid_story_wls:
-            weekly_stats.append({'author': wl['author_name'], 'week': wl['week_start'], 'time': wl['timeSpentSeconds']})
+            raw_weekly_stats.append({'author': wl['author_name'], 'week': wl['week_start'], 'time': wl['timeSpentSeconds']})
             project_stats[wl['author_name']] += wl['timeSpentSeconds']
             all_dates.add(wl['started'][:10])
             all_authors.add(wl['author_name'])
@@ -631,29 +704,44 @@ def process_single_feature(issue, start_date_obj, linked_map):
                 continue
             linked_time += t_time
             for w in valid_t_wls:
-                weekly_stats.append(
+                raw_weekly_stats.append(
                     {"author": w["author_name"], "week": w["week_start"], "time": w["timeSpentSeconds"]}
                 )
                 project_stats[w["author_name"]] += w["timeSpentSeconds"]
                 all_dates.add(w["started"][:10])
                 all_authors.add(w["author_name"])
             linked_tasks_info.append({"key": task.key, "time": t_time})
-        total_time = story_time + linked_time
+        weekly_stats = compact_weekly_stats(raw_weekly_stats)
+        total_time = sum(ws["time"] for ws in weekly_stats)
+        if total_time == 0:
+            return None
         if story_time > 0 and linked_time > 0:
             source = "Story+Linked"
         elif linked_time > 0:
             source = "Linked"
         else:
             source = "Story"
-        if total_time == 0: return None
-        worklog_weeks_sorted = sorted({stat["week"] for stat in weekly_stats})
-        worklog_weeks_str = ", ".join(worklog_weeks_sorted) if worklog_weeks_sorted else ""
+        worklog_weeks_sorted = sorted({ws["week"] for ws in weekly_stats})
+        worklog_weeks_str = ", ".join(worklog_weeks_sorted)
         thread_safe_log_info(f"✓ {issue.key} ({project_key}) - {seconds_to_hours(total_time)}ч")
-        return {'project_key': project_key, 'total_time': total_time, 'weekly_stats': weekly_stats, 'project_stats': dict(project_stats),
-                'story_data': {'key': issue.key, 'issuetype': issue.fields.issuetype.name, 'summary': issue.fields.summary, 'source': source,
-                               'total_time': total_time, 'worklog_weeks': worklog_weeks_str,
-                               'worklog_dates': ', '.join(sorted(list(all_dates))) if all_dates else 'Нет данных',
-                               'authors': list(all_authors), 'linked_tasks': linked_tasks_info, 'ke': str(getattr(issue.fields, 'customfield_18300', "Не указано"))}}
+        return {
+            'project_key': project_key,
+            'total_time': total_time,
+            'project_stats': dict(project_stats),
+            'story_data': {
+                'key': issue.key,
+                'issuetype': issue.fields.issuetype.name,
+                'summary': issue.fields.summary,
+                'source': source,
+                'total_time': total_time,
+                'worklog_weeks': worklog_weeks_str,
+                'worklog_dates': ', '.join(sorted(all_dates)) if all_dates else 'Нет данных',
+                'authors': sorted(all_authors),
+                'linked_tasks': linked_tasks_info,
+                'weekly_stats': weekly_stats,
+                'ke': str(getattr(issue.fields, 'customfield_18300', "Не указано")),
+            },
+        }
     except Exception:
         logger.exception("Ошибка разбора фичи %s", getattr(issue, "key", "?"))
         return None
@@ -672,8 +760,10 @@ def analyze_regression(start_date_obj, query_start_date, unified_data, author_pr
         start_at += 50
     logger.info("  Найдено %s релизов...", len(issues))
     total_regress_time = 0
+    fresh_regression_stats: list[dict[str, Any]] = []
     all_subtask_keys = [sub.key for rel in issues if hasattr(rel.fields, 'subtasks') for sub in rel.fields.subtasks]
-    if not all_subtask_keys: return 0
+    if not all_subtask_keys:
+        return 0, fresh_regression_stats
     batches = [all_subtask_keys[i:i + 50] for i in range(0, len(all_subtask_keys), 50)]
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = [executor.submit(process_regress_subtasks, batch, start_date_obj) for batch in batches]
@@ -681,7 +771,8 @@ def analyze_regression(start_date_obj, query_start_date, unified_data, author_pr
             for stat in future.result():
                 unified_data[stat['author']][stat['week']]['regression'] += stat['time']
                 total_regress_time += stat['time']
-    return total_regress_time
+                fresh_regression_stats.append({"author": stat["author"], "week": stat["week"], "time": stat["time"]})
+    return total_regress_time, compact_weekly_stats(fresh_regression_stats)
 
 def process_regress_subtasks(keys, start_date_obj):
     results = []
@@ -715,19 +806,22 @@ def analyze_special_activity(issue_key, start_date_obj, unified_data, by_project
         return 0
 
     project_key = issue.fields.project.key if hasattr(issue.fields, "project") else "HRC"
-    total = 0
-    by_week = defaultdict(int)
-    by_author = set()
-    for wl in valid_wls:
-        sec = wl["timeSpentSeconds"]
-        total += sec
-        by_week[wl["week_start"]] += sec
-        by_author.add(wl["author_name"])
-        unified_data[wl["author_name"]][wl["week_start"]]["activities"] += sec
-        author_project_stats[wl["author_name"]][project_key] += sec
+    raw_stats = [
+        {"author": wl["author_name"], "week": wl["week_start"], "time": wl["timeSpentSeconds"]}
+        for wl in valid_wls
+    ]
+    activity_weekly_stats = compact_weekly_stats(raw_stats)
+    if not activity_weekly_stats:
+        return 0
+
+    add_weekly_stats_to_unified(unified_data, activity_weekly_stats, "activities")
+    total = sum(ws["time"] for ws in activity_weekly_stats)
+    by_author = {ws["author"] for ws in activity_weekly_stats}
+    week_keys_sorted = sorted({ws["week"] for ws in activity_weekly_stats})
+    for ws in activity_weekly_stats:
+        author_project_stats[ws["author"]][project_key] += ws["time"]
 
     by_project_data[project_key]["times"].append(total)
-    week_keys_sorted = sorted(by_week.keys())
     by_project_data[project_key]["stories"].append(
         {
             "key": issue.key,
@@ -739,6 +833,7 @@ def analyze_special_activity(issue_key, start_date_obj, unified_data, by_project
             "worklog_dates": ", ".join(week_keys_sorted),
             "authors": sorted(by_author),
             "linked_tasks": [],
+            "weekly_stats": activity_weekly_stats,
             "ke": "n/a",
         }
     )
@@ -1325,6 +1420,15 @@ def main():
     unified_data, by_project_data, author_project_stats = create_data_store()
     fixed_start = datetime.strptime(FIXED_START_DATE, "%Y-%m-%d")
     page_state = load_page_state(PAGE_ID)
+
+    cached_schema = int((page_state or {}).get("schema_version") or 0)
+    if page_state and cached_schema != SCHEMA_VERSION:
+        logger.warning(
+            "Схема кэша Confluence (%s) не совпадает с текущей (%s), запускаем полный пересчёт.",
+            cached_schema, SCHEMA_VERSION,
+        )
+        page_state = None
+
     run_seq = int((page_state or {}).get("run_seq", 0)) + 1
     force_full = (run_seq % FULL_RECONCILE_EVERY_N_RUNS == 0)
 
@@ -1345,22 +1449,42 @@ def main():
             logger.info("Полный пересчёт: служебное состояние на странице не найдено, старт с %s", FIXED_START_DATE)
 
     analyze_features(recalc_start, query_start, unified_data, by_project_data, author_project_stats)
-    analyze_regression(recalc_start, query_start, unified_data, author_project_stats)
+    _, fresh_regression_stats = analyze_regression(recalc_start, query_start, unified_data, author_project_stats)
     analyze_special_activity(SPECIAL_ACTIVITY_ISSUE, recalc_start, unified_data, by_project_data, author_project_stats)
+
+    regression_weekly_for_state = compact_weekly_stats(
+        _cached_regression_before(page_state, recalc_start_key) + list(fresh_regression_stats)
+    )
 
     if page_state and not force_full and not validate_incremental_integrity(page_state, unified_data, recalc_start_key):
         logger.warning("Переход на full reconcile из-за нарушения инвариантов")
         unified_data, by_project_data, author_project_stats = create_data_store()
         analyze_features(fixed_start, FIXED_START_DATE, unified_data, by_project_data, author_project_stats)
-        analyze_regression(fixed_start, FIXED_START_DATE, unified_data, author_project_stats)
+        _, fresh_regression_stats = analyze_regression(fixed_start, FIXED_START_DATE, unified_data, author_project_stats)
         analyze_special_activity(SPECIAL_ACTIVITY_ISSUE, fixed_start, unified_data, by_project_data, author_project_stats)
+        regression_weekly_for_state = compact_weekly_stats(list(fresh_regression_stats))
+
+    merge_stories_by_key(by_project_data)
 
     chart = create_charts({'weekly_data': unified_data, 'by_project': by_project_data})
     html_content = generate_html_report(unified_data, by_project_data, author_project_stats, chart)
-    state_payload = build_page_state(unified_data, by_project_data, author_project_stats)
+    state_payload = build_page_state(
+        unified_data, by_project_data, author_project_stats, regression_weekly_for_state
+    )
     state_payload["run_seq"] = run_seq
     update_confluence_manual(PAGE_ID, html_content)
     save_state_to_confluence(PAGE_ID, STATE_PROPERTY_KEY, state_payload, html_content)
+
+
+def _cached_regression_before(page_state, recalc_start_key: str) -> list[dict[str, Any]]:
+    """Регресс-записи из кэша, относящиеся к неделям < recalc_start (старая часть истории)."""
+    if not page_state:
+        return []
+    return [
+        ws
+        for ws in (page_state.get("regression_weekly") or [])
+        if isinstance(ws, dict) and ws.get("week") and ws["week"] < recalc_start_key
+    ]
 
 if __name__ == "__main__":
     main()
