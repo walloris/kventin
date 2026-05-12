@@ -1,0 +1,45 @@
+---
+description: Routes work to addyosmani agent-skills in vendor/; read SKILL.md on demand
+alwaysApply: true
+---
+
+# Agent Skills (project)
+
+Full pack lives under `vendor/agent-skills/`. **Do not load every skill into the reply.** For non-trivial work: read `vendor/agent-skills/skills/using-agent-skills/SKILL.md` once, then open only the skill(s) that match the task and follow them end-to-end (steps, verification, anti-rationalization tables).
+
+## Skill entrypoints (`skills/<id>/SKILL.md`)
+
+| Phase | Skill id | When |
+|-------|-----------|------|
+| Meta | `using-agent-skills` | Pick workflow, shared operating rules |
+| Define | `idea-refine` | Vague idea → concrete proposal |
+| Define | `spec-driven-development` | PRD/spec before code |
+| Plan | `planning-and-task-breakdown` | Spec → small tasks + acceptance |
+| Build | `incremental-implementation` | Multi-file / vertical slices |
+| Build | `test-driven-development` | Logic, behavior, bugfix |
+| Build | `context-engineering` | Session start, weak output, context packing |
+| Build | `source-driven-development` | Framework decisions need official docs |
+| Build | `doubt-driven-development` | High stakes, unfamiliar code |
+| Build | `frontend-ui-engineering` | UI, a11y, design systems |
+| Build | `api-and-interface-design` | APIs, public contracts, boundaries |
+| Verify | `browser-testing-with-devtools` | Browser runtime, DOM, network |
+| Verify | `debugging-and-error-recovery` | Failing tests, broken builds, wrong behavior |
+| Review | `code-review-and-quality` | Pre-merge review |
+| Review | `code-simplification` | Works but too complex |
+| Review | `security-and-hardening` | Auth, input, secrets, OWASP |
+| Review | `performance-optimization` | Perf requirements or suspected regressions |
+| Ship | `git-workflow-and-versioning` | Commits, branch hygiene |
+| Ship | `ci-cd-and-automation` | Pipelines, gates, flags |
+| Ship | `deprecation-and-migration` | Sunsetting, migrations |
+| Ship | `documentation-and-adrs` | ADRs, API docs, why |
+| Ship | `shipping-and-launch` | Prod rollout, monitoring, rollback |
+
+Path pattern: `vendor/agent-skills/skills/<id>/SKILL.md`.
+
+## Extra material
+
+- Personas: `vendor/agent-skills/agents/*.md`
+- Checklists: `vendor/agent-skills/references/*.md`
+- Tool-specific setup: `vendor/agent-skills/docs/cursor-setup.md`
+
+Human doc (Russian): `docs/cursor-agent-skills-RU.md`.
