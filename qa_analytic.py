@@ -506,7 +506,7 @@ def fetch_linked_tasks_bulk(parent_issues):
     for i in range(0, len(linked_keys_list), 50):
         batch_keys = linked_keys_list[i:i+50]
         keys_str = ",".join(batch_keys)
-        jql = f"key in ({keys_str}) AND issuetype in (Task, Sub-task, Подзадача, Задача)"
+        jql = f"key in ({keys_str})"
         try:
             tasks = rate_limited_request(jira_client.search_issues, jql, maxResults=1000, fields='summary,worklog,issuetype,project')
             for t in tasks: linked_tasks_map[t.key] = t
@@ -572,7 +572,6 @@ def process_single_feature(issue, start_date_obj, linked_map):
                 target = getattr(link, 'outwardIssue', getattr(link, 'inwardIssue', None))
                 if target and target.key in linked_map:
                     task = linked_map[target.key]
-                    if 'тестирование' not in task.fields.summary.lower(): continue
                     t_wls = task.fields.worklog.worklogs if hasattr(task.fields, 'worklog') else []
                     valid_t_wls, _ = parse_worklogs_local(t_wls, start_date_obj)
                     t_time = sum(w['timeSpentSeconds'] for w in valid_t_wls)
@@ -584,8 +583,13 @@ def process_single_feature(issue, start_date_obj, linked_map):
                             all_dates.add(w['started'][:10])
                             all_authors.add(w['author_name'])
                         linked_tasks_info.append({'key': task.key, 'time': t_time})
-        if linked_time > 0: total_time, source = linked_time, "Task"
-        else: total_time, source = story_time, "Story"
+        total_time = story_time + linked_time
+        if story_time > 0 and linked_time > 0:
+            source = "Story+Linked"
+        elif linked_time > 0:
+            source = "Linked"
+        else:
+            source = "Story"
         if total_time == 0: return None
         thread_safe_log_info(f"✓ {issue.key} ({project_key}) - {seconds_to_hours(total_time)}ч")
         return {'project_key': project_key, 'total_time': total_time, 'weekly_stats': weekly_stats, 'project_stats': dict(project_stats),
