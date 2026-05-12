@@ -522,14 +522,32 @@ def parse_worklogs_local(worklogs_list, start_date_obj):
         authors.add(author_name)
     return filtered, authors
 
+def _related_issue_keys(issue: object) -> set[str]:
+    """Ключи задач, с которых забираем worklog вместе со Story/Bug: issue links + подзадачи."""
+    keys: set[str] = set()
+    if hasattr(issue.fields, "issuelinks") and issue.fields.issuelinks:
+        for link in issue.fields.issuelinks:
+            target = getattr(link, "outwardIssue", getattr(link, "inwardIssue", None))
+            if target is not None:
+                k = getattr(target, "key", None)
+                if k:
+                    keys.add(k)
+    if hasattr(issue.fields, "subtasks") and issue.fields.subtasks:
+        for sub in issue.fields.subtasks:
+            k = getattr(sub, "key", None)
+            if not k and isinstance(sub, dict):
+                k = sub.get("key")
+            if k:
+                keys.add(k)
+    return keys
+
+
 def fetch_linked_tasks_bulk(parent_issues):
-    linked_keys = set()
+    linked_keys: set[str] = set()
     for issue in parent_issues:
-        if hasattr(issue.fields, 'issuelinks'):
-            for link in issue.fields.issuelinks:
-                target = getattr(link, 'outwardIssue', getattr(link, 'inwardIssue', None))
-                if target: linked_keys.add(target.key)
-    if not linked_keys: return {}
+        linked_keys.update(_related_issue_keys(issue))
+    if not linked_keys:
+        return {}
     linked_tasks_map = {}
     linked_keys_list = list(linked_keys)
     for i in range(0, len(linked_keys_list), 50):
@@ -553,7 +571,13 @@ def analyze_features(start_date_obj, query_start_date, unified_data, by_project_
     all_issues = []
     start_at = 0
     while True:
-        batch = rate_limited_request(jira_client.search_issues, jql, startAt=start_at, maxResults=100, fields='summary,priority,customfield_18300,issuelinks,worklog,project,issuetype')
+        batch = rate_limited_request(
+            jira_client.search_issues,
+            jql,
+            startAt=start_at,
+            maxResults=100,
+            fields="summary,priority,customfield_18300,issuelinks,subtasks,worklog,project,issuetype",
+        )
         if not batch: break
         all_issues.extend(batch)
         logger.info("  Загружено %s задач...", len(all_issues))
@@ -596,22 +620,24 @@ def process_single_feature(issue, start_date_obj, linked_map):
             project_stats[wl['author_name']] += wl['timeSpentSeconds']
             all_dates.add(wl['started'][:10])
             all_authors.add(wl['author_name'])
-        if hasattr(issue.fields, 'issuelinks'):
-            for link in issue.fields.issuelinks:
-                target = getattr(link, 'outwardIssue', getattr(link, 'inwardIssue', None))
-                if target and target.key in linked_map:
-                    task = linked_map[target.key]
-                    t_wls = get_full_worklogs_list(task)
-                    valid_t_wls, _ = parse_worklogs_local(t_wls, start_date_obj)
-                    t_time = sum(w['timeSpentSeconds'] for w in valid_t_wls)
-                    if t_time > 0:
-                        linked_time += t_time
-                        for w in valid_t_wls:
-                            weekly_stats.append({'author': w['author_name'], 'week': w['week_start'], 'time': w['timeSpentSeconds']})
-                            project_stats[w['author_name']] += w['timeSpentSeconds']
-                            all_dates.add(w['started'][:10])
-                            all_authors.add(w['author_name'])
-                        linked_tasks_info.append({'key': task.key, 'time': t_time})
+        for rel_key in sorted(_related_issue_keys(issue)):
+            if rel_key not in linked_map:
+                continue
+            task = linked_map[rel_key]
+            t_wls = get_full_worklogs_list(task)
+            valid_t_wls, _ = parse_worklogs_local(t_wls, start_date_obj)
+            t_time = sum(w["timeSpentSeconds"] for w in valid_t_wls)
+            if t_time <= 0:
+                continue
+            linked_time += t_time
+            for w in valid_t_wls:
+                weekly_stats.append(
+                    {"author": w["author_name"], "week": w["week_start"], "time": w["timeSpentSeconds"]}
+                )
+                project_stats[w["author_name"]] += w["timeSpentSeconds"]
+                all_dates.add(w["started"][:10])
+                all_authors.add(w["author_name"])
+            linked_tasks_info.append({"key": task.key, "time": t_time})
         total_time = story_time + linked_time
         if story_time > 0 and linked_time > 0:
             source = "Story+Linked"
