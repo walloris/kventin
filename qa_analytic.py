@@ -22,6 +22,7 @@ except ImportError:
 
 from atlassian import Confluence
 from datetime import datetime, timedelta
+from typing import Any
 
 # --- ИМПОРТ КОНФИГА ---
 def _load_config():
@@ -415,6 +416,12 @@ def inject_cache_history(cache_payload, unified_data, by_project_data, author_pr
             dst["activities"] = metrics.get("activities", 0)
 
     def story_before_recalc(story):
+        wk_field = str(story.get("worklog_weeks", "")).strip()
+        if wk_field:
+            weeks_list = [w.strip() for w in wk_field.split(",") if w.strip()]
+            if not weeks_list:
+                return True
+            return max(weeks_list) < recalc_start
         dates = str(story.get("worklog_dates", "")).split(",")
         dates = [d.strip() for d in dates if d.strip() and d.strip() != "Нет данных"]
         # Если даты не разобрались, не выбрасываем задачу из состояния:
@@ -469,6 +476,28 @@ def get_week_start(date_str):
     dt = datetime.strptime(date_str, '%Y-%m-%d')
     start = dt - timedelta(days=dt.weekday())
     return start.strftime('%Y-%m-%d')
+
+
+def get_full_worklogs_list(issue: object) -> list[Any]:
+    """Все worklog-записи задачи; во вложении issue Jira отдаёт только первую порцию."""
+    container = getattr(getattr(issue, "fields", None), "worklog", None)
+    if container is None:
+        return []
+    embedded = list(getattr(container, "worklogs", []) or [])
+    total = getattr(container, "total", None)
+    if total is None:
+        total = len(embedded)
+    if total > len(embedded):
+        key = getattr(issue, "key", None)
+        if not key:
+            return embedded
+        try:
+            return list(rate_limited_request(jira_client.worklogs, key))
+        except Exception:
+            logger.exception("Не удалось загрузить полный worklog для %s", key)
+            return embedded
+    return embedded
+
 
 def parse_worklogs_local(worklogs_list, start_date_obj):
     filtered = []
@@ -558,7 +587,7 @@ def process_feature_batch(issues, start_date_obj):
 def process_single_feature(issue, start_date_obj, linked_map):
     try:
         project_key = issue.fields.project.key
-        story_wls = issue.fields.worklog.worklogs if hasattr(issue.fields, 'worklog') else []
+        story_wls = get_full_worklogs_list(issue)
         valid_story_wls, _ = parse_worklogs_local(story_wls, start_date_obj)
         story_time = sum(w['timeSpentSeconds'] for w in valid_story_wls)
         linked_time, linked_tasks_info, weekly_stats, all_dates, all_authors, project_stats = 0, [], [], set(), set(), defaultdict(int)
@@ -572,7 +601,7 @@ def process_single_feature(issue, start_date_obj, linked_map):
                 target = getattr(link, 'outwardIssue', getattr(link, 'inwardIssue', None))
                 if target and target.key in linked_map:
                     task = linked_map[target.key]
-                    t_wls = task.fields.worklog.worklogs if hasattr(task.fields, 'worklog') else []
+                    t_wls = get_full_worklogs_list(task)
                     valid_t_wls, _ = parse_worklogs_local(t_wls, start_date_obj)
                     t_time = sum(w['timeSpentSeconds'] for w in valid_t_wls)
                     if t_time > 0:
@@ -591,10 +620,13 @@ def process_single_feature(issue, start_date_obj, linked_map):
         else:
             source = "Story"
         if total_time == 0: return None
+        worklog_weeks_sorted = sorted({stat["week"] for stat in weekly_stats})
+        worklog_weeks_str = ", ".join(worklog_weeks_sorted) if worklog_weeks_sorted else ""
         thread_safe_log_info(f"✓ {issue.key} ({project_key}) - {seconds_to_hours(total_time)}ч")
         return {'project_key': project_key, 'total_time': total_time, 'weekly_stats': weekly_stats, 'project_stats': dict(project_stats),
                 'story_data': {'key': issue.key, 'issuetype': issue.fields.issuetype.name, 'summary': issue.fields.summary, 'source': source,
-                               'total_time': total_time, 'worklog_dates': ', '.join(sorted(list(all_dates))) if all_dates else 'Нет данных',
+                               'total_time': total_time, 'worklog_weeks': worklog_weeks_str,
+                               'worklog_dates': ', '.join(sorted(list(all_dates))) if all_dates else 'Нет данных',
                                'authors': list(all_authors), 'linked_tasks': linked_tasks_info, 'ke': str(getattr(issue.fields, 'customfield_18300', "Не указано"))}}
     except Exception:
         logger.exception("Ошибка разбора фичи %s", getattr(issue, "key", "?"))
@@ -634,7 +666,7 @@ def process_regress_subtasks(keys, start_date_obj):
         for t in tasks:
             is_regress = ('QA_REGRESS_TIME' in getattr(t.fields, 'labels', [])) or ('тестирование' in t.fields.summary.lower())
             if not is_regress: continue
-            wls = t.fields.worklog.worklogs if hasattr(t.fields, 'worklog') else []
+            wls = get_full_worklogs_list(t)
             valid_wls, _ = parse_worklogs_local(wls, start_date_obj)
             for w in valid_wls:
                 results.append({'author': w['author_name'], 'week': w['week_start'], 'time': w['timeSpentSeconds']})
@@ -651,7 +683,7 @@ def analyze_special_activity(issue_key, start_date_obj, unified_data, by_project
         logger.exception("Не удалось загрузить задачу активностей %s", issue_key)
         return 0
 
-    worklogs = issue.fields.worklog.worklogs if hasattr(issue.fields, "worklog") else []
+    worklogs = get_full_worklogs_list(issue)
     valid_wls, _ = parse_worklogs_local(worklogs, start_date_obj)
     if not valid_wls:
         return 0
@@ -669,6 +701,7 @@ def analyze_special_activity(issue_key, start_date_obj, unified_data, by_project
         author_project_stats[wl["author_name"]][project_key] += sec
 
     by_project_data[project_key]["times"].append(total)
+    week_keys_sorted = sorted(by_week.keys())
     by_project_data[project_key]["stories"].append(
         {
             "key": issue.key,
@@ -676,7 +709,8 @@ def analyze_special_activity(issue_key, start_date_obj, unified_data, by_project
             "summary": f"{issue.fields.summary} (активности)",
             "source": "Activity",
             "total_time": total,
-            "worklog_dates": ", ".join(sorted(by_week.keys())),
+            "worklog_weeks": ", ".join(week_keys_sorted),
+            "worklog_dates": ", ".join(week_keys_sorted),
             "authors": sorted(by_author),
             "linked_tasks": [],
             "ke": "n/a",
@@ -742,8 +776,16 @@ def weekly_total_series(unified_data, author):
     return [sum_author_week(unified_data[author], w) for w in weeks]
 
 
-def story_touches_weeks(story, weeks):
-    target_weeks = set(weeks)
+def story_touches_weeks(story: dict[str, Any], weeks: list[str] | set[str]) -> bool:
+    """True, если по дате списания (worklog started) есть время в одной из недель отчёта."""
+    target_weeks = set(weeks) if not isinstance(weeks, set) else weeks
+    wk_field = str(story.get("worklog_weeks", "")).strip()
+    if wk_field:
+        for raw in wk_field.split(","):
+            raw = raw.strip()
+            if raw and raw in target_weeks:
+                return True
+        return False
     dates = str(story.get("worklog_dates", "")).split(",")
     for raw in dates:
         raw = raw.strip()
