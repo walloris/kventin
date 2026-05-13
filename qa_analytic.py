@@ -920,362 +920,374 @@ def story_touches_weeks(story: dict[str, Any], weeks: list[str] | set[str]) -> b
     return False
 
 
-def generate_average_by_author_table(unified_data, author_project_stats):
-    all_weeks = ordered_report_weeks(unified_data, limit=None)
-    week_count = max(len(all_weeks), 1)
+def report_styles():
+    base_cell = "padding:8px 10px; border-bottom:1px solid #dfe1e6; vertical-align:top;"
+    return {
+        "page": "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif; color:#172b4d; line-height:1.35;",
+        "muted": "color:#6b778c;",
+        "panel": "border:1px solid #dfe1e6; border-radius:10px; background:#ffffff; margin:14px 0; overflow:hidden;",
+        "panel_pad": "padding:14px 16px;",
+        "card": "border:1px solid #dfe1e6; border-radius:10px; background:#ffffff; padding:14px;",
+        "card_soft": "border:1px solid #dfe1e6; border-radius:10px; background:#f7f8fa; padding:14px;",
+        "table": "border-collapse:collapse; width:100%; font-size:12px;",
+        "th": "padding:8px 10px; border-bottom:2px solid #dfe1e6; background:#f4f5f7; text-align:center; color:#42526e; font-weight:600;",
+        "th_left": "padding:8px 10px; border-bottom:2px solid #dfe1e6; background:#f4f5f7; text-align:left; color:#42526e; font-weight:600;",
+        "td": base_cell + " text-align:center;",
+        "td_left": base_cell + " text-align:left;",
+        "team_row": "padding:8px 10px; border-bottom:1px solid #dfe1e6; background:#eef4ff; color:#0747a6; font-weight:700;",
+        "pill": "display:inline-block; padding:2px 7px; border-radius:12px; background:#f4f5f7; color:#42526e; font-size:11px;",
+        "danger_pill": "display:inline-block; padding:2px 7px; border-radius:12px; background:#ffebe6; color:#bf2600; font-size:11px; font-weight:600;",
+        "success_pill": "display:inline-block; padding:2px 7px; border-radius:12px; background:#e3fcef; color:#006644; font-size:11px; font-weight:600;",
+    }
+
+
+def html_hours(seconds):
+    return html.escape(str(seconds_to_hours(seconds)))
+
+
+def html_delta(current, previous):
+    delta = seconds_to_hours(current) - seconds_to_hours(previous)
+    style = "color:#006644; font-weight:600;" if delta > 0 else ("color:#bf2600; font-weight:600;" if delta < 0 else "color:#6b778c;")
+    return f"<span style='{style}'>{html.escape(format_delta(current, previous))}</span>"
+
+
+def section_heading(title, subtitle=""):
+    subtitle_html = f"<div style='color:#6b778c; margin-top:3px;'>{html.escape(subtitle)}</div>" if subtitle else ""
+    return f"<div style='margin:22px 0 10px;'><h3 style='margin:0; font-size:18px;'>{html.escape(title)}</h3>{subtitle_html}</div>"
+
+
+def metric_card(label, value, caption="", tone="neutral"):
+    st = report_styles()
+    tone_map = {
+        "blue": ("#deebff", "#0747a6"),
+        "green": ("#e3fcef", "#006644"),
+        "red": ("#ffebe6", "#bf2600"),
+        "purple": ("#f3e8ff", "#5b2c83"),
+        "neutral": ("#f7f8fa", "#172b4d"),
+    }
+    bg, color = tone_map.get(tone, tone_map["neutral"])
+    caption_html = f"<div style='font-size:12px; color:#6b778c; margin-top:5px;'>{html.escape(caption)}</div>" if caption else ""
+    return (
+        f"<div style='{st['card']} background:{bg};'>"
+        f"<div style='font-size:12px; color:#42526e; text-transform:uppercase; letter-spacing:.03em;'>{html.escape(label)}</div>"
+        f"<div style='font-size:24px; font-weight:700; color:{color}; margin-top:4px;'>{html.escape(str(value))}</div>"
+        f"{caption_html}</div>"
+    )
+
+
+def build_people_rows(unified_data, author_project_stats, report_weeks, current_week, previous_week):
     rows = []
+    week_count = max(len(report_weeks), 1)
     for author in sorted(unified_data.keys()):
-        weekly_totals = weekly_total_series(unified_data, author)
-        ft = sum(week_bucket(unified_data[author], w)["features"] for w in all_weeks)
-        rg = sum(week_bucket(unified_data[author], w)["regression"] for w in all_weeks)
-        act = sum(week_bucket(unified_data[author], w)["activities"] for w in all_weeks)
-        total = ft + rg + act
-        if total == 0:
+        current_bucket = week_bucket(unified_data[author], current_week)
+        previous_total = sum_author_week(unified_data[author], previous_week)
+        current_total = sum_author_week(unified_data[author], current_week)
+        period_features = sum(week_bucket(unified_data[author], w)["features"] for w in report_weeks)
+        period_regression = sum(week_bucket(unified_data[author], w)["regression"] for w in report_weeks)
+        period_activities = sum(week_bucket(unified_data[author], w)["activities"] for w in report_weeks)
+        period_total = period_features + period_regression + period_activities
+        if current_total == 0 and previous_total == 0 and period_total == 0:
             continue
-        active_weeks = sum(1 for w in all_weeks if sum_author_week(unified_data[author], w) > 0)
-        regression_share = round((rg / total) * 100, 1) if total > 0 else 0
-        median_week = seconds_to_hours(float(np.median(weekly_totals)))
-        std_dev = seconds_to_hours(float(np.std(weekly_totals)))
-        stability_idx = round(100 / (1 + std_dev), 1)
+        regression_share = round((current_bucket["regression"] / current_total) * 100, 1) if current_total > 0 else 0
         rows.append(
             {
                 "author": author,
                 "team": determine_team(author, author_project_stats),
-                "ft_avg": seconds_to_hours(ft / week_count),
-                "rg_avg": seconds_to_hours(rg / week_count),
-                "act_avg": seconds_to_hours(act / week_count),
-                "total_avg": seconds_to_hours(total / week_count),
-                "median_week": median_week,
+                "current": current_total,
+                "previous": previous_total,
+                "features": current_bucket["features"],
+                "regression": current_bucket["regression"],
+                "activities": current_bucket["activities"],
                 "regression_share": regression_share,
-                "std_dev": std_dev,
-                "stability_idx": stability_idx,
-                "active_weeks": active_weeks,
+                "period_total": period_total,
+                "avg_week": period_total / week_count,
+                "active_weeks": sum(1 for w in report_weeks if sum_author_week(unified_data[author], w) > 0),
             }
         )
+    rows.sort(key=lambda r: (r["current"], r["period_total"]), reverse=True)
+    return rows
 
-    sort_key = AVG_TABLE_SORT_METRIC if AVG_TABLE_SORT_METRIC in {"total_avg", "median_week", "ft_avg", "rg_avg", "act_avg", "regression_share", "stability_idx"} else "total_avg"
-    rows.sort(key=lambda x: x[sort_key], reverse=True)
-    top_people = {r["author"] for r in rows[:TOP_HIGHLIGHT_COUNT]}
-    bottom_people = {r["author"] for r in rows[-TOP_HIGHLIGHT_COUNT:]} if len(rows) > TOP_HIGHLIGHT_COUNT else set()
 
-    table = "<h3 style='margin:14px 0 8px;'>Среднее время по сотрудникам (за весь период)</h3>"
-    table += f"<p style='margin:0 0 8px; color:#6b778c;'>Сортировка: <strong>{html.escape(sort_key)}</strong>. Топ-{TOP_HIGHLIGHT_COUNT} и нижние-{TOP_HIGHLIGHT_COUNT} подсвечены.</p>"
-    table += (
-        "<table style='border-collapse:collapse; width:100%; margin-bottom:14px;'>"
-        "<thead><tr>"
-        "<th style='padding:7px; border:1px solid #dfe1e6; background:#f4f5f7; text-align:left;'>Сотрудник</th>"
-        "<th style='padding:7px; border:1px solid #dfe1e6; background:#f4f5f7; text-align:left;'>Команда</th>"
-        "<th style='padding:7px; border:1px solid #dfe1e6; background:#f4f5f7;'>Фичи (ср/нед)</th>"
-        "<th style='padding:7px; border:1px solid #dfe1e6; background:#f4f5f7;'>Регресс (ср/нед)</th>"
-        "<th style='padding:7px; border:1px solid #dfe1e6; background:#f4f5f7;'>Активности (ср/нед)</th>"
-        "<th style='padding:7px; border:1px solid #dfe1e6; background:#f4f5f7;'>Итого (ср/нед)</th>"
-        "<th style='padding:7px; border:1px solid #dfe1e6; background:#f4f5f7;'>Медиана (ч/нед)</th>"
-        "<th style='padding:7px; border:1px solid #dfe1e6; background:#f4f5f7;'>Доля регресса, %</th>"
-        "<th style='padding:7px; border:1px solid #dfe1e6; background:#f4f5f7;'>Стабильность, %</th>"
-        "<th style='padding:7px; border:1px solid #dfe1e6; background:#f4f5f7;'>Активных недель</th>"
-        "</tr></thead><tbody>"
-    )
-    for r in rows:
-        row_bg = ""
-        if r["author"] in top_people:
-            row_bg = "background:#e3fcef;"
-        elif r["author"] in bottom_people:
-            row_bg = "background:#ffebe6;"
-        reg_share_style = "color:#bf2600; font-weight:600;" if r["regression_share"] >= 40 else ""
-        table += (
-            f"<tr style='{row_bg}'><td style='padding:7px; border:1px solid #dfe1e6; text-align:left;'>{html.escape(r['author'])}</td>"
-            f"<td style='padding:7px; border:1px solid #dfe1e6; text-align:left;'>{html.escape(r['team'])}</td>"
-            f"<td style='padding:7px; border:1px solid #dfe1e6; text-align:center;'>{r['ft_avg']}</td>"
-            f"<td style='padding:7px; border:1px solid #dfe1e6; text-align:center;'>{r['rg_avg']}</td>"
-            f"<td style='padding:7px; border:1px solid #dfe1e6; text-align:center;'>{r['act_avg']}</td>"
-            f"<td style='padding:7px; border:1px solid #dfe1e6; text-align:center; font-weight:600;'>{r['total_avg']}</td>"
-            f"<td style='padding:7px; border:1px solid #dfe1e6; text-align:center;'>{r['median_week']}</td>"
-            f"<td style='padding:7px; border:1px solid #dfe1e6; text-align:center; {reg_share_style}'>{r['regression_share']}</td>"
-            f"<td style='padding:7px; border:1px solid #dfe1e6; text-align:center;'>{r['stability_idx']}</td>"
-            f"<td style='padding:7px; border:1px solid #dfe1e6; text-align:center;'>{r['active_weeks']}</td></tr>"
+def render_people_snapshot(rows):
+    st = report_styles()
+    if not rows:
+        return (
+            section_heading("Сотрудники: текущая картина", "Нет списаний за выбранный период.")
+            + f"<div style='{st['card_soft']} color:#6b778c;'>Нет данных для отображения.</div>"
         )
-    table += "</tbody></table>"
-    table += f"<p style='margin:-4px 0 14px; color:#6b778c;'>Период расчёта: {len(all_weeks)} недель (с {FIXED_START_DATE}).</p>"
-    return table
-
-
-def generate_weekly_report(unified_data, author_project_stats, ref_date=None):
-    if not unified_data: return ""
-
-    ref_date = ref_date or datetime.now()
-    current_week_key = calendar_week_monday_key(ref_date)
-
-    sorted_weeks = ordered_report_weeks(unified_data, limit=None, ref_date=ref_date)
-
-    # Определяем команды
-    teams_map = defaultdict(list)
-    for author in unified_data.keys():
-        team = determine_team(author, author_project_stats)
-        teams_map[team].append(author)
-    sorted_teams = sorted(teams_map.keys())
-
-    style_table = "border-collapse: collapse; width: 100%; font-family: Arial; font-size: 11px; margin-bottom: 20px;"
-    style_th = "background: #f4f5f7; border: 1px solid #ddd; padding: 5px; text-align: center;"
-    style_td = "border: 1px solid #ddd; padding: 4px; text-align: center;"
-    style_team = "background: #deebff; font-weight: bold; padding: 8px; text-align: left;"
-
-    full_html = "<h3>📊 Нагрузка по неделям (весь период)</h3>"
-
-    for week in sorted_weeks:
-        monday = datetime.strptime(week, '%Y-%m-%d')
-        friday = monday + timedelta(days=4)
-        week_label = f"Неделя: {monday.strftime('%d.%m.%Y')} – {friday.strftime('%d.%m.%Y')}"
-        is_calendar_current = week == current_week_key
-        title_suffix = " (Текущая)" if is_calendar_current else ""
-
-        # Генерация таблицы для конкретной недели
-        week_table = f"<table style='{style_table}'><thead>"
-        week_table += f"<tr><th style='{style_th} width: 220px;'>Сотрудник</th>"
-        week_table += f"<th style='{style_th}'>Фичи</th><th style='{style_th}'>Регресс</th><th style='{style_th}'>Активности</th><th style='{style_th}'>Сумма</th></tr></thead><tbody>"
-
-        if is_calendar_current and not week_has_any_activity(unified_data, week):
-            week_table += (
-                f"<tr><td colspan='5' style='{style_td} text-align:left; color:#666;'>"
-                "Списаний за текущую календарную неделю в выборке Jira пока нет.</td></tr>"
-            )
-
-        # Заполняем данными по командам
-        for team in sorted_teams:
-            if team == "Вне команды / Релиз" and len(sorted_teams) > 1: continue
-
-            # Проверяем, есть ли активность в этой команде на этой неделе
-            team_active = False
-            for auth in teams_map[team]:
-                wb = week_bucket(unified_data[auth], week)
-                if wb['features'] > 0 or wb['regression'] > 0 or wb['activities'] > 0:
-                    team_active = True
-                    break
-
-            if not team_active: continue
-
-            week_table += f"<tr><td colspan='5' style='{style_team}'>{html.escape(team)}</td></tr>"
-
-            for auth in sorted(teams_map[team]):
-                wb = week_bucket(unified_data[auth], week)
-                ft = seconds_to_hours(wb['features'])
-                reg = seconds_to_hours(wb['regression'])
-                act = seconds_to_hours(wb['activities'])
-
-                # Если у сотрудника 0 часов за неделю - пропускаем его, чтобы таблица была чище
-                if ft == 0 and reg == 0 and act == 0: continue
-
-                total = round(ft + reg + act, 2)
-                st_ft = "color:#ccc;" if ft == 0 else ""
-                st_reg = "color:#ccc;" if reg == 0 else "color:#e74c3c;"
-                st_act = "color:#ccc;" if act == 0 else "color:#8e44ad;"
-                st_tot = "background:#e3fcef; font-weight:bold;" if total > 30 else ("background:#fff;" if total > 0 else "color:#eee;")
-
-                week_table += f"<tr><td style='{style_td} text-align:left;'>{html.escape(auth)}</td>"
-                week_table += f"<td style='{style_td} {st_ft}'>{ft if ft > 0 else '-'}</td>"
-                week_table += f"<td style='{style_td} {st_reg}'>{reg if reg > 0 else '-'}</td>"
-                week_table += f"<td style='{style_td} {st_act}'>{act if act > 0 else '-'}</td>"
-                week_table += f"<td style='{style_td} {st_tot}'>{total}</td></tr>"
-
-        # Обработка "Вне команды" отдельно в конце
-        if "Вне команды / Релиз" in teams_map:
-            team = "Вне команды / Релиз"
-            team_active = any(
-                (
-                    week_bucket(unified_data[auth], week)['features'] > 0
-                    or week_bucket(unified_data[auth], week)['regression'] > 0
-                    or week_bucket(unified_data[auth], week)['activities'] > 0
-                )
-                for auth in teams_map[team]
-            )
-
-            if team_active:
-                week_table += f"<tr><td colspan='5' style='{style_team} background:#f4f5f7; color:#666;'>{html.escape(team)}</td></tr>"
-                for auth in sorted(teams_map[team]):
-                    wb = week_bucket(unified_data[auth], week)
-                    ft = seconds_to_hours(wb['features'])
-                    reg = seconds_to_hours(wb['regression'])
-                    act = seconds_to_hours(wb['activities'])
-                    if ft == 0 and reg == 0 and act == 0: continue
-                    total = round(ft + reg + act, 2)
-                    week_table += f"<tr><td style='{style_td} text-align:left;'>{html.escape(auth)}</td>"
-                    week_table += f"<td style='{style_td}'>{ft if ft>0 else '-'}</td><td style='{style_td}'>{reg if reg>0 else '-'}</td><td style='{style_td}'>{act if act>0 else '-'}</td><td style='{style_td}'>{total}</td></tr>"
-
-        week_table += "</tbody></table>"
-
-        # Раскрыта только календарная «текущая» неделя; остальные — expand.
-        week_title_esc = html.escape(f"{week_label}{title_suffix}")
-        if is_calendar_current:
-            full_html += f"<h4>{week_title_esc}</h4>{week_table}"
-        else:
-            full_html += f"""
-            <ac:structured-macro ac:name="expand">
-                <ac:parameter ac:name="title">{week_title_esc}</ac:parameter>
-                <ac:rich-text-body>{week_table}</ac:rich-text-body>
-            </ac:structured-macro>
-            """
-
-    return full_html
-
-def generate_html_report(unified_data, by_project_data, author_project_stats, chart_b64):
-    report_weeks = ordered_report_weeks(unified_data, limit=None)
-    current_week = calendar_week_monday_key()
-    previous_week = get_week_start((datetime.strptime(current_week, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d"))
-    rolling_weeks = report_weeks[:4]
-
-    current_total = sum_week_metric(unified_data, current_week, "features") + sum_week_metric(unified_data, current_week, "regression") + sum_week_metric(unified_data, current_week, "activities")
-    previous_total = sum_week_metric(unified_data, previous_week, "features") + sum_week_metric(unified_data, previous_week, "regression") + sum_week_metric(unified_data, previous_week, "activities")
-    current_features = sum_week_metric(unified_data, current_week, "features")
-    current_regression = sum_week_metric(unified_data, current_week, "regression")
-    current_activities = sum_week_metric(unified_data, current_week, "activities")
-    rolling_total = sum(
-        sum_week_metric(unified_data, week, "features")
-        + sum_week_metric(unified_data, week, "regression")
-        + sum_week_metric(unified_data, week, "activities")
-        for week in rolling_weeks
+    html_rows = ""
+    for row in rows:
+        total_h = seconds_to_hours(row["current"])
+        row_style = "background:#ffebe6;" if total_h >= TEAM_ALERT_HOURS else ""
+        reg_pill = (
+            f"<span style='{st['danger_pill']}'>{row['regression_share']}%</span>"
+            if row["regression_share"] >= 40 else f"<span style='{st['pill']}'>{row['regression_share']}%</span>"
+        )
+        html_rows += (
+            f"<tr style='{row_style}'>"
+            f"<td style='{st['td_left']}'><strong>{html.escape(row['author'])}</strong><br/><span style='color:#6b778c;'>{html.escape(row['team'])}</span></td>"
+            f"<td style='{st['td']}; font-weight:700;'>{html_hours(row['current'])}</td>"
+            f"<td style='{st['td']}'>{html_hours(row['previous'])}</td>"
+            f"<td style='{st['td']}'>{html_delta(row['current'], row['previous'])}</td>"
+            f"<td style='{st['td']}'>{html_hours(row['features'])}</td>"
+            f"<td style='{st['td']}'>{html_hours(row['regression'])}</td>"
+            f"<td style='{st['td']}'>{html_hours(row['activities'])}</td>"
+            f"<td style='{st['td']}'>{reg_pill}</td>"
+            f"<td style='{st['td']}'>{html_hours(row['avg_week'])}</td>"
+            f"<td style='{st['td']}'>{row['active_weeks']}</td>"
+            "</tr>"
+        )
+    return (
+        section_heading(
+            "Сотрудники: текущая картина",
+            "Основной экран отчёта: текущая неделя, сравнение с прошлой и структура времени.",
+        )
+        + f"<div style='{st['panel']}'><table style='{st['table']}'>"
+        f"<thead><tr>"
+        f"<th style='{st['th_left']}'>Сотрудник / команда</th>"
+        f"<th style='{st['th']}'>Текущая</th>"
+        f"<th style='{st['th']}'>Прошлая</th>"
+        f"<th style='{st['th']}'>Delta</th>"
+        f"<th style='{st['th']}'>Фичи</th>"
+        f"<th style='{st['th']}'>Регресс</th>"
+        f"<th style='{st['th']}'>Активности</th>"
+        f"<th style='{st['th']}'>Регресс, %</th>"
+        f"<th style='{st['th']}'>Ср/нед</th>"
+        f"<th style='{st['th']}'>Активных недель</th>"
+        f"</tr></thead><tbody>{html_rows}</tbody></table></div>"
     )
-    rolling_avg = rolling_total / max(len(rolling_weeks), 1)
 
-    team_map = defaultdict(list)
-    for author in unified_data.keys():
-        team_map[determine_team(author, author_project_stats)].append(author)
 
-    # Быстрые инсайты для руководителя: кто перегружен, где много регресса.
-    author_now = []
-    for author in unified_data.keys():
-        wb = week_bucket(unified_data[author], current_week)
-        total = wb["features"] + wb["regression"] + wb["activities"]
-        if total > 0:
-            reg_share = (wb["regression"] / total) * 100 if total else 0
-            author_now.append((author, seconds_to_hours(total), round(reg_share, 1)))
-    author_now.sort(key=lambda x: x[1], reverse=True)
-    overloaded = author_now[:3]
-    high_reg_share = [a for a in author_now if a[2] >= 40][:3]
-    anomalies = []
-    for author in unified_data.keys():
-        cur = sum_author_week(unified_data[author], current_week)
-        prev = sum_author_week(unified_data[author], previous_week)
-        if prev <= 0:
-            continue
-        growth = ((cur - prev) / prev) * 100
-        if growth >= ANOMALY_GROWTH_THRESHOLD_PCT:
-            anomalies.append((author, seconds_to_hours(cur), seconds_to_hours(prev), round(growth, 1)))
-    anomalies.sort(key=lambda x: x[3], reverse=True)
-    anomalies = anomalies[:5]
-
-    metric_table_style = "padding:7px; border:1px solid #dfe1e6; text-align:center;"
-    report_html = f"""
-    <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif; color:#172b4d;">
-      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
-        <div>
-          <h2 style="margin:0; font-size:24px;">QA Analytics Dashboard</h2>
-          <div style="color:#6b778c; margin-top:4px;">Обновлено: {datetime.now().strftime('%d.%m.%Y %H:%M')} · данные хранятся и считаются с {FIXED_START_DATE}</div>
-        </div>
-        <div style="padding:8px 12px; border-radius:16px; background:#deebff; color:#0747a6; font-weight:600;">Инкремент из Confluence</div>
-      </div>
-      <div style="display:grid; grid-template-columns:repeat(4,minmax(160px,1fr)); gap:12px; margin:16px 0 18px;">
-        <div style="padding:14px; border-radius:12px; background:#e3fcef;"><div style="font-size:24px; font-weight:700; color:#006644;">{seconds_to_hours(current_total)} ч</div><div style="font-size:12px; color:#42526e;">Текущая неделя</div></div>
-        <div style="padding:14px; border-radius:12px; background:#deebff;"><div style="font-size:24px; font-weight:700; color:#0747a6;">{seconds_to_hours(previous_total)} ч</div><div style="font-size:12px; color:#42526e;">Прошлая неделя · Δ {format_delta(current_total, previous_total)} ч</div></div>
-        <div style="padding:14px; border-radius:12px; background:#ffebe6;"><div style="font-size:24px; font-weight:700; color:#bf2600;">{seconds_to_hours(current_regression)} ч</div><div style="font-size:12px; color:#42526e;">Регресс сейчас</div></div>
-        <div style="padding:14px; border-radius:12px; background:#f3e8ff;"><div style="font-size:24px; font-weight:700; color:#5b2c83;">{seconds_to_hours(current_activities)} ч</div><div style="font-size:12px; color:#42526e;">Активности {SPECIAL_ACTIVITY_ISSUE}</div></div>
-      </div>
-      <p style="margin:0 0 12px; color:#42526e;">Фичи сейчас: <strong>{seconds_to_hours(current_features)} ч</strong> · Среднее за последние {len(rolling_weeks)} недели: <strong>{seconds_to_hours(rolling_avg)} ч/нед</strong>. Ниже — команды, средние по сотрудникам и недельная история.</p>
-    """
-    if chart_b64:
-        report_html += f'<div style="margin-bottom:16px;"><img src="data:image/png;base64,{chart_b64}" style="max-width:100%; border:1px solid #dfe1e6; border-radius:10px;"/></div>'
-
-    report_html += "<h3 style='margin:14px 0 8px;'>Инсайты текущей недели</h3>"
-    report_html += "<div style='display:grid; grid-template-columns:repeat(3,minmax(220px,1fr)); gap:10px; margin-bottom:12px;'>"
-    if overloaded:
-        report_html += "<div style='padding:10px; border:1px solid #dfe1e6; border-radius:8px;'><div style='font-weight:700; margin-bottom:6px;'>Топ по нагрузке</div>"
-        for name, hours, _ in overloaded:
-            report_html += f"<div style='color:#172b4d;'>{html.escape(name)} — <strong>{hours} ч</strong></div>"
-        report_html += "</div>"
-    if high_reg_share:
-        report_html += "<div style='padding:10px; border:1px solid #dfe1e6; border-radius:8px;'><div style='font-weight:700; margin-bottom:6px;'>Высокая доля регресса</div>"
-        for name, hours, share in high_reg_share:
-            report_html += f"<div style='color:#172b4d;'>{html.escape(name)} — {hours} ч, <strong>{share}% регресса</strong></div>"
-        report_html += "</div>"
-    if anomalies:
-        report_html += f"<div style='padding:10px; border:1px solid #dfe1e6; border-radius:8px;'><div style='font-weight:700; margin-bottom:6px;'>Аномалии (рост &gt; {ANOMALY_GROWTH_THRESHOLD_PCT}%)</div>"
-        for name, cur_h, prev_h, growth in anomalies:
-            report_html += f"<div style='color:#172b4d;'>{html.escape(name)} — {prev_h} → <strong>{cur_h} ч</strong> ({growth}%)</div>"
-        report_html += "</div>"
-    report_html += "</div>"
-
-    report_html += "<h3 style='margin:14px 0 8px;'>Команды: текущая неделя, дельта и состав</h3>"
+def render_team_sections(team_map, unified_data, current_week, previous_week):
+    st = report_styles()
+    result = section_heading("Команды", "Сводка по текущей неделе с дельтой и составом.")
     for team, authors in sorted(team_map.items()):
         team_current = sum(sum_author_week(unified_data[a], current_week) for a in authors)
         team_previous = sum(sum_author_week(unified_data[a], previous_week) for a in authors)
-        team_ft = sum(week_bucket(unified_data[a], current_week)["features"] for a in authors)
-        team_reg = sum(week_bucket(unified_data[a], current_week)["regression"] for a in authors)
-        team_act = sum(week_bucket(unified_data[a], current_week)["activities"] for a in authors)
         if team_current == 0 and team_previous == 0:
             continue
-        alert = " ⚠" if seconds_to_hours(team_current) >= TEAM_ALERT_HOURS else ""
-        title = f"{team}: {seconds_to_hours(team_current)} ч сейчас · Δ {format_delta(team_current, team_previous)} ч ({format_delta_pct(team_current, team_previous)}){alert}"
-        report_html += f"""
-        <ac:structured-macro ac:name="expand">
-          <ac:parameter ac:name="title">{html.escape(title)}</ac:parameter>
-          <ac:rich-text-body>
-            <table style="border-collapse:collapse; width:100%; margin-bottom:10px;">
-              <thead><tr>
-                <th style="{metric_table_style} background:#f4f5f7; text-align:left;">Сотрудник</th>
-                <th style="{metric_table_style} background:#f4f5f7;">Текущая</th>
-                <th style="{metric_table_style} background:#f4f5f7;">Прошлая</th>
-                <th style="{metric_table_style} background:#f4f5f7;">Δ</th>
-                <th style="{metric_table_style} background:#f4f5f7;">Фичи</th>
-                <th style="{metric_table_style} background:#f4f5f7;">Регресс</th>
-                <th style="{metric_table_style} background:#f4f5f7;">Активности</th>
-              </tr></thead><tbody>
-              <tr>
-                <td style="{metric_table_style} text-align:left; font-weight:600;">Итого команда</td>
-                <td style="{metric_table_style} font-weight:600;">{seconds_to_hours(team_current)}</td>
-                <td style="{metric_table_style}">{seconds_to_hours(team_previous)}</td>
-                <td style="{metric_table_style}">{format_delta(team_current, team_previous)}</td>
-                <td style="{metric_table_style}">{seconds_to_hours(team_ft)}</td>
-                <td style="{metric_table_style}">{seconds_to_hours(team_reg)}</td>
-                <td style="{metric_table_style}">{seconds_to_hours(team_act)}</td>
-              </tr>
-        """
-        for author in sorted(authors):
+        ranked_authors = sorted(authors, key=lambda a: sum_author_week(unified_data[a], current_week), reverse=True)
+        top_author = ranked_authors[0] if ranked_authors else "n/a"
+        title = (
+            f"{team}: {seconds_to_hours(team_current)} ч сейчас, "
+            f"Delta {format_delta(team_current, team_previous)} ч, топ: {top_author}"
+        )
+        rows = (
+            f"<tr><td style='{st['td_left']}; font-weight:700;'>Итого команда</td>"
+            f"<td style='{st['td']}; font-weight:700;'>{html_hours(team_current)}</td>"
+            f"<td style='{st['td']}'>{html_hours(team_previous)}</td>"
+            f"<td style='{st['td']}'>{html_delta(team_current, team_previous)}</td>"
+            f"<td style='{st['td']}'>{html_hours(sum(week_bucket(unified_data[a], current_week)['features'] for a in authors))}</td>"
+            f"<td style='{st['td']}'>{html_hours(sum(week_bucket(unified_data[a], current_week)['regression'] for a in authors))}</td>"
+            f"<td style='{st['td']}'>{html_hours(sum(week_bucket(unified_data[a], current_week)['activities'] for a in authors))}</td></tr>"
+        )
+        for author in ranked_authors:
             cur = sum_author_week(unified_data[author], current_week)
             prev = sum_author_week(unified_data[author], previous_week)
             wb = week_bucket(unified_data[author], current_week)
             if cur == 0 and prev == 0:
                 continue
-            report_html += f"""
-              <tr>
-                <td style="{metric_table_style} text-align:left;">{html.escape(author)}</td>
-                <td style="{metric_table_style}">{seconds_to_hours(cur)}</td>
-                <td style="{metric_table_style}">{seconds_to_hours(prev)}</td>
-                <td style="{metric_table_style}">{format_delta(cur, prev)}</td>
-                <td style="{metric_table_style}">{seconds_to_hours(wb["features"])}</td>
-                <td style="{metric_table_style}">{seconds_to_hours(wb["regression"])}</td>
-                <td style="{metric_table_style}">{seconds_to_hours(wb["activities"])}</td>
-              </tr>
-            """
-        report_html += "</tbody></table></ac:rich-text-body></ac:structured-macro>"
+            rows += (
+                f"<tr><td style='{st['td_left']}'>{html.escape(author)}</td>"
+                f"<td style='{st['td']}'>{html_hours(cur)}</td>"
+                f"<td style='{st['td']}'>{html_hours(prev)}</td>"
+                f"<td style='{st['td']}'>{html_delta(cur, prev)}</td>"
+                f"<td style='{st['td']}'>{html_hours(wb['features'])}</td>"
+                f"<td style='{st['td']}'>{html_hours(wb['regression'])}</td>"
+                f"<td style='{st['td']}'>{html_hours(wb['activities'])}</td></tr>"
+            )
+        result += (
+            f"<ac:structured-macro ac:name='expand'><ac:parameter ac:name='title'>{html.escape(title)}</ac:parameter>"
+            f"<ac:rich-text-body><table style='{st['table']}'><thead><tr>"
+            f"<th style='{st['th_left']}'>Сотрудник</th><th style='{st['th']}'>Текущая</th>"
+            f"<th style='{st['th']}'>Прошлая</th><th style='{st['th']}'>Delta</th>"
+            f"<th style='{st['th']}'>Фичи</th><th style='{st['th']}'>Регресс</th>"
+            f"<th style='{st['th']}'>Активности</th></tr></thead><tbody>{rows}</tbody></table>"
+            f"</ac:rich-text-body></ac:structured-macro>"
+        )
+    return result
 
-    report_html += generate_average_by_author_table(unified_data, author_project_stats)
-    report_html += generate_weekly_report(unified_data, author_project_stats)
 
-    report_html += '<ac:structured-macro ac:name="expand"><ac:parameter ac:name="title">📂 Детализация задач (весь период)</ac:parameter><ac:rich-text-body>'
+def generate_average_by_author_table(unified_data, author_project_stats):
+    rows = build_people_rows(
+        unified_data,
+        author_project_stats,
+        ordered_report_weeks(unified_data, limit=None),
+        calendar_week_monday_key(),
+        get_week_start((datetime.strptime(calendar_week_monday_key(), "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")),
+    )
+    return render_people_snapshot(rows)
+
+
+def render_week_table(unified_data, teams_map, sorted_teams, week):
+    st = report_styles()
+    rows = ""
+    for team in sorted_teams:
+        team_authors = [
+            auth for auth in sorted(teams_map[team])
+            if sum_author_week(unified_data[auth], week) > 0
+        ]
+        if not team_authors:
+            continue
+        team_total = sum(sum_author_week(unified_data[auth], week) for auth in team_authors)
+        rows += f"<tr><td colspan='5' style='{st['team_row']}'>{html.escape(team)} · {html_hours(team_total)} ч</td></tr>"
+        for auth in team_authors:
+            wb = week_bucket(unified_data[auth], week)
+            total = wb["features"] + wb["regression"] + wb["activities"]
+            rows += (
+                f"<tr><td style='{st['td_left']}'>{html.escape(auth)}</td>"
+                f"<td style='{st['td']}'>{html_hours(wb['features'])}</td>"
+                f"<td style='{st['td']}'>{html_hours(wb['regression'])}</td>"
+                f"<td style='{st['td']}'>{html_hours(wb['activities'])}</td>"
+                f"<td style='{st['td']}; font-weight:700;'>{html_hours(total)}</td></tr>"
+            )
+    if not rows:
+        rows = f"<tr><td colspan='5' style='{st['td_left']} color:#6b778c;'>Списаний за неделю в выборке Jira нет.</td></tr>"
+    return (
+        f"<table style='{st['table']}'><thead><tr>"
+        f"<th style='{st['th_left']}'>Сотрудник</th><th style='{st['th']}'>Фичи</th>"
+        f"<th style='{st['th']}'>Регресс</th><th style='{st['th']}'>Активности</th>"
+        f"<th style='{st['th']}'>Сумма</th></tr></thead><tbody>{rows}</tbody></table>"
+    )
+
+
+def generate_weekly_report(unified_data, author_project_stats, ref_date=None):
+    if not unified_data:
+        return ""
+    ref_date = ref_date or datetime.now()
+    current_week_key = calendar_week_monday_key(ref_date)
+    sorted_weeks = ordered_report_weeks(unified_data, limit=None, ref_date=ref_date)
+    teams_map = defaultdict(list)
+    for author in unified_data.keys():
+        teams_map[determine_team(author, author_project_stats)].append(author)
+    sorted_teams = sorted(teams_map.keys())
+    full_html = section_heading(
+        "Недельная динамика",
+        "Неделя определяется только датой worklog: время попадает в ту неделю, когда оно было затрекано.",
+    )
+    for week in sorted_weeks:
+        monday = datetime.strptime(week, '%Y-%m-%d')
+        friday = monday + timedelta(days=4)
+        total = (
+            sum_week_metric(unified_data, week, "features")
+            + sum_week_metric(unified_data, week, "regression")
+            + sum_week_metric(unified_data, week, "activities")
+        )
+        week_title = f"{monday.strftime('%d.%m.%Y')} - {friday.strftime('%d.%m.%Y')}: {seconds_to_hours(total)} ч"
+        week_table = render_week_table(unified_data, teams_map, sorted_teams, week)
+        if week == current_week_key:
+            full_html += f"<h4 style='margin:12px 0 6px;'>{html.escape(week_title)} · текущая</h4>{week_table}"
+        else:
+            full_html += (
+                f"<ac:structured-macro ac:name='expand'><ac:parameter ac:name='title'>{html.escape(week_title)}</ac:parameter>"
+                f"<ac:rich-text-body>{week_table}</ac:rich-text-body></ac:structured-macro>"
+            )
+    return full_html
+
+
+def render_issue_details(by_project_data, report_weeks):
+    st = report_styles()
     recent_projects = []
     for pk, pdata in by_project_data.items():
-        stories = [s for s in pdata['stories'] if story_touches_weeks(s, report_weeks)]
+        stories = [s for s in pdata["stories"] if story_touches_weeks(s, report_weeks)]
         if stories:
             recent_projects.append((pk, stories))
-    for pk, stories in sorted(recent_projects, key=lambda x: sum(s['total_time'] for s in x[1]), reverse=True):
-        ph = seconds_to_hours(sum(s['total_time'] for s in stories))
-        stories = sorted(stories, key=lambda x: x['total_time'], reverse=True)
-        pk_esc = html.escape(pk)
-        report_html += f"<h4>{pk_esc} ({ph}ч)</h4><table><thead><tr><th>Key</th><th>Type</th><th>Summary</th><th>Time</th><th>Authors</th></tr></thead><tbody>"
-        for s in stories[:200]:
-            key_esc = html.escape(s['key'])
+    body = ""
+    for pk, stories in sorted(recent_projects, key=lambda x: sum(s["total_time"] for s in x[1]), reverse=True):
+        project_total = sum(s["total_time"] for s in stories)
+        rows = ""
+        for s in sorted(stories, key=lambda x: x["total_time"], reverse=True)[:200]:
+            key_esc = html.escape(s["key"])
             browse = f"{JIRA_URL}/browse/{key_esc}"
-            report_html += f"""<tr><td><a href="{browse}">{key_esc}</a></td><td>{html.escape(s['issuetype'])}</td><td>{html.escape(s['summary'][:90])}</td><td><strong>{seconds_to_hours(s['total_time'])}</strong></td><td>{html.escape(", ".join(s['authors']))}</td></tr>"""
-        report_html += "</tbody></table>"
-    report_html += "</ac:rich-text-body></ac:structured-macro>"
+            linked = ", ".join(t.get("key", "") for t in s.get("linked_tasks", []) if t.get("key"))
+            linked_text = linked if linked else "-"
+            weeks_text = str(s.get("worklog_weeks") or s.get("worklog_dates") or "-")
+            rows += (
+                f"<tr><td style='{st['td_left']}'><a href='{browse}'>{key_esc}</a></td>"
+                f"<td style='{st['td']}'>{html.escape(str(s.get('issuetype', '-')))}</td>"
+                f"<td style='{st['td_left']}'>{html.escape(str(s.get('summary', ''))[:120])}</td>"
+                f"<td style='{st['td']}'>{html.escape(str(s.get('source', '-')))}</td>"
+                f"<td style='{st['td']}; font-weight:700;'>{html_hours(s.get('total_time', 0))}</td>"
+                f"<td style='{st['td_left']}'>{html.escape(weeks_text)}</td>"
+                f"<td style='{st['td_left']}'>{html.escape(linked_text)}</td>"
+                f"<td style='{st['td_left']}'>{html.escape(', '.join(s.get('authors', [])))}</td></tr>"
+            )
+        body += (
+            f"<h4 style='margin:14px 0 6px;'>{html.escape(pk)} · {html_hours(project_total)} ч</h4>"
+            f"<table style='{st['table']}'><thead><tr>"
+            f"<th style='{st['th_left']}'>Key</th><th style='{st['th']}'>Type</th>"
+            f"<th style='{st['th_left']}'>Summary</th><th style='{st['th']}'>Source</th>"
+            f"<th style='{st['th']}'>Time</th><th style='{st['th_left']}'>Weeks</th>"
+            f"<th style='{st['th_left']}'>Linked tasks</th><th style='{st['th_left']}'>Authors</th>"
+            f"</tr></thead><tbody>{rows}</tbody></table>"
+        )
+    if not body:
+        body = f"<div style='{st['card_soft']} color:#6b778c;'>Нет задач за выбранный период.</div>"
+    return (
+        section_heading(
+            "Детализация задач",
+            "Story, Bug, активности и связанные задачи. Time уже включает время Story+Linked.",
+        )
+        + f"<ac:structured-macro ac:name='expand'><ac:parameter ac:name='title'>Показать детализацию задач</ac:parameter>"
+        + f"<ac:rich-text-body>{body}</ac:rich-text-body></ac:structured-macro>"
+    )
+
+
+def generate_html_report(unified_data, by_project_data, author_project_stats, chart_b64):
+    st = report_styles()
+    report_weeks = ordered_report_weeks(unified_data, limit=None)
+    current_week = calendar_week_monday_key()
+    previous_week = get_week_start((datetime.strptime(current_week, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d"))
+    rolling_weeks = report_weeks[:4]
+    current_total = sum(
+        sum_week_metric(unified_data, current_week, metric)
+        for metric in ("features", "regression", "activities")
+    )
+    previous_total = sum(
+        sum_week_metric(unified_data, previous_week, metric)
+        for metric in ("features", "regression", "activities")
+    )
+    current_features = sum_week_metric(unified_data, current_week, "features")
+    current_regression = sum_week_metric(unified_data, current_week, "regression")
+    current_activities = sum_week_metric(unified_data, current_week, "activities")
+    rolling_total = sum(
+        sum(sum_week_metric(unified_data, week, metric) for metric in ("features", "regression", "activities"))
+        for week in rolling_weeks
+    )
+    rolling_avg = rolling_total / max(len(rolling_weeks), 1)
+    people_rows = build_people_rows(unified_data, author_project_stats, report_weeks, current_week, previous_week)
+    active_people = sum(1 for row in people_rows if row["current"] > 0)
+    team_map = defaultdict(list)
+    for author in unified_data.keys():
+        team_map[determine_team(author, author_project_stats)].append(author)
+    report_html = f"""
+    <div style="{st['page']}">
+      <div style="border-bottom:1px solid #dfe1e6; padding-bottom:12px; margin-bottom:16px;">
+        <div style="font-size:12px; color:#6b778c; text-transform:uppercase; letter-spacing:.08em;">QA Analytics</div>
+        <h2 style="margin:4px 0 6px; font-size:26px;">Отчёт по QA-нагрузке</h2>
+        <div style="color:#6b778c;">Обновлено: {datetime.now().strftime('%d.%m.%Y %H:%M')} · период с {FIXED_START_DATE} · источник: Jira worklog по дате списания</div>
+      </div>
+      <div style="display:grid; grid-template-columns:repeat(4,minmax(160px,1fr)); gap:12px; margin:0 0 18px;">
+        {metric_card("Текущая неделя", f"{seconds_to_hours(current_total)} ч", f"Delta {format_delta(current_total, previous_total)} ч к прошлой", "blue")}
+        {metric_card("Прошлая неделя", f"{seconds_to_hours(previous_total)} ч", "Для сравнения нагрузки", "neutral")}
+        {metric_card("Среднее за 4 недели", f"{seconds_to_hours(rolling_avg)} ч", f"Окно: {len(rolling_weeks)} недели", "green")}
+        {metric_card("Активные сотрудники", str(active_people), "Есть списания на текущей неделе", "purple")}
+      </div>
+      <div style="{st['card_soft']} margin-bottom:14px;">
+        <strong>Срез текущей недели:</strong>
+        фичи {seconds_to_hours(current_features)} ч · регресс {seconds_to_hours(current_regression)} ч · активности {seconds_to_hours(current_activities)} ч.
+        Все недельные значения основаны только на дате worklog, а не на дате обновления задачи.
+      </div>
+    """
+    report_html += render_people_snapshot(people_rows)
+    if chart_b64:
+        report_html += (
+            section_heading("Графики", "Общая динамика и распределение по проектам.")
+            + f"<div style='{st['panel_pad']}; border:1px solid #dfe1e6; border-radius:10px;'><img src='data:image/png;base64,{chart_b64}' style='max-width:100%; border:0;'/></div>"
+        )
+    report_html += render_team_sections(team_map, unified_data, current_week, previous_week)
+    report_html += generate_weekly_report(unified_data, author_project_stats)
+    report_html += render_issue_details(by_project_data, report_weeks)
     report_html += "</div>"
     return report_html
 
