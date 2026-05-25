@@ -1113,7 +1113,7 @@ class ReleaseValidator:
         }
         # Epic Link: customfield_10006
         EPIC_LINK_FIELD = 'customfield_10006'
-        CLOSED_STATUSES = {'closed', 'закрыта', 'закрыто', 'resolved', 'решена', 'решено'}
+        CLOSED_STATUSES = {'closed', 'закрыта', 'закрыто', 'resolved', 'решена', 'решено', 'cancelled', 'отменён', 'отменен'}
 
         linked_keys = self._get_consist_of_issues(release_key)
         if not linked_keys:
