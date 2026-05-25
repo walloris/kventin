@@ -404,6 +404,7 @@ class ReleaseValidator:
         self._check_bugs(release_key, is_hotfix=is_hotfix)
         self._check_stories(release_key)
         self._check_cloud_label(release_key, release.fields.summary)
+        self._check_sbrppl_third_party_label(release_key)
 
         total_errors = sum(len(d['errors']) for d in self.report_data.values())
         return total_errors == 0
@@ -1307,6 +1308,58 @@ class ReleaseValidator:
                 self._log_issue(
                     issue, "success",
                     f"Лейбл '{CLOUD_LABEL}' присутствует ✓"
+                )
+
+    def _check_sbrppl_third_party_label(self, release_key: str) -> None:
+        """
+        Проверяет обязательный лейбл #Пульс_3лица для Story/Bug проекта SBRPPL.
+
+        В Jira labels обычно хранятся без символа #, поэтому сравнение
+        нормализует оба варианта: Пульс_3лица и #Пульс_3лица.
+        """
+        project_key = 'SBRPPL'
+        required_label = 'Пульс_3лица'
+        issue_types = {'story', 'bug', 'defect', 'ошибка'}
+
+        linked_keys = self._get_consist_of_issues(release_key)
+        if not linked_keys:
+            return
+
+        keys_str = ",".join(linked_keys)
+        try:
+            all_issues = self.jira_main.search_issues(
+                f'key in ({keys_str})',
+                fields='summary,issuetype,assignee,labels',
+                maxResults=200
+            )
+        except Exception as e:
+            self._log_issue("GENERAL", "error", f"Ошибка проверки лейбла #Пульс_3лица для SBRPPL: {e}")
+            return
+
+        target_issues = [
+            issue for issue in all_issues
+            if issue.key.split('-')[0] == project_key
+            and issue.fields.issuetype.name.lower() in issue_types
+        ]
+
+        if not target_issues:
+            return
+
+        for issue in target_issues:
+            labels = getattr(issue.fields, 'labels', []) or []
+            normalized_labels = {str(label).lstrip('#') for label in labels}
+            if required_label not in normalized_labels:
+                self._log_issue(
+                    issue,
+                    "error",
+                    "Для задач Story/Bug проектной области SBRPPL "
+                    "обязателен лейбл '#Пульс_3лица'"
+                )
+            else:
+                self._log_issue(
+                    issue,
+                    "success",
+                    "Лейбл '#Пульс_3лица' присутствует ✓"
                 )
 
     def _check_bugs(self, release_key, is_hotfix: bool = False):
