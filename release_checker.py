@@ -289,11 +289,47 @@ class ZephyrScaleClient:
             return []
         return tc_details.get('items', [])
 
+    def _extract_zephyr_named_value(self, value: object) -> str:
+        """Извлекает человекочитаемое значение из вложенных объектов Zephyr."""
+        if value is None:
+            return ''
+        if isinstance(value, dict):
+            for key in ('name', 'value', 'displayName', 'key'):
+                nested_value = value.get(key)
+                extracted = self._extract_zephyr_named_value(nested_value)
+                if extracted:
+                    return extracted
+            return str(value).strip()
+        return str(value).strip()
+
     def get_test_case_status(self, tc: dict) -> str:
-        status = tc.get('status', '')
-        if isinstance(status, dict):
-            return status.get('name', '')
-        return str(status).strip()
+        """
+        Возвращает статус ТК из разных форматов ответа Zephyr Scale.
+
+        Короткий issuelink endpoint и детальный testcase endpoint могут отдавать
+        статус в разных местах: status, workflowStatus, latestVersion.status и т.д.
+        """
+        direct_status_fields = ('status', 'workflowStatus', 'testCaseStatus')
+        for field_name in direct_status_fields:
+            status = self._extract_zephyr_named_value(tc.get(field_name))
+            if status:
+                return status
+
+        nested_status_paths = (
+            ('latestVersion', 'status'),
+            ('version', 'status'),
+            ('testCase', 'status'),
+            ('testcase', 'status'),
+        )
+        for parent_key, status_key in nested_status_paths:
+            parent_value = tc.get(parent_key)
+            if not isinstance(parent_value, dict):
+                continue
+            status = self._extract_zephyr_named_value(parent_value.get(status_key))
+            if status:
+                return status
+
+        return ''
 
     def get_test_case_key(self, tc: dict) -> str:
         return tc.get('key', tc.get('id', 'unknown'))
@@ -483,7 +519,17 @@ class ReleaseValidator:
                 total_tc_checked += 1
                 tc_key = self.zephyr.get_test_case_key(tc)
                 tc_name = self.zephyr.get_test_case_name(tc)
-                tc_status = self.zephyr.get_test_case_status(tc)
+                tc_details = self.zephyr.get_test_case_details(tc_key)
+                if tc_details:
+                    tc_name = self.zephyr.get_test_case_name(tc_details)
+                    tc_status = self.zephyr.get_test_case_status(tc_details)
+                else:
+                    tc_status = self.zephyr.get_test_case_status(tc)
+                    self._log_issue(
+                        issue_key, "warning",
+                        f"Zephyr ТК [{tc_key}] «{tc_name}»: не удалось получить детали ТК, "
+                        "статус проверяется по короткому ответу issuelink"
+                    )
 
                 # --- Проверка 1: статус Approved ---
                 if tc_status.lower() != ZEPHYR_APPROVED_STATUS.lower():
@@ -501,7 +547,6 @@ class ReleaseValidator:
 
                 # --- Проверка 2: «Вид тестирования» ---
                 if expected_testing_type or issue_key in hotfix_bug_keys:
-                    tc_details = self.zephyr.get_test_case_details(tc_key)
                     if tc_details:
                         actual_type = self.zephyr.get_test_case_custom_field(
                             tc_details, ZEPHYR_TESTING_TYPE_FIELD
@@ -533,6 +578,12 @@ class ReleaseValidator:
                                     f"Zephyr ТК [{tc_key}]: {ZEPHYR_TESTING_TYPE_FIELD} = "
                                     f"'{actual_type}' ✓"
                                 )
+                    else:
+                        self._log_issue(
+                            issue_key, "warning",
+                            f"Zephyr ТК [{tc_key}]: не удалось получить детали ТК "
+                            f"для проверки поля '{ZEPHYR_TESTING_TYPE_FIELD}'"
+                        )
 
         print(
             f"   Zephyr: проверено {total_tc_checked} ТК, "
