@@ -1157,8 +1157,8 @@ class ReleaseValidator:
         "HRPASSIST": 10.0,
     }
 
-    def _check_stories(self, release_key):
-        """Проверка Story: обязательные поля + Epic Link + время в тест-статусах + Task внутри Story"""
+    def _check_stories(self, release_key: str) -> None:
+        """Проверка Story: описание + обязательные поля + Epic Link + время в тест-статусах + Task внутри Story"""
         STORY_FIELDS = {
             'customfield_24000': 'Новая функциональность',
             'customfield_18400': 'Требуется НТ',
@@ -1172,7 +1172,7 @@ class ReleaseValidator:
             return
 
         keys_str = ",".join(linked_keys)
-        fields_req = f"summary,issuetype,assignee,issuelinks,{','.join(STORY_FIELDS.keys())},{EPIC_LINK_FIELD}"
+        fields_req = f"summary,description,issuetype,assignee,issuelinks,{','.join(STORY_FIELDS.keys())},{EPIC_LINK_FIELD}"
 
         try:
             story_issues = self.jira_main.search_issues(
@@ -1193,7 +1193,14 @@ class ReleaseValidator:
         for story in story_issues:
             story_project = story.key.split('-')[0]
 
-            # --- 1. Проверка полей customfield_24000 и customfield_18400 ---
+            # --- 1. Проверка описания Story ---
+            description = getattr(story.fields, 'description', None)
+            if description is None or (isinstance(description, str) and not description.strip()):
+                self._log_issue(story, "error", "Story: отсутствует описание")
+            else:
+                self._log_issue(story, "success", "Story: описание заполнено ✓")
+
+            # --- 2. Проверка полей customfield_24000 и customfield_18400 ---
             for field_id, field_name in STORY_FIELDS.items():
                 raw_val = getattr(story.fields, field_id, None)
 
