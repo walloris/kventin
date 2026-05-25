@@ -405,6 +405,7 @@ class ReleaseValidator:
         self._check_stories(release_key)
         self._check_cloud_label(release_key, release.fields.summary)
         self._check_sbrppl_third_party_label(release_key)
+        self._check_sbrppl_story_points(release_key)
 
         total_errors = sum(len(d['errors']) for d in self.report_data.values())
         return total_errors == 0
@@ -1360,6 +1361,61 @@ class ReleaseValidator:
                     issue,
                     "success",
                     "Лейбл '#Пульс_3лица' присутствует ✓"
+                )
+
+    def _check_sbrppl_story_points(self, release_key: str) -> None:
+        """
+        Проверяет обязательную оценку Story Points для Story/Bug проекта SBRPPL.
+
+        Поле Story Points в Jira: customfield_10002.
+        """
+        project_key = 'SBRPPL'
+        story_points_field = 'customfield_10002'
+        issue_types = {'story', 'bug', 'defect', 'ошибка'}
+
+        linked_keys = self._get_consist_of_issues(release_key)
+        if not linked_keys:
+            return
+
+        keys_str = ",".join(linked_keys)
+        try:
+            all_issues = self.jira_main.search_issues(
+                f'key in ({keys_str})',
+                fields=f'summary,issuetype,assignee,{story_points_field}',
+                maxResults=200
+            )
+        except Exception as e:
+            self._log_issue(
+                "GENERAL",
+                "error",
+                f"Ошибка проверки Story Points для SBRPPL: {e}"
+            )
+            return
+
+        target_issues = [
+            issue for issue in all_issues
+            if issue.key.split('-')[0] == project_key
+            and issue.fields.issuetype.name.lower() in issue_types
+        ]
+
+        if not target_issues:
+            return
+
+        for issue in target_issues:
+            story_points = getattr(issue.fields, story_points_field, None)
+            is_empty_string = isinstance(story_points, str) and not story_points.strip()
+            if story_points is None or is_empty_string:
+                self._log_issue(
+                    issue,
+                    "error",
+                    "Для задач Story/Bug проектной области SBRPPL "
+                    "обязательна оценка в Story Points (customfield_10002)"
+                )
+            else:
+                self._log_issue(
+                    issue,
+                    "success",
+                    f"Story Points заполнены: {story_points} ✓"
                 )
 
     def _check_bugs(self, release_key, is_hotfix: bool = False):
