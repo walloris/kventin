@@ -8,7 +8,7 @@
 
 import logging
 from datetime import datetime
-import re
+from typing import Any
 import html
 import urllib3
 from collections import defaultdict
@@ -62,7 +62,18 @@ class ReleaseArchiveUpdater:
                 'AND type = "Release 2.0" '
                 'AND created >= "2025-09-01"'
             )
-            return self.jira.search_issues(jql_query, maxResults=1000)
+            fields = [
+                'summary',
+                'status',
+                config['jira']['fields']['prod_installed_date_id'],
+                config['jira']['fields']['assignee_id'],
+                'customfield_18300',
+            ]
+            return self.jira.search_issues(
+                jql_query,
+                maxResults=1000,
+                fields=','.join(fields),
+            )
         except Exception as e:
             logging.error(f"Ошибка получения задач из JIRA: {str(e)}")
             raise
@@ -77,38 +88,69 @@ class ReleaseArchiveUpdater:
             logging.warning(f"Неверный формат даты: {date_str}. Ошибка: {e}")
             return None, None
 
-    def get_custom_field_value(self, issue, field_id):
+    def _extract_jira_field_text(
+        self,
+        raw_value: Any,
+        *,
+        prefer: str = "displayName",
+        depth: int = 0,
+    ) -> str:
+        """Безопасно извлекает текст из Jira-поля без str() на неизвестных объектах."""
+        if raw_value is None or depth > 4:
+            return ""
+        if isinstance(raw_value, str):
+            return raw_value.strip()
+        if isinstance(raw_value, (int, float, bool)):
+            return str(raw_value)
+        if isinstance(raw_value, list):
+            normalized_items = [
+                self._extract_jira_field_text(item, prefer=prefer, depth=depth + 1)
+                for item in raw_value[:50]
+            ]
+            normalized_items = [item for item in normalized_items if item]
+            return ", ".join(normalized_items)
+
+        attr_order = (
+            ("displayName", "value", "name")
+            if prefer == "displayName"
+            else ("value", "name", "displayName")
+        )
+
+        if isinstance(raw_value, dict):
+            for key in attr_order:
+                nested_value = raw_value.get(key)
+                if nested_value is None or nested_value == "":
+                    continue
+                extracted = self._extract_jira_field_text(
+                    nested_value,
+                    prefer=prefer,
+                    depth=depth + 1,
+                )
+                if extracted:
+                    return extracted
+            return ""
+
+        for attr in attr_order:
+            if not hasattr(raw_value, attr):
+                continue
+            nested_value = getattr(raw_value, attr, None)
+            if nested_value is None or nested_value == "" or nested_value is raw_value:
+                continue
+            extracted = self._extract_jira_field_text(
+                nested_value,
+                prefer=prefer,
+                depth=depth + 1,
+            )
+            if extracted:
+                return extracted
+        return ""
+
+    def get_custom_field_value(self, issue, field_id, prefer: str = "displayName"):
         """Безопасное получение значения кастомного поля"""
         try:
             value = getattr(issue.fields, field_id, "")
             if value:
-                def normalize_custom_value(raw_value):
-                    """Приводит значение Jira-поля к человекочитаемому тексту."""
-                    if raw_value is None:
-                        return ""
-                    if isinstance(raw_value, str):
-                        return raw_value
-                    if isinstance(raw_value, (int, float, bool)):
-                        return str(raw_value)
-                    if isinstance(raw_value, list):
-                        normalized_items = [
-                            normalize_custom_value(item)
-                            for item in raw_value
-                        ]
-                        normalized_items = [item for item in normalized_items if item]
-                        return ", ".join(normalized_items)
-                    if isinstance(raw_value, dict):
-                        for key in ("displayName", "value", "name"):
-                            if key in raw_value and raw_value[key]:
-                                return str(raw_value[key])
-                        return str(raw_value)
-                    for attr in ("displayName", "value", "name"):
-                        attr_value = getattr(raw_value, attr, None)
-                        if attr_value:
-                            return str(attr_value)
-                    return str(raw_value)
-
-                return normalize_custom_value(value)
+                return self._extract_jira_field_text(value, prefer=prefer)
             return ""
         except Exception as e:
             logging.warning(f"Ошибка получения поля {field_id}: {str(e)}")
@@ -124,8 +166,14 @@ class ReleaseArchiveUpdater:
         """Обработка задач JIRA и подготовка данных"""
         data_by_quarter = defaultdict(list)
 
-        for issue in issues:
+        total_issues = len(issues)
+        logging.info("Обработка %s релизов из JIRA...", total_issues)
+
+        for index, issue in enumerate(issues, start=1):
             try:
+                if index == 1 or index % 50 == 0 or index == total_issues:
+                    logging.info("Обработано релизов: %s/%s", index, total_issues)
+
                 main_issue = issue
                 custom_date_value = self.get_custom_field_value(
                     main_issue,
@@ -167,7 +215,11 @@ class ReleaseArchiveUpdater:
                     main_issue,
                     config['jira']['fields']['assignee_id']
                 )
-                ke_value = self.get_custom_field_value(main_issue, 'customfield_18300')
+                ke_value = self.get_custom_field_value(
+                    main_issue,
+                    'customfield_18300',
+                    prefer='value',
+                )
 
                 data_by_quarter[(quarter, year)].append({
                     'Дата': date_obj.strftime('%Y-%m-%d'),
@@ -200,7 +252,7 @@ class ReleaseArchiveUpdater:
             reverse=False
         )
 
-        html_content = '''
+        html_parts = ['''
         <style>
             .confluenceTable {
                 width: 100%;
@@ -218,7 +270,7 @@ class ReleaseArchiveUpdater:
                 border: 1px solid #ddd;
             }
         </style>
-        '''
+        ''']
 
         for quarter, year in sorted_quarters:
             data = data_by_quarter[(quarter, year)]
@@ -229,24 +281,24 @@ class ReleaseArchiveUpdater:
             is_current_quarter = quarter == self.current_quarter and year == self.current_year
             if is_current_quarter:
                 quarter_title += ' (Текущий)'
-                html_content += f'<h2>{quarter_title}</h2>'
+                html_parts.append(f'<h2>{quarter_title}</h2>')
             else:
-                html_content += (
+                html_parts.append(
                     '<ac:structured-macro ac:name="expand">'
                     f'<ac:parameter ac:name="title">{html.escape(quarter_title)}</ac:parameter>'
                     '<ac:rich-text-body>'
                 )
 
-            html_content += '<table class="confluenceTable"><tbody>'
-            html_content += '<tr>'
-            html_content += '<th>Тип релиза</th>'
-            html_content += '<th>Ссылка на релиз</th>'
-            html_content += '<th>Дата</th>'
-            html_content += '<th>До/После релиза</th>'
-            html_content += '<th>Статус</th>'
-            html_content += '<th>КЭ</th>'
-            html_content += '<th>Ответственный</th>'
-            html_content += '</tr>'
+            html_parts.append('<table class="confluenceTable"><tbody>')
+            html_parts.append('<tr>')
+            html_parts.append('<th>Тип релиза</th>')
+            html_parts.append('<th>Ссылка на релиз</th>')
+            html_parts.append('<th>Дата</th>')
+            html_parts.append('<th>До/После релиза</th>')
+            html_parts.append('<th>Статус</th>')
+            html_parts.append('<th>КЭ</th>')
+            html_parts.append('<th>Ответственный</th>')
+            html_parts.append('</tr>')
 
             for row in sorted_data:
                 # Определяем стили для ячеек
@@ -262,21 +314,21 @@ class ReleaseArchiveUpdater:
                 # Стиль для "Статус"
                 status_style = 'background-color: #FFCCCC;' if row['Статус'] == 'Отменено' else ''
 
-                html_content += '<tr>'
-                html_content += f'<td style="{type_style}">{html.escape(row["Тип релиза"])}</td>'
-                html_content += f'<td>{row["Ссылка на релиз"]}</td>'
-                html_content += f'<td>{row["Дата"]}</td>'
-                html_content += f'<td style="{days_style}">{html.escape(row["До/После релиза"])}</td>'
-                html_content += f'<td style="{status_style}">{html.escape(row["Статус"])}</td>'
-                html_content += f'<td>{html.escape(row["КЭ"])}</td>'
-                html_content += f'<td>{html.escape(row["Ответственный"])}</td>'
-                html_content += '</tr>'
+                html_parts.append('<tr>')
+                html_parts.append(f'<td style="{type_style}">{html.escape(row["Тип релиза"])}</td>')
+                html_parts.append(f'<td>{row["Ссылка на релиз"]}</td>')
+                html_parts.append(f'<td>{row["Дата"]}</td>')
+                html_parts.append(f'<td style="{days_style}">{html.escape(row["До/После релиза"])}</td>')
+                html_parts.append(f'<td style="{status_style}">{html.escape(row["Статус"])}</td>')
+                html_parts.append(f'<td>{html.escape(row["КЭ"])}</td>')
+                html_parts.append(f'<td>{html.escape(row["Ответственный"])}</td>')
+                html_parts.append('</tr>')
 
-            html_content += '</tbody></table>'
+            html_parts.append('</tbody></table>')
             if not is_current_quarter:
-                html_content += '</ac:rich-text-body></ac:structured-macro>'
+                html_parts.append('</ac:rich-text-body></ac:structured-macro>')
 
-        return html_content
+        return ''.join(html_parts)
 
     def update_confluence_page(self, data_by_quarter):
         """Обновление страницы в Confluence"""
