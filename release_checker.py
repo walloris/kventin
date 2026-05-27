@@ -15,6 +15,13 @@ except ImportError:
     print("⚠️ Внимание: не удалось импортировать analyze_bugs_standalone из bugsAnalyse.py")
     def analyze_bugs_standalone(*args, **kwargs): return []
 
+try:
+    from gigachat import get_gigachat_token, check_summary_description_match
+except ImportError:
+    print("⚠️ Внимание: не удалось импортировать функции из gigachat.py")
+    def get_gigachat_token(env): return None
+    def check_summary_description_match(env, batch, access_token, max_retries=3): return None
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Глушим все WARNING логи (jira rate-limit, confluence, requests и т.д.)
@@ -442,6 +449,7 @@ class ReleaseValidator:
         self._check_cloud_label(release_key, release.fields.summary)
         self._check_sbrppl_third_party_label(release_key)
         self._check_sbrppl_story_points(release_key)
+        self._check_summary_description_match(release_key)
 
         total_errors = sum(len(d['errors']) for d in self.report_data.values())
         return total_errors == 0
@@ -1475,6 +1483,130 @@ class ReleaseValidator:
                     "success",
                     f"Story Points заполнены: {story_points} ✓"
                 )
+
+    def _check_summary_description_match(self, release_key: str) -> None:
+        """
+        Проверяет через GigaChat соответствие summary↔description у Story/Bug/Defect/Ошибка.
+
+        Сначала пробуем env='ift', при недоступности — fallback на env='dev'.
+        Любая проблема (нет токена, нет ответа, mismatch) логируется как warning,
+        чтобы не блокировать релиз.
+        """
+        issue_types_to_check = {'story', 'bug', 'defect', 'ошибка'}
+
+        linked_keys = self._get_consist_of_issues(release_key)
+        if not linked_keys:
+            return
+
+        keys_str = ",".join(linked_keys)
+        try:
+            issues = self.jira_main.search_issues(
+                f'key in ({keys_str})',
+                fields='summary,description,issuetype,assignee',
+                maxResults=500,
+            )
+        except Exception as e:
+            self._log_issue(
+                "GENERAL",
+                "warning",
+                f"GigaChat: не удалось получить задачи для проверки summary↔description: {e}",
+            )
+            return
+
+        candidates = []
+        candidate_issue_by_key: dict = {}
+        for issue in issues:
+            issue_type = (issue.fields.issuetype.name or '').lower() if issue.fields.issuetype else ''
+            if issue_type not in issue_types_to_check:
+                continue
+            description = getattr(issue.fields, 'description', None) or ''
+            summary = issue.fields.summary or ''
+            if not summary.strip() or not description.strip():
+                continue
+            candidates.append({
+                'key': issue.key,
+                'summary': summary,
+                'description': description,
+            })
+            candidate_issue_by_key[issue.key] = issue
+
+        if not candidates:
+            return
+
+        token = None
+        used_env = None
+        for env_candidate in ('ift', 'dev'):
+            try:
+                token = get_gigachat_token(env_candidate)
+            except Exception as e:
+                self._log_issue(
+                    "GENERAL",
+                    "warning",
+                    f"GigaChat: ошибка получения токена ({env_candidate}): {e}",
+                )
+                token = None
+            if token:
+                used_env = env_candidate
+                break
+
+        if not token or not used_env:
+            self._log_issue(
+                "GENERAL",
+                "warning",
+                "GigaChat: не удалось получить токен ни на ift, ни на dev — проверка summary↔description пропущена",
+            )
+            return
+
+        try:
+            analysis = check_summary_description_match(used_env, candidates, token)
+        except Exception as e:
+            self._log_issue(
+                "GENERAL",
+                "warning",
+                f"GigaChat: сбой при проверке summary↔description ({used_env}): {e}",
+            )
+            return
+
+        if analysis is None:
+            self._log_issue(
+                "GENERAL",
+                "warning",
+                f"GigaChat: пустой ответ от модели на {used_env} — проверка summary↔description пропущена",
+            )
+            return
+
+        analyzed_keys = set()
+        for item in analysis:
+            issue_key = item.get('key', '')
+            issue_obj = candidate_issue_by_key.get(issue_key)
+            if not issue_obj:
+                continue
+            analyzed_keys.add(issue_key)
+            reason = item.get('reason') or 'без причины'
+            if item.get('is_match'):
+                self._log_issue(
+                    issue_obj,
+                    "success",
+                    f"GigaChat: summary соответствует description ✓ ({reason})",
+                )
+            else:
+                self._log_issue(
+                    issue_obj,
+                    "warning",
+                    f"GigaChat: summary не соответствует description — {reason}",
+                )
+
+        for candidate in candidates:
+            if candidate['key'] in analyzed_keys:
+                continue
+            issue_obj = candidate_issue_by_key.get(candidate['key'])
+            if not issue_obj:
+                continue
+            self._log_issue(
+                issue_obj,
+                "warning",
+                "GigaChat: не вернул вердикт по этой задаче — проверка summary↔description пропущена",
+            )
 
     def _check_bugs(self, release_key, is_hotfix: bool = False):
         VALID_DETECTION_METHODS = {"АТ НФ", "АТ Регресс", "Регрессионное тестирование", "Тестирование НФ"}
