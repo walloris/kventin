@@ -98,11 +98,11 @@ class ReleaseArchiveUpdater:
                         normalized_items = [item for item in normalized_items if item]
                         return ", ".join(normalized_items)
                     if isinstance(raw_value, dict):
-                        for key in ("value", "name", "displayName"):
+                        for key in ("displayName", "value", "name"):
                             if key in raw_value and raw_value[key]:
                                 return str(raw_value[key])
                         return str(raw_value)
-                    for attr in ("value", "name", "displayName"):
+                    for attr in ("displayName", "value", "name"):
                         attr_value = getattr(raw_value, attr, None)
                         if attr_value:
                             return str(attr_value)
@@ -226,10 +226,17 @@ class ReleaseArchiveUpdater:
             sorted_data = sorted(data, key=lambda x: x['Дата'], reverse=True)
 
             quarter_title = f'Квартал {quarter} {year}'
-            if quarter == self.current_quarter and year == self.current_year:
+            is_current_quarter = quarter == self.current_quarter and year == self.current_year
+            if is_current_quarter:
                 quarter_title += ' (Текущий)'
+                html_content += f'<h2>{quarter_title}</h2>'
+            else:
+                html_content += (
+                    '<ac:structured-macro ac:name="expand">'
+                    f'<ac:parameter ac:name="title">{html.escape(quarter_title)}</ac:parameter>'
+                    '<ac:rich-text-body>'
+                )
 
-            html_content += f'<h2>{quarter_title}</h2>'
             html_content += '<table class="confluenceTable"><tbody>'
             html_content += '<tr>'
             html_content += '<th>Тип релиза</th>'
@@ -266,6 +273,8 @@ class ReleaseArchiveUpdater:
                 html_content += '</tr>'
 
             html_content += '</tbody></table>'
+            if not is_current_quarter:
+                html_content += '</ac:rich-text-body></ac:structured-macro>'
 
         return html_content
 
