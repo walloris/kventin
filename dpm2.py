@@ -82,11 +82,33 @@ class ReleaseArchiveUpdater:
         try:
             value = getattr(issue.fields, field_id, "")
             if value:
-                if isinstance(value, list):
-                    return ", ".join(map(str, value))
-                elif hasattr(value, 'displayName'):
-                    return value.displayName
-                return str(value)
+                def normalize_custom_value(raw_value):
+                    """Приводит значение Jira-поля к человекочитаемому тексту."""
+                    if raw_value is None:
+                        return ""
+                    if isinstance(raw_value, str):
+                        return raw_value
+                    if isinstance(raw_value, (int, float, bool)):
+                        return str(raw_value)
+                    if isinstance(raw_value, list):
+                        normalized_items = [
+                            normalize_custom_value(item)
+                            for item in raw_value
+                        ]
+                        normalized_items = [item for item in normalized_items if item]
+                        return ", ".join(normalized_items)
+                    if isinstance(raw_value, dict):
+                        for key in ("value", "name", "displayName"):
+                            if key in raw_value and raw_value[key]:
+                                return str(raw_value[key])
+                        return str(raw_value)
+                    for attr in ("value", "name", "displayName"):
+                        attr_value = getattr(raw_value, attr, None)
+                        if attr_value:
+                            return str(attr_value)
+                    return str(raw_value)
+
+                return normalize_custom_value(value)
             return ""
         except Exception as e:
             logging.warning(f"Ошибка получения поля {field_id}: {str(e)}")
