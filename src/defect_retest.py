@@ -379,9 +379,89 @@ def run_retest_playwright(description: str, fallback_start_url: str) -> Tuple[bo
                     pass
 
 
+def process_retest_issue(key: str) -> bool:
+    """
+    Ретест одного дефекта Kventin по ключу.
+
+    Поток: changelog → перевод в QA → воспроизведение шагов (Playwright) →
+    Resolved/Fixed при успехе либо In Progress + назначение при провале.
+
+    Parameters
+    ----------
+    key:
+        Ключ задачи Jira (например ``KVEN-123``).
+
+    Returns
+    -------
+    bool
+        True, если задача была обработана (любой исход ретеста);
+        False, если issue не удалось загрузить или не удалось перевести в QA.
+    """
+    code, full, raw_tail = get_issue_with_changelog(key)
+    if code != 200 or not full:
+        print(f"[retest] {key}: не удалось загрузить issue ({code}): {raw_tail[:200]}")
+        return False
+
+    fields = full.get("fields") or {}
+    changelog = full.get("changelog")
+    author = find_author_who_moved_to_status(changelog, JIRA_RETEST_STATUS_READY_FOR_QA)
+    assign_back = author_to_assignee_value(author) or JIRA_RETEST_FALLBACK_ASSIGNEE
+
+    if not start_qa_transition(key):
+        add_issue_comment(
+            key,
+            "h3. Kventin retest\nНе удалось перевести задачу в QA — проверьте workflow и JIRA_RETEST_STATUS_QA.",
+        )
+        return False
+
+    desc_text = extract_description_text(fields)
+    ok, msg = run_retest_playwright(desc_text, START_URL)
+
+    if ok:
+        if resolve_issue_fixed(key):
+            add_issue_comment(
+                key,
+                f"h3. Kventin retest — пройден\nАвтоматический ретест по шагам из описания выполнен успешно.\n{{quote}}{msg}{{quote}}",
+            )
+            print(f"[retest] {key}: Fixed (Resolved)")
+        else:
+            add_issue_comment(
+                key,
+                "h3. Kventin retest — пройден (статус)\nРетест ОК, но не удалось выставить Resolved/Fixed через API — переведите вручную.",
+            )
+            print(f"[retest] {key}: ретест OK, переход Resolved не удался")
+    else:
+        body_comment = (
+            f"h3. Kventin retest — не пройден\n{{quote}}{msg}{{quote}}\n"
+            f"Задача возвращена в работу (In Progress)."
+        )
+        if reopen_or_move_to_in_progress(key, assignee_value=assign_back):
+            add_issue_comment(key, body_comment)
+            print(f"[retest] {key}: In Progress, назначено на {assign_back or '—'}")
+        else:
+            add_issue_comment(key, body_comment + "\nНе удалось выполнить переход In Progress через API.")
+            print(f"[retest] {key}: не удалось In Progress (см. комментарий)")
+
+    return True
+
+
+def collect_retest_issue_keys(max_results: int = 0) -> List[str]:
+    """
+    Вернуть ключи дефектов Kventin в статусе Ready for QA (для очереди демона).
+
+    max_results=0 — взять JIRA_RETEST_MAX_ISSUES (или 100, если не ограничено).
+    """
+    max_n = max_results or (JIRA_RETEST_MAX_ISSUES if JIRA_RETEST_MAX_ISSUES > 0 else 100)
+    issue_summaries = search_kventin_issues_by_status(
+        JIRA_RETEST_STATUS_READY_FOR_QA,
+        max_results=max_n,
+    )
+    return [it.get("key") for it in issue_summaries if it.get("key")]
+
+
 def run_kventin_defect_retests() -> int:
     """
-    CLI: обработать тикеты Kventin в статусе Ready for QA.
+    CLI: обработать тикеты Kventin в статусе Ready for QA (один прогон).
 
     Returns
     -------
@@ -397,69 +477,17 @@ def run_kventin_defect_retests() -> int:
         )
         return 2
 
-    max_n = JIRA_RETEST_MAX_ISSUES if JIRA_RETEST_MAX_ISSUES > 0 else 100
-    issue_summaries = search_kventin_issues_by_status(
-        JIRA_RETEST_STATUS_READY_FOR_QA,
-        max_results=max_n,
-    )
-    if not issue_summaries:
+    keys = collect_retest_issue_keys()
+    if not keys:
         print(f"[retest] Нет задач с лейблом kventin в статусе «{JIRA_RETEST_STATUS_READY_FOR_QA}».")
         return 0
 
-    print(
-        f"[retest] Найдено {len(issue_summaries)} задач(и) в «{JIRA_RETEST_STATUS_READY_FOR_QA}». "
-        f"Ретест (макс. {max_n})…"
-    )
+    print(f"[retest] Найдено {len(keys)} задач(и) в «{JIRA_RETEST_STATUS_READY_FOR_QA}». Ретест…")
 
     processed = 0
-    for item in issue_summaries:
-        key = item.get("key") or "?"
-        code, full, raw_tail = get_issue_with_changelog(key)
-        if code != 200 or not full:
-            print(f"[retest] {key}: не удалось загрузить issue ({code}): {raw_tail[:200]}")
-            continue
-
-        fields = full.get("fields") or {}
-        changelog = full.get("changelog")
-        author = find_author_who_moved_to_status(changelog, JIRA_RETEST_STATUS_READY_FOR_QA)
-        assign_back = author_to_assignee_value(author) or JIRA_RETEST_FALLBACK_ASSIGNEE
-
-        if not start_qa_transition(key):
-            add_issue_comment(
-                key,
-                "h3. Kventin retest\nНе удалось перевести задачу в QA — проверьте workflow и JIRA_RETEST_STATUS_QA.",
-            )
-            continue
-
-        desc_text = extract_description_text(fields)
-        ok, msg = run_retest_playwright(desc_text, START_URL)
-
-        if ok:
-            if resolve_issue_fixed(key):
-                add_issue_comment(
-                    key,
-                    f"h3. Kventin retest — пройден\nАвтоматический ретест по шагам из описания выполнен успешно.\n{{quote}}{msg}{{quote}}",
-                )
-                print(f"[retest] {key}: Fixed (Resolved)")
-            else:
-                add_issue_comment(
-                    key,
-                    "h3. Kventin retest — пройден (статус)\nРетест ОК, но не удалось выставить Resolved/Fixed через API — переведите вручную.",
-                )
-                print(f"[retest] {key}: ретест OK, переход Resolved не удался")
-        else:
-            body_comment = (
-                f"h3. Kventin retest — не пройден\n{{quote}}{msg}{{quote}}\n"
-                f"Задача возвращена в работу (In Progress)."
-            )
-            if reopen_or_move_to_in_progress(key, assignee_value=assign_back):
-                add_issue_comment(key, body_comment)
-                print(f"[retest] {key}: In Progress, назначено на {assign_back or '—'}")
-            else:
-                add_issue_comment(key, body_comment + "\nНе удалось выполнить переход In Progress через API.")
-                print(f"[retest] {key}: не удалось In Progress (см. комментарий)")
-
-        processed += 1
+    for key in keys:
+        if process_retest_issue(key):
+            processed += 1
 
     print(f"[retest] Готово, обработано задач: {processed}.")
     return 0

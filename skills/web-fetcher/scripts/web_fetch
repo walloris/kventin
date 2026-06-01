@@ -1,0 +1,27 @@
+#!/bin/bash
+# web_fetch - инструмент для извлечения содержимого веб-страниц и API
+# Использование: ./tools/web_fetch <URL> [OPTIONS]  (BASH wrapper)
+#            или: ./tools/web_fetch.py <URL> [OPTIONS] (Python, corporate-safe)
+#
+# Для корпоративной среды рекомендуется использовать Python-версию:
+#   ./tools/web_fetch.py <URL> [OPTIONS]
+#
+# BASH-версия может не работать если curl заблокирован политикой безопасности
+#
+# Примеры:
+#   ./tools/web_fetch.py https://api.example.com/data
+#   ./tools/web_fetch.py https://api.example.com/data -o output.json
+
+set -e
+
+# Используем системный Python (из /usr/bin/python3) для корректной работы с SSL
+PYTHON_CMD="/usr/bin/python3"
+
+# Проверка наличия Python
+if ! command -v $PYTHON_CMD &> /dev/null; then
+    echo "Ошибка: системный Python не найден по пути $PYTHON_CMD" >&2
+    exit 1
+fi
+
+# Передаём все аргументы Python-версии
+exec $PYTHON_CMD "$(dirname "$0")/web_fetch.py" "$@"

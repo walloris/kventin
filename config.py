@@ -25,6 +25,39 @@ ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llava")
 
+# --- gigacode CLI как «мозг» (LLM_PROVIDER=gigacode_cli) ---
+# Агентный CLI запускается как подпроцесс в неинтерактивном режиме и возвращает ответ в stdout.
+# Флаги по умолчанию — совместимые с Claude Code (gigacode -p ... --output-format json).
+GIGACODE_CLI_BIN = os.getenv("GIGACODE_CLI_BIN", "gigacode").strip()
+# Дополнительные аргументы (через пробел). Управляют неинтерактивным режимом и форматом вывода.
+GIGACODE_CLI_ARGS = os.getenv("GIGACODE_CLI_ARGS", "-p --output-format json").strip()
+# Таймаут одного вызова CLI (сек). Агентная сессия стартует медленнее REST.
+GIGACODE_CLI_TIMEOUT_SEC = int(os.getenv("GIGACODE_CLI_TIMEOUT_SEC", "180"))
+# Рабочая директория для запуска CLI (откуда подхватываются .gigacode/skills и agents). Пусто = CWD.
+GIGACODE_CLI_CWD = os.getenv("GIGACODE_CLI_CWD", "").strip()
+# Как передавать промпт: stdin (по умолчанию, безопасно для длинных текстов) или arg.
+GIGACODE_CLI_PASS_PROMPT = os.getenv("GIGACODE_CLI_PASS_PROMPT", "stdin").strip().lower()
+# Передавать ли скриншот: CLI читает изображение по пути, указанному в промпте.
+GIGACODE_CLI_SEND_IMAGE = os.getenv("GIGACODE_CLI_SEND_IMAGE", "true").lower() in ("1", "true", "yes")
+# Флаг --append-system-prompt для системного промпта (если CLI поддерживает).
+GIGACODE_CLI_SYSTEM_FLAG = os.getenv("GIGACODE_CLI_SYSTEM_FLAG", "--append-system-prompt").strip()
+# Имя поля в JSON-выводе, где лежит текст ответа (Claude Code: result).
+GIGACODE_CLI_JSON_RESULT_KEY = os.getenv("GIGACODE_CLI_JSON_RESULT_KEY", "result").strip()
+
+# --- Демон ретеста/тестирования задач ---
+# Интервал между прогонами демона (сек). По умолчанию 15 минут.
+DAEMON_INTERVAL_SEC = int(os.getenv("DAEMON_INTERVAL_SEC", "900"))
+# Файл блокировки единственного экземпляра демона.
+DAEMON_LOCK_FILE = os.getenv("DAEMON_LOCK_FILE", "./.kventin-daemon.lock").strip()
+# Статус задач (не дефектов), готовых к тестированию демоном (тест-кейсы + exploratory).
+JIRA_DAEMON_TASK_STATUS = os.getenv("JIRA_DAEMON_TASK_STATUS", "").strip()
+# Сколько задач обрабатывать за один прогон (0 = как у ретеста).
+JIRA_DAEMON_TASK_MAX = int(os.getenv("JIRA_DAEMON_TASK_MAX", "10"))
+# Каталог артефактов doc-as-code (тест-кейсы, чек-листы, тест-планы).
+DOC_AS_CODE_DIR = os.getenv("DOC_AS_CODE_DIR", "doc-as-code").strip()
+# Каталог со скиллами для CLI (test-case-writer и т.д.). Пусто = <repo>/skills.
+GIGACODE_SKILLS_DIR = os.getenv("GIGACODE_SKILLS_DIR", "").strip()
+
 # GigaChat (Keycloak password grant + gateway, как в рабочем примере)
 GIGACHAT_TOKEN_HEADER = os.getenv("GIGACHAT_TOKEN_HEADER", "")  # опционально: готовый "Bearer eyJ..."
 GIGACHAT_API_URL = os.getenv("GIGACHAT_API_URL", "")  # единый URL чата (если не заданы _DEV/_IFT)

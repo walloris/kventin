@@ -21,6 +21,11 @@ def get_llm_client():
     except ImportError:
         LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gigachat").strip().lower()
 
+    if LLM_PROVIDER in ("gigacode", "gigacode_cli", "cli"):
+        from src.gigacode_cli_client import GigacodeCliClient
+        LOG.info("Using LLM: gigacode CLI")
+        return GigacodeCliClient()
+
     if LLM_PROVIDER == "jan":
         from src.jan_client import JanClient
         LOG.info("Using LLM: Jan")

@@ -1,0 +1,390 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<project>
+    <projectId>88701</projectId>
+    <projectKey>HRPQA</projectKey>
+    <modelVersion>1.0</modelVersion>
+    <jiraVersion>8.20.11</jiraVersion>
+    <exportDate>2026-06-01 07:37:07 UTC</exportDate>
+    <folders>
+        <folder fullPath="Функциональные тест-кейсы" index="0"/>
+        <folder fullPath="Функциональные тест-кейсы/Каркас" index="5"/>
+        <folder fullPath="Функциональные тест-кейсы/Каркас/HRP.SmartProfile (Smart профиль) [CI02295205]" index="1"/>
+        <folder fullPath="Функциональные тест-кейсы/Каркас/HRP.SmartProfile (Smart профиль) [CI02295205]/Пульс API" index="1"/>
+        <folder fullPath="Функциональные тест-кейсы/Каркас/HRP.SmartProfile (Smart профиль) [CI02295205]/Пульс API/app_smart_profile" index="0"/>
+        <folder fullPath="Функциональные тест-кейсы/Каркас/HRP.SmartProfile (Smart профиль) [CI02295205]/Пульс API/app_smart_profile/top600" index="4"/>
+        <folder fullPath="Функциональные тест-кейсы/Каркас/HRP.SmartProfile (Smart профиль) [CI02295205]/Пульс API/app_smart_profile/top600/Тандеми виджет" index="0"/>
+        <folder fullPath="Функциональные тест-кейсы/Каркас/HRP.SmartProfile (Smart профиль) [CI02295205]/Сотрудник" index="3"/>
+        <folder fullPath="Функциональные тест-кейсы/Каркас/HRP.SmartProfile (Smart профиль) [CI02295205]/Сотрудник/Визитка" index="1"/>
+        <folder fullPath="Функциональные тест-кейсы/Каркас/HRP.SmartProfile (Smart профиль) [CI02295205]/Сотрудник/Визитка/Кнопки" index="20"/>
+        <folder fullPath="Функциональные тест-кейсы/Каркас/HRP.SmartProfile (Smart профиль) [CI02295205]/Сотрудник/Визитка/Контакты" index="9"/>
+        <folder fullPath="Функциональные тест-кейсы/Каркас/HRP.SmartProfile (Smart профиль) [CI02295205]/Сотрудник/Визитка/Контакты/Звонки" index="5"/>
+    </folders>
+    <testCases>
+        <testCase id="14737077" key="HRPQA-T129003">
+            <attachments/>
+            <confluencePageLinks/>
+            <createdBy>Канаев Леонид Олегович</createdBy>
+            <createdOn>2026-03-24 13:16:06 UTC</createdOn>
+            <customFields>
+                <customField name="Автоматизирован" type="SINGLE_CHOICE_SELECT_LIST">
+                    <value><![CDATA[Готов к автоматизации]]></value>
+                </customField>
+                <customField name="АС" type="SINGLE_CHOICE_SELECT_LIST">
+                    <value><![CDATA[HRP.SmartProfile (Smart профиль) [CI02295205]]]></value>
+                </customField>
+                <customField name="Проверяется при внедрении Cloud" type="SINGLE_CHOICE_SELECT_LIST">
+                    <value><![CDATA[Нет]]></value>
+                </customField>
+                <customField name="Команда" type="SINGLE_CHOICE_SELECT_LIST">
+                    <value><![CDATA[Профиль сотрудника [61146085]]]></value>
+                </customField>
+                <customField name="Smoke" type="SINGLE_CHOICE_SELECT_LIST">
+                    <value><![CDATA[Нет]]></value>
+                </customField>
+                <customField name="Негативный" type="SINGLE_CHOICE_SELECT_LIST">
+                    <value><![CDATA[Да]]></value>
+                </customField>
+                <customField name="Вид тестирования" type="SINGLE_CHOICE_SELECT_LIST">
+                    <value><![CDATA[Регресс]]></value>
+                </customField>
+                <customField name="Sigma" type="CHECKBOX">
+                    <value><![CDATA[true]]></value>
+                </customField>
+                <customField name="Уровень теста" type="SINGLE_CHOICE_SELECT_LIST">
+                    <value><![CDATA[API]]></value>
+                </customField>
+            </customFields>
+            <estimatedTime>300000</estimatedTime>
+            <folder><![CDATA[Функциональные тест-кейсы/Каркас/HRP.SmartProfile (Smart профиль) [CI02295205]/Пульс API/app_smart_profile/top600/Тандеми виджет]]></folder>
+            <issues>
+                <issue>
+                    <key>SFILE-11162</key>
+                    <summary><![CDATA[Top 600+600]]></summary>
+                </issue>
+                <issue>
+                    <key>SFILE-11273</key>
+                    <summary><![CDATA[[back] Изменение уровня грейда при отображении тандеми]]></summary>
+                </issue>
+            </issues>
+            <labels>
+                <label><![CDATA[API]]></label>
+            </labels>
+            <name><![CDATA[GET /web/widgets/data?widgets=tandemy data.userId грейд ниже 16]]></name>
+            <objective><![CDATA[г. Иначе, если ответ пустой, не заполняем объект tandemy <br />Аналитика:<br />https://confluence.sberbank.ru/pages/viewpage.action?pageId=23021781342#expand-]]></objective>
+            <owner>JIRAUSER1693565</owner>
+            <precondition><![CDATA[1. У пользователя есть тандеми<br />Запрос на добавление в таблицу, база SMProf, схема main:<br /><strong>INSERT</strong> <strong>INTO</strong> top600_tandemy (user_id, <strong>data</strong>, <strong>version</strong>)<br /><strong>VALUES</strong> ( 'd2d6c426-15ec-4570-9359-7cff04dc0930', '{"userId":"d2d6c426-15ec-4570-9359-7cff04dc0930","tandemyId":"d8fe5309-7707-4d42-ba6e-a4c3f536ce9a","photoUrl":"/common/pics/d8fe5309-7707-4d42-ba6e-a4c3f536ce9a/c9b90b4b-7c71-4fd3-8425-99ced463f4ce/userphoto.jpeg?hash=EQHkOaDXFQyQFBP4qzNPlw","firstName":"Имя","lastName":"Фамилия00004441","dateFrom":"27.03.2026","dateTo":"30.10.2026"}', 1);<br />Для добавления других тандеми, достаточно заменить tandemyId<br />2. Тогл show_tandemy включен<br />3. Грейд руководителя (userId) ниже 16]]></precondition>
+            <priority><![CDATA[Normal]]></priority>
+            <status><![CDATA[Approved]]></status>
+            <parameters/>
+            <testScript type="steps">
+                <steps>
+                    <step index="0">
+                        <customFields/>
+                        <description><![CDATA[Сделать GET запрос<br />path: /web/widgets/data<br />params: widgets=tandemy&amp;userId=%{userId}]]></description>
+                        <expectedResult><![CDATA[Статус код ответа 200<br />"success": true,"status": "OK",<br />data.code = "tandemy"<br />data.data = {}<br /><br />Пример ответа:<br />{<br />    "success": true,<br />    "status": "OK",<br />    "data": [<br />        {<br />            "code": "tandemy",<br />            "data": {}<br />        }<br />    ]<br />}<br /><br />]]></expectedResult>
+                        <testData><![CDATA[]]></testData>
+                    </step>
+                </steps>
+            </testScript>
+            <updatedBy>Метляев Игорь Андреевич</updatedBy>
+            <updatedOn>2026-04-20 15:25:06 UTC</updatedOn>
+        </testCase>
+        <testCase id="14897588" key="HRPQA-T135249">
+            <attachments/>
+            <confluencePageLinks/>
+            <createdBy>Синица Захар Алексеевич</createdBy>
+            <createdOn>2026-05-04 19:13:37 UTC</createdOn>
+            <customFields>
+                <customField name="Вид тестирования" type="SINGLE_CHOICE_SELECT_LIST">
+                    <value><![CDATA[Регресс]]></value>
+                </customField>
+                <customField name="Проверяется при внедрении Cloud" type="SINGLE_CHOICE_SELECT_LIST">
+                    <value><![CDATA[Нет]]></value>
+                </customField>
+                <customField name="АС" type="SINGLE_CHOICE_SELECT_LIST">
+                    <value><![CDATA[HRP.SmartProfile (Smart профиль) [CI02295205]]]></value>
+                </customField>
+                <customField name="Команда" type="SINGLE_CHOICE_SELECT_LIST">
+                    <value><![CDATA[Профиль сотрудника [61146085]]]></value>
+                </customField>
+                <customField name="Sigma" type="CHECKBOX">
+                    <value><![CDATA[true]]></value>
+                </customField>
+                <customField name="Автоматизирован" type="SINGLE_CHOICE_SELECT_LIST">
+                    <value><![CDATA[Готов к автоматизации]]></value>
+                </customField>
+                <customField name="Уровень теста" type="SINGLE_CHOICE_SELECT_LIST">
+                    <value><![CDATA[API]]></value>
+                </customField>
+                <customField name="Smoke" type="SINGLE_CHOICE_SELECT_LIST">
+                    <value><![CDATA[Нет]]></value>
+                </customField>
+                <customField name="Актуализирован" type="MULTI_CHOICE_SELECT_LIST">
+                    <value><![CDATA[Да]]></value>
+                </customField>
+            </customFields>
+            <estimatedTime>18000000</estimatedTime>
+            <folder><![CDATA[Функциональные тест-кейсы/Каркас/HRP.SmartProfile (Smart профиль) [CI02295205]/Сотрудник/Визитка/Контакты/Звонки]]></folder>
+            <issues>
+                <issue>
+                    <key>SFILE-11347</key>
+                    <summary><![CDATA[[back][addressbook] Изменить поведение и отображение звонка на номер]]></summary>
+                </issue>
+            </issues>
+            <labels>
+                <label><![CDATA[Web]]></label>
+                <label><![CDATA[iPad]]></label>
+                <label><![CDATA[Sigma]]></label>
+            </labels>
+            <name><![CDATA[[back] Сотрудник. Звонки. Вызов метода отображения виджета contacts для другого профиля]]></name>
+            <objective><![CDATA[Проверка вызова метода GET web/widgets/data?widgets=contacts&amp;userId=%{userId} для другого профиля]]></objective>
+            <owner>JIRAUSER1794425</owner>
+            <precondition><![CDATA[Пользователь авторизован в системе]]></precondition>
+            <priority><![CDATA[Normal]]></priority>
+            <status><![CDATA[Approved]]></status>
+            <parameters/>
+            <testScript type="steps">
+                <steps>
+                    <step index="0">
+                        <customFields/>
+                        <description><![CDATA[Вызвать метод GET web/widgets/data?widgets=contacts&amp;userId=%{userId}]]></description>
+                        <expectedResult><![CDATA[Пример ответа:<br /><div><code>{</code></div><div><code>    </code><code>"success"</code><code>: </code><code>true</code><code>,</code></div><div><code>    </code><code>"status"</code><code>: </code><code>"OK"</code><code>,</code></div><div><code>    </code><code>"data"</code><code>: [</code></div><div><code>    </code><code>{</code></div><div><code>        </code><code>"code"</code><code>: </code><code>"contacts"</code><code>,</code></div><div><code>        </code><code>"data"</code><code>: {</code></div><div><code>            </code><code>"callOptions"</code><code>: {</code></div><div><code>                </code><code>"allowCalling"</code><code>: </code><code>true</code><code>,</code></div><div><code>                </code><code>"callHint"</code><code>: </code><code>"После подтверждения вызова на ваш номер поступит звонок от Сбера, а затем будет установлено соединение с абонентом."</code><code>,</code></div><div><code>                </code><code>"buttonHint"</code><code>: </code><code>"позвонить по номеру"</code><code>,</code></div><div><code>                </code><code>"caller"</code><code>: {</code></div><div><code>                    </code><code>"photoURL"</code><code>: </code><code>"/api-web/cs/api/1/common/pics/142818f9-8bfd-4354-b4c4-579ad324e726/adab798b-22e9-4121-afa5-e354c1465533/userphoto.jpeg"</code><code>,</code></div><div><code>                    </code><code>"callerFio"</code><code>: </code><code>"Иван Иванов"</code><code>,</code></div><div><code>                    </code><code>"availablePhones"</code><code>: [</code></div><div><code>                    </code><code>{</code></div><div><code>                        </code><code>"recommended"</code><code>: </code><code>false</code><code>,</code></div><div><code>                        </code><code>"phoneNumber"</code><code>: </code><code>"+79056785432"</code><code>,</code></div><div><code>                        </code><code>"phoneType"</code><code>: </code><code>"рабочий"</code></div><div><code>                    </code><code>},</code></div><div><code>                    </code><code>...</code></div><div><code>                    </code><code>]</code></div><div><code>                </code><code>},</code></div><div><code>                </code><code>"recipient"</code><code>: {</code></div><div><code>                    </code><code>"photoURL"</code><code>: </code><code>"/api-web/cs/api/1/common/pics/142818f9-8bfd-4354-b4c4-579ad324e726/adab798b-22e9-4121-afa5-e354c1465533/userphoto.jpeg"</code><code>,</code></div><div><code>                    </code><code>"recipientFio"</code><code>: </code><code>"Петр Петров"</code><code>,</code></div><div><code>                    </code><code>"availablePhones"</code><code>: [</code></div><div><code>                    </code><code>{</code></div><div><code>                        </code><code>"recommended"</code><code>: </code><code>true</code><code>,</code></div><div><code>                        </code><code>"phoneNumber"</code><code>: </code><code>"+79997232112"</code><code>,</code></div><div><code>                        </code><code>"phoneType"</code><code>: </code><code>"личный мобильный"</code></div><div><code>                    </code><code>},</code></div><div><code>                    </code><code>...</code></div><div><code>                    </code><code>]</code></div><div><code>                </code><code>}</code></div><div><code>            </code><code>},</code></div><div><code>            </code><code>...</code></div><div><code>        </code><code>}</code></div><div><code>    </code><code>}]</code></div><div><code>}</code></div><br />]]></expectedResult>
+                        <testData><![CDATA[%{userId} - идентификатор пользователя, чьи контакты мы смотрим]]></testData>
+                    </step>
+                </steps>
+            </testScript>
+            <updatedBy>Метляев Игорь Андреевич</updatedBy>
+            <updatedOn>2026-05-06 16:09:17 UTC</updatedOn>
+        </testCase>
+        <testCase id="14897606" key="HRPQA-T135250">
+            <attachments/>
+            <confluencePageLinks/>
+            <createdBy>Синица Захар Алексеевич</createdBy>
+            <createdOn>2026-05-04 19:39:49 UTC</createdOn>
+            <customFields>
+                <customField name="Вид тестирования" type="SINGLE_CHOICE_SELECT_LIST">
+                    <value><![CDATA[Регресс]]></value>
+                </customField>
+                <customField name="Проверяется при внедрении Cloud" type="SINGLE_CHOICE_SELECT_LIST">
+                    <value><![CDATA[Нет]]></value>
+                </customField>
+                <customField name="АС" type="SINGLE_CHOICE_SELECT_LIST">
+                    <value><![CDATA[HRP.SmartProfile (Smart профиль) [CI02295205]]]></value>
+                </customField>
+                <customField name="Команда" type="SINGLE_CHOICE_SELECT_LIST">
+                    <value><![CDATA[Профиль сотрудника [61146085]]]></value>
+                </customField>
+                <customField name="Sigma" type="CHECKBOX">
+                    <value><![CDATA[true]]></value>
+                </customField>
+                <customField name="Автоматизирован" type="SINGLE_CHOICE_SELECT_LIST">
+                    <value><![CDATA[Готов к автоматизации]]></value>
+                </customField>
+                <customField name="Уровень теста" type="SINGLE_CHOICE_SELECT_LIST">
+                    <value><![CDATA[API]]></value>
+                </customField>
+                <customField name="Smoke" type="SINGLE_CHOICE_SELECT_LIST">
+                    <value><![CDATA[Нет]]></value>
+                </customField>
+                <customField name="Актуализирован" type="MULTI_CHOICE_SELECT_LIST">
+                    <value><![CDATA[Да]]></value>
+                </customField>
+            </customFields>
+            <estimatedTime>18000000</estimatedTime>
+            <folder><![CDATA[Функциональные тест-кейсы/Каркас/HRP.SmartProfile (Smart профиль) [CI02295205]/Сотрудник/Визитка/Контакты/Звонки]]></folder>
+            <issues>
+                <issue>
+                    <key>SFILE-11347</key>
+                    <summary><![CDATA[[back][addressbook] Изменить поведение и отображение звонка на номер]]></summary>
+                </issue>
+            </issues>
+            <labels>
+                <label><![CDATA[Web]]></label>
+                <label><![CDATA[Sigma]]></label>
+                <label><![CDATA[iPad]]></label>
+            </labels>
+            <name><![CDATA[[back] Сотрудник. Звонки. Вызов метода отображения виджета contacts для своего профиля]]></name>
+            <objective><![CDATA[Проверка вызова метода GET web/widgets/data?widgets=contacts&amp;userId=%{userId} для своего профиля<br />В данном случае параметр %{userId} - необязательный параметр]]></objective>
+            <owner>JIRAUSER1794425</owner>
+            <precondition><![CDATA[Пользователь авторизован в системе]]></precondition>
+            <priority><![CDATA[Normal]]></priority>
+            <status><![CDATA[Approved]]></status>
+            <parameters/>
+            <testScript type="steps">
+                <steps>
+                    <step index="0">
+                        <customFields/>
+                        <description><![CDATA[Вызвать метод GET web/widgets/data?widgets=contacts]]></description>
+                        <expectedResult><![CDATA[Пример ответа:<br /><div><code>{</code></div><div><code>    </code><code>"success"</code><code>: </code><code>true</code><code>,</code></div><div><code>    </code><code>"status"</code><code>: </code><code>"OK"</code><code>,</code></div><div><code>    </code><code>"data"</code><code>: [</code></div><div><code>    </code><code>{</code></div><div><code>        </code><code>"code"</code><code>: </code><code>"contacts"</code><code>,</code></div><div><code>        </code><code>"data"</code><code>: {</code></div><div><code>            </code><code>"callOptions"</code><code>: {</code></div><div><code>                </code><code>"allowCalling"</code><code>: </code><code>true</code><code>,</code></div><div><code>                </code><code>"callHint"</code><code>: </code><code>"После подтверждения вызова на ваш номер поступит звонок от Сбера, а затем будет установлено соединение с абонентом."</code><code>,</code></div><div><code>                </code><code>"buttonHint"</code><code>: </code><code>"позвонить по номеру"</code><code>,</code></div><div><code>                </code><code>"caller"</code><code>: {</code></div><div><code>                    </code><code>"photoURL"</code><code>: </code><code>"/api-web/cs/api/1/common/pics/142818f9-8bfd-4354-b4c4-579ad324e726/adab798b-22e9-4121-afa5-e354c1465533/userphoto.jpeg"</code><code>,</code></div><div><code>                    </code><code>"callerFio"</code><code>: </code><code>"Иван Иванов"</code><code>,</code></div><div><code>                    </code><code>"availablePhones"</code><code>: [</code></div><div><code>                    </code><code>{</code></div><div><code>                        </code><code>"recommended"</code><code>: </code><code>false</code><code>,</code></div><div><code>                        </code><code>"phoneNumber"</code><code>: </code><code>"+79056785432"</code><code>,</code></div><div><code>                        </code><code>"phoneType"</code><code>: </code><code>"рабочий"</code></div><div><code>                    </code><code>},</code></div><div><code>                    </code><code>...</code></div><div><code>                    </code><code>]</code></div><div><code>                </code><code>},</code></div><div><code>                </code><code>"recipient"</code><code>: {</code></div><div><code>                    </code><code>"photoURL"</code><code>: </code><code>"/api-web/cs/api/1/common/pics/142818f9-8bfd-4354-b4c4-579ad324e726/adab798b-22e9-4121-afa5-e354c1465533/userphoto.jpeg"</code><code>,</code></div><div><code>                    </code><code>"recipientFio"</code><code>: </code><code>"Петр Петров"</code><code>,</code></div><div><code>                    </code><code>"availablePhones"</code><code>: [</code></div><div><code>                    </code><code>{</code></div><div><code>                        </code><code>"recommended"</code><code>: </code><code>true</code><code>,</code></div><div><code>                        </code><code>"phoneNumber"</code><code>: </code><code>"+79997232112"</code><code>,</code></div><div><code>                        </code><code>"phoneType"</code><code>: </code><code>"личный мобильный"</code></div><div><code>                    </code><code>},</code></div><div><code>                    </code><code>...</code></div><div><code>                    </code><code>]</code></div><div><code>                </code><code>}</code></div><div><code>            </code><code>},</code></div><div><code>            </code><code>...</code></div><div><code>        </code><code>}</code></div><div><code>    </code><code>}]</code></div><div><code>}</code></div><br />]]></expectedResult>
+                        <testData><![CDATA[]]></testData>
+                    </step>
+                </steps>
+            </testScript>
+            <updatedBy>Метляев Игорь Андреевич</updatedBy>
+            <updatedOn>2026-05-06 16:09:06 UTC</updatedOn>
+        </testCase>
+        <testCase id="14915979" key="HRPQA-T137133">
+            <attachments/>
+            <confluencePageLinks/>
+            <createdBy>Меркуленков Дмитрий Игоревич [B]</createdBy>
+            <createdOn>2026-05-13 15:19:18 UTC</createdOn>
+            <customFields>
+                <customField name="Автоматизирован" type="SINGLE_CHOICE_SELECT_LIST">
+                    <value><![CDATA[Готов к автоматизации]]></value>
+                </customField>
+                <customField name="Команда" type="SINGLE_CHOICE_SELECT_LIST">
+                    <value><![CDATA[Профиль сотрудника [61146085]]]></value>
+                </customField>
+                <customField name="Вид тестирования" type="SINGLE_CHOICE_SELECT_LIST">
+                    <value><![CDATA[Новый функционал]]></value>
+                </customField>
+                <customField name="Уровень теста" type="SINGLE_CHOICE_SELECT_LIST">
+                    <value><![CDATA[API]]></value>
+                </customField>
+                <customField name="АС" type="SINGLE_CHOICE_SELECT_LIST">
+                    <value><![CDATA[HRP.SmartProfile (Smart профиль) [CI02295205]]]></value>
+                </customField>
+                <customField name="Проверяется при внедрении Cloud" type="SINGLE_CHOICE_SELECT_LIST">
+                    <value><![CDATA[ Нет ]]></value>
+                </customField>
+                <customField name="Smoke" type="SINGLE_CHOICE_SELECT_LIST">
+                    <value><![CDATA[Нет]]></value>
+                </customField>
+                <customField name="Sigma" type="CHECKBOX">
+                    <value><![CDATA[true]]></value>
+                </customField>
+            </customFields>
+            <folder><![CDATA[Функциональные тест-кейсы/Каркас/HRP.SmartProfile (Smart профиль) [CI02295205]/Сотрудник/Визитка/Кнопки]]></folder>
+            <issues>
+                <issue>
+                    <key>SFILE-11394</key>
+                    <summary><![CDATA[[back] В динамическое меню не приходит печатная версия профиля когда спец роль смотрит чужой профиль]]></summary>
+                </issue>
+            </issues>
+            <labels>
+                <label><![CDATA[Web]]></label>
+                <label><![CDATA[Sigma]]></label>
+                <label><![CDATA[iPad]]></label>
+            </labels>
+            <name><![CDATA[Сотрудник. Новый профиль. Динамическое меню. Чужой профиль. просматривающий не руководитель с ролью HR, allowGratitude = false]]></name>
+            <objective><![CDATA[Проверить сценарий просмотра чужого профиля сотрудником с ролью HR (без подчинения) при отключённом виджете «Признание».]]></objective>
+            <owner>JIRAUSER1743414</owner>
+            <precondition><![CDATA[1) В админ панели профиля выключен тоггл allowGratitude показывать виджет признание (Визитка-Признание)<br />2) Авторизоваться под ролью HR<br />3) Перейти в профиль другого сотрудника<br />4) Скопировать uuid пользователя которого просматриваем]]></precondition>
+            <priority><![CDATA[Normal]]></priority>
+            <status><![CDATA[Approved]]></status>
+            <parameters/>
+            <testScript type="steps">
+                <steps>
+                    <step index="0">
+                        <customFields/>
+                        <description><![CDATA[<ul><li>Отправить GET-запрос<ul><li>path: https://hr-ift.sberbank.ru/api-mobile/smart-profile/api/v1/dynamic-menu?userId= {uuid } пользователя</li></ul></li></ul>]]></description>
+                        <expectedResult><![CDATA[Код 200, status OK]]></expectedResult>
+                    </step>
+                    <step index="1">
+                        <customFields/>
+                        <description><![CDATA[Проверить тело ответа]]></description>
+                        <expectedResult><![CDATA[<pre>{
+    "success": true,
+    "status": "OK",
+    "data": {
+        "firstItem": "поделиться мнением",
+        "secondItem": "запланировать диалог",
+        "dotsMenu": [
+            "добавить заметку",
+            "запросить мнение",
+            "подписаться/отписаться",
+            "сформировать сопроводительный лист",
+            "печатная версия профиля",
+        ]
+    }
+}</pre><br /><br />]]></expectedResult>
+                    </step>
+                </steps>
+            </testScript>
+            <updatedBy>Меркуленков Дмитрий Игоревич [B]</updatedBy>
+            <updatedOn>2026-05-29 07:51:35 UTC</updatedOn>
+        </testCase>
+        <testCase id="14915991" key="HRPQA-T137136">
+            <attachments/>
+            <confluencePageLinks/>
+            <createdBy>Меркуленков Дмитрий Игоревич [B]</createdBy>
+            <createdOn>2026-05-13 15:23:43 UTC</createdOn>
+            <customFields>
+                <customField name="Smoke" type="SINGLE_CHOICE_SELECT_LIST">
+                    <value><![CDATA[Нет]]></value>
+                </customField>
+                <customField name="Уровень теста" type="SINGLE_CHOICE_SELECT_LIST">
+                    <value><![CDATA[API]]></value>
+                </customField>
+                <customField name="Проверяется при внедрении Cloud" type="SINGLE_CHOICE_SELECT_LIST">
+                    <value><![CDATA[ Нет ]]></value>
+                </customField>
+                <customField name="Автоматизирован" type="SINGLE_CHOICE_SELECT_LIST">
+                    <value><![CDATA[Готов к автоматизации]]></value>
+                </customField>
+                <customField name="Команда" type="SINGLE_CHOICE_SELECT_LIST">
+                    <value><![CDATA[Профиль сотрудника [61146085]]]></value>
+                </customField>
+                <customField name="Вид тестирования" type="SINGLE_CHOICE_SELECT_LIST">
+                    <value><![CDATA[Регресс]]></value>
+                </customField>
+                <customField name="АС" type="SINGLE_CHOICE_SELECT_LIST">
+                    <value><![CDATA[HRP.SmartProfile (Smart профиль) [CI02295205]]]></value>
+                </customField>
+                <customField name="Sigma" type="CHECKBOX">
+                    <value><![CDATA[true]]></value>
+                </customField>
+            </customFields>
+            <folder><![CDATA[Функциональные тест-кейсы/Каркас/HRP.SmartProfile (Smart профиль) [CI02295205]/Сотрудник/Визитка/Кнопки]]></folder>
+            <issues>
+                <issue>
+                    <key>SFILE-11394</key>
+                    <summary><![CDATA[[back] В динамическое меню не приходит печатная версия профиля когда спец роль смотрит чужой профиль]]></summary>
+                </issue>
+            </issues>
+            <labels>
+                <label><![CDATA[Web]]></label>
+                <label><![CDATA[Sigma]]></label>
+                <label><![CDATA[iPad]]></label>
+            </labels>
+            <name><![CDATA[Сотрудник. Новый профиль. Динамическое меню. Чужой профиль. просматривающий не руководитель с ролью HR, allowGratitude = true]]></name>
+            <objective><![CDATA[Проверить сценарий просмотра чужого профиля сотрудником с ролью HR (без подчинения) при включённом виджете «Признание».]]></objective>
+            <owner>JIRAUSER1743414</owner>
+            <precondition><![CDATA[1) В админ панели профиля включен тоггл allowGratitude показывать виджет признание (Визитка-Признание)<br />2) Авторизоваться под ролью HR<br />3) Перейти в профиль другого сотрудника<br />4) Скопировать uuid пользователя которого просматриваем]]></precondition>
+            <priority><![CDATA[Normal]]></priority>
+            <status><![CDATA[Approved]]></status>
+            <parameters/>
+            <testScript type="steps">
+                <steps>
+                    <step index="0">
+                        <customFields/>
+                        <description><![CDATA[<ul><li>Отправить GET-запрос<ul><li>path: https://hr-ift.sberbank.ru/api-mobile/smart-profile/api/v1/dynamic-menu?userId= {uuid } пользователя</li></ul></li></ul>]]></description>
+                        <expectedResult><![CDATA[Код 200, status OK]]></expectedResult>
+                    </step>
+                    <step index="1">
+                        <customFields/>
+                        <description><![CDATA[Проверить тело ответа]]></description>
+                        <expectedResult><![CDATA[<pre>{
+  "success": true,
+  "status": "OK",
+  "data": {
+    "firstItem": "поблагодарить",
+    "secondItem": "поделиться мнением",
+    "dotsMenu": [
+      "добавить заметку",
+      "запросить мнение",
+      "запланировать диалог",
+      "подписаться/отписаться",
+      "сформировать сопроводительный лист",
+      "печатная версия профиля"
+    ]
+  }
+}</pre><br /><br />]]></expectedResult>
+                    </step>
+                </steps>
+            </testScript>
+            <updatedBy>Синица Захар Алексеевич</updatedBy>
+            <updatedOn>2026-05-14 15:12:02 UTC</updatedOn>
+        </testCase>
+    </testCases>
+</project>

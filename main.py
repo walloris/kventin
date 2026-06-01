@@ -61,18 +61,11 @@ def main():
         action="store_true",
         help="В конце вывести JSON-сводку в stdout (defects, steps, error)",
     )
-    parser.add_argument(
-        "--retest-kventin",
-        action="store_true",
-        help="Ретест задач Kventin в Jira (статус Ready for QA → QA, шаги из описания, Resolved/In Progress)",
-    )
     args = parser.parse_args()
 
-    if args.retest_kventin:
-        from src.defect_retest import run_kventin_defect_retests
-
-        sys.exit(run_kventin_defect_retests())
-
+    # Ретест дефектов и тестирование задач вынесены в отдельный демон:
+    #   python daemon.py            # цикл раз в 15 минут
+    #   python daemon.py --once     # один прогон (cron)
     urls = _collect_urls(args)
     if not urls:
         print("[main] Нет URL для тестирования (укажи URL, --urls-file или START_URLS в .env)", file=sys.stderr)

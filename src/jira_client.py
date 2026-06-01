@@ -686,6 +686,74 @@ def search_kventin_issues_by_status(
     return list(data.get("issues") or [])
 
 
+def search_issues_by_status(
+    status_name: str,
+    *,
+    require_label: Optional[str] = None,
+    exclude_label: Optional[str] = None,
+    issue_type: Optional[str] = None,
+    max_results: int = 50,
+) -> List[dict]:
+    """
+    Найти задачи проекта в указанном статусе (универсальный поиск для демона).
+
+    Parameters
+    ----------
+    status_name:
+        Имя статуса Jira.
+    require_label:
+        Если задан — добавляет ``AND labels = <label>``.
+    exclude_label:
+        Если задан — добавляет ``AND (labels != <label> OR labels is EMPTY)``.
+    issue_type:
+        Если задан — добавляет ``AND issuetype = "<type>"``.
+    """
+    conn = _jira_connection_from_env()
+    if not conn:
+        LOG.warning("search_issues_by_status: нет подключения к Jira")
+        return []
+    status_escaped = (status_name or "").replace('"', '\\"')
+    jql = f'project = {conn["project_key"]} AND status = "{status_escaped}"'
+    if require_label:
+        jql += f" AND labels = {require_label}"
+    if exclude_label:
+        jql += f" AND (labels != {exclude_label} OR labels is EMPTY)"
+    if issue_type:
+        it = issue_type.replace('"', '\\"')
+        jql += f' AND issuetype = "{it}"'
+    code, data, _ = _jira_rest(
+        "GET",
+        "search",
+        params={"jql": jql, "fields": "summary,status,issuetype", "maxResults": max_results},
+    )
+    if code != 200 or not data:
+        LOG.warning("search_issues_by_status: JQL search failed code=%s", code)
+        return []
+    return list(data.get("issues") or [])
+
+
+def attach_file_to_issue(issue_key: str, file_path: str) -> bool:
+    """Приложить один файл к задаче, используя REST-параметры из окружения."""
+    conn = _jira_connection_from_env()
+    if not conn:
+        LOG.warning("attach_file_to_issue: нет подключения к Jira")
+        return False
+    if not file_path or not os.path.isfile(file_path):
+        LOG.warning("attach_file_to_issue: файл не найден: %s", file_path)
+        return False
+    api_token = (os.getenv("JIRA_API_TOKEN", "") or "").strip()
+    _attach_files(
+        conn["jira_url"],
+        issue_key,
+        [file_path],
+        headers_base=conn["headers"],
+        auth=conn["auth"],
+        use_bearer=conn["use_bearer"],
+        api_token=api_token,
+    )
+    return True
+
+
 def get_issue_with_changelog(issue_key: str) -> tuple[int, Optional[dict], str]:
     """GET issue с expand=changelog, полями description, summary, status, assignee."""
     return _jira_rest(
