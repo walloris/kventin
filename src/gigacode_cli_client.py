@@ -157,3 +157,35 @@ class GigacodeCliClient:
                     os.remove(tmp_path)
                 except OSError:
                     pass
+
+
+def _smoke_test() -> int:
+    """
+    Проверка клиента из консоли (не запускайте файл как скрипт без этого блока).
+
+    Из корня репозитория:
+        python3 -m src.gigacode_cli_client
+    или:
+        cd /Users/walloris/Documents/kventin && python3 -m src.gigacode_cli_client
+    """
+    logging.basicConfig(level=logging.INFO, format="[gigacode-cli] %(levelname)s %(message)s")
+    client = GigacodeCliClient()
+    print(f"bin={client.bin!r} extra_args={client.extra_args!r} cwd={client.cwd!r} timeout={client.timeout}s")
+    token = client._get_token()
+    if not token:
+        print("FAIL: gigacode не найден в PATH. Задайте GIGACODE_CLI_BIN в .env на полный путь к бинарю.")
+        return 2
+    print(f"OK: CLI доступен (_get_token -> {token!r})")
+    print("Запрос к CLI (может занять до GIGACODE_CLI_TIMEOUT_SEC сек)…")
+    answer = client.query("Ответь одним словом: ок", system="Отвечай только одним словом, без пояснений.")
+    if not (answer or "").strip():
+        print("FAIL: пустой ответ. Проверьте GIGACODE_CLI_ARGS (one-shot: -p --output-format json) и gigacode --help.")
+        return 1
+    print("--- ответ CLI ---")
+    print(answer.strip()[:2000])
+    print("--- конец ---")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_smoke_test())

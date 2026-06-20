@@ -28,7 +28,7 @@ git commit -m "обновление" && git push -u origin main
 ## Требования
 
 - Python 3.9+
-- Учётные данные GigaChat API (для консультаций)
+- Один из LLM-провайдеров: `gigacode_cli`, `gigachat`, `jan`, `openai`, `anthropic`, `ollama`
 - Учётные данные Jira (если нужно заводить дефекты)
 - Доступ в интернет
 
@@ -40,6 +40,13 @@ python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 playwright install chromium
+```
+
+Для разработки и запуска тестов:
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest -q
 ```
 
 ## Настройка
@@ -55,15 +62,36 @@ cp .env.example .env
 | Переменная | Описание |
 |------------|----------|
 | `START_URL` | **Обязательно.** URL страницы для тестирования (например `https://example.com`). |
-| `GIGACHAT_CREDENTIALS` | Строка авторизации GigaChat (Base64 от `client_id:client_secret`) или используйте `GIGACHAT_CLIENT_ID` и `GIGACHAT_CLIENT_SECRET`. |
+| `LLM_PROVIDER` | Провайдер модели: `gigacode_cli`, `gigachat`, `jan`, `openai`, `anthropic`, `ollama`. |
+| `LLM_REQUEST_TIMEOUT_SEC` | HTTP timeout для Jan/OpenAI/Ollama. |
+| `GIGACHAT_CREDENTIALS` | Строка авторизации GigaChat (Base64 от `client_id:client_secret`) или используйте стендовые переменные GigaChat. |
 | `JIRA_URL` | URL вашего Jira (например `https://your-company.atlassian.net`). |
 | `JIRA_USERNAME` | Логин (username) в Jira. |
 | `JIRA_EMAIL` | Email в Jira (если у вас логин по email, например Atlassian Cloud). |
 | `JIRA_API_TOKEN` | API-токен (или пароль) для Jira. |
 | `JIRA_PROJECT_KEY` | Ключ проекта для создания дефектов (например `PROJ`). |
+| `JIRA_VERIFY_SSL` | `0` — отключить проверку SSL для внутренней Jira; по умолчанию `1`. |
 | `BROWSER_SLOW_MO` | Замедление операций браузера в мс (по умолчанию 300), чтобы было видно действия. |
 | `HIGHLIGHT_DURATION_MS` | Пауза после подсветки элемента в мс (по умолчанию 800). |
 | `HEADLESS` | `true` — без окна браузера; по умолчанию `false` (окно видно). |
+
+### gigacode CLI
+
+Рекомендуемый режим для локального агентного запуска:
+
+```env
+LLM_PROVIDER=gigacode_cli
+GIGACODE_CLI_BIN=gigacode
+GIGACODE_CLI_ARGS=-p --output-format json
+GIGACODE_CLI_PASS_PROMPT=stdin
+GIGACODE_CLI_SEND_IMAGE=true
+```
+
+Проверить доступность CLI:
+
+```bash
+python -m src.gigacode_cli_client
+```
 
 ### Локальная модель в Jan (Mac M4 32GB и др.)
 
@@ -105,6 +133,12 @@ python main.py
 ```
 
 Агент работает **бесконечно**: в цикле анализирует страницу, спрашивает GigaChat «что делать дальше», выполняет клики или создаёт дефекты в Jira, при переходе по ссылке проверяет открытие и возвращается на переданную страницу.
+
+Для CI можно ограничить прогон:
+
+```bash
+HEADLESS=true MAX_STEPS=20 python main.py https://example.com --json-summary
+```
 
 ## Поведение агента
 

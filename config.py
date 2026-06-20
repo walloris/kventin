@@ -24,6 +24,8 @@ ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
 # Ollama (локально: llava, llama3.2-vision)
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llava")
+# Единый таймаут для не-GigaChat LLM HTTP-клиентов.
+LLM_REQUEST_TIMEOUT_SEC = int(os.getenv("LLM_REQUEST_TIMEOUT_SEC", "30"))
 
 # --- gigacode CLI как «мозг» (LLM_PROVIDER=gigacode_cli) ---
 # Агентный CLI запускается как подпроцесс в неинтерактивном режиме и возвращает ответ в stdout.
@@ -86,6 +88,8 @@ JIRA_USERNAME = os.getenv("JIRA_USERNAME", "")
 JIRA_EMAIL = os.getenv("JIRA_EMAIL", "")  # для Atlassian Cloud часто используют email
 JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN", "")
 JIRA_PROJECT_KEY = os.getenv("JIRA_PROJECT_KEY", "")
+# SSL-проверка Jira. Для корп. стендов можно выключить через JIRA_VERIFY_SSL=0.
+JIRA_VERIFY_SSL = os.getenv("JIRA_VERIFY_SSL", "1").lower() in ("1", "true", "yes")
 # Тип задачи при создании (на время тестирования — Task, потом можно Bug)
 JIRA_ISSUE_TYPE = os.getenv("JIRA_ISSUE_TYPE", "Task")
 # Assignee (назначить дефект на пользователя): username для Server, accountId для Cloud, или пусто = текущий пользователь

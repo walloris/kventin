@@ -16,7 +16,6 @@ import json
 import os
 import re
 import shutil
-import sys
 import time
 from concurrent.futures import Future
 from datetime import datetime
@@ -27,8 +26,6 @@ from playwright.sync_api import sync_playwright, Page
 from config import (
     START_URL,
     START_URL_TRY_REDIRECT_FALLBACKS,
-    BROWSER_SLOW_MO,
-    HEADLESS,
     BROWSER_USER_DATA_DIR,
     CHECKLIST_STEP_DELAY_MS,
     VIEWPORT_WIDTH,
@@ -83,14 +80,6 @@ from config import (
     TEST_UPLOAD_FILE_PATH,
     ENABLE_SHADOW_DOM,
     BROWSER_ENGINE,
-    BROWSER_SUPPRESS_CERT_PROMPT,
-    BROWSER_CHROMIUM_ARGS,
-    BROWSER_CLIENT_CERT_ORIGIN,
-    BROWSER_CLIENT_CERT_ORIGINS,
-    BROWSER_CLIENT_CERT_PFX_PATH,
-    BROWSER_CLIENT_CERT_PASSPHRASE,
-    BROWSER_CLIENT_CERT_CERT_PATH,
-    BROWSER_CLIENT_CERT_KEY_PATH,
     BROWSER_AUTO_SELECT_CERT_PATTERNS,
     PLAYWRIGHT_EXPORT_PATH,
     ENABLE_API_INTERCEPT,
@@ -175,6 +164,13 @@ from src.defect_builder import (
 )
 from src.locators import url_pattern as _url_pattern
 from src.network_capture import NetworkCapture
+from src.browser_options import (
+    build_browser_launch_options,
+    build_client_certificates,
+    build_start_url_candidates,
+    is_too_many_redirects_error,
+    should_write_auto_select_cert_policy,
+)
 
 # Бюджет на URL — единый источник правды в config.py.
 from config import URL_BUDGET_NO_PROGRESS  # noqa: E402,F401
@@ -1139,35 +1135,11 @@ def _handle_new_tabs(
 
 
 def _is_too_many_redirects_error(exc: Exception) -> bool:
-    s = str(exc).lower()
-    return "err_too_many_redirects" in s or "too many redirects" in s
+    return is_too_many_redirects_error(exc)
 
 
 def _build_start_url_candidates(primary: str) -> List[str]:
-    """
-    URL для поочерёдного page.goto при петле редиректов.
-    Без сюрпризов: только исходный, вариант без хвостового /, затем START_URL_FALLBACKS.
-    (Автопереход на «корень» хоста убран — на корп. стендах открывалась не та зона.)    
-    """
-    from config import START_URL_FALLBACKS
-
-    out: List[str] = []
-    seen = set()
-
-    def add(u: str) -> None:
-        u = (u or "").strip()
-        if not u or u in seen:
-            return
-        seen.add(u)
-        out.append(u)
-
-    add(primary)
-    stripped = primary.rstrip("/")
-    if stripped and stripped != primary:
-        add(stripped)
-    for f in START_URL_FALLBACKS:
-        add(f)
-    return out
+    return build_start_url_candidates(primary)
 
 
 def _print_redirect_loop_hints() -> None:
@@ -1235,37 +1207,10 @@ def run_agent(start_url: str = None):
     with sync_playwright() as p:
         browser = None
         engine = getattr(p, BROWSER_ENGINE, p.chromium)
-        # Аргументы Chromium: подавить диалог выбора сертификата в headless/CI.
-        use_chromium = BROWSER_ENGINE == "chromium" or bool(BROWSER_USER_DATA_DIR)
-        chromium_args = list(BROWSER_CHROMIUM_ARGS)
-        if use_chromium and BROWSER_SUPPRESS_CERT_PROMPT:
-            chromium_args.append("--ignore-certificate-errors")
-            if sys.platform == "darwin":
-                chromium_args.append("--use-mock-keychain")
-        launch_kw = {"headless": HEADLESS, "slow_mo": BROWSER_SLOW_MO}
-        if use_chromium and chromium_args:
-            launch_kw["args"] = chromium_args
-
-        # Клиентский сертификат: один и тот же сертификат для всех origin (браузер подставляет сам).
-        origins = ([BROWSER_CLIENT_CERT_ORIGIN] if BROWSER_CLIENT_CERT_ORIGIN else []) + list(BROWSER_CLIENT_CERT_ORIGINS)
-        origins = [o for o in origins if o]
-        client_certs = []
-        if origins:
-            if BROWSER_CLIENT_CERT_CERT_PATH and BROWSER_CLIENT_CERT_KEY_PATH:
-                cert_path = os.path.abspath(BROWSER_CLIENT_CERT_CERT_PATH)
-                key_path = os.path.abspath(BROWSER_CLIENT_CERT_KEY_PATH)
-                if os.path.isfile(cert_path) and os.path.isfile(key_path):
-                    for origin in origins:
-                        client_certs.append({"origin": origin, "certPath": cert_path, "keyPath": key_path})
-            elif BROWSER_CLIENT_CERT_PFX_PATH and os.path.isfile(BROWSER_CLIENT_CERT_PFX_PATH):
-                pfx_path = os.path.abspath(BROWSER_CLIENT_CERT_PFX_PATH)
-                for origin in origins:
-                    entry = {"origin": origin, "pfxPath": pfx_path}
-                    if BROWSER_CLIENT_CERT_PASSPHRASE:
-                        entry["passphrase"] = BROWSER_CLIENT_CERT_PASSPHRASE
-                    client_certs.append(entry)
+        launch_kw = build_browser_launch_options(engine_name=BROWSER_ENGINE)
+        client_certs = build_client_certificates()
         # Политика авто-выбора сертификата по URL (без файла сертификата): пишем в профиль при persistent context.
-        if BROWSER_USER_DATA_DIR and BROWSER_AUTO_SELECT_CERT_PATTERNS and use_chromium:
+        if should_write_auto_select_cert_policy(BROWSER_ENGINE):
             try:
                 policy_entries = [json.dumps({"pattern": p, "filter": {}}) for p in BROWSER_AUTO_SELECT_CERT_PATTERNS]
                 policy_json = json.dumps({"AutoSelectCertificateForUrls": policy_entries})

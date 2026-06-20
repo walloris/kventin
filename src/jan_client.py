@@ -29,14 +29,15 @@ class JanClient:
     """
 
     def __init__(self):
-        from config import JAN_API_URL, JAN_API_KEY, JAN_MODEL
+        from config import JAN_API_URL, JAN_API_KEY, JAN_MODEL, LLM_REQUEST_TIMEOUT_SEC
         self.api_url = JAN_API_URL.rstrip("/")
         self.chat_url = f"{self.api_url}/v1/chat/completions"
         self.api_key = JAN_API_KEY or "jan-api-key"
         self.model = JAN_MODEL or "vikhr-7b-instruct"
+        self.timeout = max(5, int(LLM_REQUEST_TIMEOUT_SEC))
         LOG.info("Jan client: %s, model=%s", self.chat_url, self.model)
 
-    def _request(self, payload: Dict[str, Any], timeout: int = 120) -> str:
+    def _request(self, payload: Dict[str, Any], timeout: Optional[int] = None) -> str:
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
@@ -47,7 +48,7 @@ class JanClient:
                 self.chat_url,
                 json=payload,
                 headers=headers,
-                timeout=timeout,
+                timeout=timeout or self.timeout,
             )
             LOG.info("Jan response %s len=%s", r.status_code, len(r.text))
             if r.status_code != 200:

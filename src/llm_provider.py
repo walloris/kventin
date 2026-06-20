@@ -71,15 +71,17 @@ class _OpenAIClient:
 
     def __init__(self):
         try:
-            from config import OPENAI_API_KEY, OPENAI_MODEL, OPENAI_BASE_URL
+            from config import LLM_REQUEST_TIMEOUT_SEC, OPENAI_API_KEY, OPENAI_MODEL, OPENAI_BASE_URL
         except ImportError:
             OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
             OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
             OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+            LLM_REQUEST_TIMEOUT_SEC = int(os.getenv("LLM_REQUEST_TIMEOUT_SEC", "30"))
         self.api_key = OPENAI_API_KEY
         self.model = OPENAI_MODEL or "gpt-4o-mini"
         self.base_url = OPENAI_BASE_URL or "https://api.openai.com/v1"
         self.chat_url = f"{self.base_url}/chat/completions"
+        self.timeout = max(5, int(LLM_REQUEST_TIMEOUT_SEC))
 
     def _get_token(self):
         return self.api_key or None
@@ -111,7 +113,7 @@ class _OpenAIClient:
                 self.chat_url,
                 headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
                 json={"model": self.model, "messages": messages, "max_tokens": 2048, "temperature": 0.2},
-                timeout=120,
+                timeout=self.timeout,
             )
             if r.status_code != 200:
                 LOG.error("OpenAI %s %s", r.status_code, r.text[:500])
@@ -185,13 +187,15 @@ class _OllamaClient:
 
     def __init__(self):
         try:
-            from config import OLLAMA_HOST, OLLAMA_MODEL
+            from config import LLM_REQUEST_TIMEOUT_SEC, OLLAMA_HOST, OLLAMA_MODEL
         except ImportError:
             OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
             OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llava")
+            LLM_REQUEST_TIMEOUT_SEC = int(os.getenv("LLM_REQUEST_TIMEOUT_SEC", "30"))
         self.base_url = OLLAMA_HOST or "http://127.0.0.1:11434"
         self.model = OLLAMA_MODEL or "llava"
         self.chat_url = f"{self.base_url}/api/chat"
+        self.timeout = max(5, int(LLM_REQUEST_TIMEOUT_SEC))
 
     def _get_token(self):
         return "ok"
@@ -211,7 +215,7 @@ class _OllamaClient:
                 "messages": [{"role": "user", "content": text_prompt, "images": images}],
                 "stream": False,
             }
-            r = requests.post(self.chat_url, json=payload, timeout=120)
+            r = requests.post(self.chat_url, json=payload, timeout=self.timeout)
             if r.status_code != 200:
                 LOG.error("Ollama %s %s", r.status_code, r.text[:300])
                 return self.query(text_prompt, system)
@@ -226,7 +230,7 @@ class _OllamaClient:
         try:
             import requests
             payload = {"model": self.model, "messages": messages, "stream": False}
-            r = requests.post(self.chat_url, json=payload, timeout=120)
+            r = requests.post(self.chat_url, json=payload, timeout=self.timeout)
             if r.status_code != 200:
                 return ""
             data = r.json()

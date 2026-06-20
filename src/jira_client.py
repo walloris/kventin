@@ -1,7 +1,7 @@
 """
 Клиент Jira REST API для создания дефектов.
 Создаёт только реальные баги; флаки и проблемы тестовой среды не заводим.
-Поддержка вложений (скриншоты, логи). Bearer или Basic, X-Atlassian-Token, verify=False.
+Поддержка вложений (скриншоты, логи). Bearer или Basic, X-Atlassian-Token.
 Многоуровневая дедупликация: локальная (память сессии) → Jira (JQL) → GigaChat (семантика).
 """
 import copy
@@ -29,6 +29,7 @@ from config import (
     JIRA_RETEST_STATUS_IN_PROGRESS,
     JIRA_RETEST_STATUS_QA,
     JIRA_RETEST_STATUS_RESOLVED,
+    JIRA_VERIFY_SSL,
 )
 
 LOG = logging.getLogger("Jira")
@@ -171,7 +172,7 @@ def _jira_request(
 ) -> Optional[dict]:
     """Выполнить запрос к Jira API. Возвращает JSON или None."""
     url = f"{jira_url}/rest/api/2/{path.lstrip('/')}"
-    kwargs.setdefault("verify", False)
+    kwargs.setdefault("verify", JIRA_VERIFY_SSL)
     kwargs.setdefault("timeout", 30)
     if use_bearer:
         kwargs["auth"] = None
@@ -371,7 +372,7 @@ def _assign_issue(
                 json=body,
                 headers=h,
                 auth=auth if not use_bearer else None,
-                verify=False,
+                verify=JIRA_VERIFY_SSL,
                 timeout=15,
             )
             if r.status_code in (200, 204):
@@ -409,7 +410,7 @@ def _attach_files(
                     files=files,
                     headers=headers,
                     auth=auth if not use_bearer else None,
-                    verify=False,
+                    verify=JIRA_VERIFY_SSL,
                     timeout=60,
                 )
             if r.status_code in (200, 201):
@@ -534,7 +535,7 @@ def create_jira_issue(
         LOG.debug("create issue: priority не передаётся (JIRA_PRIORITY_* пусто или нет severity)")
 
     try:
-        r = requests.post(url, json=payload, headers=headers, auth=auth, verify=False, timeout=30)
+        r = requests.post(url, json=payload, headers=headers, auth=auth, verify=JIRA_VERIFY_SSL, timeout=30)
         if r.status_code == 400 and "priority" in (payload.get("fields") or {}):
             err_json: dict = {}
             try:
@@ -549,7 +550,7 @@ def create_jira_issue(
                 LOG.warning("Jira 400: invalid priority, retrying without priority field")
                 payload2 = copy.deepcopy(payload)
                 payload2["fields"].pop("priority", None)
-                r = requests.post(url, json=payload2, headers=headers, auth=auth, verify=False, timeout=30)
+                r = requests.post(url, json=payload2, headers=headers, auth=auth, verify=JIRA_VERIFY_SSL, timeout=30)
         r.raise_for_status()
         key = r.json().get("key")
         LOG.info("Создан дефект: %s", key)
@@ -639,7 +640,7 @@ def _jira_rest(
             json=json_body,
             headers=conn["headers"],
             auth=None if conn["use_bearer"] else conn["auth"],
-            verify=False,
+            verify=JIRA_VERIFY_SSL,
             timeout=45,
         )
         text = (r.text or "")[:800]
