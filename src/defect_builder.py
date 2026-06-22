@@ -438,7 +438,7 @@ def build_defect_description(
     env = (
         f"URL: {url}\n"
         f"Дата: {datetime.now().isoformat()}\n"
-        f"Источник: AI-тестировщик Kventin (Playwright, GigaChat)."
+        f"Источник: AI-тестировщик Kventin (Playwright, local LLM)."
     )
     if checklist_results:
         failed = [r for r in checklist_results if not r.get("ok")]

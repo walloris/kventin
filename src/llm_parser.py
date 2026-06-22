@@ -1,12 +1,12 @@
 """
-Парсинг и валидация действий, полученных от LLM (GigaChat).
+Парсинг и валидация действий, полученных от локальной LLM.
 
 Отдельный лёгкий модуль — без зависимостей на Page или AgentMemory, чтобы его
 можно было импортировать из любого места (agent_checks, defect_pipeline,
 тесты) без риска циклов.
 
 - parse_llm_action(raw)     — выдрать JSON-объект {action: ...} из сырого ответа.
-- validate_llm_action(act)  — нормализация полей (реэкспорт из gigachat_client).
+- validate_llm_action(act)  — нормализация полей (реэкспорт из llm_client).
 """
 from __future__ import annotations
 
@@ -14,11 +14,11 @@ import json
 import re
 from typing import Any, Dict, Optional
 
-from src.gigachat_client import validate_llm_action  # re-export
+from src.llm_client import validate_llm_action  # re-export
 
 
 def parse_llm_action(raw: str) -> Optional[Dict[str, Any]]:
-    """Попытаться распарсить JSON-действие из ответа GigaChat."""
+    """Попытаться распарсить JSON-действие из ответа LLM."""
     if not raw:
         return None
     cleaned = re.sub(r"^```(?:json)?\s*", "", raw.strip(), flags=re.MULTILINE)

@@ -5,7 +5,7 @@
 1. Читает задачу через Jira REST (summary + description).
 2. По возможности гоняет фокусный exploratory-тест фичи (Playwright) для сбора фактуры.
 3. Генерирует тест-кейсы в формате Zephyr XML строго по образцу
-   (skills/test-case-writer) через «мозг» — gigacode CLI — и валидирует их
+   (skills/test-case-writer) через локальную OpenAI-compatible LLM и валидирует их
    скриптом validate_xml.py (Coverage Gate), повторяя при INVALID.
 4. Пишет в задачу комментарий с трассируемостью и прикладывает XML.
 
@@ -23,7 +23,7 @@ from typing import List, Optional, Tuple
 
 from config import (
     DOC_AS_CODE_DIR,
-    GIGACODE_SKILLS_DIR,
+    LLM_SKILLS_DIR,
     MAX_STEPS,
     START_URL,
 )
@@ -45,8 +45,8 @@ def _repo_root() -> Path:
 
 
 def _skills_dir() -> Path:
-    if GIGACODE_SKILLS_DIR:
-        return Path(GIGACODE_SKILLS_DIR)
+    if LLM_SKILLS_DIR:
+        return Path(LLM_SKILLS_DIR)
     return _repo_root() / "skills"
 
 
@@ -132,7 +132,7 @@ def generate_test_cases_xml(
     evidence: str = "",
 ) -> Tuple[Optional[Path], str]:
     """
-    Сгенерировать XML тест-кейсов через gigacode CLI и провалидировать.
+    Сгенерировать XML тест-кейсов через локальную OpenAI-compatible LLM и провалидировать.
 
     Returns
     -------
@@ -148,16 +148,16 @@ def generate_test_cases_xml(
     out_dir.mkdir(parents=True, exist_ok=True)
     out_file = out_dir / f"{key}.xml"
 
-    from src.gigacode_cli_client import GigacodeCliClient
+    from src.local_openai_client import LocalOpenAIClient
 
-    client = GigacodeCliClient()
+    client = LocalOpenAIClient()
     last_errors = ""
     for attempt in range(1, _TC_GEN_MAX_RETRIES + 1):
         prompt = _build_tc_prompt(key, summary, description, evidence, example_xml, fix_errors=last_errors)
         raw = client.query(prompt, system="Ты выводишь только XML без пояснений.")
         xml = _strip_code_fences(raw or "")
         if not xml or "<" not in xml:
-            last_errors = "CLI вернул пустой/не-XML ответ"
+            last_errors = "LLM вернула пустой/не-XML ответ"
             LOG.warning("%s: попытка %d — нет XML", key, attempt)
             continue
         out_file.write_text(xml, encoding="utf-8")

@@ -286,7 +286,7 @@ def _check_color_contrast(page: Page) -> List[Dict]:
 
 
 def format_a11y_issues(issues: List[Dict]) -> str:
-    """Форматировать a11y-issue в текст для GigaChat / отчёта."""
+    """Форматировать a11y-issue в текст для LLM / отчёта."""
     if not issues:
         return ""
     lines = [f"Accessibility проверка: найдено {len(issues)} проблем(ы):"]

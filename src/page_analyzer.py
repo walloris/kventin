@@ -332,7 +332,7 @@ def get_dom_summary(page: Page, max_length: int = 8000, include_shadow_dom: bool
     Получить описание DOM с уникальными ref-id для каждого элемента.
     Каждому интерактивному элементу присваивается data-agent-ref="N",
     и ссылка на DOM-ноду сохраняется в window.__agentRefs[N].
-    GigaChat возвращает ref:N как selector → _find_element находит элемент мгновенно.
+    LLM возвращает ref:N как selector → _find_element находит элемент мгновенно.
     include_shadow_dom: обходить Shadow DOM (Web Components).
     """
     try:
@@ -500,7 +500,7 @@ def get_dom_summary(page: Page, max_length: int = 8000, include_shadow_dom: bool
                     }
                     return false;
                 };
-                const servicePatterns = ['chat','чат','support','поддержк','help','консультант','jivo','intercom','crisp','drift','tawk','livechat','live-chat','widget-chat','chat-widget','feedback','обратн','звонок','callback','kventin','agent-llm','agent-banner','диалог с llm','ai-тестировщик','gigachat','cookie','consent'];
+                const servicePatterns = ['chat','чат','support','поддержк','help','консультант','jivo','intercom','crisp','drift','tawk','livechat','live-chat','widget-chat','chat-widget','feedback','обратн','звонок','callback','kventin','agent-llm','agent-banner','диалог с llm','ai-тестировщик','cookie','consent'];
                 const isServiceElement = (el) => {
                     if (!el) return true;
                     const combined = ((el.textContent||'')+(el.id||'')+(el.className||'')).toLowerCase();
@@ -934,7 +934,7 @@ def detect_active_overlays(page: Page) -> Dict[str, Any]:
 
 
 def format_overlays_context(overlay_info: Dict[str, Any]) -> str:
-    """Форматировать информацию об оверлеях в текст для GigaChat."""
+    """Форматировать информацию об оверлеях в текст для LLM."""
     if not overlay_info.get("has_overlay"):
         return ""
     lines = ["⚠️ АКТИВНЫЕ ОВЕРЛЕИ НА СТРАНИЦЕ (тестируй их в первую очередь!):"]
@@ -964,7 +964,7 @@ def build_context(
     network_failures: List[Dict[str, Any]],
 ) -> str:
     """
-    Собрать текстовый контекст страницы для GigaChat: консоль, сеть, DOM.
+    Собрать текстовый контекст страницы для LLM: консоль, сеть, DOM.
     """
     lines = [f"Текущий URL: {current_url}", ""]
 

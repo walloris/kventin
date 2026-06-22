@@ -8,43 +8,15 @@ load_dotenv()
 # Страница для тестирования
 START_URL = os.getenv("START_URL", "https://example.com")
 
-# --- Провайдер LLM: gigachat | jan | openai | anthropic | ollama ---
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gigachat").strip().lower()
-# Jan (локальная модель, OpenAI-совместимый API)
-JAN_API_URL = os.getenv("JAN_API_URL", "http://127.0.0.1:1337").rstrip("/")
-JAN_API_KEY = os.getenv("JAN_API_KEY", "jan-api-key")
-JAN_MODEL = os.getenv("JAN_MODEL", "llama-3.2-11b-vision-instruct")
-# OpenAI (gpt-4o, gpt-4o-mini с vision)
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-# Anthropic (Claude с vision)
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
-ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
-# Ollama (локально: llava, llama3.2-vision)
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llava")
-# Единый таймаут для не-GigaChat LLM HTTP-клиентов.
-LLM_REQUEST_TIMEOUT_SEC = int(os.getenv("LLM_REQUEST_TIMEOUT_SEC", "30"))
-
-# --- gigacode CLI как «мозг» (LLM_PROVIDER=gigacode_cli) ---
-# Агентный CLI запускается как подпроцесс в неинтерактивном режиме и возвращает ответ в stdout.
-# Флаги по умолчанию — совместимые с Claude Code (gigacode -p ... --output-format json).
-GIGACODE_CLI_BIN = os.getenv("GIGACODE_CLI_BIN", "gigacode").strip()
-# Дополнительные аргументы (через пробел). Управляют неинтерактивным режимом и форматом вывода.
-GIGACODE_CLI_ARGS = os.getenv("GIGACODE_CLI_ARGS", "-p --output-format json").strip()
-# Таймаут одного вызова CLI (сек). Агентная сессия стартует медленнее REST.
-GIGACODE_CLI_TIMEOUT_SEC = int(os.getenv("GIGACODE_CLI_TIMEOUT_SEC", "180"))
-# Рабочая директория для запуска CLI (откуда подхватываются .gigacode/skills и agents). Пусто = CWD.
-GIGACODE_CLI_CWD = os.getenv("GIGACODE_CLI_CWD", "").strip()
-# Как передавать промпт: stdin (по умолчанию, безопасно для длинных текстов) или arg.
-GIGACODE_CLI_PASS_PROMPT = os.getenv("GIGACODE_CLI_PASS_PROMPT", "stdin").strip().lower()
-# Передавать ли скриншот: CLI читает изображение по пути, указанному в промпте.
-GIGACODE_CLI_SEND_IMAGE = os.getenv("GIGACODE_CLI_SEND_IMAGE", "true").lower() in ("1", "true", "yes")
-# Флаг --append-system-prompt для системного промпта (если CLI поддерживает).
-GIGACODE_CLI_SYSTEM_FLAG = os.getenv("GIGACODE_CLI_SYSTEM_FLAG", "--append-system-prompt").strip()
-# Имя поля в JSON-выводе, где лежит текст ответа (Claude Code: result).
-GIGACODE_CLI_JSON_RESULT_KEY = os.getenv("GIGACODE_CLI_JSON_RESULT_KEY", "result").strip()
+# --- Local OpenAI-compatible LLM ---
+# Единственный активный LLM-путь. Старые внешние провайдеры отключены.
+# Можно указать как base URL (.../v1), так и полный endpoint (.../v1/chat/completions).
+LOCAL_LLM_API_URL = os.getenv("LOCAL_LLM_API_URL", "http://127.0.0.1:3333/v1").rstrip("/")
+# Пусто = клиент сам возьмёт первую модель из GET /v1/models.
+LOCAL_LLM_MODEL = os.getenv("LOCAL_LLM_MODEL", "").strip()
+# Для локального endpoint обычно не нужен, но OpenAI-compatible серверы часто ждут Bearer.
+LOCAL_LLM_API_KEY = os.getenv("LOCAL_LLM_API_KEY", "local").strip()
+LLM_REQUEST_TIMEOUT_SEC = int(os.getenv("LLM_REQUEST_TIMEOUT_SEC", "60"))
 
 # --- Демон ретеста/тестирования задач ---
 # Интервал между прогонами демона (сек). По умолчанию 15 минут.
@@ -57,30 +29,8 @@ JIRA_DAEMON_TASK_STATUS = os.getenv("JIRA_DAEMON_TASK_STATUS", "").strip()
 JIRA_DAEMON_TASK_MAX = int(os.getenv("JIRA_DAEMON_TASK_MAX", "10"))
 # Каталог артефактов doc-as-code (тест-кейсы, чек-листы, тест-планы).
 DOC_AS_CODE_DIR = os.getenv("DOC_AS_CODE_DIR", "doc-as-code").strip()
-# Каталог со скиллами для CLI (test-case-writer и т.д.). Пусто = <repo>/skills.
-GIGACODE_SKILLS_DIR = os.getenv("GIGACODE_SKILLS_DIR", "").strip()
-
-# GigaChat (Keycloak password grant + gateway, как в рабочем примере)
-GIGACHAT_TOKEN_HEADER = os.getenv("GIGACHAT_TOKEN_HEADER", "")  # опционально: готовый "Bearer eyJ..."
-GIGACHAT_API_URL = os.getenv("GIGACHAT_API_URL", "")  # единый URL чата (если не заданы _DEV/_IFT)
-GIGACHAT_TOKEN_URL = os.getenv("GIGACHAT_TOKEN_URL", "")  # единый URL токена
-GIGACHAT_MODEL = os.getenv("GIGACHAT_MODEL", "GigaChat-2-Max")
-GIGACHAT_AUTHORIZATION_KEY = os.getenv("GIGACHAT_AUTHORIZATION_KEY", "")
-GIGACHAT_CLIENT_ID = os.getenv("GIGACHAT_CLIENT_ID", "fakeuser")
-GIGACHAT_CLIENT_SECRET = os.getenv("GIGACHAT_CLIENT_SECRET", "")
-GIGACHAT_USERNAME = os.getenv("GIGACHAT_USERNAME", "")
-GIGACHAT_PASSWORD = os.getenv("GIGACHAT_PASSWORD", "")
-GIGACHAT_ENV = os.getenv("GIGACHAT_ENV", "dev").strip().lower()  # "dev" | "ift"
-GIGACHAT_VERIFY_SSL = os.getenv("GIGACHAT_VERIFY_SSL", "0") == "1"
-# Person ID для Keycloak (обязательно для password grant через x-hrp-person-id)
-GIGACHAT_PERSON_ID_DEV = os.getenv("GIGACHAT_PERSON_ID_DEV", "4c36eb04-0920-4449-9e07-ca4a68f80eef")
-GIGACHAT_PERSON_ID_IFT = os.getenv("GIGACHAT_PERSON_ID_IFT", "91ed8888-bff4-4d61-a72d-310db2eeaa37")
-# URL по стендам (если не заданы — подставляются дефолты под Sberbank HR)
-GIGACHAT_TOKEN_URL_DEV = os.getenv("GIGACHAT_TOKEN_URL_DEV", "https://hr-dev.sberbank.ru/auth/realms/PAOSberbank/protocol/openid-connect/token")
-GIGACHAT_TOKEN_URL_IFT = os.getenv("GIGACHAT_TOKEN_URL_IFT", "https://hr-ift.sberbank.ru/auth/realms/PAOSberbank/protocol/openid-connect/token")
-GIGACHAT_API_URL_DEV = os.getenv("GIGACHAT_API_URL_DEV", "https://hr-dev.sberbank.ru/api-web/neurosearchbar/api/v1/gigachat/completion")
-GIGACHAT_API_URL_IFT = os.getenv("GIGACHAT_API_URL_IFT", "https://hr-ift.sberbank.ru/api-web/neurosearchbar/api/v1/gigachat/completion")
-GIGACHAT_CREDENTIALS = os.getenv("GIGACHAT_CREDENTIALS", "")
+# Каталог со скиллами (test-case-writer и т.д.). Пусто = <repo>/skills.
+LLM_SKILLS_DIR = os.getenv("LLM_SKILLS_DIR", "").strip()
 
 # Jira (логин: username или email — в зависимости от типа Jira)
 JIRA_URL = os.getenv("JIRA_URL", "").rstrip("/")
@@ -227,20 +177,15 @@ SESSION_REPORT_SAVE_EVERY_N = int(os.getenv("SESSION_REPORT_SAVE_EVERY_N", "1"))
 # Максимальное число шагов агента (0 = бесконечный цикл). При достижении — печатает отчёт и останавливается.
 MAX_STEPS = int(os.getenv("MAX_STEPS", "0"))
 
-# Retry при сбое GigaChat (пустой ответ / не JSON): экспоненциальный backoff.
-# По умолчанию ОДИН retry — иначе при таймаутах 30с×3 + backoff каждый шаг анализа
-# зависал бы на минуту-полторы и фоновые findings не успевали к следующему шагу.
+# Retry при сбое локальной LLM (пустой ответ / не JSON): экспоненциальный backoff.
 LLM_RETRY_COUNT = int(os.getenv("LLM_RETRY_COUNT", "1"))
 LLM_RETRY_BASE_DELAY = float(os.getenv("LLM_RETRY_BASE_DELAY", "1.0"))  # секунды
-# Жёсткий timeout на ОДИН HTTP-запрос к GigaChat. При плохой сети раньше стояло 120с,
-# и каждый таймаут на стенде HR-DEV блокировал весь пайплайн анализа.
-GIGACHAT_TIMEOUT_SEC = int(os.getenv("GIGACHAT_TIMEOUT_SEC", "30"))
-# Если GigaChat не ответил за N секунд — берём fast action (не зависаем)
-GIGACHAT_RESPONSE_TIMEOUT_SEC = int(os.getenv("GIGACHAT_RESPONSE_TIMEOUT_SEC", "20"))
-# Circuit breaker: после N таймаутов подряд не вызывать GigaChat M секунд (0 = отключить).
+# Если LLM не ответила за N секунд — берём fast action (не зависаем).
+LLM_RESPONSE_TIMEOUT_SEC = int(os.getenv("LLM_RESPONSE_TIMEOUT_SEC", "20"))
+# Circuit breaker: после N таймаутов подряд не вызывать LLM M секунд (0 = отключить).
 # Применяется и к выбору действия, и к фоновому анализу (любой chat()-вызов).
-GIGACHAT_CIRCUIT_BREAKER_AFTER_N_TIMEOUTS = int(os.getenv("GIGACHAT_CIRCUIT_BREAKER_AFTER_N_TIMEOUTS", "2"))
-GIGACHAT_CIRCUIT_BREAKER_COOLDOWN_SEC = int(os.getenv("GIGACHAT_CIRCUIT_BREAKER_COOLDOWN_SEC", "60"))
+LLM_CIRCUIT_BREAKER_AFTER_N_TIMEOUTS = int(os.getenv("LLM_CIRCUIT_BREAKER_AFTER_N_TIMEOUTS", "2"))
+LLM_CIRCUIT_BREAKER_COOLDOWN_SEC = int(os.getenv("LLM_CIRCUIT_BREAKER_COOLDOWN_SEC", "60"))
 # Таймаут на одно действие Playwright (клик, fill, wait), мс
 ACTION_TIMEOUT_MS = int(os.getenv("ACTION_TIMEOUT_MS", "10000"))
 # Путь к файлу итогового отчёта сессии (пусто = только в консоль)
@@ -252,7 +197,7 @@ SESSION_REPORT_HTML_PATH = os.getenv("SESSION_REPORT_HTML_PATH", "./session_repo
 SESSION_REPORT_JSONL = os.getenv("SESSION_REPORT_JSONL", "").strip()
 # Сохранять скриншот после каждого шага в папку (путь к папке)
 SAVE_STEP_SCREENSHOTS_DIR = os.getenv("SAVE_STEP_SCREENSHOTS_DIR", "").strip()
-# Оракул только при изменении экрана или новых ошибках (экономия вызовов GigaChat)
+# Оракул только при изменении экрана или новых ошибках (экономия вызовов LLM)
 ORACLE_ON_VISUAL_OR_ERROR = os.getenv("ORACLE_ON_VISUAL_OR_ERROR", "true").lower() in ("1", "true", "yes")
 
 # --- Константы агента (бывшие магические числа) ---
@@ -294,7 +239,7 @@ RESPONSIVE_VIEWPORTS = [
 SESSION_PERSIST_CHECK_EVERY_N = int(os.getenv("SESSION_PERSIST_CHECK_EVERY_N", "20"))
 # Self-healing: после N неудачных действий подряд — мета-рефлексия
 SELF_HEAL_AFTER_FAILURES = int(os.getenv("SELF_HEAL_AFTER_FAILURES", "4"))
-# Сценарные цепочки: запрашивать у GigaChat цепочку из N действий
+# Сценарные цепочки: запрашивать у LLM цепочку из N действий
 ENABLE_SCENARIO_CHAINS = os.getenv("ENABLE_SCENARIO_CHAINS", "true").lower() in ("1", "true", "yes")
 SCENARIO_CHAIN_LENGTH = int(os.getenv("SCENARIO_CHAIN_LENGTH", "4"))
 # iframe: тестировать содержимое iframe
@@ -310,7 +255,7 @@ COOKIE_BANNER_BUTTON_TEXTS = [s.strip() for s in os.getenv("COOKIE_BANNER_BUTTON
 
 # Оверлеи, которые НЕ часть приложения: чат, поддержка, виджеты + служебный UI агента (чат с LLM, Kventin).
 # Паттерны в id/class/aria-label/тексте (нижний регистр). Через запятую.
-OVERLAY_IGNORE_PATTERNS = [s.strip().lower() for s in os.getenv("OVERLAY_IGNORE_PATTERNS", "chat,чат,support,поддержк,help,консультант,jivo,intercom,crisp,drift,tawk,livechat,live-chat,widget-chat,chat-widget,feedback,обратн,звонок,callback,kventin,agent-llm,agent-banner,диалог с llm,ai-тестировщик,gigachat").split(",") if s.strip()]
+OVERLAY_IGNORE_PATTERNS = [s.strip().lower() for s in os.getenv("OVERLAY_IGNORE_PATTERNS", "chat,чат,support,поддержк,help,консультант,jivo,intercom,crisp,drift,tawk,livechat,live-chat,widget-chat,chat-widget,feedback,обратн,звонок,callback,kventin,agent-llm,agent-banner,диалог с llm,ai-тестировщик").split(",") if s.strip()]
 
 # --- Навигация и покрытие ---
 # Максимальная глубина переходов от start_url (0 = без лимита). Не уходить глубже N кликов.

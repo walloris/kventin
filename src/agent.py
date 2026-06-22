@@ -1,15 +1,15 @@
 """
 AI-агент тестировщик: активно ходит по сайту, кликает, заполняет формы,
-скринит экран и отправляет в GigaChat за советом. Многофазный цикл:
-1) Скриншот + контекст → GigaChat (что вижу, что делать?)
+скринит экран и отправляет в локальную LLM за советом. Многофазный цикл:
+1) Скриншот + контекст → LLM (что вижу, что делать?)
 2) Выполняем действие (click, type, scroll, hover)
-3) Скриншот после действия → GigaChat (что произошло, есть баг?)
+3) Скриншот после действия → LLM (что произошло, есть баг?)
 4) Если баг → Jira. Если нет → следующее действие.
 Все действия видимы. Память действий — не повторяемся.
 
 Архитектура: pipeline с фоновым пулом потоков.
 - Main thread: Playwright (действия, скриншоты) — sync only
-- Background pool: GigaChat, Jira, a11y, perf — параллельно
+- Background pool: LLM, Jira, a11y, perf — параллельно
 """
 import base64
 import json
@@ -50,9 +50,9 @@ from config import (
     NETWORK_LOG_LIMIT,
     POST_ACTION_DELAY,
     PHASE_STEPS_TO_ADVANCE,
-    GIGACHAT_RESPONSE_TIMEOUT_SEC,
-    GIGACHAT_CIRCUIT_BREAKER_AFTER_N_TIMEOUTS,
-    GIGACHAT_CIRCUIT_BREAKER_COOLDOWN_SEC,
+    LLM_RESPONSE_TIMEOUT_SEC,
+    LLM_CIRCUIT_BREAKER_AFTER_N_TIMEOUTS,
+    LLM_CIRCUIT_BREAKER_COOLDOWN_SEC,
     ACTION_TIMEOUT_MS,
     A11Y_CHECK_EVERY_N,
     PERF_CHECK_EVERY_N,
@@ -90,13 +90,13 @@ from config import (
     TEST_SPEC_YAML_PATH,
     FLAKINESS_RERUN_COUNT,
 )
-from src.gigachat_client import (
+from src.llm_client import (
     consult_agent_with_screenshot,
     consult_agent,
     get_structured_test_plan,
     get_test_plan_from_screenshot,
     ask_is_this_really_bug,
-    init_gigachat_connection,
+    init_llm_connection,
 )
 from src.llm_parser import parse_llm_action, validate_llm_action
 from src.form_strategies import detect_field_type, get_test_value, get_form_fill_strategy
@@ -121,7 +121,7 @@ if not LOG.handlers:
 # Текущая память агента в основном цикле (для self-healing в _find_element)
 _current_agent_memory: Optional["AgentMemory"] = None
 
-# Фоновый пул для параллельных задач (GigaChat, Jira, a11y, perf).
+# Фоновый пул для параллельных задач (LLM, Jira, a11y, perf).
 # Playwright НЕ thread-safe → только main thread. Всё остальное — в пул.
 # Реализация и сам инстанс пула живут в src/bg_pool.py.
 from src.bg_pool import (
@@ -1181,9 +1181,9 @@ def _goto_start_page_with_redirect_fallbacks(page: Page, start_url: str) -> str:
 def run_agent(start_url: str = None):
     """
     Запуск умного агента. Многофазный цикл:
-    Phase 1: Скриншот + контекст → GigaChat (что делать?)
+    Phase 1: Скриншот + контекст → LLM (что делать?)
     Phase 2: Выполнение действия
-    Phase 3: Скриншот после действия → GigaChat (анализ)
+    Phase 3: Скриншот после действия → LLM (анализ)
     Phase 4: Если дефект → Jira с фактурой
     """
     global _current_agent_memory
@@ -1196,12 +1196,12 @@ def run_agent(start_url: str = None):
     memory = AgentMemory()
     reset_session_defects()  # сбросить локальный кеш дефектов
 
-    # Инициализация соединения с GigaChat до запуска браузера
-    if not init_gigachat_connection():
-        print("[Agent] GigaChat недоступен. Проверьте настройки (токен, URL). Браузер не запускается.")
-        return {"defects": 0, "steps": 0, "error": "GigaChat недоступен"}
+    # Инициализация соединения с локальной LLM до запуска браузера
+    if not init_llm_connection():
+        print("[Agent] Локальная LLM недоступна. Проверьте LOCAL_LLM_API_URL и запущенный endpoint. Браузер не запускается.")
+        return {"defects": 0, "steps": 0, "error": "Локальная LLM недоступна"}
 
-    print("[Agent] GigaChat готов. Запуск браузера…")
+    print("[Agent] Локальная LLM готова. Запуск браузера…")
     result = {"defects": 0, "steps": 0, "error": None}
 
     with sync_playwright() as p:
@@ -1551,20 +1551,20 @@ def run_agent(start_url: str = None):
         else:
             print(f"[Agent] Бесконечный цикл. Ctrl+C для остановки.")
 
-        # ========== PIPELINE: Асинхронный GigaChat + мгновенные действия ==========
-        # GigaChat работает в фоне. Пока ждём ответ — агент кликает по ref-id.
-        # Когда GigaChat отвечает — берём его действие следующим.
-        _gigachat_future: Optional[Future] = None
-        _gigachat_future_started_at: float = 0.0
-        _gigachat_action: Optional[Dict[str, Any]] = None
-        _gigachat_meta: Dict[str, Any] = {}  # has_overlay, screenshot_b64
-        _gigachat_circuit_open_until: float = 0.0  # Circuit breaker: не вызывать GigaChat до этого времени
-        _gigachat_consecutive_timeouts: int = 0
+        # ========== PIPELINE: Асинхронная LLM + мгновенные действия ==========
+        # LLM работает в фоне. Пока ждём ответ — агент кликает по ref-id.
+        # Когда LLM отвечает — берём её действие следующим.
+        _llm_future: Optional[Future] = None
+        _llm_future_started_at: float = 0.0
+        _llm_action: Optional[Dict[str, Any]] = None
+        _llm_meta: Dict[str, Any] = {}  # has_overlay, screenshot_b64
+        _llm_circuit_open_until: float = 0.0  # Circuit breaker: не вызывать LLM до этого времени
+        _llm_consecutive_timeouts: int = 0
 
-        def _start_gigachat_async(page_, step_, memory_, console_log_, network_failures_, checklist_results_, context_):
-            """Запустить GigaChat в фоновом потоке. Возвращает Future."""
-            nonlocal _gigachat_future
-            # Проверка: страница закрыта — не запускаем GigaChat
+        def _start_llm_async(page_, step_, memory_, console_log_, network_failures_, checklist_results_, context_):
+            """Запустить LLM в фоновом потоке. Возвращает Future."""
+            nonlocal _llm_future
+            # Проверка: страница закрыта — не запускаем LLM
             if page_.is_closed():
                 return
             
@@ -1584,7 +1584,7 @@ def run_agent(start_url: str = None):
                 page_type = detect_page_type(page_)
             except Exception as e:
                 # Страница закрылась во время сбора данных
-                LOG.debug("_start_gigachat_async: страница закрыта во время сбора данных: %s", e)
+                LOG.debug("_start_llm_async: страница закрыта во время сбора данных: %s", e)
                 return
             coverage_hint = ""
             if current_url_ in memory_._page_coverage:
@@ -1592,8 +1592,8 @@ def run_agent(start_url: str = None):
                 if tested_count > 0:
                     coverage_hint = f"\nПротестировано: {tested_count}. Выбери НОВЫЙ элемент.\n"
 
-            _gigachat_meta["has_overlay"] = has_overlay
-            _gigachat_meta["screenshot_b64"] = screenshot_b64
+            _llm_meta["has_overlay"] = has_overlay
+            _llm_meta["screenshot_b64"] = screenshot_b64
 
             # Формируем контекст и вопрос
             ctx = build_context(page_, current_url_, console_log_, network_failures_)
@@ -1653,7 +1653,7 @@ def run_agent(start_url: str = None):
             phase_instruction = memory_.get_phase_instruction()
             send_screenshot = screenshot_b64 if screenshot_changed else None
 
-            def _call_gigachat():
+            def _call_llm():
                 raw = consult_agent_with_screenshot(
                     ctx, question, screenshot_b64=send_screenshot,
                     phase_instruction=phase_instruction, tester_phase=memory_.tester_phase,
@@ -1676,36 +1676,36 @@ def run_agent(start_url: str = None):
                             return validate_llm_action(action)
                 return None
 
-            nonlocal _gigachat_future_started_at
-            _gigachat_future_started_at = time.time()
-            _gigachat_future = _bg_submit(_call_gigachat)
+            nonlocal _llm_future_started_at
+            _llm_future_started_at = time.time()
+            _llm_future = _bg_submit(_call_llm)
 
-        def _poll_gigachat() -> Optional[Dict[str, Any]]:
-            """Проверить готов ли GigaChat (не блокирует). При таймауте — отменить и вернуть None."""
-            nonlocal _gigachat_future, _gigachat_action, _gigachat_future_started_at, _gigachat_consecutive_timeouts, _gigachat_circuit_open_until
-            if _gigachat_future is None:
-                return _gigachat_action
-            if _gigachat_future.done():
+        def _poll_llm() -> Optional[Dict[str, Any]]:
+            """Проверить готова ли LLM (не блокирует). При таймауте — отменить и вернуть None."""
+            nonlocal _llm_future, _llm_action, _llm_future_started_at, _llm_consecutive_timeouts, _llm_circuit_open_until
+            if _llm_future is None:
+                return _llm_action
+            if _llm_future.done():
                 try:
-                    result = _gigachat_future.result(timeout=0)
-                    _gigachat_action = result
+                    result = _llm_future.result(timeout=0)
+                    _llm_action = result
                     if result is not None:
-                        _gigachat_consecutive_timeouts = 0  # успех — сброс счётчика
+                        _llm_consecutive_timeouts = 0  # успех — сброс счётчика
                 except Exception:
-                    _gigachat_action = None
-                _gigachat_future = None
-                return _gigachat_action
-            if GIGACHAT_RESPONSE_TIMEOUT_SEC > 0 and (time.time() - _gigachat_future_started_at) > GIGACHAT_RESPONSE_TIMEOUT_SEC:
+                    _llm_action = None
+                _llm_future = None
+                return _llm_action
+            if LLM_RESPONSE_TIMEOUT_SEC > 0 and (time.time() - _llm_future_started_at) > LLM_RESPONSE_TIMEOUT_SEC:
                 try:
-                    _gigachat_future.cancel()
+                    _llm_future.cancel()
                 except Exception:
                     pass
-                _gigachat_future = None
-                if GIGACHAT_CIRCUIT_BREAKER_AFTER_N_TIMEOUTS > 0:
-                    _gigachat_consecutive_timeouts += 1
-                    if _gigachat_consecutive_timeouts >= GIGACHAT_CIRCUIT_BREAKER_AFTER_N_TIMEOUTS:
-                        _gigachat_circuit_open_until = time.time() + GIGACHAT_CIRCUIT_BREAKER_COOLDOWN_SEC
-                        print(f"[Agent] Circuit breaker: GigaChat не отвечает {_gigachat_consecutive_timeouts} раз подряд. Только fast action следующие {GIGACHAT_CIRCUIT_BREAKER_COOLDOWN_SEC} сек.")
+                _llm_future = None
+                if LLM_CIRCUIT_BREAKER_AFTER_N_TIMEOUTS > 0:
+                    _llm_consecutive_timeouts += 1
+                    if _llm_consecutive_timeouts >= LLM_CIRCUIT_BREAKER_AFTER_N_TIMEOUTS:
+                        _llm_circuit_open_until = time.time() + LLM_CIRCUIT_BREAKER_COOLDOWN_SEC
+                        print(f"[Agent] Circuit breaker: LLM не отвечает {_llm_consecutive_timeouts} раз подряд. Только fast action следующие {LLM_CIRCUIT_BREAKER_COOLDOWN_SEC} сек.")
                 return None
             return None  # ещё думает
 
@@ -1868,7 +1868,7 @@ def run_agent(start_url: str = None):
                 # Чеклист ОТКЛЮЧЕН — агент должен активно кликать, а не проверять
                 checklist_results = []
 
-                # ========== ВЫБОР ДЕЙСТВИЯ: GigaChat (если готов) или быстрое локальное ==========
+                # ========== ВЫБОР ДЕЙСТВИЯ: LLM (если готов) или быстрое локальное ==========
                 # Проверка: страница закрыта — выходим из цикла
                 if page.is_closed():
                     print(f"[Agent] #{step} Страница закрыта. Завершаю.")
@@ -1892,14 +1892,14 @@ def run_agent(start_url: str = None):
                     except Exception:
                         pass
 
-                # Ref-id для быстрого выбора (и для GigaChat)
+                # Ref-id для быстрого выбора (и для LLM)
                 if not page.is_closed():
                     try:
                         get_dom_summary(page, max_length=4000, include_shadow_dom=ENABLE_SHADOW_DOM)
                     except Exception:
                         pass
 
-                gc_action = _poll_gigachat()
+                llm_action = _poll_llm()
 
                 forced = getattr(memory, "_forced_action", None)
                 if forced and getattr(memory, "_diversify_step", -1) == step:
@@ -1907,17 +1907,17 @@ def run_agent(start_url: str = None):
                     memory._forced_action = None
                     screenshot_b64 = None
                     source = "AntiLoop"
-                    if gc_action is not None:
-                        # GigaChat предложил действие, но мы под антилупом — игнорируем
+                    if llm_action is not None:
+                        # LLM предложил действие, но мы под антилупом — игнорируем
                         # его на этом шаге и не теряем зря: сбрасываем future, а не кладём
                         # «отложенное решение для потом» (контекст ушёл).
-                        _gigachat_action = None
-                elif gc_action is not None:
-                    action = gc_action
-                    _gigachat_action = None
-                    has_overlay = _gigachat_meta.get("has_overlay", has_overlay)
-                    screenshot_b64 = _gigachat_meta.get("screenshot_b64")
-                    source = "GigaChat"
+                        _llm_action = None
+                elif llm_action is not None:
+                    action = llm_action
+                    _llm_action = None
+                    has_overlay = _llm_meta.get("has_overlay", has_overlay)
+                    screenshot_b64 = _llm_meta.get("screenshot_b64")
+                    source = "LLM"
                 else:
                     action = _get_fast_action(page, memory, has_overlay)
                     screenshot_b64 = None
@@ -1926,13 +1926,13 @@ def run_agent(start_url: str = None):
                 # Обогащаем action stable_key + url_pattern для надёжной памяти
                 enrich_action(page, memory, action)
 
-                # Circuit breaker: не вызывать GigaChat пока открыт контур
-                if _gigachat_future is None and not page.is_closed():
-                    if time.time() < _gigachat_circuit_open_until:
+                # Circuit breaker: не вызывать LLM пока открыт контур
+                if _llm_future is None and not page.is_closed():
+                    if time.time() < _llm_circuit_open_until:
                         pass  # только fast action
                     else:
                         try:
-                            _start_gigachat_async(page, step, memory, console_log, network_failures, checklist_results, context)
+                            _start_llm_async(page, step, memory, console_log, network_failures, checklist_results, context)
                         except Exception:
                             pass
 
@@ -2084,10 +2084,10 @@ def run_agent(start_url: str = None):
         except KeyboardInterrupt:
             print("\n[Agent] Остановлен по Ctrl+C.")
         finally:
-            # Отменить фоновые задачи GigaChat
-            if '_gigachat_future' in locals() and _gigachat_future is not None:
+            # Отменить фоновые задачи LLM
+            if '_llm_future' in locals() and _llm_future is not None:
                 try:
-                    _gigachat_future.cancel()
+                    _llm_future.cancel()
                 except Exception:
                     pass
             
@@ -2714,7 +2714,7 @@ tr:last-child td {{ border-bottom: none; }}
 .act-close_modal {{ background: rgba(239,68,68,0.22); color: var(--danger); }}
 .act-fill_form {{ background: rgba(34,197,94,0.28); color: var(--success); }}
 .src {{ padding: 0.2em 0.45em; border-radius: 4px; font-size: 0.78em; }}
-.src-gigachat {{ background: rgba(99,102,241,0.22); color: var(--accent2); }}
+.src-llm {{ background: rgba(99,102,241,0.22); color: var(--accent2); }}
 .src-fast {{ background: var(--surface3); color: var(--text2); }}
 .step-thumb {{ width: 88px; height: 50px; object-fit: cover; border-radius: var(--radius-sm); display: block; }}
 .thumb {{ width: 100px; }}
@@ -3346,7 +3346,7 @@ def _get_fast_action(
 
 
 def _step_get_action(page, step, memory, console_log, network_failures, checklist_results, context):
-    """STEP 2: Скриншот + контекст → GigaChat → получить действие."""
+    """STEP 2: Скриншот + контекст → LLM → получить действие."""
     dom_max = 4000
     history_n = 15
 
@@ -3460,7 +3460,7 @@ def _step_get_action(page, step, memory, console_log, network_failures, checklis
     phase_instruction = memory.get_phase_instruction()
     update_llm_overlay(page, prompt=f"#{step} [{memory.tester_phase}]", loading=True)
 
-    # Скриншот для GigaChat: если не изменился — можно не отправлять (экономия токенов)
+    # Скриншот для LLM: если не изменился — можно не отправлять (экономия токенов)
     send_screenshot = screenshot_b64 if screenshot_changed else None
 
     # Scenario chains: в critical_path каждый 3-й шаг запрашиваем цепочку
@@ -3485,7 +3485,7 @@ def _step_get_action(page, step, memory, console_log, network_failures, checklis
         if act_check != "check_defect" and memory.is_already_done_action(action):
             print(f"[Agent] #{step} ⚠️ Scenario chain содержит повтор: {act_check} -> {sel_check[:40]}. Очищаю очередь.")
             memory._scenario_queue = []
-            # Продолжить к обычному запросу к GigaChat
+            # Продолжить к обычному запросу к LLM
         else:
             action = memory._scenario_queue.pop(0)
             enrich_action(page, memory, action)
@@ -3509,7 +3509,7 @@ def _step_get_action(page, step, memory, console_log, network_failures, checklis
     update_llm_overlay(page, prompt=f"#{step} Ответ", response=raw_answer or "Нет ответа", loading=False, error="Нет ответа" if not raw_answer else None)
 
     if not raw_answer:
-        print(f"[Agent] #{step} GigaChat недоступен после retry, возвращаю None для fallback")
+        print(f"[Agent] #{step} LLM недоступен после retry, возвращаю None для fallback")
         return None, has_overlay, screenshot_b64
 
     action = parse_llm_action(raw_answer)
@@ -3536,15 +3536,15 @@ def _step_get_action(page, step, memory, console_log, network_failures, checklis
     act_precheck = (action.get("action") or "").lower()
     sel_precheck = (action.get("selector") or "").strip()
     if act_precheck != "check_defect" and memory.is_already_done_action(action):
-        print(f"[Agent] #{step} ⚠️ GigaChat предложил повтор: {act_precheck} -> {sel_precheck[:40]} (key={action.get('_stable_key', '')[:40]}). Игнорирую и выбираю альтернативу.")
+        print(f"[Agent] #{step} ⚠️ LLM предложил повтор: {act_precheck} -> {sel_precheck[:40]} (key={action.get('_stable_key', '')[:40]}). Игнорирую и выбираю альтернативу.")
         memory.record_repeat()
         # Выбрать альтернативное действие
         if has_overlay and not getattr(memory, "ignore_overlay", False):
-            action = {"action": "close_modal", "selector": "", "reason": "GigaChat предложил повтор — закрываю оверлей"}
+            action = {"action": "close_modal", "selector": "", "reason": "LLM предложил повтор — закрываю оверлей"}
         elif not memory.should_avoid_scroll():
-            action = {"action": "scroll", "selector": "down", "reason": "GigaChat предложил повтор — прокрутка"}
+            action = {"action": "scroll", "selector": "down", "reason": "LLM предложил повтор — прокрутка"}
         else:
-            action = {"action": "hover", "selector": "body", "reason": "GigaChat предложил повтор — hover для поиска"}
+            action = {"action": "hover", "selector": "body", "reason": "LLM предложил повтор — hover для поиска"}
         enrich_action(page, memory, action)
     # layout_issue → possible_bug
     if action.get("layout_issue") and not action.get("possible_bug"):
@@ -3825,7 +3825,7 @@ def _analyze_in_background(
             + (f"\n\nНовые ошибки консоли после действия:\n{console_brief}" if console_brief else "")
         )
 
-    # Оракул (GigaChat — thread-safe). Lazy: только при изменении экрана или новых ошибках (ORACLE_ON_VISUAL_OR_ERROR)
+    # Оракул (LLM — thread-safe). Lazy: только при изменении экрана или новых ошибках (ORACLE_ON_VISUAL_OR_ERROR)
     run_oracle = ENABLE_ORACLE_AFTER_ACTION and act_type in ("type", "click") and post_screenshot_b64 and not new_network_fails
     if run_oracle and ORACLE_ON_VISUAL_OR_ERROR:
         run_oracle = visual_diff_info.get("changed") or bool(new_errors)
@@ -3957,7 +3957,7 @@ def _step_post_analysis(
     # СИНХРОННЫЙ FAST-PATH: быстрые правила в main thread.
     # Если правило сработало — дефект заводится СРАЗУ, не дожидаясь фонового
     # LLM-оракула. Раньше всё это было только в _analyze_in_background, и
-    # когда GigaChat висел по таймауту 120с, future не успевал к следующему
+    # когда LLM висел по таймауту 120с, future не успевал к следующему
     # шагу — _flush_pending_analysis получал пустой findings и дефект терялся.
     # ============================================================
     if memory.defects_on_current_step == 0:
@@ -4048,7 +4048,7 @@ def _flush_pending_analysis(page, memory, console_log, network_failures):
 
     future = pending["future"]
     step = pending.get("step", "?")
-    # Ждём только до 5с (раньше было 10): если GigaChat где-то висит, circuit
+    # Ждём только до 5с (раньше было 10): если LLM где-то висит, circuit
     # breaker уже должен был сработать. Если future всё ещё в работе — это
     # ненормально, фиксируем и идём дальше, чтобы main thread не стоял.
     from concurrent.futures import TimeoutError as _FutureTimeout
@@ -4219,7 +4219,7 @@ from src.agent_checks import (
 def _self_heal(page: Page, memory: AgentMemory, console_log, network_failures):
     """
     Self-healing: после серии неудач ИЛИ зацикливания — мета-рефлексия.
-    Спрашиваем GigaChat «что пошло не так и что делать?».
+    Спрашиваем LLM «что пошло не так и что делать?».
     """
     is_stuck = memory.is_stuck()
     reason = f"{memory._consecutive_repeats} повторов подряд" if is_stuck else f"{memory.consecutive_failures} неудач подряд"

@@ -1,4 +1,4 @@
-# AI-агент тестировщик (Playwright + GigaChat + Jira)
+# AI-агент тестировщик (Playwright + Local OpenAI-compatible LLM + Jira)
 
 Автономный агент, который **бесконечно** тестирует одну переданную страницу:
 
@@ -23,14 +23,16 @@ git commit -m "обновление" && git push -u origin main
 
 ---
 
-Автономный агент, который **бесконечно** тестирует одну переданную страницу: анализирует консоль, сеть и DOM, советуется с **GigaChat** для принятия решений и при необходимости создаёт дефекты в **Jira** через API. Флаки и типичные проблемы тестовой среды (404 в консоли и т.п.) **игнорируются**. Все действия агента **видимы**: браузер в режиме с замедлением, визуальный курсор на странице и подсветка элементов перед кликом.
+Автономный агент, который **бесконечно** тестирует одну переданную страницу: анализирует консоль, сеть и DOM, советуется с локальной **OpenAI-compatible LLM** для принятия решений и при необходимости создаёт дефекты в **Jira** через API. Флаки и типичные проблемы тестовой среды (404 в консоли и т.п.) **игнорируются**. Все действия агента **видимы**: браузер в режиме с замедлением, визуальный курсор на странице и подсветка элементов перед кликом.
 
 ## Требования
 
 - Python 3.9+
-- Один из LLM-провайдеров: `gigacode_cli`, `gigachat`, `jan`, `openai`, `anthropic`, `ollama`
+- Локальный OpenAI-compatible endpoint:
+  - `http://127.0.0.1:3333/v1/chat/completions`
+  - `http://127.0.0.1:3333/v1/models`
 - Учётные данные Jira (если нужно заводить дефекты)
-- Доступ в интернет
+- Доступ в интернет только для Jira/установки зависимостей
 
 ## Установка
 
@@ -62,9 +64,10 @@ cp .env.example .env
 | Переменная | Описание |
 |------------|----------|
 | `START_URL` | **Обязательно.** URL страницы для тестирования (например `https://example.com`). |
-| `LLM_PROVIDER` | Провайдер модели: `gigacode_cli`, `gigachat`, `jan`, `openai`, `anthropic`, `ollama`. |
-| `LLM_REQUEST_TIMEOUT_SEC` | HTTP timeout для Jan/OpenAI/Ollama. |
-| `GIGACHAT_CREDENTIALS` | Строка авторизации GigaChat (Base64 от `client_id:client_secret`) или используйте стендовые переменные GigaChat. |
+| `LOCAL_LLM_API_URL` | Base URL `http://127.0.0.1:3333/v1` или полный `/v1/chat/completions`. |
+| `LOCAL_LLM_MODEL` | ID модели. Если пусто, агент берёт первую модель из `GET /v1/models`. |
+| `LOCAL_LLM_API_KEY` | Bearer token для совместимости; по умолчанию `local`. |
+| `LLM_REQUEST_TIMEOUT_SEC` | HTTP timeout локальной LLM. |
 | `JIRA_URL` | URL вашего Jira (например `https://your-company.atlassian.net`). |
 | `JIRA_USERNAME` | Логин (username) в Jira. |
 | `JIRA_EMAIL` | Email в Jira (если у вас логин по email, например Atlassian Cloud). |
@@ -75,48 +78,24 @@ cp .env.example .env
 | `HIGHLIGHT_DURATION_MS` | Пауза после подсветки элемента в мс (по умолчанию 800). |
 | `HEADLESS` | `true` — без окна браузера; по умолчанию `false` (окно видно). |
 
-### gigacode CLI
+### Локальная LLM
 
-Рекомендуемый режим для локального агентного запуска:
+Агент использует только OpenAI-compatible API. Минимальная настройка:
 
 ```env
-LLM_PROVIDER=gigacode_cli
-GIGACODE_CLI_BIN=gigacode
-GIGACODE_CLI_ARGS=-p --output-format json
-GIGACODE_CLI_PASS_PROMPT=stdin
-GIGACODE_CLI_SEND_IMAGE=true
+LOCAL_LLM_API_URL=http://127.0.0.1:3333/v1
+LOCAL_LLM_MODEL=
+LOCAL_LLM_API_KEY=local
+LLM_REQUEST_TIMEOUT_SEC=60
 ```
 
-Проверить доступность CLI:
+Если `LOCAL_LLM_MODEL` пустой, агент вызовет:
 
 ```bash
-python -m src.gigacode_cli_client
+curl http://127.0.0.1:3333/v1/models
 ```
 
-### Локальная модель в Jan (Mac M4 32GB и др.)
-
-Вместо GigaChat можно использовать **локальную модель** в [Jan](https://jan.ai/) (OpenAI-совместимый API).
-
-**Важно:** чтобы агент «видел» скриншоты страницы, в Jan должна быть загружена **vision-модель** (multimodal). Обычные текстовые модели (Vikhr, Qwen2.5-7B без VL) скриншоты не обрабатывают.
-
-1. Установи [Jan](https://github.com/janhq/jan/releases) и запусти приложение.
-2. Скачай **vision-модель** (для Mac Mini M4 32GB):
-   - **Llama 3.2 11B Vision Instruct** (GGUF, квант Q4_K_M ~6 GB) — мультиязычная, хорошо работает с экранами. В Jan/Hugging Face ищи `Llama-3.2-11B-Vision-Instruct-GGUF`.
-   - **Qwen2-VL-7B** (именно VL — vision, не Qwen2.5 7B текстовый) — мультиязычная, понимает изображения.
-   - Альтернативы: **LLaVA**, **Pixtral** (если есть в каталоге Jan).
-3. В Jan: **Settings → Local API Server** → задай API Key (например `jan-api-key`) → **Start Server**. В логах: `JAN API listening at http://127.0.0.1:1337`.
-4. В `.env` задай:
-   ```
-   LLM_PROVIDER=jan
-   JAN_API_URL=http://127.0.0.1:1337
-   JAN_API_KEY=jan-api-key
-   JAN_MODEL=<ID модели в Jan>
-   ```
-   `JAN_MODEL` — точный ID модели, как в Jan (например `llama-3.2-11b-vision-instruct-q4_k_m` или как в списке после загрузки).
-
-Только vision-модели получают скриншот. Текстовые (Vikhr, Qwen2.5 без VL) работают без картинки — агент опирается на DOM и контекст.
-
-Получить GigaChat API: [developers.sber.ru — GigaChat](https://developers.sber.ru/portal/products/gigachat-api).
+Для анализа скриншотов endpoint должен поддерживать OpenAI vision-формат `image_url` с data URL.
 
 ## Запуск
 
@@ -132,7 +111,7 @@ python main.py https://example.com
 python main.py
 ```
 
-Агент работает **бесконечно**: в цикле анализирует страницу, спрашивает GigaChat «что делать дальше», выполняет клики или создаёт дефекты в Jira, при переходе по ссылке проверяет открытие и возвращается на переданную страницу.
+Агент работает **бесконечно**: в цикле анализирует страницу, спрашивает локальную LLM «что делать дальше», выполняет клики или создаёт дефекты в Jira, при переходе по ссылке проверяет открытие и возвращается на переданную страницу.
 
 Для CI можно ограничить прогон:
 
@@ -151,11 +130,11 @@ HEADLESS=true MAX_STEPS=20 python main.py https://example.com --json-summary
    - **Сеть** — неуспешные ответы (статус и URL);
    - **DOM** — кнопки и ссылки (тег, текст, id, класс, href).
 
-3. **GigaChat**  
-   Контекст (консоль, сеть, DOM) отправляется в GigaChat. Агент задаёт вопрос: что кликнуть следующим или есть ли дефект для Jira. Действия выполняются по ответу.
+3. **Local LLM**
+   Контекст (консоль, сеть, DOM и скриншот) отправляется в локальный OpenAI-compatible endpoint. Агент задаёт вопрос: что кликнуть следующим или есть ли дефект для Jira. Действия выполняются по ответу.
 
 4. **Jira**  
-   Дефекты создаются по API только когда GigaChat указывает на реальный баг. Игнорируются:
+   Дефекты создаются по API только когда LLM указывает на реальный баг. Игнорируются:
    - типичные флаки и проблемы тестовой среды;
    - 404 в консоли, `Failed to load resource`, запросы к аналитике, расширениям и т.п.  
    Список игнорируемых паттернов настраивается в `config.py` (`IGNORE_CONSOLE_PATTERNS`, `IGNORE_NETWORK_STATUSES`).
@@ -177,7 +156,8 @@ kventin/
 └── src/
     ├── __init__.py
     ├── agent.py          # Основной цикл агента
-    ├── gigachat_client.py # Запросы к GigaChat API
+    ├── llm_client.py # Фасад LLM для агента
+    ├── local_openai_client.py # Локальный OpenAI-compatible клиент
     ├── jira_client.py    # Создание дефектов в Jira
     ├── page_analyzer.py  # Сбор консоли, сети, DOM
     └── visible_actions.py # Курсор и подсветка элементов

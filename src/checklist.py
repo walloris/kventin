@@ -156,7 +156,7 @@ def run_checklist(
 
 
 def checklist_results_to_context(results: List[Dict[str, Any]]) -> str:
-    """Собрать текстовый контекст из результатов чеклиста для GigaChat."""
+    """Собрать текстовый контекст из результатов чеклиста для LLM."""
     lines = ["Чеклист проверок:"]
     for r in results:
         status = "✅" if r.get("ok") else "❌"

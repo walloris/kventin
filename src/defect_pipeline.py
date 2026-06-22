@@ -9,7 +9,7 @@ last_action_summary, record_defect_created и атрибут pending_defect_futu
 Публичный API:
 - create_defect(...)            — создать дефект (фильтр шума, evidence, отправка в фон).
 - check_broken_links_bg(...)    — фоновая проверка URL на 4xx/5xx.
-- is_semantic_duplicate(...)    — внутренняя проверка через GigaChat (используется и из bg).
+- is_semantic_duplicate(...)    — внутренняя проверка через LLM (используется и из bg).
 """
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ from src.defect_builder import (
     memory_actions_to_retest_plan,
 )
 from src.defect_rules import should_create_defect
-from src.gigachat_client import consult_agent
+from src.llm_client import consult_agent
 from src.jira_client import (
     build_defect_signature,
     create_jira_issue,
@@ -130,7 +130,7 @@ def _compute_defect_signature(
 
 def is_semantic_duplicate(bug_description: str, memory: Any) -> bool:
     """
-    Уровень 3: семантическая проверка через GigaChat — «это тот же баг что уже есть?»
+    Уровень 3: семантическая проверка через LLM — «это тот же баг что уже есть?»
     """
     if not memory or not getattr(memory, "defects_created", None):
         return False
@@ -145,7 +145,7 @@ def is_semantic_duplicate(bug_description: str, memory: Any) -> bool:
             f"Это ДУБЛЬ одного из уже заведённых? Ответь ОДНИМ словом: ДА или НЕТ."
         )
         if answer and "да" in answer.strip().lower()[:10]:
-            LOG.info("Семантический дубль (GigaChat): %s", bug_description[:60])
+            LOG.info("Семантический дубль (LLM): %s", bug_description[:60])
             return True
     except Exception as e:
         LOG.debug("semantic dedup error: %s", e)
@@ -161,14 +161,14 @@ def _create_defect_bg(
     severity: str = "major",
     signature: str = "",
 ) -> None:
-    """Фоновое создание дефекта (Jira API + GigaChat дедупликация)."""
+    """Фоновое создание дефекта (Jira API + LLM-дедупликация)."""
     LOG.info(
         "_create_defect_bg: старт summary=%r severity=%s sig=%r",
         summary[:140], severity, signature[:120],
     )
     try:
         if is_semantic_duplicate(bug_description, memory):
-            print(f"[Agent] Пропуск дефекта (семантический дубль GigaChat): {summary[:60]}")
+            print(f"[Agent] Пропуск дефекта (семантический дубль LLM): {summary[:60]}")
             LOG.info("_create_defect_bg: отбито is_semantic_duplicate")
             register_local_defect(summary, signature=signature)
             return

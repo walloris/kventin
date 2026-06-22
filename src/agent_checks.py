@@ -38,7 +38,7 @@ from config import (
 )
 from src.defect_pipeline import create_defect
 from src.defect_rules import rule_page_load_errors
-from src.gigachat_client import consult_agent_with_screenshot
+from src.llm_client import consult_agent_with_screenshot
 from src.llm_parser import parse_llm_action, validate_llm_action
 from src.performance import check_performance, format_performance_issues
 from src.page_analyzer import take_screenshot_b64
@@ -182,7 +182,7 @@ def run_responsive_check(
 ) -> None:
     """
     Переключить viewport на мобильный/планшетный, сделать скриншот и проверить
-    верстку через GigaChat. Возвращает viewport обратно в финале.
+    верстку через LLM. Возвращает viewport обратно в финале.
     """
     if not ENABLE_RESPONSIVE_TEST:
         return
@@ -278,7 +278,7 @@ def request_scenario_chain(
     screenshot_b64: Optional[str],
 ) -> List[Dict]:
     """
-    Попросить GigaChat сгенерировать цепочку из N связанных действий (сценарий).
+    Попросить LLM сгенерировать цепочку из N связанных действий (сценарий).
     Возвращает список action-dict (не enriched — обогащение делается на стороне agent).
     """
     if not ENABLE_SCENARIO_CHAINS:
