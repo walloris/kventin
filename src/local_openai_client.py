@@ -16,6 +16,29 @@ import requests
 LOG = logging.getLogger("LocalLLM")
 
 
+TLS_PROXY_HINT = (
+    "Локальный OpenAI-compatible endpoint ответил ошибкой TLS/self-signed certificate. "
+    "Это обычно падает не в Kventin, а внутри Node-прокси при запросе к upstream. "
+    "Запустите прокси с доверенным корпоративным CA: "
+    "NODE_EXTRA_CA_CERTS=/path/to/corporate-ca.pem node proxy.js. "
+    "Временный небезопасный обход: NODE_TLS_REJECT_UNAUTHORIZED=0 node proxy.js."
+)
+
+
+def _looks_like_tls_proxy_error(text: str) -> bool:
+    low = (text or "").lower()
+    return any(
+        marker in low
+        for marker in (
+            "self_signed_cert_in_chain",
+            "self-signed certificate",
+            "unable_to_verify_leaf_signature",
+            "certificate verify failed",
+            "fetch failed",
+        )
+    )
+
+
 class LocalOpenAIClient:
     """Small client for a local OpenAI-compatible chat completions endpoint."""
 
@@ -85,7 +108,11 @@ class LocalOpenAIClient:
                 timeout=self.timeout,
             )
             if response.status_code != 200:
-                LOG.error("Local LLM HTTP %s: %s", response.status_code, response.text[:800])
+                body = response.text[:1200]
+                if _looks_like_tls_proxy_error(body):
+                    LOG.error("%s\nProxy response: %s", TLS_PROXY_HINT, body)
+                else:
+                    LOG.error("Local LLM HTTP %s: %s", response.status_code, body)
                 return ""
             data = response.json()
             choices = data.get("choices") or []

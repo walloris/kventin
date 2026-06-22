@@ -97,6 +97,20 @@ curl http://127.0.0.1:3333/v1/models
 
 Для анализа скриншотов endpoint должен поддерживать OpenAI vision-формат `image_url` с data URL.
 
+Если локальный `gigacode-proxy` пишет `SELF_SIGNED_CERT_IN_CHAIN` или `self-signed certificate in certificate chain`, ошибка находится внутри Node-прокси при его запросе к upstream. Kventin ходит в локальный `http://127.0.0.1:3333`, TLS там не участвует.
+
+Правильный вариант — запустить прокси с корпоративным CA:
+
+```bash
+NODE_EXTRA_CA_CERTS=/path/to/corporate-ca.pem node proxy.js
+```
+
+Временный небезопасный обход только для локальной отладки:
+
+```bash
+NODE_TLS_REJECT_UNAUTHORIZED=0 node proxy.js
+```
+
 ## Запуск
 
 Передать URL страницы аргументом:

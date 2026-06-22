@@ -1,4 +1,4 @@
-from src.local_openai_client import LocalOpenAIClient
+from src.local_openai_client import LocalOpenAIClient, _looks_like_tls_proxy_error
 
 
 def test_local_client_accepts_base_url(monkeypatch) -> None:
@@ -25,3 +25,10 @@ def test_local_client_accepts_full_chat_completions_url(monkeypatch) -> None:
     assert client.base_url == "http://127.0.0.1:3333/v1"
     assert client.chat_url == "http://127.0.0.1:3333/v1/chat/completions"
     assert client.models_url == "http://127.0.0.1:3333/v1/models"
+
+
+def test_local_client_detects_tls_proxy_errors() -> None:
+    body = "TypeError: fetch failed SELF_SIGNED_CERT_IN_CHAIN self-signed certificate in certificate chain"
+
+    assert _looks_like_tls_proxy_error(body) is True
+    assert _looks_like_tls_proxy_error("ordinary model error") is False
