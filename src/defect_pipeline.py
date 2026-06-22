@@ -272,7 +272,13 @@ def create_defect(
 
     retest_wiki = ""
     if memory:
-        plan_dict = memory_actions_to_retest_plan(memory, current_url)
+        plan_dict = memory_actions_to_retest_plan(
+            memory,
+            current_url,
+            bug_description=bug_description,
+            console_log=console_log,
+            network_failures=network_failures,
+        )
         if plan_dict and plan_dict.get("steps"):
             try:
                 retest_wiki = format_retest_spec_wiki(plan_dict)

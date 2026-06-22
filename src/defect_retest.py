@@ -67,6 +67,109 @@ from src.page_analyzer import get_dom_summary
 LOG = logging.getLogger("kventin.retest")
 
 
+def _short_sig(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "")).strip().lower()
+
+
+def _install_retest_observers(
+    page: Page,
+    console_log: List[Dict[str, Any]],
+    network_failures: List[Dict[str, Any]],
+) -> None:
+    """Collect deterministic signals during retest for the JSON oracle."""
+
+    def on_console(msg):
+        try:
+            console_log.append({"type": msg.type, "text": msg.text})
+        except Exception:
+            pass
+
+    def on_pageerror(exc):
+        try:
+            console_log.append({"type": "pageerror", "text": str(exc)})
+        except Exception:
+            pass
+
+    def on_response(resp):
+        try:
+            status = resp.status
+            if status >= 400:
+                req = resp.request
+                network_failures.append({
+                    "status": status,
+                    "method": req.method,
+                    "url": resp.url,
+                })
+        except Exception:
+            pass
+
+    page.on("console", on_console)
+    page.on("pageerror", on_pageerror)
+    page.on("response", on_response)
+
+
+def _network_matches(expected: Dict[str, Any], actual: Dict[str, Any]) -> bool:
+    exp_status = int(expected.get("status") or 0)
+    act_status = int(actual.get("status") or 0)
+    if exp_status and exp_status != act_status:
+        return False
+    exp_method = (expected.get("method") or "").upper()
+    act_method = (actual.get("method") or "").upper()
+    if exp_method and exp_method != act_method:
+        return False
+    exp_path = (expected.get("url_path") or "").strip()
+    act_url = (actual.get("url") or "").strip()
+    if exp_path and exp_path not in act_url:
+        return False
+    return True
+
+
+def _assert_retest_oracle(
+    plan: Dict[str, Any],
+    memory: AgentMemory,
+    console_log: List[Dict[str, Any]],
+    network_failures: List[Dict[str, Any]],
+) -> Tuple[bool, str]:
+    """Return False when the original defect signal is still present."""
+    oracle = plan.get("oracle") or {}
+    if not isinstance(oracle, dict):
+        return True, "oracle отсутствует, проверены только шаги"
+
+    action_needles = [
+        _short_sig(x)
+        for x in (oracle.get("fail_on_action_result_contains") or [])
+        if isinstance(x, str) and x.strip()
+    ]
+    for action in getattr(memory, "actions", []) or []:
+        result = _short_sig(action.get("result") or "")
+        if result and any(needle in result for needle in action_needles):
+            return False, f"повторился action-сигнал: {action.get('action')} -> {action.get('result')}"
+
+    console_needles = [
+        _short_sig(x)
+        for x in (oracle.get("fail_on_console_contains") or [])
+        if isinstance(x, str) and x.strip()
+    ]
+    for entry in console_log:
+        text = _short_sig(entry.get("text") or "")
+        if text and any(needle and needle in text for needle in console_needles):
+            return False, f"повторился console-сигнал: {entry.get('type')} {entry.get('text')[:180]}"
+
+    expected_network = [
+        x for x in (oracle.get("fail_on_network") or [])
+        if isinstance(x, dict)
+    ]
+    for exp in expected_network:
+        for actual in network_failures:
+            if _network_matches(exp, actual):
+                return False, (
+                    "повторился network-сигнал: "
+                    f"{actual.get('status')} {actual.get('method')} {actual.get('url')[:180]}"
+                )
+
+    return True, "шаги выполнены, исходные oracle-сигналы не повторились"
+
+
 def extract_canonical_locator(description: str) -> str:
     """Вытащить строку канонического локатора из wiki-описания (блок «Затронутый элемент»)."""
     if not description:
@@ -298,9 +401,12 @@ def run_retest_playwright(description: str, fallback_start_url: str) -> Tuple[bo
 
     memory = AgentMemory()
     agent_mod._current_agent_memory = memory
+    console_log: List[Dict[str, Any]] = []
+    network_failures: List[Dict[str, Any]] = []
 
     with sync_playwright() as p:
         context, page, browser = _retest_launch_browser(p)
+        _install_retest_observers(page, console_log, network_failures)
         try:
             if AUTH_URL and AUTH_USERNAME and AUTH_PASSWORD:
                 _do_auth_login(page, AUTH_URL, AUTH_USERNAME, AUTH_PASSWORD, AUTH_SUBMIT_SELECTOR)
@@ -318,7 +424,10 @@ def run_retest_playwright(description: str, fallback_start_url: str) -> Tuple[bo
                 smart_wait_after_goto(page, timeout=5000)
                 _inject_all(page)
                 get_dom_summary(page, max_length=4000, include_shadow_dom=ENABLE_SHADOW_DOM)
-                return _run_loaded_plan_steps(page, memory, plan)
+                ok, msg = _run_loaded_plan_steps(page, memory, plan)
+                if not ok:
+                    return False, msg
+                return _assert_retest_oracle(plan, memory, console_log, network_failures)
 
             # --- эвристический путь (старые тикеты без JSON) ---
             LOG.info("retest: режим текстовых шагов (без KVENTIN_RETEST_JSON_V1)")

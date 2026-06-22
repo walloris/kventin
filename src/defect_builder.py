@@ -19,6 +19,7 @@ RETEST_JSON_MARKER = "KVENTIN_RETEST_JSON_V1"
 # Ограничение размера JSON в поле Description Jira.
 RETEST_PLAN_MAX_STEPS = 28
 RETEST_JSON_MAX_CHARS = 26000
+RETEST_SIGNAL_MAX_ITEMS = 8
 
 # Уровни серьёзности в Kventin; соответствие имён приоритета в Jira — JIRA_PRIORITY_* в config (опционально).
 SEVERITY_CRITICAL = "critical"
@@ -124,10 +125,116 @@ def _selector_for_retest_step(canonical_locator: str, selector: str) -> str:
     return (selector or "").strip()
 
 
+def _short_text_signature(text: str, *, max_len: int = 220) -> str:
+    """Stable, compact text signature for later retest matching."""
+    text = re.sub(r"\s+", " ", (text or "")).strip()
+    # Drop long volatile ids/hashes while keeping the useful error wording.
+    text = re.sub(r"\b[0-9a-f]{16,}\b", "<hash>", text, flags=re.I)
+    text = re.sub(r"\b\d{10,}\b", "<num>", text)
+    return text[:max_len]
+
+
+def _network_signature(entry: Dict[str, Any]) -> Dict[str, Any]:
+    url = (entry.get("url") or "").strip()
+    path = url
+    try:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+        path = parsed.path or "/"
+    except Exception:
+        pass
+    return {
+        "status": int(entry.get("status") or 0),
+        "method": (entry.get("method") or "GET").upper()[:12],
+        "url_path": path[:300],
+    }
+
+
+def build_retest_oracle(
+    bug_description: str,
+    *,
+    memory: Any = None,
+    console_log: Optional[List[Dict[str, Any]]] = None,
+    network_failures: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """
+    Build deterministic signals that mean the defect still reproduces.
+
+    The retest should not ask an LLM whether the bug is fixed. It should replay
+    steps and then check exact signals from the original failure: action errors,
+    console errors, and HTTP failures.
+    """
+    oracle: Dict[str, Any] = {
+        "bug_summary": _short_text_signature(bug_description, max_len=600),
+        "pass_condition": (
+            "Все шаги ретеста выполняются без action_error/not_found, "
+            "и после воспроизведения не появляются перечисленные console/network сигналы."
+        ),
+        "fail_on_action_result_contains": [
+            "click_error",
+            "type_error",
+            "hover_error",
+            "not_found",
+            "timeout",
+            "possible_dead_click",
+        ],
+        "fail_on_console_contains": [],
+        "fail_on_network": [],
+    }
+
+    if memory is not None:
+        try:
+            for action in reversed(getattr(memory, "actions", []) or []):
+                result = _short_text_signature(action.get("result") or "")
+                low = result.lower()
+                if result and any(x in low for x in ("error", "not_found", "timeout", "dead_click")):
+                    oracle["original_action_failure"] = {
+                        "action": (action.get("action") or "")[:40],
+                        "selector": (action.get("canonical_locator") or action.get("selector") or "")[:500],
+                        "result": result,
+                    }
+                    break
+        except Exception:
+            pass
+
+    console_signals: List[str] = []
+    for entry in (console_log or [])[-80:]:
+        etype = (entry.get("type") or "").lower()
+        if etype not in ("pageerror", "error"):
+            continue
+        text = _short_text_signature(entry.get("text") or "")
+        if text and text not in console_signals:
+            console_signals.append(text)
+        if len(console_signals) >= RETEST_SIGNAL_MAX_ITEMS:
+            break
+    oracle["fail_on_console_contains"] = console_signals
+
+    network_signals: List[Dict[str, Any]] = []
+    seen_net = set()
+    for entry in (network_failures or [])[-80:]:
+        status = int(entry.get("status") or 0)
+        if status < 400:
+            continue
+        sig = _network_signature(entry)
+        key = (sig["status"], sig["method"], sig["url_path"])
+        if key in seen_net:
+            continue
+        seen_net.add(key)
+        network_signals.append(sig)
+        if len(network_signals) >= RETEST_SIGNAL_MAX_ITEMS:
+            break
+    oracle["fail_on_network"] = network_signals
+    return oracle
+
+
 def memory_actions_to_retest_plan(
     memory: Any,
     current_url: str,
     *,
+    bug_description: str = "",
+    console_log: Optional[List[Dict[str, Any]]] = None,
+    network_failures: Optional[List[Dict[str, Any]]] = None,
     max_steps: int = RETEST_PLAN_MAX_STEPS,
 ) -> Optional[Dict[str, Any]]:
     """
@@ -235,6 +342,12 @@ def memory_actions_to_retest_plan(
         "kventin_retest_version": RETEST_SPEC_VERSION,
         "start_url": start_url[:2000],
         "primary_locator": playwright_canonical_to_exec_selector(primary) or primary[:600],
+        "oracle": build_retest_oracle(
+            bug_description,
+            memory=memory,
+            console_log=console_log,
+            network_failures=network_failures,
+        ),
         "steps": steps_out,
     }
     return plan
@@ -267,10 +380,12 @@ def format_retest_spec_wiki(plan: Dict[str, Any]) -> str:
     payload = json.dumps(slim, ensure_ascii=False, indent=2)
     return (
         "h3. Сценарий автоматического ретеста (Kventin)\n"
-        "Ниже — машиночитаемый сценарий для автоматического ретеста "
+        "Ниже — машиночитаемый сценарий и oracle для автоматического ретеста "
         "(из корня проекта: {code}python main.py --retest-kventin{code}). "
         "Строка маркера KVENTIN_RETEST_JSON_V1 и JSON не удаляются: без них ретест "
-        "опирается только на текстовые шаги в разделе «Шаги воспроизведения».\n\n"
+        "опирается только на текстовые шаги в разделе «Шаги воспроизведения». "
+        "Oracle фиксирует конкретные сигналы исходного бага, чтобы ретест не принимал "
+        "решение по догадкам.\n\n"
         f"{RETEST_JSON_MARKER}\n"
         f"{{code}}\n{payload}\n{{code}}"
     )
@@ -282,8 +397,14 @@ def parse_retest_plan_from_description(description: str) -> Optional[Dict[str, A
         return None
     idx = description.find(RETEST_JSON_MARKER)
     chunk = description[idx + len(RETEST_JSON_MARKER):].strip()
-    chunk = re.sub(r"^\{code\}\s*", "", chunk, flags=re.IGNORECASE)
-    chunk = re.sub(r"\s*\{code\}\s*\Z", "", chunk, flags=re.IGNORECASE).strip()
+    code_match = re.search(r"\{code\}\s*(.*?)\s*\{code\}", chunk, flags=re.IGNORECASE | re.DOTALL)
+    if code_match:
+        chunk = code_match.group(1).strip()
+    else:
+        # Backward-compatible fallback for old descriptions where the JSON was the
+        # final body after the marker.
+        chunk = re.sub(r"^\{code\}\s*", "", chunk, flags=re.IGNORECASE)
+        chunk = re.sub(r"\s*\{code\}\s*\Z", "", chunk, flags=re.IGNORECASE).strip()
     try:
         plan = json.loads(chunk)
     except json.JSONDecodeError:
@@ -399,6 +520,13 @@ def build_defect_description(
 
     if retest_spec_wiki and retest_spec_wiki.strip():
         sections.append(retest_spec_wiki.strip())
+
+    sections.append(
+        "h3. Критерий ретеста\n"
+        "Автоматический ретест должен выполнить шаги воспроизведения и проверить oracle "
+        "из блока KVENTIN_RETEST_JSON_V1: исходные action/console/network сигналы не должны повториться. "
+        "Если шаг воспроизведения снова падает или появляется тот же сигнал, дефект считается не исправленным."
+    )
 
     sections.append(
         "h3. Ожидаемый результат\n"
