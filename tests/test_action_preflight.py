@@ -95,3 +95,20 @@ def test_preflight_rejects_repeated_action() -> None:
 
     assert result.ok is False
     assert result.reason == "repeat"
+
+
+def test_preflight_rejects_background_ref_when_overlay_active() -> None:
+    page = FakePage(
+        ref_meta={"1": "tid:save"},
+        states={"1": {"exists": True, "visible": True, "outside_overlay": True}},
+    )
+
+    result = preflight_action(
+        page,
+        AgentMemory(),
+        {"action": "click", "selector": "ref:1"},
+        has_overlay=True,
+    )
+
+    assert result.ok is False
+    assert result.reason == "outside_overlay"

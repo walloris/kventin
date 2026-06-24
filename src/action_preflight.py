@@ -145,10 +145,14 @@ def _inspect_ref_state(page: Any, selector: str) -> Dict[str, Any]:
                 const activeOverlayRoots = [];
                 const overlaySels = [
                     '[aria-modal="true"]', '[role="dialog"]', '[role="alertdialog"]', 'dialog[open]',
+                    '[popover]:popover-open',
                     '[class*="modal"][class*="open"]', '[class*="modal"][class*="show"]',
                     '[class*="drawer"][class*="open"]', '[class*="drawer"][class*="show"]',
                     '[class*="sidebar"][class*="open"]', '[class*="sidebar"][class*="show"]',
-                    '[class*="overlay"][class*="open"]', '[class*="overlay"][class*="show"]'
+                    '[class*="side-bar"][class*="open"]', '[class*="side-bar"][class*="show"]',
+                    '[class*="offcanvas"][class*="show"]',
+                    '[class*="overlay"][class*="open"]', '[class*="overlay"][class*="show"]',
+                    '[role="menu"]', '[role="listbox"]', '.dropdown-menu.show'
                 ];
                 for (const sel of overlaySels) {
                     try {
@@ -159,7 +163,7 @@ def _inspect_ref_state(page: Any, selector: str) -> Dict[str, Any]:
                             const visible = r.width > 20 && r.height > 20
                                 && s.display !== 'none' && s.visibility !== 'hidden'
                                 && parseFloat(s.opacity || '1') > 0.1;
-                            if (visible && (zOf(node) >= 5 || node.getAttribute('aria-modal') === 'true' || node.open)) {
+                            if (visible && (zOf(node) >= 5 || node.getAttribute('aria-modal') === 'true' || node.open || node.matches('[popover]:popover-open'))) {
                                 activeOverlayRoots.push(node);
                             }
                         });

@@ -42,7 +42,7 @@ def score_candidate(cand: ActionCandidate, memory: Any = None) -> float:
     elif cand.action == "hover":
         score += 8
     elif cand.action == "close_modal":
-        score += 16
+        score += 70
 
     if any(word in label for word in CTA_WORDS):
         score += 28

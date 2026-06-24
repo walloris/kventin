@@ -185,7 +185,7 @@ def collect_action_candidates(
 
     try:
         raw_items = page.evaluate(
-            """() => {
+            """(hasOverlay) => {
                 const out = [];
                 const meta = window.__agentRefMeta || {};
                 const locators = window.__agentLocator || {};
@@ -206,8 +206,59 @@ def collect_action_candidates(
                     }
                     return false;
                 };
+                const zOf = (el) => {
+                    let z = 0;
+                    let cur = el;
+                    while (cur && cur !== document.body) {
+                        const zi = parseInt(getComputedStyle(cur).zIndex, 10);
+                        if (!Number.isNaN(zi) && zi > z) z = zi;
+                        cur = cur.parentElement || (cur.getRootNode && cur.getRootNode().host) || null;
+                    }
+                    return z;
+                };
+                const activeOverlayRoots = (() => {
+                    if (!hasOverlay) return [];
+                    const roots = [];
+                    const sels = [
+                        '[aria-modal="true"]', '[role="dialog"]', '[role="alertdialog"]', 'dialog[open]',
+                        '[popover]:popover-open',
+                        '[class*="modal"][class*="open"]', '[class*="modal"][class*="show"]',
+                        '[class*="drawer"][class*="open"]', '[class*="drawer"][class*="show"]',
+                        '[class*="sidebar"][class*="open"]', '[class*="sidebar"][class*="show"]',
+                        '[class*="side-bar"][class*="open"]', '[class*="side-bar"][class*="show"]',
+                        '[class*="offcanvas"][class*="show"]', '[class*="overlay"][class*="open"]',
+                        '[class*="overlay"][class*="show"]', '[role="menu"]', '[role="listbox"]',
+                        '.dropdown-menu.show'
+                    ];
+                    const rootVisible = (node) => {
+                        if (!node || isAgent(node) || hiddenByDomState(node)) return false;
+                        const r = node.getBoundingClientRect();
+                        if (r.width < 20 || r.height < 20) return false;
+                        const s = getComputedStyle(node);
+                        return s.display !== 'none'
+                            && s.visibility !== 'hidden'
+                            && parseFloat(s.opacity || '1') > 0.1;
+                    };
+                    for (const sel of sels) {
+                        try {
+                            document.querySelectorAll(sel).forEach(node => {
+                                if (!rootVisible(node)) return;
+                                if (zOf(node) >= 5 || node.getAttribute('aria-modal') === 'true' || node.open || node.matches('[popover]:popover-open')) {
+                                    roots.push(node);
+                                }
+                            });
+                        } catch(e) {}
+                    }
+                    roots.sort((a, b) => zOf(b) - zOf(a));
+                    return roots.filter((node, idx) => roots.indexOf(node) === idx).slice(0, 4);
+                })();
+                const inActiveOverlayScope = (el) => {
+                    if (!hasOverlay || !activeOverlayRoots.length) return true;
+                    return activeOverlayRoots.some(root => root === el || root.contains(el));
+                };
                 const visible = (el) => {
                     if (!el || isAgent(el) || hiddenByDomState(el)) return false;
+                    if (!inActiveOverlayScope(el)) return false;
                     const r = el.getBoundingClientRect();
                     if (r.width < 5 || r.height < 5) return false;
                     if (r.bottom <= 0 || r.top >= window.innerHeight || r.right <= 0 || r.left >= window.innerWidth) return false;
@@ -255,7 +306,8 @@ def collect_action_candidates(
                 document.querySelectorAll('[role="tab"]').forEach(el => add(el, 'tab'));
                 document.querySelectorAll('[role="menuitem"]').forEach(el => add(el, 'menuitem'));
                 return out;
-            }"""
+            }""",
+            bool(has_overlay and not getattr(memory, "ignore_overlay", False)),
         ) or []
     except Exception:
         raw_items = []

@@ -65,3 +65,12 @@ def test_candidate_prompt_and_lookup() -> None:
 
     assert "c1:" in render_candidates_for_prompt(candidates)
     assert candidate_by_id(candidates, "c1").selector == "ref:1"
+
+
+def test_policy_prefers_overlay_close_over_background_cta() -> None:
+    candidates = [
+        ActionCandidate(id="c0", action="close_modal", selector="ref:9", label="Закрыть активный оверлей", kind="overlay", priority=5),
+        ActionCandidate(id="c1", action="click", selector="ref:1", label="Сохранить", kind="button", priority=10),
+    ]
+
+    assert choose_best_candidate(candidates).id == "c0"
