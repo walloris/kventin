@@ -8,6 +8,7 @@ import logging
 import requests
 from pathlib import Path
 from collections import defaultdict
+from typing import Optional
 
 try:
     from bugsAnalyse import analyze_bugs_standalone
@@ -128,7 +129,7 @@ class ZephyrScaleClient:
             'Content-Type': 'application/json',
         })
 
-    def get_test_cases_for_issue(self, issue_key: str) -> tuple[list[dict], str | None]:
+    def get_test_cases_for_issue(self, issue_key: str) -> tuple[list[dict], Optional[str]]:
         """
         Возвращает (list_of_tcs, error_message).
           - error_message = None — ответ получен успешно
@@ -150,7 +151,7 @@ class ZephyrScaleClient:
         except Exception as e:
             return [], f"{e}"
 
-    def get_test_case_details(self, tc_key: str) -> dict | None:
+    def get_test_case_details(self, tc_key: str) -> Optional[dict]:
         """
         Возвращает полные данные тест-кейса, включая customFields.
         Эндпоинт: GET /rest/atm/1.0/testcase/{testCaseKey}
@@ -180,7 +181,7 @@ class ZephyrScaleClient:
         except Exception:
             return None
 
-    def get_test_case_custom_field(self, tc_details: dict, field_name: str) -> str | None:
+    def get_test_case_custom_field(self, tc_details: dict, field_name: str) -> Optional[str]:
         """
         Извлекает значение кастомного поля из данных ТК.
         Zephyr Scale Server хранит кастомные поля в объекте 'customFields' (dict).
@@ -204,7 +205,7 @@ class ZephyrScaleClient:
             return val.get('name', val.get('value', str(val)))
         return str(val).strip()
 
-    def get_test_cycles_for_issue(self, issue_key: str, issue_id: str | None = None) -> list[dict]:
+    def get_test_cycles_for_issue(self, issue_key: str, issue_id: Optional[str] = None) -> list[dict]:
         """
         Возвращает список ТЦ, привязанных к релизу.
 
@@ -275,7 +276,7 @@ class ZephyrScaleClient:
 
         return matched
 
-    def get_test_cycle_details(self, tc_key: str) -> dict | None:
+    def get_test_cycle_details(self, tc_key: str) -> Optional[dict]:
         """
         Возвращает полные данные ТЦ, включая customFields.
         Эндпоинт: GET /rest/atm/1.0/testrun/{testRunKey}
