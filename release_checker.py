@@ -1168,6 +1168,7 @@ class ReleaseValidator:
         "PERFREVIEW": 5.2,
         "HRPASSIST": 10.0,
     }
+    STORY_MIN_TESTING_RATIO = 0.5
 
     def _check_stories(self, release_key: str) -> None:
         """Проверка Story: описание + обязательные поля + Epic Link + время в тест-статусах + Task внутри Story"""
@@ -1255,6 +1256,7 @@ class ReleaseValidator:
             # --- 3. Проверка времени в тест-статусах ---
             max_days = self.STORY_MAX_TESTING_DAYS.get(story_project)
             if max_days is not None:
+                min_days = max_days * self.STORY_MIN_TESTING_RATIO
                 try:
                     story_full = self.jira_main.issue(story.key, expand='changelog')
                     actual_days = self._calc_status_days(
@@ -1262,6 +1264,7 @@ class ReleaseValidator:
                         self.STORY_MONITORED_STATUSES
                     )
                     actual_days_rounded = round(actual_days, 2)
+                    min_days_rounded = round(min_days, 2)
                     if actual_days > max_days:
                         self._log_issue(
                             story, "error",
@@ -1269,10 +1272,19 @@ class ReleaseValidator:
                             f"({actual_days_rounded} д.) превышает целевое ({max_days} д.) "
                             f"для проектной области {story_project}"
                         )
+                    elif actual_days < min_days:
+                        self._log_issue(
+                            story, "error",
+                            f"Story: суммарное время в тест-статусах "
+                            f"({actual_days_rounded} д.) меньше 50% норматива "
+                            f"({min_days_rounded} д. из {max_days} д.) "
+                            f"для проектной области {story_project}"
+                        )
                     else:
                         self._log_issue(
                             story, "success",
-                            f"Story: время в тест-статусах {actual_days_rounded} д. ≤ {max_days} д. ✓"
+                            f"Story: время в тест-статусах {actual_days_rounded} д. "
+                            f"в пределах 50–100% норматива ({min_days_rounded}–{max_days} д.) ✓"
                         )
                 except Exception as e:
                     self._log_issue(
