@@ -32,3 +32,71 @@ def test_local_client_detects_tls_proxy_errors() -> None:
 
     assert _looks_like_tls_proxy_error(body) is True
     assert _looks_like_tls_proxy_error("ordinary model error") is False
+
+
+def test_local_client_retries_http_429(monkeypatch) -> None:
+    monkeypatch.setattr("config.LOCAL_LLM_API_URL", "http://127.0.0.1:3333/v1")
+    monkeypatch.setattr("config.LOCAL_LLM_API_KEY", "local")
+    monkeypatch.setattr("config.LOCAL_LLM_MODEL", "test-model")
+    monkeypatch.setattr("config.LLM_REQUEST_TIMEOUT_SEC", 60)
+    monkeypatch.setattr("config.LLM_RETRY_COUNT", 2)
+    monkeypatch.setattr("config.LLM_RETRY_BASE_DELAY", 0.1)
+    monkeypatch.setattr("src.local_openai_client.time.sleep", lambda _: None)
+    monkeypatch.setattr("src.local_openai_client.random.uniform", lambda *_: 0)
+
+    class Response:
+        def __init__(self, status_code, text="", data=None, headers=None):
+            self.status_code = status_code
+            self.text = text
+            self._data = data or {}
+            self.headers = headers or {}
+
+        def json(self):
+            return self._data
+
+    calls = []
+
+    def fake_post(*args, **kwargs):
+        calls.append((args, kwargs))
+        if len(calls) == 1:
+            return Response(429, "rate limit", headers={"Retry-After": "0.1"})
+        return Response(200, data={"choices": [{"message": {"content": "ok"}}]})
+
+    monkeypatch.setattr("src.local_openai_client.requests.post", fake_post)
+
+    client = LocalOpenAIClient()
+
+    assert client.query("ping") == "ok"
+    assert len(calls) == 2
+
+
+def test_local_client_retries_http_500(monkeypatch) -> None:
+    monkeypatch.setattr("config.LOCAL_LLM_API_URL", "http://127.0.0.1:3333/v1")
+    monkeypatch.setattr("config.LOCAL_LLM_API_KEY", "local")
+    monkeypatch.setattr("config.LOCAL_LLM_MODEL", "test-model")
+    monkeypatch.setattr("config.LLM_REQUEST_TIMEOUT_SEC", 60)
+    monkeypatch.setattr("config.LLM_RETRY_COUNT", 2)
+    monkeypatch.setattr("config.LLM_RETRY_BASE_DELAY", 0.1)
+    monkeypatch.setattr("src.local_openai_client.time.sleep", lambda _: None)
+    monkeypatch.setattr("src.local_openai_client.random.uniform", lambda *_: 0)
+
+    class Response:
+        status_code = 500
+        text = "temporary upstream error"
+        headers = {}
+
+        def json(self):
+            return {}
+
+    calls = []
+
+    def fake_post(*args, **kwargs):
+        calls.append((args, kwargs))
+        return Response()
+
+    monkeypatch.setattr("src.local_openai_client.requests.post", fake_post)
+
+    client = LocalOpenAIClient()
+
+    assert client.query("ping") == ""
+    assert len(calls) == 2

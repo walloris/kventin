@@ -78,7 +78,7 @@ def _llm_call_with_retry(prompt: str, screenshot_b64: Optional[str] = None, syst
     return last_result
 
 
-VALID_ACTIONS = {"click", "type", "scroll", "hover", "close_modal", "select_option", "press_key", "check_defect", "explore", "fill_form"}
+VALID_ACTIONS = {"click", "type", "scroll", "hover", "close_modal", "select_option", "press_key", "check_defect", "explore", "fill_form", "upload_file"}
 
 
 def validate_llm_action(action: dict) -> dict:
@@ -131,8 +131,15 @@ def _build_system_prompt(
 6) Верстка: оценивай расположение (наложения, обрезки, сломанная сетка, кнопки вне экрана).
 
 СТРОГО JSON (без markdown):
+Если в вопросе есть блок "КАНДИДАТЫ ДЕЙСТВИЙ", предпочитай короткий формат:
 {
-  "action": "click|type|scroll|hover|close_modal|select_option|press_key|check_defect|fill_form",
+  "candidate_id": "cN",
+  "reason": "почему выбран этот кандидат"
+}
+
+Если кандидатов нет или нужно явно сообщить баг, используй полный формат:
+{
+  "action": "click|type|scroll|hover|close_modal|select_option|press_key|check_defect|fill_form|upload_file",
   "selector": "ref:N (число из [N] в списке элементов)",
   "value": "текст (type) / опция (select_option) / клавиша (press_key)",
   "reason": "зачем",
@@ -173,7 +180,7 @@ def consult_agent_with_screenshot(
 def get_test_plan_from_screenshot(screenshot_b64: Optional[str], url: str) -> List[str]:
     system = "Ты — тест-аналитик. По скриншоту главной страницы составь краткий тест-план. Отвечай ТОЛЬКО нумерованным списком из 5-7 шагов на русском, по одному шагу на строку."
     prompt = f"URL: {url}\n\nСоставь тест-план из 5-7 конкретных шагов для тестирования этой страницы."
-    raw = _get_client().chat_with_screenshot(prompt, screenshot_b64=screenshot_b64, system=system)
+    raw = _llm_call_with_retry(prompt, screenshot_b64=screenshot_b64, system=system)
     if not raw:
         return []
     steps = []
@@ -202,7 +209,7 @@ def get_structured_test_plan(
         f"URL: {url}\nОписание страницы: {page_summary[:600] if page_summary else '-'}{modules_block}\n\n"
         "Выдай тест-план в виде JSON-массива из 6-10 пунктов."
     )
-    raw = _get_client().chat_with_screenshot(prompt, screenshot_b64=screenshot_b64, system=system) or ""
+    raw = _llm_call_with_retry(prompt, screenshot_b64=screenshot_b64, system=system) or ""
     cleaned = re.sub(r"^```(?:json)?\s*", "", raw.strip(), flags=re.MULTILINE)
     cleaned = re.sub(r"```\s*$", "", cleaned.strip(), flags=re.MULTILINE)
     try:
@@ -244,7 +251,7 @@ def get_structured_test_plan(
 def ask_is_this_really_bug(bug_description: str, screenshot_b64: Optional[str]) -> bool:
     system = "Ты — ревьюер дефектов. Ответь СТРОГО одним словом: ДА, если это реальный баг приложения; НЕТ, если это не баг, флак или проблема среды."
     prompt = f"Описание:\n{bug_description[:1500]}\n\nЭто точно баг приложения? Ответь ДА или НЕТ."
-    raw = _get_client().chat_with_screenshot(prompt, screenshot_b64=screenshot_b64, system=system)
+    raw = _llm_call_with_retry(prompt, screenshot_b64=screenshot_b64, system=system)
     if not raw:
         return True
     low = raw.strip().lower()

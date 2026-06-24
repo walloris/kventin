@@ -496,7 +496,16 @@ def get_dom_summary(page: Page, max_length: int = 8000, include_shadow_dom: bool
                     let cur = el;
                     while (cur && cur !== document.body) {
                         if (cur.hasAttribute && cur.hasAttribute('data-agent-host')) return true;
-                        cur = cur.parentElement;
+                        cur = cur.parentElement || (cur.getRootNode && cur.getRootNode().host) || null;
+                    }
+                    return false;
+                };
+                const hiddenByDomState = (el) => {
+                    let cur = el;
+                    while (cur && cur.nodeType === 1) {
+                        if (cur.hidden || cur.inert) return true;
+                        if (cur.getAttribute && (cur.getAttribute('aria-hidden') || '').toLowerCase() === 'true') return true;
+                        cur = cur.parentElement || (cur.getRootNode && cur.getRootNode().host) || null;
                     }
                     return false;
                 };
@@ -505,11 +514,11 @@ def get_dom_summary(page: Page, max_length: int = 8000, include_shadow_dom: bool
                     if (!el) return true;
                     const combined = ((el.textContent||'')+(el.id||'')+(el.className||'')).toLowerCase();
                     for (const p of servicePatterns) { if (combined.includes(p)) return true; }
-                    let cur = el.parentElement, d = 0;
+                    let cur = el.parentElement || (el.getRootNode && el.getRootNode().host) || null, d = 0;
                     while (cur && cur !== document.body && d < 3) {
                         const pt = ((cur.className||'')+(cur.id||'')).toLowerCase();
                         for (const p of servicePatterns) { if (pt.includes(p)) return true; }
-                        cur = cur.parentElement; d++;
+                        cur = cur.parentElement || (cur.getRootNode && cur.getRootNode().host) || null; d++;
                     }
                     return false;
                 };
@@ -519,21 +528,64 @@ def get_dom_summary(page: Page, max_length: int = 8000, include_shadow_dom: bool
                     return r.top < vh && r.bottom > 0 && r.left < vw && r.right > 0;
                 };
                 const ancestorsVisible = (el) => {
-                    let cur = el.parentElement;
+                    let cur = el.parentElement || (el.getRootNode && el.getRootNode().host) || null;
                     while (cur && cur !== document.body) {
                         const s = getComputedStyle(cur);
                         if (s.display === 'none' || s.visibility === 'hidden' || parseFloat(s.opacity) === 0) return false;
-                        cur = cur.parentElement;
+                        cur = cur.parentElement || (cur.getRootNode && cur.getRootNode().host) || null;
                     }
                     return true;
                 };
+                const zOf = (el) => {
+                    let z = 0;
+                    let cur = el;
+                    while (cur && cur !== document.body) {
+                        const zi = parseInt(getComputedStyle(cur).zIndex, 10);
+                        if (!Number.isNaN(zi) && zi > z) z = zi;
+                        cur = cur.parentElement || (cur.getRootNode && cur.getRootNode().host) || null;
+                    }
+                    return z;
+                };
+                const activeOverlayRoots = (() => {
+                    const roots = [];
+                    const sels = [
+                        '[aria-modal="true"]', '[role="dialog"]', '[role="alertdialog"]', 'dialog[open]',
+                        '[class*="modal"][class*="open"]', '[class*="modal"][class*="show"]',
+                        '[class*="drawer"][class*="open"]', '[class*="drawer"][class*="show"]',
+                        '[class*="sidebar"][class*="open"]', '[class*="sidebar"][class*="show"]',
+                        '[class*="overlay"][class*="open"]', '[class*="overlay"][class*="show"]',
+                        '[role="menu"]', '[role="listbox"]', '.dropdown-menu.show'
+                    ];
+                    const rootVisible = (node) => {
+                        if (!node || hiddenByDomState(node)) return false;
+                        const r = node.getBoundingClientRect();
+                        if (r.width < 20 || r.height < 20) return false;
+                        const s = getComputedStyle(node);
+                        return s.display !== 'none' && s.visibility !== 'hidden' && parseFloat(s.opacity) > 0.1;
+                    };
+                    for (const sel of sels) {
+                        try {
+                            document.querySelectorAll(sel).forEach(node => {
+                                if (isAgentUI(node) || isServiceElement(node) || !rootVisible(node)) return;
+                                if (zOf(node) >= 5 || node.getAttribute('aria-modal') === 'true' || node.open) roots.push(node);
+                            });
+                        } catch (e) {}
+                    }
+                    return roots.filter((node, idx) => roots.indexOf(node) === idx).slice(0, 8);
+                })();
+                const inActiveOverlayScope = (el) => {
+                    if (!activeOverlayRoots.length) return true;
+                    return activeOverlayRoots.some(root => root === el || root.contains(el));
+                };
                 const vis = (el) => {
                     if (!el) return false;
+                    if (hiddenByDomState(el)) return false;
                     const r = el.getBoundingClientRect();
                     if (r.width === 0 || r.height === 0) return false;
                     const s = getComputedStyle(el);
                     if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return false;
                     if (!inViewport(el) || !ancestorsVisible(el)) return false;
+                    if (!inActiveOverlayScope(el)) return false;
                     return true;
                 };
 
@@ -962,6 +1014,7 @@ def build_context(
     current_url: str,
     console_log: List[Dict[str, Any]],
     network_failures: List[Dict[str, Any]],
+    dom_summary: Optional[str] = None,
 ) -> str:
     """
     Собрать текстовый контекст страницы для LLM: консоль, сеть, DOM.
@@ -987,7 +1040,7 @@ def build_context(
                 lines.append(f"  {entry.get('status')} {entry.get('url', '')[:150]}")
             lines.append("")
 
-    dom = get_dom_summary(page)
+    dom = dom_summary if dom_summary is not None else get_dom_summary(page)
     if dom:
         lines.append("ЭЛЕМЕНТЫ (формат [ref] тип \"текст\" атрибуты — используй ref:N как selector):")
         lines.append(dom[:4000])

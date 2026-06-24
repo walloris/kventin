@@ -325,7 +325,8 @@ def create_defect(
         summary, description, bug_description, attachment_paths, memory, severity, signature,
     )
     if fut is None:
-        LOG.error("create_defect: bg_submit вернул None — фоновый пул недоступен, дефект ПОТЕРЯН")
+        LOG.error("create_defect: bg_submit вернул None — создаём дефект синхронно")
+        _create_defect_bg(summary, description, bug_description, attachment_paths, memory, severity, signature)
         return
     if memory is not None:
         try:

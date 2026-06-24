@@ -47,7 +47,7 @@ ALLOWED_TESTERS = {
     "Метляев Игорь Андреевич", "Петрунин Никита Анатольевич",
     "Приколотина Евгения Александровна",
     "Симиник Даниил Григорьевич", "Федоров Никита Андреевич",
-    "Чиж Мария Михайловна", "Синица Захар Алексеевич"
+    "Чиж Мария Михайловна", "Синица Захар Алексеевич", "Абдулгалимов Гамзат Абусуньянович"
 }
 
 # Статус ТК, который считается утверждённым (Approved)
@@ -93,6 +93,10 @@ def extract_issue_key_from_url(url_or_key):
     if match:
         return match.group(1)
     return url_or_key
+
+
+def normalize_status_name(status: str) -> str:
+    return str(status or '').strip().casefold()
 
 
 class ZephyrScaleClient:
@@ -1615,6 +1619,8 @@ class ReleaseValidator:
         DISCOVERY_STAGE_FIELD = 'customfield_11507'
         HOTFIX_REQUIRED_STAGE = 'ПРОМ'
         HOTFIX_REQUIRED_PRIORITIES = {'blocker', 'блокирующий', 'critical', 'критичный'}
+        REGULAR_RELEASE_BUG_STATUSES = {normalize_status_name(status) for status in {'закрыт', 'closed'}}
+        HOTFIX_BUG_STATUS = normalize_status_name('подтверждение исправления')
         # Хотя бы один из этих лейблов должен быть у каждого бага
         REQUIRED_CONTOUR_LABELS = {'sigma', 'cloud', 'mobile'}
 
@@ -1626,7 +1632,7 @@ class ReleaseValidator:
             jql = f'parent = {release_key} OR key in ({keys_str})'
 
         try:
-            fields_req = f"summary,description,priority,labels,issuetype,assignee,customfield_16901,customfield_11507,{STAND_FIELD_ID},*all"
+            fields_req = f"summary,description,priority,labels,issuetype,status,assignee,customfield_16901,customfield_11507,{STAND_FIELD_ID},*all"
             all_issues = self.jira_main.search_issues(jql, fields=fields_req, maxResults=100)
         except Exception as e:
             self._log_issue("GENERAL", "error", f"Ошибка поиска багов: {e}")
@@ -1645,6 +1651,31 @@ class ReleaseValidator:
 
         for bug in bugs:
             bug_keys.append(bug.key)
+
+            bug_status = bug.fields.status.name if getattr(bug.fields, 'status', None) else ''
+            bug_status_normalized = normalize_status_name(bug_status)
+            if is_hotfix:
+                if bug_status_normalized != HOTFIX_BUG_STATUS:
+                    self._log_issue(
+                        bug, "error",
+                        f"Hotfix: Bug в статусе '{bug_status}', ожидается '{HOTFIX_BUG_STATUS}'"
+                    )
+                else:
+                    self._log_issue(
+                        bug, "success",
+                        f"Hotfix: Bug в статусе '{bug_status}' ✓"
+                    )
+            elif bug_status_normalized not in REGULAR_RELEASE_BUG_STATUSES:
+                expected_statuses = "', '".join(sorted(REGULAR_RELEASE_BUG_STATUSES))
+                self._log_issue(
+                    bug, "error",
+                    f"Bug в статусе '{bug_status}', ожидается один из: '{expected_statuses}'"
+                )
+            else:
+                self._log_issue(
+                    bug, "success",
+                    f"Bug в статусе '{bug_status}' ✓"
+                )
 
             if not bug.fields.description or not bug.fields.description.strip():
                 self._log_issue(bug, "error", "Отсутствует описание")

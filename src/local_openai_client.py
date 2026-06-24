@@ -9,11 +9,14 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import random
+import time
 from typing import Any, Dict, List, Optional
 
 import requests
 
 LOG = logging.getLogger("LocalLLM")
+RETRYABLE_HTTP_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
 
 
 TLS_PROXY_HINT = (
@@ -63,6 +66,23 @@ class LocalOpenAIClient:
         self.model = (LOCAL_LLM_MODEL or "").strip()
         self.timeout = max(5, int(LLM_REQUEST_TIMEOUT_SEC))
 
+    def _retry_settings(self) -> tuple[int, float]:
+        try:
+            from config import LLM_RETRY_COUNT, LLM_RETRY_BASE_DELAY
+        except ImportError:
+            LLM_RETRY_COUNT = int(os.getenv("LLM_RETRY_COUNT", "3"))
+            LLM_RETRY_BASE_DELAY = float(os.getenv("LLM_RETRY_BASE_DELAY", "1.0"))
+        return max(1, int(LLM_RETRY_COUNT)), max(0.1, float(LLM_RETRY_BASE_DELAY))
+
+    def _retry_after_seconds(self, response: requests.Response, fallback: float) -> float:
+        raw = (response.headers.get("Retry-After") or "").strip()
+        if raw:
+            try:
+                return max(0.1, min(float(raw), 30.0))
+            except ValueError:
+                pass
+        return fallback
+
     def _get_token(self) -> str:
         """Compatibility hook used by the previous LLM init path."""
         return "local-openai-compatible"
@@ -100,19 +120,52 @@ class LocalOpenAIClient:
         }
         if max_tokens:
             payload["max_tokens"] = max_tokens
-        try:
-            response = requests.post(
-                self.chat_url,
-                json=payload,
-                headers=self._headers(),
-                timeout=self.timeout,
-            )
+        retry_count, base_delay = self._retry_settings()
+        for attempt in range(retry_count):
+            try:
+                response = requests.post(
+                    self.chat_url,
+                    json=payload,
+                    headers=self._headers(),
+                    timeout=self.timeout,
+                )
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+                if attempt < retry_count - 1:
+                    delay = base_delay * (2 ** attempt) + random.uniform(0, base_delay * 0.25)
+                    LOG.warning(
+                        "Local LLM transport error, retry %d/%d in %.1fs: %s",
+                        attempt + 1,
+                        retry_count,
+                        delay,
+                        exc,
+                    )
+                    time.sleep(delay)
+                    continue
+                LOG.warning("Local LLM is not reachable at %s: %s", self.chat_url, exc)
+                return ""
+            except Exception as exc:  # noqa: BLE001
+                LOG.exception("Local LLM request failed: %s", exc)
+                return ""
+
             if response.status_code != 200:
                 body = response.text[:1200]
                 if _looks_like_tls_proxy_error(body):
                     LOG.error("%s\nProxy response: %s", TLS_PROXY_HINT, body)
-                else:
-                    LOG.error("Local LLM HTTP %s: %s", response.status_code, body)
+                    return ""
+                if response.status_code in RETRYABLE_HTTP_STATUSES and attempt < retry_count - 1:
+                    fallback = base_delay * (2 ** attempt) + random.uniform(0, base_delay * 0.25)
+                    delay = self._retry_after_seconds(response, fallback)
+                    LOG.warning(
+                        "Local LLM HTTP %s, retry %d/%d in %.1fs: %s",
+                        response.status_code,
+                        attempt + 1,
+                        retry_count,
+                        delay,
+                        body,
+                    )
+                    time.sleep(delay)
+                    continue
+                LOG.error("Local LLM HTTP %s: %s", response.status_code, body)
                 return ""
             data = response.json()
             choices = data.get("choices") or []
@@ -120,12 +173,7 @@ class LocalOpenAIClient:
                 LOG.warning("Local LLM response has no choices: %s", str(data)[:500])
                 return ""
             return ((choices[0].get("message") or {}).get("content") or "").strip()
-        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
-            LOG.warning("Local LLM is not reachable at %s: %s", self.chat_url, exc)
-            return ""
-        except Exception as exc:  # noqa: BLE001
-            LOG.exception("Local LLM request failed: %s", exc)
-            return ""
+        return ""
 
     def query(self, prompt: str, system: Optional[str] = None) -> str:
         messages = [

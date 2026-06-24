@@ -178,7 +178,7 @@ SESSION_REPORT_SAVE_EVERY_N = int(os.getenv("SESSION_REPORT_SAVE_EVERY_N", "1"))
 MAX_STEPS = int(os.getenv("MAX_STEPS", "0"))
 
 # Retry при сбое локальной LLM (пустой ответ / не JSON): экспоненциальный backoff.
-LLM_RETRY_COUNT = int(os.getenv("LLM_RETRY_COUNT", "1"))
+LLM_RETRY_COUNT = int(os.getenv("LLM_RETRY_COUNT", "3"))
 LLM_RETRY_BASE_DELAY = float(os.getenv("LLM_RETRY_BASE_DELAY", "1.0"))  # секунды
 # Если LLM не ответила за N секунд — берём fast action (не зависаем).
 LLM_RESPONSE_TIMEOUT_SEC = int(os.getenv("LLM_RESPONSE_TIMEOUT_SEC", "20"))

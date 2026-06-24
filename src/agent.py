@@ -171,6 +171,12 @@ from src.browser_options import (
     is_too_many_redirects_error,
     should_write_auto_select_cert_policy,
 )
+from src.action_preflight import preflight_action
+from src.action_candidates import collect_action_candidates, render_candidates_for_prompt
+from src.action_policy import action_from_llm_candidate_choice, choose_best_candidate, rank_candidates
+from src.decision_trace import build_decision_trace, summarize_decision_trace
+from src.defect_signals import add_oracle_signal, collect_rule_signals, pick_best_signal
+from src.oracle import build_oracle_context, should_run_oracle
 
 # Бюджет на URL — единый источник правды в config.py.
 from config import URL_BUDGET_NO_PROGRESS  # noqa: E402,F401
@@ -1579,6 +1585,19 @@ def run_agent(start_url: str = None):
                 screenshot_changed = memory_.is_screenshot_changed(screenshot_b64 or "")
                 current_url_ = page_.url
                 dom_summary = get_dom_summary(page_, max_length=dom_max, include_shadow_dom=ENABLE_SHADOW_DOM)
+                try:
+                    ref_meta = page_.evaluate("() => Object.assign({}, window.__agentRefMeta || {})") or {}
+                except Exception:
+                    ref_meta = {}
+                raw_candidates = collect_action_candidates(
+                    page_,
+                    memory_,
+                    has_overlay=has_overlay,
+                    overlay_info=overlay_info,
+                    max_candidates=60,
+                )
+                candidates = rank_candidates(raw_candidates, memory_)
+                candidates_prompt = render_candidates_for_prompt(candidates, limit=18)
                 history_text = memory_.get_history_text(last_n=history_n)
                 overlay_context = format_overlays_context(overlay_info)
                 page_type = detect_page_type(page_)
@@ -1594,9 +1613,11 @@ def run_agent(start_url: str = None):
 
             _llm_meta["has_overlay"] = has_overlay
             _llm_meta["screenshot_b64"] = screenshot_b64
+            _llm_meta["ref_meta"] = ref_meta
+            _llm_meta["candidates"] = candidates
 
             # Формируем контекст и вопрос
-            ctx = build_context(page_, current_url_, console_log_, network_failures_)
+            ctx = build_context(page_, current_url_, console_log_, network_failures_, dom_summary=dom_summary)
             if checklist_results_:
                 ctx = checklist_results_to_context(checklist_results_) + "\n\n" + ctx
             if overlay_context:
@@ -1614,9 +1635,12 @@ def run_agent(start_url: str = None):
                 question = f"""Скриншот. АКТИВНЫЙ ОВЕРЛЕЙ.
 {overlay_context}
 {module_ctx}
-ЭЛЕМЕНТЫ: {dom_summary[:2500]}
+КАНДИДАТЫ ДЕЙСТВИЙ (выбери candidate_id из списка):
+{candidates_prompt}
+
+ЭЛЕМЕНТЫ: {dom_summary[:1800]}
 {history_text}
-Используй selector="ref:N". Тестируй оверлей или закрой (close_modal)."""
+Верни JSON: {{"candidate_id":"cN","reason":"почему"}}. Не придумывай selector."""
             else:
                 plan_hint = ""
                 if memory_.test_plan or getattr(memory_, "structured_test_plan", None):
@@ -1644,11 +1668,14 @@ def run_agent(start_url: str = None):
                 question = f"""Скриншот и контекст.
 {module_ctx}
 {ptype_hint}{coverage_hint}{critical_hint}
+КАНДИДАТЫ ДЕЙСТВИЙ (выбери candidate_id из списка):
+{candidates_prompt}
+
 ЭЛЕМЕНТЫ СТРАНИЦЫ (только видимые на экране, формат: [N] тип "текст" атрибуты):
-{dom_summary[:2500]}
+{dom_summary[:1800]}
 {history_text}
 {plan_hint}{stuck_w}
-Используй selector="ref:N". Выбери КОНКРЕТНОЕ действие в рамках текущего модуля."""
+Верни JSON: {{"candidate_id":"cN","reason":"почему"}}. Если кандидатов нет — верни action=scroll."""
 
             phase_instruction = memory_.get_phase_instruction()
             send_screenshot = screenshot_b64 if screenshot_changed else None
@@ -1660,17 +1687,27 @@ def run_agent(start_url: str = None):
                     has_overlay=has_overlay,
                 )
                 if raw:
+                    candidate_action = action_from_llm_candidate_choice(raw, candidates)
+                    if candidate_action:
+                        return candidate_action
                     action = parse_llm_action(raw)
                     if action:
                         return validate_llm_action(action)
                     # Один retry с запросом только валидного JSON
-                    retry_q = "Ответь ТОЛЬКО валидным JSON с полями action, selector, value, reason, test_goal, expected_outcome. Без markdown и пояснений."
+                    retry_q = (
+                        "Ответь ТОЛЬКО валидным JSON. Предпочтительно: "
+                        "{\"candidate_id\":\"cN\",\"reason\":\"...\"}. "
+                        "Если кандидатов нет: action/selector/value/reason. Без markdown."
+                    )
                     retry_raw = consult_agent_with_screenshot(
                         ctx, retry_q, screenshot_b64=send_screenshot,
                         phase_instruction=phase_instruction, tester_phase=memory_.tester_phase,
                         has_overlay=has_overlay,
                     )
                     if retry_raw:
+                        candidate_action = action_from_llm_candidate_choice(retry_raw, candidates)
+                        if candidate_action:
+                            return candidate_action
                         action = parse_llm_action(retry_raw)
                         if action:
                             return validate_llm_action(action)
@@ -1907,6 +1944,7 @@ def run_agent(start_url: str = None):
                     memory._forced_action = None
                     screenshot_b64 = None
                     source = "AntiLoop"
+                    decision_candidates = []
                     if llm_action is not None:
                         # LLM предложил действие, но мы под антилупом — игнорируем
                         # его на этом шаге и не теряем зря: сбрасываем future, а не кладём
@@ -1918,13 +1956,68 @@ def run_agent(start_url: str = None):
                     has_overlay = _llm_meta.get("has_overlay", has_overlay)
                     screenshot_b64 = _llm_meta.get("screenshot_b64")
                     source = "LLM"
+                    decision_candidates = _llm_meta.get("candidates") or []
                 else:
                     action = _get_fast_action(page, memory, has_overlay)
                     screenshot_b64 = None
                     source = "Fast"
+                    decision_candidates = getattr(memory, "_last_action_candidates", []) or []
 
                 # Обогащаем action stable_key + url_pattern для надёжной памяти
                 enrich_action(page, memory, action)
+                expected_ref_meta = _llm_meta.get("ref_meta") if source == "LLM" else None
+                preflight_reason = ""
+                preflight = preflight_action(
+                    page,
+                    memory,
+                    action,
+                    has_overlay=has_overlay,
+                    expected_ref_meta=expected_ref_meta,
+                )
+                if preflight.ok:
+                    action = preflight.action
+                    if preflight.repaired:
+                        source = f"{source}/Preflight"
+                        print(
+                            f"[Agent] #{step} Preflight: ref обновлён -> "
+                            f"{action.get('selector', '')[:40]}"
+                        )
+                else:
+                    preflight_reason = preflight.reason
+                    if preflight.reason == "repeat":
+                        memory.record_repeat()
+                    print(
+                        f"[Agent] #{step} Preflight: действие отклонено "
+                        f"({preflight.reason}), беру fallback"
+                    )
+                    fallback_action = _get_fast_action(page, memory, has_overlay)
+                    enrich_action(page, memory, fallback_action)
+                    fallback_preflight = preflight_action(
+                        page,
+                        memory,
+                        fallback_action,
+                        has_overlay=has_overlay,
+                        allow_repeat=True,
+                    )
+                    if fallback_preflight.ok:
+                        action = fallback_preflight.action
+                    else:
+                        action = (
+                            {"action": "close_modal", "selector": "", "reason": f"Preflight fallback: {preflight.reason}"}
+                            if has_overlay and not getattr(memory, "ignore_overlay", False)
+                            else {"action": "scroll", "selector": "down", "reason": f"Preflight fallback: {preflight.reason}"}
+                        )
+                        enrich_action(page, memory, action)
+                    source = f"{source}/Preflight"
+                decision_trace = build_decision_trace(
+                    source=source,
+                    selected_action=action,
+                    candidates=decision_candidates,
+                    preflight_reason=preflight_reason,
+                )
+                trace_summary = summarize_decision_trace(decision_trace)
+                if trace_summary:
+                    LOG.debug("#%s decision: %s", step, trace_summary)
 
                 # Circuit breaker: не вызывать LLM пока открыт контур
                 if _llm_future is None and not page.is_closed():
@@ -2017,6 +2110,7 @@ def run_agent(start_url: str = None):
                     "result": (result or "")[:200],
                     "source": source,
                     "screenshot_path": screenshot_path_rel,
+                    "decision_trace": decision_trace,
                 }
                 if flak:
                     step_entry["flakiness_ok"], step_entry["flakiness_total"] = flak[0], flak[1]
@@ -3033,6 +3127,31 @@ def _get_fast_action(
         if page.is_closed():
             return {"action": "scroll", "selector": "down", "reason": "Страница закрыта"}
 
+        policy_candidates = collect_action_candidates(
+            page,
+            memory,
+            has_overlay=has_overlay,
+            max_candidates=60,
+        )
+        if policy_candidates:
+            if not (TEST_UPLOAD_FILE_PATH and os.path.isfile(TEST_UPLOAD_FILE_PATH)):
+                policy_candidates = [c for c in policy_candidates if c.action != "upload_file"]
+            else:
+                for c in policy_candidates:
+                    if c.action == "upload_file":
+                        c.value = TEST_UPLOAD_FILE_PATH
+            ranked_candidates = rank_candidates(policy_candidates, memory)
+            try:
+                memory._last_action_candidates = ranked_candidates
+            except Exception:
+                pass
+            best = choose_best_candidate(ranked_candidates, memory)
+            if best:
+                action = best.as_action()
+                action["_candidate_id"] = best.id
+                action["_candidate_score"] = best.score
+                return action
+
         if has_overlay and not getattr(memory, "ignore_overlay", False):
             return {"action": "close_modal", "selector": "", "reason": "Закрываю оверлей"}
 
@@ -3362,7 +3481,8 @@ def _step_get_action(page, step, memory, console_log, network_failures, checklis
     screenshot_changed = memory.is_screenshot_changed(screenshot_b64 or "")
 
     current_url = page.url
-    context_str = build_context(page, current_url, console_log, network_failures)
+    dom_summary = get_dom_summary(page, max_length=dom_max, include_shadow_dom=ENABLE_SHADOW_DOM)
+    context_str = build_context(page, current_url, console_log, network_failures, dom_summary=dom_summary)
     if checklist_results:
         context_str = checklist_results_to_context(checklist_results) + "\n\n" + context_str
     if overlay_context:
@@ -3381,7 +3501,6 @@ def _step_get_action(page, step, memory, console_log, network_failures, checklis
         }
         page_type_hint = f"\nТип страницы: {page_type}. {type_strategies.get(page_type, '')}\n"
     
-    dom_summary = get_dom_summary(page, max_length=dom_max, include_shadow_dom=ENABLE_SHADOW_DOM)
     history_text = memory.get_history_text(last_n=history_n)
     
     # Проверяем покрытие элементов на текущей странице
@@ -3762,9 +3881,6 @@ def _analyze_in_background(
     from src.defect_rules import (
         is_noise_url,
         is_noise_console_text,
-        rule_pageerror,
-        rule_4xx_on_main,
-        rule_action_failure,
     )
     new_errors = [
         c for c in new_console
@@ -3811,30 +3927,43 @@ def _analyze_in_background(
         return "\n".join(lines)
 
     console_brief = _fmt_console_brief(new_errors)
+    defect_signals = collect_rule_signals(
+        action=action,
+        result=result,
+        current_url=current_url,
+        new_console=new_errors,
+        new_network=new_network,
+    )
 
     # 5xx
-    if new_network_fails:
-        five_xx_detail = "\n".join(
-            f"- {n.get('status')} {n.get('method', 'GET')} {n.get('url', '')[:120]}"
-            for n in new_network_fails[-10:]
-        )
+    five_xx_signal = next((s for s in defect_signals if s.kind == "network_5xx"), None)
+    if five_xx_signal:
         findings["five_xx_bug"] = (
             f"HTTP 5xx после действия агента.\n\n"
             f"Действие: {act_type} | selector: {sel[:100]} | value: {val[:50]}\n\n"
-            f"Неуспешные запросы:\n{five_xx_detail}"
+            f"{five_xx_signal.to_bug_text()}"
             + (f"\n\nНовые ошибки консоли после действия:\n{console_brief}" if console_brief else "")
         )
 
-    # Оракул (LLM — thread-safe). Lazy: только при изменении экрана или новых ошибках (ORACLE_ON_VISUAL_OR_ERROR)
-    run_oracle = ENABLE_ORACLE_AFTER_ACTION and act_type in ("type", "click") and post_screenshot_b64 and not new_network_fails
-    if run_oracle and ORACLE_ON_VISUAL_OR_ERROR:
-        run_oracle = visual_diff_info.get("changed") or bool(new_errors)
+    # Оракул (LLM — thread-safe). Lazy: только при изменении экрана или новых ошибках.
+    run_oracle = should_run_oracle(
+        enabled=ENABLE_ORACLE_AFTER_ACTION,
+        action_type=act_type,
+        has_screenshot=bool(post_screenshot_b64),
+        visual_diff=visual_diff_info,
+        new_errors=new_errors,
+        new_network=new_network,
+        lazy_on_visual_or_error=ORACLE_ON_VISUAL_OR_ERROR,
+    )
     if run_oracle:
-        expected_text = f"Ожидалось: {expected_outcome[:200]}" if expected_outcome else "Ожидался успешный результат."
-        vdiff_text = ""
-        if visual_diff_info.get("changed"):
-            vdiff_text = f" Visual diff: {visual_diff_info.get('detail', '')}."
-        oracle_context = f"Действие: {act_type} -> {sel[:60]}. Результат: {result}. {expected_text}{vdiff_text}"
+        oracle_context = build_oracle_context(
+            action=action,
+            result=result,
+            expected_outcome=expected_outcome,
+            visual_diff=visual_diff_info,
+            new_errors=new_errors,
+            new_network=new_network,
+        )
         oracle_ans = consult_agent_with_screenshot(
             oracle_context,
             "Произошло ли ожидаемое? Ответь: успех / ошибка / неясно.",
@@ -3842,6 +3971,7 @@ def _analyze_in_background(
         )
         if oracle_ans and "ошибка" in oracle_ans.lower():
             findings["oracle_error"] = True
+            add_oracle_signal(defect_signals, oracle_error=True, console_brief=console_brief)
 
     # Пост-анализ ошибок с улучшенной классификацией
     if not new_network_fails and (new_errors or possible_bug or findings["oracle_error"]):
@@ -3873,6 +4003,11 @@ Visual diff: {visual_diff_info.get('change_percent', 0):.1f}% изменений
                 if console_brief:
                     bug_text = f"{bug_text}\n\nНовые ошибки консоли после действия:\n{console_brief}"
                 findings["bug_to_report"] = bug_text
+                add_oracle_signal(
+                    defect_signals,
+                    possible_bug=post_action["possible_bug"],
+                    console_brief=console_brief,
+                )
         else:
             LOG.warning(
                 "#%s оракул не ответил (LLM пуст) — fallback на правила без LLM",
@@ -3884,29 +4019,19 @@ Visual diff: {visual_diff_info.get('change_percent', 0):.1f}% изменений
     # Порядок: сначала самый специфичный (UI: клик не прошёл из-за overlay/timeout),
     # потом JS-ошибки в консоли, потом 4xx на ключевых эндпоинтах.
     if not findings["bug_to_report"] and not findings["five_xx_bug"]:
-        rule_bug_act = rule_action_failure(action, result, current_url)
-        if rule_bug_act:
+        best_signal = pick_best_signal(s for s in defect_signals if s.kind != "network_5xx")
+        if best_signal:
             findings["bug_to_report"] = (
-                f"{rule_bug_act['title']}\n\n{rule_bug_act['details']}"
+                best_signal.to_bug_text()
                 + (f"\n\nНовые ошибки консоли после действия:\n{console_brief}" if console_brief else "")
             )
-            LOG.info("#%s правило rule_action_failure → дефект (%s)", step, rule_bug_act.get("severity"))
-        else:
-            rule_bug = rule_pageerror(new_errors)
-            if rule_bug:
-                findings["bug_to_report"] = (
-                    f"{rule_bug['title']}\n\n{rule_bug['details']}"
-                    + (f"\n\nНовые ошибки консоли после действия:\n{console_brief}" if console_brief else "")
-                )
-                LOG.info("#%s правило rule_pageerror → дефект", step)
-            else:
-                rule_bug4 = rule_4xx_on_main(new_network, current_url)
-                if rule_bug4:
-                    findings["bug_to_report"] = (
-                        f"{rule_bug4['title']}\n\n{rule_bug4['details']}"
-                        + (f"\n\nНовые ошибки консоли после действия:\n{console_brief}" if console_brief else "")
-                    )
-                    LOG.info("#%s правило rule_4xx_on_main → дефект", step)
+            LOG.info(
+                "#%s defect signal %s → дефект (severity=%s confidence=%.2f)",
+                step,
+                best_signal.kind,
+                best_signal.severity,
+                best_signal.confidence,
+            )
 
     if not findings["bug_to_report"] and not findings["five_xx_bug"]:
         LOG.debug(
@@ -3961,10 +4086,7 @@ def _step_post_analysis(
     # шагу — _flush_pending_analysis получал пустой findings и дефект терялся.
     # ============================================================
     if memory.defects_on_current_step == 0:
-        from src.defect_rules import (
-            is_noise_url, is_noise_console_text,
-            rule_action_failure, rule_pageerror, rule_4xx_on_main, rule_5xx,
-        )
+        from src.defect_rules import is_noise_console_text
         pre_lens = {
             "console": memory.console_len_before_action,
             "network": memory.network_len_before_action,
@@ -3976,31 +4098,31 @@ def _step_post_analysis(
             if (c.get("type") or "").lower() in ("error", "pageerror")
             and not is_noise_console_text(c.get("text") or "")
         ]
-        # Порядок: 5xx (самый громкий) → action_failure (UI клик) → pageerror → 4xx
+        sync_signals = collect_rule_signals(
+            action=action,
+            result=result,
+            current_url=current_url,
+            new_console=new_errors_sync,
+            new_network=new_network,
+        )
+        sync_signal = pick_best_signal(sync_signals)
         sync_bug = None
-        sync_bug_obj = rule_5xx(new_network)
-        if sync_bug_obj:
-            sync_bug = (
+        if sync_signal:
+            if sync_signal.kind == "network_5xx":
+                sync_bug = (
                 f"HTTP 5xx после действия агента.\n\n"
                 f"Действие: {act_type} | selector: {sel[:100]} | value: {val[:50]}\n\n"
-                f"{sync_bug_obj['title']}\n{sync_bug_obj['details']}"
+                f"{sync_signal.to_bug_text()}"
+                )
+            else:
+                sync_bug = sync_signal.to_bug_text()
+            LOG.info(
+                "#%s sync defect signal %s → дефект (severity=%s confidence=%.2f)",
+                step,
+                sync_signal.kind,
+                sync_signal.severity,
+                sync_signal.confidence,
             )
-            LOG.info("#%s sync rule_5xx → дефект", step)
-        if not sync_bug:
-            sync_bug_obj = rule_action_failure(action, result, current_url)
-            if sync_bug_obj:
-                sync_bug = f"{sync_bug_obj['title']}\n\n{sync_bug_obj['details']}"
-                LOG.info("#%s sync rule_action_failure → дефект (%s)", step, sync_bug_obj.get("severity"))
-        if not sync_bug:
-            sync_bug_obj = rule_pageerror(new_errors_sync)
-            if sync_bug_obj:
-                sync_bug = f"{sync_bug_obj['title']}\n\n{sync_bug_obj['details']}"
-                LOG.info("#%s sync rule_pageerror → дефект", step)
-        if not sync_bug:
-            sync_bug_obj = rule_4xx_on_main(new_network, current_url)
-            if sync_bug_obj:
-                sync_bug = f"{sync_bug_obj['title']}\n\n{sync_bug_obj['details']}"
-                LOG.info("#%s sync rule_4xx_on_main → дефект", step)
 
         if sync_bug:
             try:
