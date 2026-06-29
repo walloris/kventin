@@ -1646,11 +1646,23 @@ class ReleaseValidator:
             return any(self._json_contains_pull_request(item) for item in value)
         return False
 
+    def _json_contains_commit(self, value: object) -> bool:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                key_normalized = str(key).casefold()
+                if key_normalized in {'commit', 'commits'} and item:
+                    return True
+                if self._json_contains_commit(item):
+                    return True
+        elif isinstance(value, list):
+            return any(self._json_contains_commit(item) for item in value)
+        return False
+
     def _get_dev_status_payloads(self, issue_id: str) -> list[dict]:
         base_url = config['jira']['url'].rstrip('/')
         payloads = []
         application_types = ('stash', 'bitbucket', 'bitbucket-server')
-        data_types = ('pullrequest', 'repository')
+        data_types = ('pullrequest', 'repository', 'commit')
 
         for application_type in application_types:
             for data_type in data_types:
@@ -1679,8 +1691,9 @@ class ReleaseValidator:
 
         payloads = self._get_dev_status_payloads(issue_id)
         has_pull_request = any(self._json_contains_pull_request(payload) for payload in payloads)
+        has_commit = any(self._json_contains_commit(payload) for payload in payloads)
         has_gigacode_marker = any(self._json_contains_gigacode_marker(payload) for payload in payloads)
-        return has_pull_request and has_gigacode_marker
+        return has_gigacode_marker and (has_pull_request or has_commit)
 
     def _add_label_if_missing(self, issue, label: str) -> bool:
         labels = list(getattr(issue.fields, 'labels', []) or [])
@@ -1721,7 +1734,7 @@ class ReleaseValidator:
                 maxResults=500
             )
         except Exception as e:
-            self._log_issue("GENERAL", "error", f"Ошибка проверки GigaCode PR: {e}")
+            self._log_issue("GENERAL", "error", f"Ошибка проверки GigaCode PR/commit: {e}")
             return
 
         target_issues = [
@@ -1742,7 +1755,7 @@ class ReleaseValidator:
                             fields='summary,issuetype,assignee,labels'
                         )
                     except Exception as e:
-                        self._log_issue(target_issue, "warning", f"GigaCode PR: не удалось получить Task {task_key}: {e}")
+                        self._log_issue(target_issue, "warning", f"GigaCode PR/commit: не удалось получить Task {task_key}: {e}")
                         continue
                     if task.fields.issuetype and task.fields.issuetype.name.casefold() == 'task':
                         issues_to_check.append(task)
@@ -1757,11 +1770,11 @@ class ReleaseValidator:
                     self._log_issue(
                         target_issue,
                         "warning",
-                        f"GigaCode PR: не удалось проверить {issue_to_check.key}: {e}"
+                        f"GigaCode PR/commit: не удалось проверить {issue_to_check.key}: {e}"
                     )
 
             if not matched_issue:
-                self._log_issue(target_issue, "success", "GigaCode PR не найден — лейбл AIFIXED не требуется ✓")
+                self._log_issue(target_issue, "success", "GigaCode PR/commit не найден — лейбл AIFIXED не требуется ✓")
                 continue
 
             try:
@@ -1770,19 +1783,19 @@ class ReleaseValidator:
                     self._log_issue(
                         target_issue,
                         "success",
-                        f"GigaCode PR найден в {matched_issue.key}; лейбл {AIFIXED_LABEL} добавлен ✓"
+                        f"GigaCode PR/commit найден в {matched_issue.key}; лейбл {AIFIXED_LABEL} добавлен ✓"
                     )
                 else:
                     self._log_issue(
                         target_issue,
                         "success",
-                        f"GigaCode PR найден в {matched_issue.key}; лейбл {AIFIXED_LABEL} уже есть ✓"
+                        f"GigaCode PR/commit найден в {matched_issue.key}; лейбл {AIFIXED_LABEL} уже есть ✓"
                     )
             except Exception as e:
                 self._log_issue(
                     target_issue,
                     "error",
-                    f"GigaCode PR найден в {matched_issue.key}, но не удалось добавить лейбл {AIFIXED_LABEL}: {e}"
+                    f"GigaCode PR/commit найден в {matched_issue.key}, но не удалось добавить лейбл {AIFIXED_LABEL}: {e}"
                 )
 
     def _check_cloud_label(self, release_key: str, release_summary: str):
