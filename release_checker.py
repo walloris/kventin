@@ -115,7 +115,8 @@ def extract_jira_field_value(raw_val: object) -> str | None:
         for key in ('value', 'name', 'displayName'):
             if raw_val.get(key) is not None:
                 return normalize_field_text(raw_val.get(key))
-        return normalize_field_text(raw_val)
+        values = [extract_jira_field_value(item) for item in raw_val.values()]
+        return normalize_field_text(' '.join(value for value in values if value))
     if isinstance(raw_val, list):
         values = [extract_jira_field_value(item) for item in raw_val]
         return ', '.join(value for value in values if value)
@@ -1271,19 +1272,57 @@ class ReleaseValidator:
         if not field_value:
             return {}
 
+        rows_by_label = {}
         parser = JiraTableFieldParser()
         try:
             parser.feed(field_value)
         except Exception:
-            return {}
+            pass
 
-        rows_by_label = {}
         for row in parser.rows:
             if len(row) < 2:
                 continue
             label = normalize_field_text(row[0]['text']).casefold()
             if label:
                 rows_by_label[label] = row[1]
+
+        if rows_by_label:
+            return rows_by_label
+
+        return self._extract_story_requirements_rows_from_text(field_value)
+
+    def _extract_story_requirements_rows_from_text(self, field_value: str) -> dict[str, dict]:
+        labels = ('Бизнес-требования', 'Функциональное решение', 'Архитектура')
+        text = normalize_field_text(field_value)
+        text_casefolded = text.casefold()
+        positions = []
+
+        for label in labels:
+            idx = text_casefolded.find(label.casefold())
+            if idx >= 0:
+                positions.append((idx, label))
+
+        rows_by_label = {}
+        positions.sort()
+
+        for index, (start, label) in enumerate(positions):
+            value_start = start + len(label)
+            value_end = positions[index + 1][0] if index + 1 < len(positions) else len(text)
+            value_fragment = normalize_field_text(text[value_start:value_end])
+            links = re.findall(r'https?://[^\s\])"]+', value_fragment)
+            value_text = normalize_field_text(re.sub(r'https?://[^\s\])"]+', '', value_fragment))
+
+            for possible_value in ('Зафиксировано', 'Не меняется', 'Утверждена'):
+                possible_value_normalized = possible_value.casefold()
+                if possible_value_normalized in value_text.casefold():
+                    value_text = possible_value
+                    break
+
+            rows_by_label[label.casefold()] = {
+                'text': value_text,
+                'links': links,
+            }
+
         return rows_by_label
 
     def _check_story_requirements_block(self, story) -> bool:
