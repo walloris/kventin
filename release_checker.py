@@ -456,6 +456,12 @@ class ReleaseValidator:
             token=config['jira']['token'],
             verify_ssl=False
         )
+        self.jira_http = requests.Session()
+        self.jira_http.verify = False
+        self.jira_http.headers.update({
+            'Authorization': f"Bearer {config['jira']['token']}",
+            'Content-Type': 'application/json',
+        })
 
         self.report_data = defaultdict(lambda: {
             'summary': '',
@@ -539,6 +545,7 @@ class ReleaseValidator:
         self._check_zephyr_test_cases(release_key, is_hotfix=is_hotfix)
         self._check_bugs(release_key, is_hotfix=is_hotfix)
         self._check_stories(release_key)
+        self._check_gigacode_pull_requests(release_key)
         self._check_cloud_label(release_key, release.fields.summary)
         self._check_sbrppl_third_party_label(release_key)
         self._check_sbrppl_story_points(release_key)
@@ -1570,6 +1577,173 @@ class ReleaseValidator:
 
                 except Exception as e:
                     self._log_issue(task_key, "error", f"Ошибка проверки Task {task_key}: {e}")
+
+    def _json_contains_gigacode_marker(self, value: object) -> bool:
+        markers = (
+            '#gigacode agent',
+            'co-authored-by: gigacode',
+            'co-authorer-by: gigacode',
+        )
+        if isinstance(value, str):
+            value_normalized = value.casefold()
+            return any(marker in value_normalized for marker in markers)
+        if isinstance(value, dict):
+            return any(self._json_contains_gigacode_marker(item) for item in value.values())
+        if isinstance(value, list):
+            return any(self._json_contains_gigacode_marker(item) for item in value)
+        return False
+
+    def _json_contains_pull_request(self, value: object) -> bool:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                key_normalized = str(key).casefold()
+                if 'pullrequest' in key_normalized or 'pull_request' in key_normalized or 'pull request' in key_normalized:
+                    if item:
+                        return True
+                if self._json_contains_pull_request(item):
+                    return True
+        elif isinstance(value, list):
+            return any(self._json_contains_pull_request(item) for item in value)
+        return False
+
+    def _get_dev_status_payloads(self, issue_id: str) -> list[dict]:
+        base_url = config['jira']['url'].rstrip('/')
+        payloads = []
+        application_types = ('stash', 'bitbucket', 'bitbucket-server')
+        data_types = ('pullrequest', 'repository')
+
+        for application_type in application_types:
+            for data_type in data_types:
+                url = f"{base_url}/rest/dev-status/latest/issue/detail"
+                try:
+                    response = self.jira_http.get(
+                        url,
+                        params={
+                            'issueId': issue_id,
+                            'applicationType': application_type,
+                            'dataType': data_type,
+                        },
+                        timeout=30,
+                    )
+                    if response.status_code == 200:
+                        payloads.append(response.json())
+                except Exception:
+                    continue
+
+        return payloads
+
+    def _issue_has_gigacode_pull_request(self, issue) -> bool:
+        issue_id = str(getattr(issue, 'id', '') or '')
+        if not issue_id:
+            return False
+
+        payloads = self._get_dev_status_payloads(issue_id)
+        has_pull_request = any(self._json_contains_pull_request(payload) for payload in payloads)
+        has_gigacode_marker = any(self._json_contains_gigacode_marker(payload) for payload in payloads)
+        return has_pull_request and has_gigacode_marker
+
+    def _add_label_if_missing(self, issue, label: str) -> bool:
+        labels = list(getattr(issue.fields, 'labels', []) or [])
+        if label.casefold() in {existing_label.casefold() for existing_label in labels}:
+            return False
+
+        issue.update(fields={'labels': labels + [label]})
+        issue.fields.labels = labels + [label]
+        return True
+
+    def _get_story_task_keys(self, story) -> list[str]:
+        task_keys = []
+        if not hasattr(story.fields, 'issuelinks') or not story.fields.issuelinks:
+            return task_keys
+
+        for link in story.fields.issuelinks:
+            link_type = link.type.name.casefold() if hasattr(link.type, 'name') else ''
+            if 'consist' not in link_type and 'part' not in link_type:
+                continue
+            linked_issue = getattr(link, 'outwardIssue', None) or getattr(link, 'inwardIssue', None)
+            if linked_issue:
+                task_keys.append(linked_issue.key)
+        return task_keys
+
+    def _check_gigacode_pull_requests(self, release_key: str) -> None:
+        AIFIXED_LABEL = 'AIFIXED'
+        issue_types = {'story', 'bug', 'defect', 'ошибка'}
+
+        linked_keys = self._get_consist_of_issues(release_key)
+        if not linked_keys:
+            return
+
+        keys_str = ",".join(linked_keys)
+        try:
+            release_issues = self.jira_main.search_issues(
+                f'key in ({keys_str})',
+                fields='summary,issuetype,assignee,labels,issuelinks',
+                maxResults=500
+            )
+        except Exception as e:
+            self._log_issue("GENERAL", "error", f"Ошибка проверки GigaCode PR: {e}")
+            return
+
+        target_issues = [
+            issue for issue in release_issues
+            if issue.fields.issuetype and issue.fields.issuetype.name.casefold() in issue_types
+        ]
+
+        print(f"   Проверка Pull Request с GigaCode для {len(target_issues)} Story/Bug...")
+
+        for target_issue in target_issues:
+            issues_to_check = [target_issue]
+
+            if target_issue.fields.issuetype.name.casefold() == 'story':
+                for task_key in self._get_story_task_keys(target_issue):
+                    try:
+                        task = self.jira_main.issue(
+                            task_key,
+                            fields='summary,issuetype,assignee,labels'
+                        )
+                    except Exception as e:
+                        self._log_issue(target_issue, "warning", f"GigaCode PR: не удалось получить Task {task_key}: {e}")
+                        continue
+                    if task.fields.issuetype and task.fields.issuetype.name.casefold() == 'task':
+                        issues_to_check.append(task)
+
+            matched_issue = None
+            for issue_to_check in issues_to_check:
+                try:
+                    if self._issue_has_gigacode_pull_request(issue_to_check):
+                        matched_issue = issue_to_check
+                        break
+                except Exception as e:
+                    self._log_issue(
+                        target_issue,
+                        "warning",
+                        f"GigaCode PR: не удалось проверить {issue_to_check.key}: {e}"
+                    )
+
+            if not matched_issue:
+                self._log_issue(target_issue, "success", "GigaCode PR не найден — лейбл AIFIXED не требуется ✓")
+                continue
+
+            try:
+                added = self._add_label_if_missing(target_issue, AIFIXED_LABEL)
+                if added:
+                    self._log_issue(
+                        target_issue,
+                        "success",
+                        f"GigaCode PR найден в {matched_issue.key}; лейбл {AIFIXED_LABEL} добавлен ✓"
+                    )
+                else:
+                    self._log_issue(
+                        target_issue,
+                        "success",
+                        f"GigaCode PR найден в {matched_issue.key}; лейбл {AIFIXED_LABEL} уже есть ✓"
+                    )
+            except Exception as e:
+                self._log_issue(
+                    target_issue,
+                    "error",
+                    f"GigaCode PR найден в {matched_issue.key}, но не удалось добавить лейбл {AIFIXED_LABEL}: {e}"
+                )
 
     def _check_cloud_label(self, release_key: str, release_summary: str):
         """
