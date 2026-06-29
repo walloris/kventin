@@ -1328,6 +1328,7 @@ class ReleaseValidator:
     def _check_story_requirements_block(self, story) -> bool:
         REQUIREMENTS_FIELD = 'customfield_21100'
         ARCHITECTURE_IMPACT_FIELD = 'customfield_23700'
+        ARCHITECTURE_IMPACT_FIELD_NAME = 'Архитектурные изменения'
         ARCHITECTURE_NO_CHANGE = 'не меняется'
         ARCHITECTURE_APPROVED = 'утверждена'
         ARCHITECTURE_NO_IMPACT = 'не влияет на архитектуру'
@@ -1388,7 +1389,7 @@ class ReleaseValidator:
                 block_is_valid = False
                 self._log_issue(
                     story, "error",
-                    f"Story: Архитектура = 'Не меняется', но {ARCHITECTURE_IMPACT_FIELD} = "
+                    f"Story: Архитектура = 'Не меняется', но поле '{ARCHITECTURE_IMPACT_FIELD_NAME}' = "
                     f"'{architecture_impact or 'None'}'. Ожидается 'Не влияет на архитектуру'"
                 )
             else:
@@ -1404,7 +1405,7 @@ class ReleaseValidator:
                 block_is_valid = False
                 self._log_issue(
                     story, "error",
-                    f"Story: Архитектура = 'Утверждена', но {ARCHITECTURE_IMPACT_FIELD} = "
+                    f"Story: Архитектура = 'Утверждена', но поле '{ARCHITECTURE_IMPACT_FIELD_NAME}' = "
                     f"'{architecture_impact or 'None'}' содержит недопустимое значение"
                 )
             else:
