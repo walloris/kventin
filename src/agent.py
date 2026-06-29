@@ -171,11 +171,12 @@ from src.browser_options import (
     is_too_many_redirects_error,
     should_write_auto_select_cert_policy,
 )
-from src.action_preflight import preflight_action
-from src.action_candidates import collect_action_candidates, render_candidates_for_prompt
+from src.action_candidates import collect_action_candidates
 from src.action_policy import action_from_llm_candidate_choice, choose_best_candidate, rank_candidates
-from src.decision_trace import build_decision_trace, summarize_decision_trace
+from src.action_executor import ActionHandlers, execute_browser_action
+from src.action_selection import apply_preflight_or_fallback
 from src.defect_signals import add_oracle_signal, collect_rule_signals, pick_best_signal
+from src.observation import collect_page_observation
 from src.oracle import build_oracle_context, should_run_oracle
 
 # Бюджет на URL — единый источник правды в config.py.
@@ -321,56 +322,18 @@ def describe_element_for_report(page: Page, selector: str) -> str:
 # --- Выполнение действия ---
 def execute_action(page: Page, action: Dict[str, Any], memory: AgentMemory) -> str:
     """Выполнить действие на странице. Возвращает текстовый результат."""
-    act = action.get("action", "").lower()
-    selector = action.get("selector", "").strip()
-    value = action.get("value", "").strip()
-    reason = action.get("reason", "")
-
-    print(f"[Agent] Действие: {act} -> {selector[:60]} | {reason[:60]}")
-
-    if act == "click":
-        result = _do_click(page, selector, reason)
-        # Записываем клик в покрытие
-        if memory and "clicked" in (result or "").lower():
-            memory.record_page_element(page.url, f"click:{_norm_key(selector)}")
-        return result
-    elif act == "fill_form":
-        # Умное заполнение формы
-        form_strat = action.get("_form_strategy", "happy")
-        result = _fill_form_smart(page, form_strategy=form_strat, memory=memory)
-        # Записываем заполнение формы в покрытие
-        if memory and "form_filled" in (result or "").lower():
-            memory.record_page_element(page.url, "fill_form:all_fields")
-        return result
-    elif act == "type":
-        form_strat = action.get("_form_strategy", "happy")
-        result = _do_type(page, selector, value, form_strategy=form_strat)
-        # Записываем в покрытие
-        if memory and "typed" in (result or "").lower():
-            memory.record_page_element(page.url, f"type:{_norm_key(selector)}")
-        return result
-    elif act == "scroll":
-        return _do_scroll(page, selector)
-    elif act == "hover":
-        return _do_hover(page, selector)
-    elif act == "explore":
-        return _do_scroll(page, "down")
-    elif act == "close_modal":
-        return _do_close_modal(page, selector)
-    elif act == "select_option":
-        return _do_select_option(page, selector, value)
-    elif act == "press_key":
-        return _do_press_key(page, selector or value or "Escape")
-    elif act == "upload_file":
-        result = _do_upload_file(page, selector, value)
-        if memory and "uploaded" in (result or "").lower():
-            memory.record_page_element(page.url, f"type:{_norm_key(selector)}")
-        return result
-    elif act == "check_defect":
-        return "defect_found"
-    else:
-        print(f"[Agent] Неизвестное действие: {act}, пробую клик")
-        return _do_click(page, selector, reason) if selector else "no_action"
+    handlers = ActionHandlers(
+        click=lambda selector, reason: _do_click(page, selector, reason),
+        fill_form=lambda form_strategy: _fill_form_smart(page, form_strategy=form_strategy, memory=memory),
+        type_text=lambda selector, value, form_strategy: _do_type(page, selector, value, form_strategy=form_strategy),
+        scroll=lambda direction: _do_scroll(page, direction),
+        hover=lambda selector: _do_hover(page, selector),
+        close_modal=lambda selector: _do_close_modal(page, selector),
+        select_option=lambda selector, value: _do_select_option(page, selector, value),
+        press_key=lambda key: _do_press_key(page, key),
+        upload_file=lambda selector, file_path: _do_upload_file(page, selector, file_path),
+    )
+    return execute_browser_action(page, action, memory, handlers)
 
 
 def _find_element(page: Page, selector: str):
@@ -1579,67 +1542,53 @@ def run_agent(start_url: str = None):
             history_n = 15
             
             try:
-                overlay_info = detect_active_overlays(page_)
-                has_overlay = overlay_info.get("has_overlay", False)
-                screenshot_b64 = take_screenshot_b64(page_)
-                screenshot_changed = memory_.is_screenshot_changed(screenshot_b64 or "")
-                current_url_ = page_.url
-                dom_summary = get_dom_summary(page_, max_length=dom_max, include_shadow_dom=ENABLE_SHADOW_DOM)
-                try:
-                    ref_meta = page_.evaluate("() => Object.assign({}, window.__agentRefMeta || {})") or {}
-                except Exception:
-                    ref_meta = {}
-                raw_candidates = collect_action_candidates(
+                observation = collect_page_observation(
                     page_,
                     memory_,
-                    has_overlay=has_overlay,
-                    overlay_info=overlay_info,
+                    console_log_,
+                    network_failures_,
+                    checklist_results_,
+                    screenshot_func=take_screenshot_b64,
+                    include_shadow_dom=ENABLE_SHADOW_DOM,
+                    dom_max=dom_max,
+                    history_n=history_n,
                     max_candidates=60,
                 )
-                candidates = rank_candidates(raw_candidates, memory_)
-                candidates_prompt = render_candidates_for_prompt(candidates, limit=18)
-                history_text = memory_.get_history_text(last_n=history_n)
-                overlay_context = format_overlays_context(overlay_info)
-                page_type = detect_page_type(page_)
             except Exception as e:
                 # Страница закрылась во время сбора данных
                 LOG.debug("_start_llm_async: страница закрыта во время сбора данных: %s", e)
                 return
             coverage_hint = ""
-            if current_url_ in memory_._page_coverage:
-                tested_count = len(memory_._page_coverage[current_url_])
+            if observation.current_url in memory_._page_coverage:
+                tested_count = len(memory_._page_coverage[observation.current_url])
                 if tested_count > 0:
                     coverage_hint = f"\nПротестировано: {tested_count}. Выбери НОВЫЙ элемент.\n"
 
-            _llm_meta["has_overlay"] = has_overlay
-            _llm_meta["screenshot_b64"] = screenshot_b64
-            _llm_meta["ref_meta"] = ref_meta
-            _llm_meta["candidates"] = candidates
+            _llm_meta["has_overlay"] = observation.has_overlay
+            _llm_meta["screenshot_b64"] = observation.screenshot_b64
+            _llm_meta["ref_meta"] = observation.ref_meta
+            _llm_meta["candidates"] = observation.candidates
 
             # Формируем контекст и вопрос
-            ctx = build_context(page_, current_url_, console_log_, network_failures_, dom_summary=dom_summary)
-            if checklist_results_:
-                ctx = checklist_results_to_context(checklist_results_) + "\n\n" + ctx
-            if overlay_context:
-                ctx = overlay_context + "\n\n" + ctx
+            ctx = observation.context
 
             type_strategies = {
                 "landing": "Landing page: CTA, формы", "form": "Form: заполни поля",
                 "dashboard": "Dashboard: таблицы, фильтры", "catalog": "Catalog: карточки, фильтры",
             }
-            ptype_hint = f"\nТип: {page_type}. {type_strategies.get(page_type, '')}\n" if page_type != "unknown" else ""
+            ptype_hint = f"\nТип: {observation.page_type}. {type_strategies.get(observation.page_type, '')}\n" if observation.page_type != "unknown" else ""
 
             module_ctx = memory_.get_module_context_text()
 
-            if has_overlay:
+            if observation.has_overlay:
                 question = f"""Скриншот. АКТИВНЫЙ ОВЕРЛЕЙ.
-{overlay_context}
+{observation.overlay_context}
 {module_ctx}
 КАНДИДАТЫ ДЕЙСТВИЙ (выбери candidate_id из списка):
-{candidates_prompt}
+{observation.candidates_prompt}
 
-ЭЛЕМЕНТЫ: {dom_summary[:1800]}
-{history_text}
+ЭЛЕМЕНТЫ: {observation.dom_summary[:1800]}
+{observation.history_text}
 Верни JSON: {{"candidate_id":"cN","reason":"почему"}}. Не придумывай selector."""
             else:
                 plan_hint = ""
@@ -1669,25 +1618,25 @@ def run_agent(start_url: str = None):
 {module_ctx}
 {ptype_hint}{coverage_hint}{critical_hint}
 КАНДИДАТЫ ДЕЙСТВИЙ (выбери candidate_id из списка):
-{candidates_prompt}
+{observation.candidates_prompt}
 
 ЭЛЕМЕНТЫ СТРАНИЦЫ (только видимые на экране, формат: [N] тип "текст" атрибуты):
-{dom_summary[:1800]}
-{history_text}
+{observation.dom_summary[:1800]}
+{observation.history_text}
 {plan_hint}{stuck_w}
 Верни JSON: {{"candidate_id":"cN","reason":"почему"}}. Если кандидатов нет — верни action=scroll."""
 
             phase_instruction = memory_.get_phase_instruction()
-            send_screenshot = screenshot_b64 if screenshot_changed else None
+            send_screenshot = observation.screenshot_b64 if observation.screenshot_changed else None
 
             def _call_llm():
                 raw = consult_agent_with_screenshot(
                     ctx, question, screenshot_b64=send_screenshot,
                     phase_instruction=phase_instruction, tester_phase=memory_.tester_phase,
-                    has_overlay=has_overlay,
+                    has_overlay=observation.has_overlay,
                 )
                 if raw:
-                    candidate_action = action_from_llm_candidate_choice(raw, candidates)
+                    candidate_action = action_from_llm_candidate_choice(raw, observation.candidates)
                     if candidate_action:
                         return candidate_action
                     action = parse_llm_action(raw)
@@ -1702,10 +1651,10 @@ def run_agent(start_url: str = None):
                     retry_raw = consult_agent_with_screenshot(
                         ctx, retry_q, screenshot_b64=send_screenshot,
                         phase_instruction=phase_instruction, tester_phase=memory_.tester_phase,
-                        has_overlay=has_overlay,
+                        has_overlay=observation.has_overlay,
                     )
                     if retry_raw:
-                        candidate_action = action_from_llm_candidate_choice(retry_raw, candidates)
+                        candidate_action = action_from_llm_candidate_choice(retry_raw, observation.candidates)
                         if candidate_action:
                             return candidate_action
                         action = parse_llm_action(retry_raw)
@@ -1963,61 +1912,18 @@ def run_agent(start_url: str = None):
                     source = "Fast"
                     decision_candidates = getattr(memory, "_last_action_candidates", []) or []
 
-                # Обогащаем action stable_key + url_pattern для надёжной памяти
-                enrich_action(page, memory, action)
                 expected_ref_meta = _llm_meta.get("ref_meta") if source == "LLM" else None
-                preflight_reason = ""
-                preflight = preflight_action(
-                    page,
-                    memory,
-                    action,
-                    has_overlay=has_overlay,
-                    expected_ref_meta=expected_ref_meta,
-                )
-                if preflight.ok:
-                    action = preflight.action
-                    if preflight.repaired:
-                        source = f"{source}/Preflight"
-                        print(
-                            f"[Agent] #{step} Preflight: ref обновлён -> "
-                            f"{action.get('selector', '')[:40]}"
-                        )
-                else:
-                    preflight_reason = preflight.reason
-                    if preflight.reason == "repeat":
-                        memory.record_repeat()
-                    print(
-                        f"[Agent] #{step} Preflight: действие отклонено "
-                        f"({preflight.reason}), беру fallback"
-                    )
-                    fallback_action = _get_fast_action(page, memory, has_overlay)
-                    enrich_action(page, memory, fallback_action)
-                    fallback_preflight = preflight_action(
-                        page,
-                        memory,
-                        fallback_action,
-                        has_overlay=has_overlay,
-                        allow_repeat=True,
-                    )
-                    if fallback_preflight.ok:
-                        action = fallback_preflight.action
-                    else:
-                        action = (
-                            {"action": "close_modal", "selector": "", "reason": f"Preflight fallback: {preflight.reason}"}
-                            if has_overlay and not getattr(memory, "ignore_overlay", False)
-                            else {"action": "scroll", "selector": "down", "reason": f"Preflight fallback: {preflight.reason}"}
-                        )
-                        enrich_action(page, memory, action)
-                    source = f"{source}/Preflight"
-                decision_trace = build_decision_trace(
+                action, source, decision_trace = apply_preflight_or_fallback(
+                    page=page,
+                    memory=memory,
+                    action=action,
                     source=source,
-                    selected_action=action,
-                    candidates=decision_candidates,
-                    preflight_reason=preflight_reason,
+                    has_overlay=has_overlay,
+                    decision_candidates=decision_candidates,
+                    fallback_factory=lambda: _get_fast_action(page, memory, has_overlay),
+                    expected_ref_meta=expected_ref_meta,
+                    step=step,
                 )
-                trace_summary = summarize_decision_trace(decision_trace)
-                if trace_summary:
-                    LOG.debug("#%s decision: %s", step, trace_summary)
 
                 # Circuit breaker: не вызывать LLM пока открыт контур
                 if _llm_future is None and not page.is_closed():
