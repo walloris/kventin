@@ -106,7 +106,7 @@ def normalize_field_text(value: object) -> str:
     return re.sub(r'\s+', ' ', str(value or '')).strip()
 
 
-def extract_jira_field_value(raw_val: object) -> str | None:
+def extract_jira_field_value(raw_val: object) -> Optional[str]:
     if raw_val is None:
         return None
     if hasattr(raw_val, 'value'):
@@ -121,6 +121,19 @@ def extract_jira_field_value(raw_val: object) -> str | None:
         values = [extract_jira_field_value(item) for item in raw_val]
         return ', '.join(value for value in values if value)
     return normalize_field_text(raw_val)
+
+
+def extract_jira_field_values(raw_val: object) -> list[str]:
+    """Извлекает список человекочитаемых значений Jira field/select/multiselect."""
+    if raw_val is None:
+        return []
+    if isinstance(raw_val, list):
+        values = []
+        for item in raw_val:
+            values.extend(extract_jira_field_values(item))
+        return [value for value in values if value]
+    value = extract_jira_field_value(raw_val)
+    return [value] if value else []
 
 
 class JiraTableFieldParser(HTMLParser):
@@ -1332,23 +1345,46 @@ class ReleaseValidator:
         ARCHITECTURE_NO_CHANGE = 'не меняется'
         ARCHITECTURE_APPROVED = 'утверждена'
         ARCHITECTURE_NO_IMPACT = 'не влияет на архитектуру'
-        ARCHITECTURE_APPROVED_ALLOWED_IMPACTS = {
-            None,
-            'none',
+        ARCHITECTURE_IMPACT_ALLOWED_VALUES = {
+            'не влияет на архитектуру',
             'это первое внедрение для кэ',
             'в результате доработки этот кэ будет отправлен в архив или выведен',
             'в результате доработки зависимый кэ будет отправлен в архив или выведен',
+            'реализуется новая интеграция с другой ас',
+            'реализуется выгрузка данных на фир',
+            'реализуется загрузка данных с фир',
+            'реализуется механизм получения и обработки электронных писем',
+            'реализуется механизм отправки электронных писем',
+            'осуществляется миграция на другой тех.стек',
+            'создается или изменяется dblink',
+            'создание или расширение реплики данных внутри ас или в другую ас',
+            'реализуется новый ui/ арм',
+            'один из компонентов кэ будет размещен в отличном от текущего сегменте сети',
+            'создается новый rpa-алгоритм (робот)',
+            'вносятся изменения в интерфейсы, с которыми работают rpa',
+            'доработки привели к нарушению одного из архитектурных стандартов',
+            'после внедрения ожидается закрытие ранее выставленного атд',
+            'вносятся изменения в существующую интеграцию с другой ас',
+            'к существующем сервису подключается новый потребитель',
+            'реализуется возможность выгрузки данных/отчетов на рабочую станцию пользователя',
+            'вносятся изменения в существующий процесс выгрузки данных/отчетов на рабочую станцию пользователя',
+            'создание новых хранимых процедур или триггеров в бд',
+            'реализуется новая схема данных в бд или отдельный инстанс бд',
+            'вносятся изменения в существующую интеграцию внутри одной ас',
+            'создается новая интеграция внутри одной ас',
+            'создается или изменяется api',
         }
 
         rows = self._extract_story_requirements_rows(getattr(story.fields, REQUIREMENTS_FIELD, None))
-        architecture_impact = extract_jira_field_value(getattr(story.fields, ARCHITECTURE_IMPACT_FIELD, None))
-        architecture_impact_normalized = (
-            normalize_field_text(architecture_impact).casefold()
-            if architecture_impact
-            else None
-        )
+        architecture_impact_values = extract_jira_field_values(getattr(story.fields, ARCHITECTURE_IMPACT_FIELD, None))
+        architecture_impact_display = ', '.join(architecture_impact_values) if architecture_impact_values else 'None'
+        architecture_impact_normalized_values = {
+            normalize_field_text(value).casefold()
+            for value in architecture_impact_values
+            if normalize_field_text(value)
+        }
 
-        def get_row(label: str) -> dict | None:
+        def get_row(label: str) -> Optional[dict]:
             return rows.get(label.casefold())
 
         block_is_valid = True
@@ -1386,12 +1422,12 @@ class ReleaseValidator:
 
         architecture_status = normalize_field_text(architecture_row['text']).casefold()
         if architecture_status == ARCHITECTURE_NO_CHANGE:
-            if architecture_impact_normalized != ARCHITECTURE_NO_IMPACT:
+            if architecture_impact_normalized_values != {ARCHITECTURE_NO_IMPACT}:
                 block_is_valid = False
                 self._log_issue(
                     story, "error",
                     f"Story: Архитектура = 'Не меняется', но поле '{ARCHITECTURE_IMPACT_FIELD_NAME}' = "
-                    f"'{architecture_impact or 'None'}'. Ожидается 'Не влияет на архитектуру'"
+                    f"'{architecture_impact_display}'. Ожидается 'Не влияет на архитектуру'"
                 )
             else:
                 self._log_issue(
@@ -1402,12 +1438,29 @@ class ReleaseValidator:
             if not architecture_row['links']:
                 block_is_valid = False
                 self._log_issue(story, "error", "Story: Архитектура = 'Утверждена', но ссылка не указана")
-            elif architecture_impact_normalized not in ARCHITECTURE_APPROVED_ALLOWED_IMPACTS:
+            elif not architecture_impact_normalized_values:
                 block_is_valid = False
                 self._log_issue(
                     story, "error",
                     f"Story: Архитектура = 'Утверждена', но поле '{ARCHITECTURE_IMPACT_FIELD_NAME}' = "
-                    f"'{architecture_impact or 'None'}' содержит недопустимое значение"
+                    f"'{architecture_impact_display}'. Ожидается одно или несколько архитектурных изменений"
+                )
+            elif ARCHITECTURE_NO_IMPACT in architecture_impact_normalized_values:
+                block_is_valid = False
+                self._log_issue(
+                    story, "error",
+                    f"Story: Архитектура = 'Утверждена', но поле '{ARCHITECTURE_IMPACT_FIELD_NAME}' = "
+                    f"'{architecture_impact_display}'. Значение 'Не влияет на архитектуру' допустимо только "
+                    "для статуса 'Не меняется'"
+                )
+            elif not architecture_impact_normalized_values.issubset(ARCHITECTURE_IMPACT_ALLOWED_VALUES):
+                block_is_valid = False
+                unexpected_values = sorted(architecture_impact_normalized_values - ARCHITECTURE_IMPACT_ALLOWED_VALUES)
+                self._log_issue(
+                    story, "error",
+                    f"Story: Архитектура = 'Утверждена', но поле '{ARCHITECTURE_IMPACT_FIELD_NAME}' = "
+                    f"'{architecture_impact_display}' содержит недопустимые значения: "
+                    f"{', '.join(unexpected_values)}"
                 )
             else:
                 self._log_issue(
