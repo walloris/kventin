@@ -3,6 +3,7 @@ from atlassian import Confluence
 import os
 import sys
 import re
+import time
 import urllib3
 import logging
 import requests
@@ -182,12 +183,40 @@ class ZephyrScaleClient:
     def __init__(self, base_url: str, token: str, verify_ssl: bool = False):
         self.base_url = base_url.rstrip('/')
         self.verify_ssl = verify_ssl
+        self.max_retries = 3
+        self.retry_backoff_seconds = 2
+        self.retry_status_codes = {429, 500, 502, 503, 504}
         self.session = requests.Session()
         self.session.verify = verify_ssl
         self.session.headers.update({
             'Authorization': f'Bearer {token}',
             'Content-Type': 'application/json',
         })
+
+    def _get_with_retries(self, url: str, **kwargs) -> requests.Response:
+        kwargs.setdefault('timeout', 30)
+        last_exception = None
+
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                response = self.session.get(url, **kwargs)
+                if response.status_code not in self.retry_status_codes or attempt == self.max_retries:
+                    return response
+            except requests.RequestException as e:
+                last_exception = e
+                if attempt == self.max_retries:
+                    raise
+
+            sleep_seconds = self.retry_backoff_seconds * attempt
+            print(
+                f"   ⚠️ Zephyr API: повтор запроса {attempt + 1}/{self.max_retries} "
+                f"через {sleep_seconds} сек."
+            )
+            time.sleep(sleep_seconds)
+
+        if last_exception:
+            raise last_exception
+        raise RuntimeError("Zephyr API: запрос не выполнен")
 
     def get_test_cases_for_issue(self, issue_key: str) -> tuple[list[dict], Optional[str]]:
         """
@@ -198,7 +227,7 @@ class ZephyrScaleClient:
         """
         url = f"{self.base_url}/rest/atm/1.0/issuelink/{issue_key}/testcases"
         try:
-            response = self.session.get(url, timeout=30)
+            response = self._get_with_retries(url)
             if response.status_code == 200:
                 data = response.json()
                 if isinstance(data, list):
@@ -234,7 +263,7 @@ class ZephyrScaleClient:
         """
         url = f"{self.base_url}/rest/atm/1.0/testcase/{tc_key}"
         try:
-            response = self.session.get(url, timeout=30)
+            response = self._get_with_retries(url)
             if response.status_code == 200:
                 return response.json()
             return None
@@ -306,10 +335,9 @@ class ZephyrScaleClient:
 
         while True:
             try:
-                response = self.session.get(
+                response = self._get_with_retries(
                     url,
                     params={'query': query, 'maxResults': page_size, 'startAt': start_at},
-                    timeout=30
                 )
             except Exception:
                 break
@@ -343,7 +371,7 @@ class ZephyrScaleClient:
         """
         url = f"{self.base_url}/rest/atm/1.0/testrun/{tc_key}"
         try:
-            response = self.session.get(url, timeout=30)
+            response = self._get_with_retries(url)
             if response.status_code == 200:
                 return response.json()
             return None
@@ -2081,7 +2109,7 @@ def _diag_tc(validator: 'ReleaseValidator', tc_key: str):
     import json
     url = f"{validator.zephyr.base_url}/rest/atm/1.0/testrun/{tc_key}"
     print(f"\n=== GET {url} ===")
-    resp = validator.zephyr.session.get(url, timeout=30)
+    resp = validator.zephyr._get_with_retries(url)
     print(f"Status: {resp.status_code}")
     try:
         print(json.dumps(resp.json(), ensure_ascii=False, indent=2))
@@ -2104,7 +2132,6 @@ def _diag_search(validator: 'ReleaseValidator', release_key: str):
         print(f"Failed to get issue id: {e}")
 
     base = validator.zephyr.base_url
-    sess = validator.zephyr.session
 
     queries = [
         f'projectKey = "{issue_project}" AND issueId = "{release_id}"',
@@ -2116,7 +2143,7 @@ def _diag_search(validator: 'ReleaseValidator', release_key: str):
 
     for q in queries:
         url = f"{base}/rest/atm/1.0/testrun/search"
-        resp = sess.get(url, params={'query': q, 'maxResults': 10}, timeout=30)
+        resp = validator.zephyr._get_with_retries(url, params={'query': q, 'maxResults': 10})
         data = None
         try:
             data = resp.json()
@@ -2133,7 +2160,7 @@ def _diag_search(validator: 'ReleaseValidator', release_key: str):
 
     # Также пробуем issuelink
     url2 = f"{base}/rest/atm/1.0/issuelink/{release_key}/testruns"
-    resp2 = sess.get(url2, timeout=30)
+    resp2 = validator.zephyr._get_with_retries(url2)
     try:
         d2 = resp2.json()
     except Exception:
