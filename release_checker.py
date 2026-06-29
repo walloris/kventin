@@ -6,6 +6,7 @@ import re
 import urllib3
 import logging
 import requests
+from html.parser import HTMLParser
 from pathlib import Path
 from collections import defaultdict
 from typing import Optional
@@ -98,6 +99,65 @@ def extract_issue_key_from_url(url_or_key):
 
 def normalize_status_name(status: str) -> str:
     return str(status or '').strip().casefold()
+
+
+def normalize_field_text(value: object) -> str:
+    return re.sub(r'\s+', ' ', str(value or '')).strip()
+
+
+def extract_jira_field_value(raw_val: object) -> str | None:
+    if raw_val is None:
+        return None
+    if hasattr(raw_val, 'value'):
+        return normalize_field_text(raw_val.value)
+    if isinstance(raw_val, dict):
+        for key in ('value', 'name', 'displayName'):
+            if raw_val.get(key) is not None:
+                return normalize_field_text(raw_val.get(key))
+        return normalize_field_text(raw_val)
+    if isinstance(raw_val, list):
+        values = [extract_jira_field_value(item) for item in raw_val]
+        return ', '.join(value for value in values if value)
+    return normalize_field_text(raw_val)
+
+
+class JiraTableFieldParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.rows = []
+        self._current_row = None
+        self._current_cell = None
+        self._in_cell = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag == 'tr':
+            self._current_row = []
+        elif tag == 'td' and self._current_row is not None:
+            self._in_cell = True
+            self._current_cell = {'text': [], 'links': []}
+        elif tag == 'a' and self._in_cell and self._current_cell is not None:
+            href = dict(attrs).get('href')
+            if href:
+                self._current_cell['links'].append(href)
+
+    def handle_data(self, data):
+        if self._in_cell and self._current_cell is not None:
+            text = normalize_field_text(data)
+            if text:
+                self._current_cell['text'].append(text)
+
+    def handle_endtag(self, tag):
+        if tag == 'td' and self._current_row is not None and self._current_cell is not None:
+            self._current_row.append({
+                'text': normalize_field_text(' '.join(self._current_cell['text'])),
+                'links': self._current_cell['links'],
+            })
+            self._current_cell = None
+            self._in_cell = False
+        elif tag == 'tr' and self._current_row is not None:
+            if self._current_row:
+                self.rows.append(self._current_row)
+            self._current_row = None
 
 
 class ZephyrScaleClient:
@@ -1171,6 +1231,122 @@ class ReleaseValidator:
     }
     STORY_MIN_TESTING_RATIO = 0.5
 
+    def _extract_story_requirements_rows(self, raw_val: object) -> dict[str, dict]:
+        field_value = extract_jira_field_value(raw_val)
+        if not field_value:
+            return {}
+
+        parser = JiraTableFieldParser()
+        try:
+            parser.feed(field_value)
+        except Exception:
+            return {}
+
+        rows_by_label = {}
+        for row in parser.rows:
+            if len(row) < 2:
+                continue
+            label = normalize_field_text(row[0]['text']).casefold()
+            if label:
+                rows_by_label[label] = row[1]
+        return rows_by_label
+
+    def _check_story_requirements_block(self, story) -> bool:
+        REQUIREMENTS_FIELD = 'customfield_21100'
+        ARCHITECTURE_IMPACT_FIELD = 'customfield_23700'
+        ARCHITECTURE_NO_CHANGE = 'не меняется'
+        ARCHITECTURE_APPROVED = 'утверждена'
+        ARCHITECTURE_NO_IMPACT = 'не влияет на архитектуру'
+        ARCHITECTURE_APPROVED_ALLOWED_IMPACTS = {
+            None,
+            'это первое внедрение для кэ',
+            'в результате доработки этот кэ будет отправлен в архив или выведен',
+            'в результате доработки зависимый кэ будет отправлен в архив или выведен',
+        }
+
+        rows = self._extract_story_requirements_rows(getattr(story.fields, REQUIREMENTS_FIELD, None))
+        architecture_impact = extract_jira_field_value(getattr(story.fields, ARCHITECTURE_IMPACT_FIELD, None))
+        architecture_impact_normalized = (
+            normalize_field_text(architecture_impact).casefold()
+            if architecture_impact
+            else None
+        )
+
+        def get_row(label: str) -> dict | None:
+            return rows.get(label.casefold())
+
+        block_is_valid = True
+
+        def check_fixed_with_link(label: str) -> bool:
+            row = get_row(label)
+            if not row:
+                self._log_issue(story, "error", f"Story: в {REQUIREMENTS_FIELD} не найдена строка '{label}'")
+                return False
+
+            row_text = normalize_field_text(row['text']).casefold()
+            if row_text != 'зафиксировано':
+                self._log_issue(
+                    story, "error",
+                    f"Story: {label} = '{row['text']}', ожидается 'Зафиксировано'"
+                )
+                return False
+
+            if not row['links']:
+                self._log_issue(story, "error", f"Story: {label} = 'Зафиксировано', но ссылка не указана")
+                return False
+
+            self._log_issue(story, "success", f"Story: {label} зафиксированы, ссылка есть ✓")
+            return True
+
+        if not check_fixed_with_link('Бизнес-требования'):
+            block_is_valid = False
+        if not check_fixed_with_link('Функциональное решение'):
+            block_is_valid = False
+
+        architecture_row = get_row('Архитектура')
+        if not architecture_row:
+            self._log_issue(story, "error", f"Story: в {REQUIREMENTS_FIELD} не найдена строка 'Архитектура'")
+            return False
+
+        architecture_status = normalize_field_text(architecture_row['text']).casefold()
+        if architecture_status == ARCHITECTURE_NO_CHANGE:
+            if architecture_impact_normalized != ARCHITECTURE_NO_IMPACT:
+                block_is_valid = False
+                self._log_issue(
+                    story, "error",
+                    f"Story: Архитектура = 'Не меняется', но {ARCHITECTURE_IMPACT_FIELD} = "
+                    f"'{architecture_impact or 'None'}'. Ожидается 'Не влияет на архитектуру'"
+                )
+            else:
+                self._log_issue(
+                    story, "success",
+                    "Story: Архитектура не меняется, влияние на архитектуру заполнено корректно ✓"
+                )
+        elif architecture_status == ARCHITECTURE_APPROVED:
+            if not architecture_row['links']:
+                block_is_valid = False
+                self._log_issue(story, "error", "Story: Архитектура = 'Утверждена', но ссылка не указана")
+            elif architecture_impact_normalized not in ARCHITECTURE_APPROVED_ALLOWED_IMPACTS:
+                block_is_valid = False
+                self._log_issue(
+                    story, "error",
+                    f"Story: Архитектура = 'Утверждена', но {ARCHITECTURE_IMPACT_FIELD} = "
+                    f"'{architecture_impact or 'None'}' содержит недопустимое значение"
+                )
+            else:
+                self._log_issue(
+                    story, "success",
+                    "Story: Архитектура утверждена, ссылка и влияние на архитектуру корректны ✓"
+                )
+        else:
+            block_is_valid = False
+            self._log_issue(
+                story, "error",
+                f"Story: Архитектура = '{architecture_row['text']}', ожидается 'Не меняется' или 'Утверждена'"
+            )
+
+        return block_is_valid
+
     def _check_stories(self, release_key: str) -> None:
         """Проверка Story: описание + обязательные поля + Epic Link + время в тест-статусах + Task внутри Story"""
         STORY_FIELDS = {
@@ -1179,14 +1355,21 @@ class ReleaseValidator:
         }
         # Epic Link: customfield_10006
         EPIC_LINK_FIELD = 'customfield_10006'
+        REQUIREMENTS_FIELD = 'customfield_21100'
+        ARCHITECTURE_IMPACT_FIELD = 'customfield_23700'
         CLOSED_STATUSES = {'closed', 'закрыта', 'закрыто', 'resolved', 'решена', 'решено', 'cancelled', 'отменён', 'отменен'}
+        CORRUPTED_STORY_STATUSES = {'ready for uat', 'uat', 'done'}
 
         linked_keys = self._get_consist_of_issues(release_key)
         if not linked_keys:
             return
 
         keys_str = ",".join(linked_keys)
-        fields_req = f"summary,description,issuetype,assignee,issuelinks,{','.join(STORY_FIELDS.keys())},{EPIC_LINK_FIELD}"
+        fields_req = (
+            f"summary,description,issuetype,status,assignee,issuelinks,"
+            f"{','.join(STORY_FIELDS.keys())},{EPIC_LINK_FIELD},"
+            f"{REQUIREMENTS_FIELD},{ARCHITECTURE_IMPACT_FIELD}"
+        )
 
         try:
             story_issues = self.jira_main.search_issues(
@@ -1254,7 +1437,18 @@ class ReleaseValidator:
             else:
                 self._log_issue(story, "success", f"Story: Epic Link = {epic_link} ✓")
 
-            # --- 3. Проверка времени в тест-статусах ---
+            # --- 3. Проверка блока требований и архитектуры ---
+            requirements_block_is_valid = self._check_story_requirements_block(story)
+            if not requirements_block_is_valid:
+                story_status = story.fields.status.name if getattr(story.fields, 'status', None) else ''
+                if normalize_status_name(story_status) in CORRUPTED_STORY_STATUSES:
+                    self._log_issue(
+                        story, "error",
+                        f"Story испорчена и влияет на метрику модели зрелости: "
+                        f"проверка блока требований/архитектуры не выполнена, текущий статус '{story_status}'"
+                    )
+
+            # --- 4. Проверка времени в тест-статусах ---
             max_days = self.STORY_MAX_TESTING_DAYS.get(story_project)
             if max_days is not None:
                 min_days = max_days * self.STORY_MIN_TESTING_RATIO
@@ -1293,7 +1487,7 @@ class ReleaseValidator:
                         f"Story: не удалось получить changelog для проверки времени в статусах: {e}"
                     )
 
-            # --- 4. Проверка Task внутри Story через связь "consists of" ---
+            # --- 5. Проверка Task внутри Story через связь "consists of" ---
             task_keys = []
             if hasattr(story.fields, 'issuelinks') and story.fields.issuelinks:
                 for link in story.fields.issuelinks:
