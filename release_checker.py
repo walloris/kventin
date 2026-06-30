@@ -4,6 +4,7 @@ import os
 import sys
 import re
 import time
+import html
 import urllib3
 import logging
 import requests
@@ -1031,11 +1032,25 @@ class ReleaseValidator:
                 assignee = data['assignee']
                 summary = data['summary'][:50] if data['summary'] else "—"
                 url = data['url']
-                # В Confluence wiki-разметке:
+                # В Jira wiki-разметке:
                 # • \\ — перенос строки внутри ячейки таблицы
                 # • | внутри текста ячейки ломает таблицу — заменяем на HTML-энтити
                 def _escape(text: str) -> str:
-                    return text.replace('|', '&#124;')
+                    safe_text = normalize_field_text(text)
+                    safe_text = html.escape(safe_text, quote=False)
+                    replacements = {
+                        '|': '&#124;',
+                        '{': '&#123;',
+                        '}': '&#125;',
+                        '[': '&#91;',
+                        ']': '&#93;',
+                        '*': '&#42;',
+                        '_': '&#95;',
+                        '#': '&#35;',
+                    }
+                    for raw_char, escaped_char in replacements.items():
+                        safe_text = safe_text.replace(raw_char, escaped_char)
+                    return safe_text
                 error_lines = [f"• {_escape(e)}" for e in data['errors']]
                 error_text = " \\\\ ".join(error_lines)
                 safe_summary = _escape(summary)
@@ -1226,6 +1241,20 @@ class ReleaseValidator:
                 self._log_issue(key, "error", "Отсутствует тестовое покрытие (нет прилинкованных ТК)")
 
     @staticmethod
+    def _parse_jira_datetime(ts_str: str):
+        from datetime import datetime
+
+        if not ts_str:
+            return None
+        try:
+            return datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+        except Exception:
+            try:
+                return datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%S.%f%z")
+            except Exception:
+                return None
+
+    @staticmethod
     def _calc_status_days(changelog, monitored_statuses: list[str]) -> float:
         """
         По ченщикам changelog вычисляет суммарное время (в днях) нахождения
@@ -1241,10 +1270,8 @@ class ReleaseValidator:
             for item in history.items:
                 if item.field == 'status':
                     ts_str = history.created  # формат "2024-04-01T12:34:56.000+0300"
-                    try:
-                        # Парсим с timezone
-                        ts = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
-                    except Exception:
+                    ts = ReleaseValidator._parse_jira_datetime(ts_str)
+                    if ts is None:
                         continue
                     new_status = (item.toString or '').lower()
                     transitions.append((ts, new_status))
@@ -1476,6 +1503,63 @@ class ReleaseValidator:
 
         return block_is_valid
 
+    def _check_story_requirements_timing(self, story, changelog) -> None:
+        REQUIREMENTS_FIELD = 'customfield_21100'
+        ARCHITECTURE_IMPACT_FIELD = 'customfield_23700'
+        ARCHITECTURE_IMPACT_FIELD_NAME = 'Архитектурные изменения'
+        late_statuses = {'ready for uat', 'uat', 'done'}
+        tracked_fields = {
+            REQUIREMENTS_FIELD: 'Бизнес-требования / Функциональное решение / Архитектура',
+            ARCHITECTURE_IMPACT_FIELD: ARCHITECTURE_IMPACT_FIELD_NAME,
+        }
+
+        first_late_status_at = None
+        late_status_name = ''
+        field_changes_after_late_status: list[tuple[str, object]] = []
+
+        histories = sorted(
+            getattr(changelog, 'histories', []) or [],
+            key=lambda history: getattr(history, 'created', '') or ''
+        )
+
+        for history in histories:
+            changed_at = self._parse_jira_datetime(getattr(history, 'created', ''))
+            if changed_at is None:
+                continue
+
+            for item in getattr(history, 'items', []) or []:
+                item_field = normalize_field_text(getattr(item, 'field', ''))
+                item_field_id = normalize_field_text(getattr(item, 'fieldId', ''))
+                if item_field == 'status':
+                    new_status = normalize_status_name(getattr(item, 'toString', ''))
+                    if new_status in late_statuses and first_late_status_at is None:
+                        first_late_status_at = changed_at
+                        late_status_name = getattr(item, 'toString', '') or new_status
+                    continue
+
+                if first_late_status_at is None or changed_at <= first_late_status_at:
+                    continue
+
+                for field_id, field_name in tracked_fields.items():
+                    if item_field_id == field_id or item_field == field_id or item_field.casefold() == field_name.casefold():
+                        field_changes_after_late_status.append((field_name, changed_at))
+
+        if first_late_status_at is None:
+            return
+
+        seen_messages = set()
+        for field_name, changed_at in field_changes_after_late_status:
+            message_key = (field_name, changed_at)
+            if message_key in seen_messages:
+                continue
+            seen_messages.add(message_key)
+            self._log_issue(
+                story,
+                "error",
+                f"Story: поле '{field_name}' было изменено после перехода в '{late_status_name}' "
+                f"({changed_at.strftime('%Y-%m-%d %H:%M')}). Требования и архитектура должны быть привязаны до UAT/Done"
+            )
+
     def _check_stories(self, release_key: str) -> None:
         """Проверка Story: описание + обязательные поля + Epic Link + время в тест-статусах + Task внутри Story"""
         STORY_FIELDS = {
@@ -1566,8 +1650,20 @@ class ReleaseValidator:
             else:
                 self._log_issue(story, "success", f"Story: Epic Link = {epic_link} ✓")
 
+            story_full = None
+            try:
+                story_full = self.jira_main.issue(story.key, expand='changelog')
+            except Exception as e:
+                self._log_issue(
+                    story,
+                    "warning",
+                    f"Story: не удалось получить changelog для проверки порядка привязки требований: {e}"
+                )
+
             # --- 3. Проверка блока требований и архитектуры ---
             requirements_block_is_valid = self._check_story_requirements_block(story)
+            if story_full is not None:
+                self._check_story_requirements_timing(story, story_full.changelog)
             if not requirements_block_is_valid:
                 story_status = story.fields.status.name if getattr(story.fields, 'status', None) else ''
                 if normalize_status_name(story_status) in CORRUPTED_STORY_STATUSES:
@@ -1582,7 +1678,8 @@ class ReleaseValidator:
             if max_days is not None:
                 min_days = max_days * self.STORY_MIN_TESTING_RATIO
                 try:
-                    story_full = self.jira_main.issue(story.key, expand='changelog')
+                    if story_full is None:
+                        story_full = self.jira_main.issue(story.key, expand='changelog')
                     actual_days = self._calc_status_days(
                         story_full.changelog,
                         self.STORY_MONITORED_STATUSES
