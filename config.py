@@ -58,13 +58,16 @@ JIRA_RETEST_STATUS_READY_FOR_QA = os.getenv("JIRA_RETEST_STATUS_READY_FOR_QA", "
 # Целевой статус после перевода на QA/ретест (to.name перехода «взять в QA»).
 JIRA_RETEST_STATUS_QA = os.getenv("JIRA_RETEST_STATUS_QA", "QA").strip()
 JIRA_RETEST_STATUS_IN_PROGRESS = os.getenv("JIRA_RETEST_STATUS_IN_PROGRESS", "In Progress").strip()
-JIRA_RETEST_STATUS_RESOLVED = os.getenv("JIRA_RETEST_STATUS_RESOLVED", "Resolved").strip()
+JIRA_RETEST_STATUS_RESOLVED = os.getenv("JIRA_RETEST_STATUS_RESOLVED", "Closed").strip()
 # Резолюция при успешном ретесте (имя в Jira).
 JIRA_RETEST_RESOLUTION_FIXED = os.getenv("JIRA_RETEST_RESOLUTION_FIXED", "Fixed").strip()
 # Сколько тикетов обработать за один запуск (0 = без лимита).
 JIRA_RETEST_MAX_ISSUES = int(os.getenv("JIRA_RETEST_MAX_ISSUES", "20"))
 # Если из changelog не удалось извлечь автора перехода в Ready for QA — кого назначить (username / accountId / email).
 JIRA_RETEST_FALLBACK_ASSIGNEE = os.getenv("JIRA_RETEST_FALLBACK_ASSIGNEE", "").strip()
+# Фоновая проверка дефектов в QA во время бесконечного тестирования.
+ENABLE_QA_RETEST_MONITOR = os.getenv("ENABLE_QA_RETEST_MONITOR", "1").lower() not in ("0", "false", "no")
+JIRA_RETEST_MONITOR_INTERVAL_SEC = int(os.getenv("JIRA_RETEST_MONITOR_INTERVAL_SEC", "2400"))
 
 # Видимость действий
 BROWSER_SLOW_MO = int(os.getenv("BROWSER_SLOW_MO", "300"))
@@ -225,6 +228,12 @@ URL_BUDGET_NO_PROGRESS = int(os.getenv("URL_BUDGET_NO_PROGRESS", "25"))
 LOOP_GUARD_DIVERSIFY_AFTER = int(os.getenv("LOOP_GUARD_DIVERSIFY_AFTER", "12"))
 LOOP_GUARD_GOTO_START_AFTER = int(os.getenv("LOOP_GUARD_GOTO_START_AFTER", "30"))
 LOOP_GUARD_HARD_STOP_AFTER = int(os.getenv("LOOP_GUARD_HARD_STOP_AFTER", "80"))
+
+# --- Long-running agent memory ---
+# Файл долговременной памяти агента. Нужен для бесконечных/многодневных прогонов:
+# агент помнит уже проверенные url_pattern + stable_key, навигацию и новые вкладки.
+AGENT_MEMORY_PATH = os.getenv("AGENT_MEMORY_PATH", "./.kventin_agent_memory.json").strip()
+AGENT_MEMORY_SAVE_EVERY_N = int(os.getenv("AGENT_MEMORY_SAVE_EVERY_N", "1"))
 
 # --- Продвинутые проверки ---
 A11Y_CHECK_EVERY_N = int(os.getenv("A11Y_CHECK_EVERY_N", "10"))

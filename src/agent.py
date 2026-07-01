@@ -14,8 +14,10 @@ AI-агент тестировщик: активно ходит по сайту,
 import base64
 import json
 import os
+import queue
 import re
 import shutil
+import threading
 import time
 from concurrent.futures import Future
 from datetime import datetime
@@ -89,6 +91,11 @@ from config import (
     VISUAL_REGRESSION_THRESHOLD_PCT,
     TEST_SPEC_YAML_PATH,
     FLAKINESS_RERUN_COUNT,
+    AGENT_MEMORY_PATH,
+    AGENT_MEMORY_SAVE_EVERY_N,
+    ENABLE_QA_RETEST_MONITOR,
+    JIRA_RETEST_MONITOR_INTERVAL_SEC,
+    JIRA_RETEST_STATUS_QA,
 )
 from src.llm_client import (
     consult_agent_with_screenshot,
@@ -178,6 +185,7 @@ from src.action_selection import apply_preflight_or_fallback
 from src.defect_signals import add_oracle_signal, collect_rule_signals, pick_best_signal
 from src.observation import collect_page_observation
 from src.oracle import build_oracle_context, should_run_oracle
+from src.page_objects import capture_page_state
 
 # Бюджет на URL — единый источник правды в config.py.
 from config import URL_BUDGET_NO_PROGRESS  # noqa: E402,F401
@@ -993,8 +1001,8 @@ def _handle_new_tabs(
     """
     Обработать все новые вкладки из очереди:
     - Дождаться загрузки (domcontentloaded, таймаут 15с)
-    - Если загрузка успешна → лог, скриншот для визуала, закрыть вкладку
-    - Если загрузка неуспешна (таймаут, краш, ошибка) → завести дефект, закрыть вкладку
+    - Зафиксировать состояние вкладки в долговременной памяти
+    - Закрыть вкладку и вернуться в рабочую вкладку
     """
     while new_tabs_queue:
         new_tab = new_tabs_queue.pop(0)
@@ -1063,28 +1071,25 @@ def _handle_new_tabs(
                 pass
 
             if is_error_page or is_http_error:
-                # Загрузка неуспешна → дефект
-                bug_desc = f"Ссылка открыла новую вкладку с ошибкой.\nURL: {tab_url}\nTitle: {title}\nОшибки JS: {', '.join(tab_errors[:3])}"
-                print(f"[Agent] #{step} Новая вкладка: ОШИБКА → дефект. URL: {tab_url[:60]}")
-                update_llm_overlay(main_page, prompt=f"Новая вкладка: ошибка!", response=bug_desc[:200], loading=False)
-                _create_defect(main_page, bug_desc, tab_url, [], console_log, network_failures, memory)
-                memory.add_action({"action": "new_tab_error", "selector": tab_url}, result="defect_reported")
+                detail = f"title={title[:80]} errors={', '.join(tab_errors[:3])}"
+                print(f"[Agent] #{step} Новая вкладка открылась с ошибочным состоянием: {tab_url[:60]} → закрываю")
+                memory.record_external_tab(tab_url, "opened_error_state", title=title, detail=detail)
+                memory.add_action({"action": "new_tab_checked", "selector": tab_url}, result=f"opened_error_state: {detail[:80]}")
             else:
                 # Загрузка успешна
                 load_ok = True
                 print(f"[Agent] #{step} Новая вкладка OK: {tab_url[:60]} → закрываю")
+                memory.record_external_tab(tab_url, "opened_ok", title=title)
                 memory.add_action({"action": "new_tab_ok", "selector": tab_url}, result=f"tab_loaded: {title[:40]}")
 
         except Exception as e:
-            # Таймаут загрузки или краш → дефект
+            # Таймаут загрузки или краш: для внешней вкладки достаточно запомнить и вернуться.
             try:
                 tab_url = new_tab.url or tab_url
             except Exception:
                 pass
-            bug_desc = f"Новая вкладка не загрузилась (таймаут/ошибка).\nURL: {tab_url}\nОшибка: {str(e)[:200]}"
-            print(f"[Agent] #{step} Новая вкладка: ТАЙМАУТ/КРАШ → дефект. URL: {tab_url[:60]}")
-            update_llm_overlay(main_page, prompt="Новая вкладка: не загрузилась!", response=bug_desc[:200], loading=False)
-            _create_defect(main_page, bug_desc, tab_url, [], console_log, network_failures, memory)
+            print(f"[Agent] #{step} Новая вкладка: таймаут/ошибка. URL: {tab_url[:60]} → закрываю")
+            memory.record_external_tab(tab_url, "opened_timeout_or_error", detail=str(e)[:200])
             memory.add_action({"action": "new_tab_timeout", "selector": tab_url}, result=f"error: {str(e)[:60]}")
 
         finally:
@@ -1163,6 +1168,8 @@ def run_agent(start_url: str = None):
     console_log: List[Dict[str, Any]] = []
     network_failures: List[Dict[str, Any]] = []
     memory = AgentMemory()
+    if AGENT_MEMORY_PATH and memory.load_from_file(AGENT_MEMORY_PATH):
+        print(f"[Agent] Восстановлена долговременная память: {AGENT_MEMORY_PATH}")
     reset_session_defects()  # сбросить локальный кеш дефектов
 
     # Инициализация соединения с локальной LLM до запуска браузера
@@ -1401,6 +1408,22 @@ def run_agent(start_url: str = None):
                 page.goto(start_url, wait_until="domcontentloaded", timeout=30000)
             smart_wait_after_goto(page, timeout=15000)
             _inject_all(page)
+            try:
+                collect_page_observation(
+                    page,
+                    memory,
+                    console_log,
+                    network_failures,
+                    [],
+                    screenshot_func=lambda _page: None,
+                    include_shadow_dom=ENABLE_SHADOW_DOM,
+                    dom_max=5000,
+                    history_n=0,
+                    max_candidates=80,
+                )
+                print(f"[Agent] PageObject создан/обновлен для {page.url[:100]}")
+            except Exception:
+                LOG.debug("initial page object update failed", exc_info=True)
         except Exception as e:
             print(f"[Agent] Ошибка загрузки {start_url}: {e}")
             if browser:
@@ -1519,6 +1542,89 @@ def run_agent(start_url: str = None):
             print(f"[Agent] Лимит: {MAX_STEPS} шагов.")
         else:
             print(f"[Agent] Бесконечный цикл. Ctrl+C для остановки.")
+
+        retest_queue: "queue.Queue[str]" = queue.Queue()
+        retest_stop_event = threading.Event()
+        retest_seen_keys: set[str] = set()
+        retest_thread: Optional[threading.Thread] = None
+
+        def _qa_retest_monitor_loop() -> None:
+            """Фоново ищет kventin-дефекты в QA. Playwright здесь не трогаем."""
+            from src.defect_retest import collect_qa_retest_issue_keys
+            from src.jira_client import is_jira_rest_configured
+
+            if not is_jira_rest_configured():
+                LOG.info("QA retest monitor disabled: Jira REST is not configured")
+                return
+            interval = max(60, int(JIRA_RETEST_MONITOR_INTERVAL_SEC or 2400))
+            while not retest_stop_event.is_set():
+                try:
+                    keys = collect_qa_retest_issue_keys()
+                    for key in keys:
+                        if key and key not in retest_seen_keys:
+                            retest_seen_keys.add(key)
+                            retest_queue.put(key)
+                            print(f"[Agent] Ретест: найден дефект в {JIRA_RETEST_STATUS_QA}: {key}")
+                except Exception:
+                    LOG.exception("QA retest monitor: ошибка поиска дефектов")
+                retest_stop_event.wait(interval)
+
+        def _process_qa_retests(step_: int) -> bool:
+            """Синхронно обработать очередь ретестов в main thread. Возвращает True, если был ретест."""
+            nonlocal _llm_future, _llm_action
+            processed_any = False
+            while True:
+                try:
+                    key = retest_queue.get_nowait()
+                except queue.Empty:
+                    return processed_any
+                processed_any = True
+                print(f"[Agent] #{step_} Пауза тестирования: ретест дефекта {key}")
+                try:
+                    if _llm_future is not None:
+                        try:
+                            _llm_future.cancel()
+                        except Exception:
+                            pass
+                        _llm_future = None
+                        _llm_action = None
+                    from src.defect_retest import process_retest_issue_on_current_page
+
+                    process_retest_issue_on_current_page(
+                        key,
+                        page,
+                        memory,
+                        console_log,
+                        network_failures,
+                        fallback_start_url=start_url,
+                    )
+                    if AGENT_MEMORY_PATH:
+                        memory.save_to_file(AGENT_MEMORY_PATH)
+                    if not page.is_closed():
+                        try:
+                            page.goto(start_url, wait_until="domcontentloaded", timeout=20000)
+                            smart_wait_after_goto(page, timeout=5000)
+                            _inject_all(page)
+                            memory.set_current_url_pattern(start_url)
+                        except Exception:
+                            LOG.exception("QA retest: не удалось вернуть рабочую страницу")
+                except Exception:
+                    LOG.exception("QA retest %s: ошибка обработки", key)
+                finally:
+                    retest_seen_keys.discard(key)
+                    retest_queue.task_done()
+
+        if ENABLE_QA_RETEST_MONITOR:
+            retest_thread = threading.Thread(
+                target=_qa_retest_monitor_loop,
+                name="kventin-qa-retest-monitor",
+                daemon=True,
+            )
+            retest_thread.start()
+            print(
+                f"[Agent] QA-ретест монитор включён: статус '{JIRA_RETEST_STATUS_QA}', "
+                f"интервал {max(60, int(JIRA_RETEST_MONITOR_INTERVAL_SEC or 2400))} сек."
+            )
 
         # ========== PIPELINE: Асинхронная LLM + мгновенные действия ==========
         # LLM работает в фоне. Пока ждём ответ — агент кликает по ref-id.
@@ -1706,6 +1812,11 @@ def run_agent(start_url: str = None):
                     print(f"[Agent] Лимит {MAX_STEPS} шагов. Завершаю.")
                     break
 
+                if _process_qa_retests(step):
+                    if SESSION_REPORT_SAVE_EVERY_N > 0:
+                        _save_report_now(step, "QA-ретест")
+                    continue
+
                 # Сохранять отчёт в начале каждого шага
                 if SESSION_REPORT_SAVE_EVERY_N > 0 and step >= 1:
                     _save_report_now(step, f"начало шага {step}")
@@ -1783,6 +1894,24 @@ def run_agent(start_url: str = None):
                 # Подробности в AgentMemory.loop_guard_action / config.LOOP_GUARD_*.
                 guard = memory.loop_guard_action()
                 if guard == "hard_stop":
+                    if MAX_STEPS <= 0 and not page.is_closed():
+                        print(
+                            f"[Agent] #{step} Anti-loop: бесконечный режим — вместо HARD STOP возвращаюсь на старт"
+                        )
+                        try:
+                            page.goto(start_url, wait_until="domcontentloaded", timeout=20000)
+                            smart_wait_after_goto(page, timeout=5000)
+                            _inject_all(page)
+                            memory.set_current_url_pattern(start_url)
+                            memory.advance_tester_phase(force=True)
+                            memory.reset_repeats()
+                            memory.reset_session_progress()
+                            memory.session_should_stop = False
+                            memory.session_stop_reason = ""
+                            memory.save_to_file(AGENT_MEMORY_PATH)
+                        except Exception:
+                            LOG.exception("infinite loop hard-stop recovery failed")
+                        continue
                     print(
                         f"[Agent] #{step} Anti-loop: HARD STOP — {memory.session_stop_reason}"
                     )
@@ -2078,12 +2207,21 @@ def run_agent(start_url: str = None):
                 # Сохранять отчёт после каждого шага
                 if SESSION_REPORT_SAVE_EVERY_N > 0 and step >= 1:
                     _save_report_now(step, f"конец шага {step}")
+                if AGENT_MEMORY_PATH and AGENT_MEMORY_SAVE_EVERY_N > 0 and step % AGENT_MEMORY_SAVE_EVERY_N == 0:
+                    memory.save_to_file(AGENT_MEMORY_PATH)
 
                 time.sleep(0.3)
 
         except KeyboardInterrupt:
             print("\n[Agent] Остановлен по Ctrl+C.")
         finally:
+            try:
+                retest_stop_event.set()
+                if retest_thread is not None:
+                    retest_thread.join(timeout=2)
+            except Exception:
+                pass
+
             # Отменить фоновые задачи LLM
             if '_llm_future' in locals() and _llm_future is not None:
                 try:
@@ -2114,6 +2252,36 @@ def run_agent(start_url: str = None):
 
             # wait=True — гарантируем, что воркеры успели завершить отправки.
             _shutdown_bg_pool(wait=True)
+
+            if AGENT_MEMORY_PATH:
+                memory.save_to_file(AGENT_MEMORY_PATH)
+            
+            # Закрыть transient UI, которое агент открыл как отдельное состояние страницы.
+            try:
+                registry = getattr(memory, "page_objects", None)
+                if registry and registry.has_open_transient_states() and not page.is_closed():
+                    print("[Agent] Закрываю transient UI перед завершением сессии...")
+                    for _ in range(5):
+                        overlay_info = detect_active_overlays(page)
+                        has_overlay_now = bool(overlay_info.get("has_overlay"))
+                        focus_now = capture_page_state(page, overlay_info=overlay_info).get("focus", "")
+                        if not has_overlay_now and not focus_now:
+                            registry.mark_current_closed()
+                            break
+                        if has_overlay_now:
+                            _do_close_modal(page, "")
+                        else:
+                            _do_press_key(page, "Escape")
+                        time.sleep(0.3)
+                    final_overlay = detect_active_overlays(page)
+                    final_focus = capture_page_state(page, overlay_info=final_overlay).get("focus", "")
+                    if not final_overlay.get("has_overlay") and not final_focus:
+                        registry.mark_current_closed()
+                        print("[Agent] Transient UI закрыт и проверен по DOM.")
+                    else:
+                        print("[Agent] Не удалось полностью закрыть transient UI по DOM-проверке.")
+            except Exception:
+                LOG.debug("final transient UI cleanup failed", exc_info=True)
             
             if ENABLE_CONSOLE_WARNINGS_IN_REPORT:
                 try:
@@ -3634,6 +3802,16 @@ def _step_execute(page, action, step, memory, context):
     """STEP 3: Выполнение действия с retry."""
     act_type = (action.get("action") or "").lower()
     sel = (action.get("selector") or "").strip()
+    page_state_before = {}
+    if not page.is_closed():
+        try:
+            page_state_before = capture_page_state(
+                page,
+                dom_summary=str(page.evaluate("() => document.body ? document.body.innerHTML.length : 0")),
+                overlay_info=detect_active_overlays(page),
+            )
+        except Exception:
+            page_state_before = {}
     if ENABLE_DOM_DIFF_AFTER_ACTION and not page.is_closed():
         try:
             memory._dom_hash_before = page.evaluate("() => document.body ? document.body.innerHTML.length : 0")
@@ -3718,6 +3896,22 @@ def _step_execute(page, action, step, memory, context):
     except Exception:
         pass
 
+    if not page.is_closed() and getattr(memory, "page_objects", None):
+        try:
+            overlay_info = detect_active_overlays(page)
+            dom_len = page.evaluate("() => document.body ? document.body.innerHTML.length : 0")
+            page_state = memory.page_objects.update_from_observation(
+                page,
+                dom_summary=str(dom_len),
+                overlay_info=overlay_info,
+                candidates=[],
+                ref_meta={},
+            )
+            if page_state_before and page_state_before.get("state_key") != page_state.state_key:
+                result = (result or "") + f" page_state_changed:{page_state.state_name[:80]}"
+        except Exception:
+            LOG.debug("page object state update after action failed", exc_info=True)
+
     return result
 
 
@@ -3795,7 +3989,7 @@ def _analyze_in_background(
     ]
     new_network_fails = [
         n for n in new_network
-        if n.get("status") and n.get("status") >= 500
+        if n.get("status") and n.get("status") >= 400
         and not is_noise_url(n.get("url") or "")
     ]
     # Сохраним новые ошибки консоли в finding — пригодится для описания дефекта (стек + путь к JS).
@@ -3833,6 +4027,20 @@ def _analyze_in_background(
         return "\n".join(lines)
 
     console_brief = _fmt_console_brief(new_errors)
+
+    def _action_context_bug_prefix(actual: str) -> str:
+        step_ctx = (action or {}).get("_step_context") or {}
+        locator = step_ctx.get("element_desc") or (action or {}).get("_canonical_locator") or sel
+        if isinstance(locator, str) and locator.startswith("ref:"):
+            locator = (action or {}).get("_stable_key") or locator
+        return (
+            f"Действие агента: {act_type}.\n"
+            f"Локатор/элемент: {locator[:500] if locator else '—'}\n"
+            f"Цель: {(action or {}).get('test_goal') or (action or {}).get('reason') or '—'}\n"
+            f"Ожидаемый результат: {expected_outcome or 'Действие выполняется успешно, ошибок в консоли и сети нет.'}\n"
+            f"Фактический результат: {actual or result or 'Зафиксирована ошибка.'}\n"
+        )
+
     defect_signals = collect_rule_signals(
         action=action,
         result=result,
@@ -3846,7 +4054,7 @@ def _analyze_in_background(
     if five_xx_signal:
         findings["five_xx_bug"] = (
             f"HTTP 5xx после действия агента.\n\n"
-            f"Действие: {act_type} | selector: {sel[:100]} | value: {val[:50]}\n\n"
+            f"{_action_context_bug_prefix('HTTP 5xx в сетевом запросе')}\n"
             f"{five_xx_signal.to_bug_text()}"
             + (f"\n\nНовые ошибки консоли после действия:\n{console_brief}" if console_brief else "")
         )
@@ -3861,6 +4069,13 @@ def _analyze_in_background(
         new_network=new_network,
         lazy_on_visual_or_error=ORACLE_ON_VISUAL_OR_ERROR,
     )
+    if (
+        ENABLE_ORACLE_AFTER_ACTION
+        and post_screenshot_b64
+        and expected_outcome
+        and act_type in ("click", "type", "select_option", "fill_form", "upload_file", "press_key")
+    ):
+        run_oracle = True
     if run_oracle:
         oracle_context = build_oracle_context(
             action=action,
@@ -3905,7 +4120,7 @@ Visual diff: {visual_diff_info.get('change_percent', 0):.1f}% изменений
         if post_answer:
             post_action = parse_llm_action(post_answer)
             if post_action and post_action.get("action") == "check_defect" and post_action.get("possible_bug"):
-                bug_text = post_action["possible_bug"]
+                bug_text = _action_context_bug_prefix(post_action["possible_bug"]) + "\n" + post_action["possible_bug"]
                 if console_brief:
                     bug_text = f"{bug_text}\n\nНовые ошибки консоли после действия:\n{console_brief}"
                 findings["bug_to_report"] = bug_text
@@ -3928,7 +4143,9 @@ Visual diff: {visual_diff_info.get('change_percent', 0):.1f}% изменений
         best_signal = pick_best_signal(s for s in defect_signals if s.kind != "network_5xx")
         if best_signal:
             findings["bug_to_report"] = (
-                best_signal.to_bug_text()
+                _action_context_bug_prefix(best_signal.to_bug_text())
+                + "\n"
+                + best_signal.to_bug_text()
                 + (f"\n\nНовые ошибки консоли после действия:\n{console_brief}" if console_brief else "")
             )
             LOG.info(

@@ -10,7 +10,9 @@ LLM-клиента, ни от run_agent. Это «чистая» структу�
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
+import os
 from concurrent.futures import Future
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -27,6 +29,7 @@ from config import (
 )
 from src.element_resolver import norm_key as _norm_key
 from src.locators import detect_repeating_pattern, url_pattern as _url_pattern
+from src.page_objects import PageObjectRegistry
 
 LOG = logging.getLogger("kventin.memory")
 
@@ -125,6 +128,8 @@ class AgentMemory:
         self._last_session_goto_start_step: int = -1
         self.session_should_stop: bool = False
         self.session_stop_reason: str = ""
+        self.page_objects = PageObjectRegistry()
+        self._external_tabs: List[Dict[str, Any]] = []
 
     # ------------------------------------------------------------------ navigation
 
@@ -489,6 +494,114 @@ class AgentMemory:
         self.steps_without_progress = 0
         self._defects_count_at_last_progress = len(self.defects_created)
 
+    # ------------------------------------------------------------------ persistence
+
+    @staticmethod
+    def _set_to_list(value: Any) -> Any:
+        if isinstance(value, set):
+            return sorted(value, key=str)
+        if isinstance(value, dict):
+            return {str(k): AgentMemory._set_to_list(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [AgentMemory._set_to_list(v) for v in value]
+        return value
+
+    @staticmethod
+    def _list_to_set(value: Any) -> set:
+        if isinstance(value, list):
+            return set(value)
+        return set()
+
+    def to_persistent_dict(self) -> Dict[str, Any]:
+        return {
+            "version": 1,
+            "saved_at": datetime.now().isoformat(),
+            "actions": self.actions[-self.max_actions:],
+            "defects_created": self.defects_created[-200:],
+            "done_click": self._set_to_list(self.done_click),
+            "done_hover": self._set_to_list(self.done_hover),
+            "done_type": self._set_to_list(self.done_type),
+            "done_select_option": [list(x) for x in self.done_select_option],
+            "done_by_url": self._set_to_list(self.done_by_url),
+            "steps_on_url_no_progress": dict(self.steps_on_url_no_progress),
+            "touched_keys_on_url": self._set_to_list(self.touched_keys_on_url),
+            "all_touched_keys": self._set_to_list(self._all_touched_keys),
+            "all_visited_url_patterns": self._set_to_list(self._all_visited_url_patterns),
+            "page_coverage": self._set_to_list(self._page_coverage),
+            "nav_graph": self._nav_graph[-500:],
+            "url_depths": dict(self._url_depths),
+            "start_url": self._start_url_nav,
+            "external_tabs": self._external_tabs[-500:],
+        }
+
+    def restore_persistent_dict(self, data: Dict[str, Any]) -> None:
+        if not isinstance(data, dict):
+            return
+        self.actions = list(data.get("actions") or [])[-self.max_actions:]
+        self.defects_created = list(data.get("defects_created") or [])[-200:]
+        self.done_click = self._list_to_set(data.get("done_click"))
+        self.done_hover = self._list_to_set(data.get("done_hover"))
+        self.done_type = self._list_to_set(data.get("done_type"))
+        self.done_select_option = {tuple(x) for x in (data.get("done_select_option") or []) if isinstance(x, list)}
+        self.done_by_url = {
+            url: {act: set(vals or []) for act, vals in (bucket or {}).items()}
+            for url, bucket in (data.get("done_by_url") or {}).items()
+            if isinstance(bucket, dict)
+        }
+        self.steps_on_url_no_progress = {
+            str(k): int(v or 0) for k, v in (data.get("steps_on_url_no_progress") or {}).items()
+        }
+        self.touched_keys_on_url = {
+            str(k): set(v or []) for k, v in (data.get("touched_keys_on_url") or {}).items()
+        }
+        self._all_touched_keys = self._list_to_set(data.get("all_touched_keys"))
+        self._all_visited_url_patterns = self._list_to_set(data.get("all_visited_url_patterns"))
+        self._page_coverage = {
+            str(k): set(v or []) for k, v in (data.get("page_coverage") or {}).items()
+        }
+        self._nav_graph = list(data.get("nav_graph") or [])[-500:]
+        self._url_depths = {str(k): int(v or 0) for k, v in (data.get("url_depths") or {}).items()}
+        self._start_url_nav = str(data.get("start_url") or "")
+        self._external_tabs = list(data.get("external_tabs") or [])[-500:]
+        self.iteration = len(self.actions)
+
+    def save_to_file(self, path: str) -> bool:
+        if not path:
+            return False
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            tmp_path = f"{path}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(self.to_persistent_dict(), f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, path)
+            return True
+        except Exception:
+            LOG.debug("save memory failed: %s", path, exc_info=True)
+            return False
+
+    def load_from_file(self, path: str) -> bool:
+        if not path or not os.path.isfile(path):
+            return False
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.restore_persistent_dict(data)
+            return True
+        except Exception:
+            LOG.debug("load memory failed: %s", path, exc_info=True)
+            return False
+
+    def record_external_tab(self, url: str, status: str, title: str = "", detail: str = "") -> None:
+        self._external_tabs.append({
+            "time": datetime.now().isoformat(),
+            "url": (url or "")[:500],
+            "status": status,
+            "title": (title or "")[:200],
+            "detail": (detail or "")[:300],
+        })
+        if len(self._external_tabs) > 500:
+            self._external_tabs = self._external_tabs[-500:]
+
     def record_action_key(self, action: str, selector: str) -> None:
         key = f"{action}:{_norm_key(selector)}"
         self._recent_action_keys.append(key)
@@ -759,6 +872,12 @@ class AgentMemory:
                 lines.append(f"  - {d.get('key', '')}: {d.get('summary', '')[:60]}")
         else:
             lines.append("Дефектов не обнаружено.")
+        if self._external_tabs:
+            lines.append(f"Внешние/новые вкладки проверены: {len(self._external_tabs)}")
+            for tab in self._external_tabs[-5:]:
+                lines.append(
+                    f"  - {tab.get('status', '')}: {(tab.get('url') or '')[:80]}"
+                )
         m = getattr(self, "_browser_metrics_latest", None) or {}
         if m:
             lines.append("--- Метрики браузера (последний сбор) ---")

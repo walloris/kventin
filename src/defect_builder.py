@@ -278,6 +278,8 @@ def memory_actions_to_retest_plan(
 
         canon = (entry.get("canonical_locator") or "").strip()
         sel_raw = (entry.get("selector") or "").strip()
+        if sel_raw.startswith("ref:") and not canon:
+            sel_raw = (entry.get("element_desc") or entry.get("stable_key") or "").strip()
         sel = _selector_for_retest_step(canon, sel_raw)
         val = entry.get("value")
         val_str = "" if val is None else str(val)

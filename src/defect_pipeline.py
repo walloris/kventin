@@ -128,6 +128,59 @@ def _compute_defect_signature(
     )
 
 
+def _has_hard_error_signal(
+    bug_description: str,
+    console_log: Optional[List[Dict[str, Any]]] = None,
+    network_failures: Optional[List[Dict[str, Any]]] = None,
+) -> bool:
+    if _extract_error_signature(bug_description):
+        return True
+    if any((c.get("type") or "").lower() in ("error", "pageerror") for c in (console_log or [])):
+        return True
+    return any(int(n.get("status") or 0) >= 400 for n in (network_failures or []))
+
+
+def _last_step_defect_context(memory: Any, bug_description: str) -> str:
+    if not memory or not getattr(memory, "actions", None):
+        return ""
+    action = (memory.actions or [])[-1]
+    act = (action.get("action") or "—").strip()
+    element_desc = (action.get("element_desc") or "").strip()
+    canonical_locator = (action.get("canonical_locator") or "").strip()
+    selector = (action.get("selector") or "").strip()
+    stable_key = (action.get("stable_key") or "").strip()
+    expected = (action.get("expected_outcome") or "Действие выполняется успешно, ошибок в консоли и сети нет.").strip()
+    factual = (action.get("result") or bug_description or "Зафиксирована ошибка.").strip()
+    goal = (action.get("test_goal") or action.get("reason") or "").strip()
+
+    locator_lines = []
+    if element_desc:
+        locator_lines.append(f"* Элемент: {{{{{element_desc[:800]}}}}}")
+    if canonical_locator:
+        locator_lines.append(f"* Читаемый Playwright locator: {{{{{canonical_locator[:800]}}}}}")
+    elif selector and not selector.startswith("ref:"):
+        locator_lines.append(f"* Locator: {{{{{selector[:500]}}}}}")
+    if stable_key:
+        locator_lines.append(f"* Stable key: {{{{{stable_key[:300]}}}}}")
+
+    lines = [
+        "h3. Последний шаг агента",
+        f"* Действие: {act}",
+    ]
+    if goal:
+        lines.append(f"* Цель: {goal[:500]}")
+    lines.extend(locator_lines)
+    lines.extend([
+        "",
+        "h3. Ожидаемый результат (ОР)",
+        expected[:1200],
+        "",
+        "h3. Фактический результат (ФР)",
+        factual[:1600],
+    ])
+    return "\n".join(lines)
+
+
 def is_semantic_duplicate(bug_description: str, memory: Any) -> bool:
     """
     Уровень 3: семантическая проверка через LLM — «это тот же баг что уже есть?»
@@ -230,7 +283,8 @@ def create_defect(
         (bug_description or "")[:140],
     )
 
-    if not should_create_defect(
+    hard_signal = _has_hard_error_signal(bug_description, console_log, network_failures)
+    if not hard_signal and not should_create_defect(
         bug_text=bug_description,
         console_log=console_log,
         network_failures=network_failures,
@@ -294,6 +348,13 @@ def create_defect(
         steps_to_reproduce=steps_to_reproduce,
         retest_spec_wiki=retest_wiki or None,
     )
+    step_context_block = _last_step_defect_context(memory, bug_description)
+    if step_context_block:
+        anchor = "h3. Шаги воспроизведения"
+        if anchor in description:
+            description = description.replace(anchor, step_context_block + "\n\n" + anchor, 1)
+        else:
+            description = step_context_block + "\n\n" + description
     if canonical_locator or last_action_summary:
         affected_block = "h3. Затронутый элемент\n"
         if canonical_locator:

@@ -74,6 +74,19 @@ def collect_page_observation(
         memory,
     )
     candidates_prompt = render_candidates_for_prompt(candidates, limit=prompt_candidate_limit)
+    if memory and getattr(memory, "page_objects", None):
+        try:
+            page_state = memory.page_objects.update_from_observation(
+                page,
+                dom_summary=dom_summary,
+                overlay_info=overlay_info,
+                candidates=candidates,
+                ref_meta={str(k): str(v) for k, v in ref_meta.items()},
+            )
+            if page_state.must_close:
+                memory._last_page_object_state = page_state.state_key
+        except Exception:
+            pass
     history_text = memory.get_history_text(last_n=history_n) if memory else ""
     overlay_context = format_overlays_context(overlay_info)
     page_type = detect_page_type(page)

@@ -67,6 +67,72 @@ from src.page_analyzer import get_dom_summary
 LOG = logging.getLogger("kventin.retest")
 
 
+def _format_retest_lines(items: List[Dict[str, Any]], *, limit: int = 20) -> str:
+    lines: List[str] = []
+    for item in items[-limit:]:
+        if "status" in item:
+            lines.append(
+                f"* {item.get('status')} {item.get('method', 'GET')} {item.get('url', '')[:500]}"
+            )
+        else:
+            src = item.get("source_url") or ""
+            loc = ""
+            if src:
+                loc = f" ({src[:180]}"
+                if item.get("line") is not None:
+                    loc += f":{item.get('line')}"
+                loc += ")"
+            text = (item.get("text") or "").replace("\r", " ").strip()
+            stack = (item.get("stack") or "").strip()
+            if stack:
+                text = f"{text}\n{stack[:1800]}"
+            lines.append(f"* {item.get('type', 'console')}: {text[:2200]}{loc}")
+    return "\n".join(lines) if lines else "* нет"
+
+
+def format_retest_failure_comment(
+    key: str,
+    msg: str,
+    *,
+    scenario: str,
+    start_url: str,
+    console_log: List[Dict[str, Any]],
+    network_failures: List[Dict[str, Any]],
+    actions: List[Dict[str, Any]],
+) -> str:
+    action_lines = []
+    for a in actions[-30:]:
+        action_lines.append(
+            f"* #{a.get('step', '?')} {a.get('action', '')} "
+            f"{a.get('selector', '')[:220]} -> {(a.get('result') or '')[:500]}"
+        )
+    return (
+        f"h3. Kventin retest — не пройден\n"
+        f"Дефект {key} возвращён в работу: исходный сценарий по описанию всё ещё не проходит.\n\n"
+        f"*Стартовая страница:* {start_url or '—'}\n"
+        f"*Причина:* {{quote}}{msg}{{quote}}\n\n"
+        f"h4. Сценарий ретеста\n{scenario or '* нет шагов в описании'}\n\n"
+        f"h4. Выполненные действия\n{chr(10).join(action_lines) if action_lines else '* нет'}\n\n"
+        f"h4. Консоль / pageerror\n{_format_retest_lines(console_log)}\n\n"
+        f"h4. Network >= 400\n{_format_retest_lines(network_failures)}"
+    )
+
+
+def _plan_scenario_text(description: str) -> tuple[str, str]:
+    plan = parse_retest_plan_from_description(description or "")
+    if plan and plan.get("steps"):
+        lines = []
+        for idx, step in enumerate(plan.get("steps") or [], 1):
+            if not isinstance(step, dict):
+                continue
+            op = step.get("op") or "step"
+            target = step.get("selector") or step.get("url") or step.get("direction") or step.get("key") or ""
+            lines.append(f"# {idx}. {op}: {str(target)[:260]}")
+        return (plan.get("start_url") or "", "\n".join(lines))
+    start_url, steps = parse_reproduction_steps(description or "")
+    return start_url, "\n".join(f"# {idx}. {step}" for idx, step in enumerate(steps, 1))
+
+
 def _short_sig(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "")).strip().lower()
 
@@ -390,6 +456,123 @@ def _run_loaded_plan_steps(page: Page, memory: AgentMemory, plan: Dict[str, Any]
     return True, "ok"
 
 
+def run_retest_on_page(
+    page: Page,
+    memory: AgentMemory,
+    description: str,
+    fallback_start_url: str,
+    console_log: List[Dict[str, Any]],
+    network_failures: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Выполнить ретест на уже открытой странице агента.
+
+    Это путь для фонового QA-монитора: Playwright остаётся в main thread,
+    а ретест использует тот же executor, память и обработчики консоли/сети.
+    """
+    plan = parse_retest_plan_from_description(description or "")
+    use_plan = bool(plan and plan.get("steps"))
+    console_start = len(console_log)
+    network_start = len(network_failures)
+    base_url_hint, scenario = _plan_scenario_text(description or "")
+
+    if use_plan:
+        base_url = (plan.get("start_url") or fallback_start_url or START_URL or "").strip()
+        if not base_url:
+            return {
+                "ok": False,
+                "message": "В плане ретеста нет start_url; задайте START_URL в .env или корректный первый navigate.",
+                "scenario": scenario,
+                "start_url": "",
+                "console_log": [],
+                "network_failures": [],
+                "actions": [],
+            }
+        if not base_url.startswith("http"):
+            base_url = "https://" + base_url
+        try:
+            page.goto(base_url, wait_until="domcontentloaded", timeout=30000)
+            smart_wait_after_goto(page, timeout=5000)
+            _inject_all(page)
+            get_dom_summary(page, max_length=4000, include_shadow_dom=ENABLE_SHADOW_DOM)
+        except Exception as exc:
+            ok, msg = False, f"navigate {base_url[:120]}: {exc}"
+        else:
+            ok, msg = _run_loaded_plan_steps(page, memory, plan)
+            if ok:
+                ok, msg = _assert_retest_oracle(
+                    plan,
+                    memory,
+                    console_log[console_start:],
+                    network_failures[network_start:],
+                )
+        return {
+            "ok": ok,
+            "message": msg,
+            "scenario": scenario,
+            "start_url": base_url,
+            "console_log": console_log[console_start:],
+            "network_failures": network_failures[network_start:],
+            "actions": list(getattr(memory, "actions", [])[-50:]),
+        }
+
+    canon_sel = extract_canonical_locator(description)
+    start_url, steps = parse_reproduction_steps(description)
+    base_url = (start_url or fallback_start_url or START_URL or "").strip()
+    if not base_url:
+        return {
+            "ok": False,
+            "message": "Нет стартового URL в описании и не задан START_URL.",
+            "scenario": scenario,
+            "start_url": "",
+            "console_log": [],
+            "network_failures": [],
+            "actions": [],
+        }
+    if not base_url.startswith("http"):
+        base_url = "https://" + base_url
+
+    ok = True
+    msg = "ok"
+    try:
+        page.goto(base_url, wait_until="domcontentloaded", timeout=30000)
+        smart_wait_after_goto(page, timeout=5000)
+        _inject_all(page)
+        get_dom_summary(page, max_length=4000, include_shadow_dom=ENABLE_SHADOW_DOM)
+        for step in steps:
+            sl = step.lower()
+            if sl.startswith("открыть") and re.search(r"https?://", step):
+                url_m = re.search(r"https?://[^\s\)\]]+", step)
+                if url_m:
+                    u = url_m.group(0).rstrip(".,;)")
+                    page.goto(u, wait_until="domcontentloaded", timeout=25000)
+                    smart_wait_after_goto(page, timeout=5000)
+                    _inject_all(page)
+                    get_dom_summary(page, max_length=4000, include_shadow_dom=ENABLE_SHADOW_DOM)
+                continue
+            act = _interpret_step_to_action(step, canon_sel)
+            if not act:
+                continue
+            result = execute_action(page, act, memory)
+            low_res = (result or "").lower()
+            if any(x in low_res for x in ("error", "not_found", "not found", "click_error", "no_action")):
+                ok, msg = False, f"Шаг «{step[:100]}» → {result}"
+                break
+            time.sleep(0.35)
+    except Exception as exc:
+        ok, msg = False, str(exc)
+
+    return {
+        "ok": ok,
+        "message": msg,
+        "scenario": scenario,
+        "start_url": base_url,
+        "console_log": console_log[console_start:],
+        "network_failures": network_failures[network_start:],
+        "actions": list(getattr(memory, "actions", [])[-50:]),
+    }
+
+
 def run_retest_playwright(description: str, fallback_start_url: str) -> Tuple[bool, str]:
     """
     Открыть браузер и выполнить шаги из описания. Возвращает (успех, сообщение).
@@ -554,6 +737,80 @@ def process_retest_issue(key: str) -> bool:
     return True
 
 
+def process_retest_issue_on_current_page(
+    key: str,
+    page: Page,
+    memory: AgentMemory,
+    console_log: List[Dict[str, Any]],
+    network_failures: List[Dict[str, Any]],
+    *,
+    fallback_start_url: str,
+) -> bool:
+    """
+    Обработать дефект, который уже находится в QA, внутри основного цикла агента.
+
+    Нормальное тестирование должно быть поставлено на паузу вызывающей стороной:
+    эта функция синхронно выполняет шаги ретеста на текущем Playwright page.
+    """
+    code, full, raw_tail = get_issue_with_changelog(key)
+    if code != 200 or not full:
+        LOG.warning("retest monitor %s: issue load failed %s %s", key, code, raw_tail[:200])
+        return False
+
+    fields = full.get("fields") or {}
+    changelog = full.get("changelog")
+    author = find_author_who_moved_to_status(changelog, JIRA_RETEST_STATUS_QA)
+    assign_back = author_to_assignee_value(author) or JIRA_RETEST_FALLBACK_ASSIGNEE
+    desc_text = extract_description_text(fields)
+
+    retest = run_retest_on_page(
+        page,
+        memory,
+        desc_text,
+        fallback_start_url or START_URL,
+        console_log,
+        network_failures,
+    )
+    ok = bool(retest.get("ok"))
+    msg = str(retest.get("message") or "")
+
+    if ok:
+        if resolve_issue_fixed(key):
+            add_issue_comment(
+                key,
+                (
+                    "h3. Kventin retest — пройден\n"
+                    "Автоматический ретест по шагам из описания выполнен успешно.\n"
+                    f"{{quote}}{msg}{{quote}}\n\n"
+                    f"h4. Сценарий\n{retest.get('scenario') or '* нет шагов в описании'}"
+                ),
+            )
+            LOG.info("retest monitor %s: Closed/Fixed", key)
+        else:
+            add_issue_comment(
+                key,
+                "h3. Kventin retest — пройден (статус)\n"
+                "Ретест ОК, но не удалось закрыть задачу через API — переведите вручную.",
+            )
+        return True
+
+    comment = format_retest_failure_comment(
+        key,
+        msg,
+        scenario=str(retest.get("scenario") or ""),
+        start_url=str(retest.get("start_url") or ""),
+        console_log=list(retest.get("console_log") or []),
+        network_failures=list(retest.get("network_failures") or []),
+        actions=list(retest.get("actions") or []),
+    )
+    if reopen_or_move_to_in_progress(key, assignee_value=assign_back):
+        add_issue_comment(key, comment)
+        LOG.info("retest monitor %s: In Progress, assignee=%s", key, assign_back or "—")
+    else:
+        add_issue_comment(key, comment + "\n\nНе удалось выполнить переход In Progress через API.")
+    return True
+
+
 def collect_retest_issue_keys(max_results: int = 0) -> List[str]:
     """
     Вернуть ключи дефектов Kventin в статусе Ready for QA (для очереди демона).
@@ -563,6 +820,18 @@ def collect_retest_issue_keys(max_results: int = 0) -> List[str]:
     max_n = max_results or (JIRA_RETEST_MAX_ISSUES if JIRA_RETEST_MAX_ISSUES > 0 else 100)
     issue_summaries = search_kventin_issues_by_status(
         JIRA_RETEST_STATUS_READY_FOR_QA,
+        max_results=max_n,
+    )
+    return [it.get("key") for it in issue_summaries if it.get("key")]
+
+
+def collect_qa_retest_issue_keys(max_results: int = 0) -> List[str]:
+    """
+    Вернуть ключи дефектов Kventin, уже ожидающих ретеста в статусе QA.
+    """
+    max_n = max_results or (JIRA_RETEST_MAX_ISSUES if JIRA_RETEST_MAX_ISSUES > 0 else 100)
+    issue_summaries = search_kventin_issues_by_status(
+        JIRA_RETEST_STATUS_QA,
         max_results=max_n,
     )
     return [it.get("key") for it in issue_summaries if it.get("key")]
