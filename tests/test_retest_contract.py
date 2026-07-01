@@ -1,12 +1,12 @@
-from src.agent_memory import AgentMemory
-from src.defect_builder import (
+from agent.core.agent_memory import AgentMemory
+from agent.defects.defect_builder import (
     RETEST_JSON_MARKER,
     build_retest_oracle,
     format_retest_spec_wiki,
     memory_actions_to_retest_plan,
     parse_retest_plan_from_description,
 )
-from src.defect_retest import _assert_retest_oracle
+from agent.defects.defect_retest import _assert_retest_oracle
 
 
 def test_retest_plan_parses_code_block_before_following_sections() -> None:

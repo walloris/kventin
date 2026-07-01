@@ -1,5 +1,5 @@
-from src.action_preflight import expected_stable_key, preflight_action, ref_num
-from src.agent_memory import AgentMemory
+from agent.actions.action_preflight import expected_stable_key, preflight_action, ref_num
+from agent.core.agent_memory import AgentMemory
 
 
 class FakePage:

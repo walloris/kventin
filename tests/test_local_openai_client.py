@@ -1,4 +1,4 @@
-from src.local_openai_client import LocalOpenAIClient, _looks_like_tls_proxy_error
+from agent.llm.local_openai_client import LocalOpenAIClient, _looks_like_tls_proxy_error
 
 
 def test_local_client_accepts_base_url(monkeypatch) -> None:
@@ -41,8 +41,8 @@ def test_local_client_retries_http_429(monkeypatch) -> None:
     monkeypatch.setattr("config.LLM_REQUEST_TIMEOUT_SEC", 60)
     monkeypatch.setattr("config.LLM_RETRY_COUNT", 2)
     monkeypatch.setattr("config.LLM_RETRY_BASE_DELAY", 0.1)
-    monkeypatch.setattr("src.local_openai_client.time.sleep", lambda _: None)
-    monkeypatch.setattr("src.local_openai_client.random.uniform", lambda *_: 0)
+    monkeypatch.setattr("agent.llm.local_openai_client.time.sleep", lambda _: None)
+    monkeypatch.setattr("agent.llm.local_openai_client.random.uniform", lambda *_: 0)
 
     class Response:
         def __init__(self, status_code, text="", data=None, headers=None):
@@ -62,7 +62,7 @@ def test_local_client_retries_http_429(monkeypatch) -> None:
             return Response(429, "rate limit", headers={"Retry-After": "0.1"})
         return Response(200, data={"choices": [{"message": {"content": "ok"}}]})
 
-    monkeypatch.setattr("src.local_openai_client.requests.post", fake_post)
+    monkeypatch.setattr("agent.llm.local_openai_client.requests.post", fake_post)
 
     client = LocalOpenAIClient()
 
@@ -77,8 +77,8 @@ def test_local_client_retries_http_500(monkeypatch) -> None:
     monkeypatch.setattr("config.LLM_REQUEST_TIMEOUT_SEC", 60)
     monkeypatch.setattr("config.LLM_RETRY_COUNT", 2)
     monkeypatch.setattr("config.LLM_RETRY_BASE_DELAY", 0.1)
-    monkeypatch.setattr("src.local_openai_client.time.sleep", lambda _: None)
-    monkeypatch.setattr("src.local_openai_client.random.uniform", lambda *_: 0)
+    monkeypatch.setattr("agent.llm.local_openai_client.time.sleep", lambda _: None)
+    monkeypatch.setattr("agent.llm.local_openai_client.random.uniform", lambda *_: 0)
 
     class Response:
         status_code = 500
@@ -94,7 +94,7 @@ def test_local_client_retries_http_500(monkeypatch) -> None:
         calls.append((args, kwargs))
         return Response()
 
-    monkeypatch.setattr("src.local_openai_client.requests.post", fake_post)
+    monkeypatch.setattr("agent.llm.local_openai_client.requests.post", fake_post)
 
     client = LocalOpenAIClient()
 

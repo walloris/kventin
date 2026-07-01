@@ -1,4 +1,4 @@
-from src.action_executor import ActionHandlers, execute_browser_action
+from agent.actions.action_executor import ActionHandlers, execute_browser_action
 
 
 class Page:

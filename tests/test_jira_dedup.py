@@ -1,4 +1,4 @@
-from src.jira_client import (
+from agent.defects.jira_client import (
     build_defect_signature,
     is_local_duplicate,
     register_local_defect,

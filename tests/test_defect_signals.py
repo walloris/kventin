@@ -1,4 +1,4 @@
-from src.defect_signals import collect_rule_signals, pick_best_signal
+from agent.defects.defect_signals import collect_rule_signals, pick_best_signal
 
 
 def test_defect_signals_prioritize_5xx() -> None:

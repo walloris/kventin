@@ -1,6 +1,6 @@
-from src.action_candidates import ActionCandidate, candidate_by_id, render_candidates_for_prompt
-from src.action_policy import action_from_llm_candidate_choice, choose_best_candidate, rank_candidates
-from src.agent_memory import AgentMemory
+from agent.actions.action_candidates import ActionCandidate, candidate_by_id, render_candidates_for_prompt
+from agent.actions.action_policy import action_from_llm_candidate_choice, choose_best_candidate, rank_candidates
+from agent.core.agent_memory import AgentMemory
 
 
 def test_policy_prefers_new_cta_over_footer_link() -> None:

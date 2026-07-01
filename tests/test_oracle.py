@@ -1,4 +1,4 @@
-from src.oracle import build_oracle_context, should_run_oracle
+from agent.core.oracle import build_oracle_context, should_run_oracle
 
 
 def test_should_run_oracle_only_on_useful_signal_when_lazy() -> None:

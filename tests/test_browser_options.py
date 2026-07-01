@@ -1,4 +1,4 @@
-import src.browser_options as browser_options
+import agent.browser.browser_options as browser_options
 
 
 def test_build_start_url_candidates_deduplicates_and_keeps_order() -> None:

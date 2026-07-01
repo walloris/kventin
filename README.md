@@ -116,13 +116,13 @@ NODE_TLS_REJECT_UNAUTHORIZED=0 node proxy.js
 Передать URL страницы аргументом:
 
 ```bash
-python main.py https://example.com
+python scripts/main.py https://example.com
 ```
 
 Или без аргумента — тогда используется `START_URL` из `.env`:
 
 ```bash
-python main.py
+python scripts/main.py
 ```
 
 Агент работает **бесконечно**: в цикле анализирует страницу, спрашивает локальную LLM «что делать дальше», выполняет клики или создаёт дефекты в Jira, при переходе по ссылке проверяет открытие и возвращается на переданную страницу.
@@ -130,7 +130,7 @@ python main.py
 Для CI можно ограничить прогон:
 
 ```bash
-HEADLESS=true MAX_STEPS=20 python main.py https://example.com --json-summary
+HEADLESS=true MAX_STEPS=20 python scripts/main.py https://example.com --json-summary
 ```
 
 ## Поведение агента
@@ -162,19 +162,25 @@ HEADLESS=true MAX_STEPS=20 python main.py https://example.com --json-summary
 
 ```
 kventin/
-├── main.py              # Точка входа (python main.py [URL])
 ├── config.py             # Конфиг и переменные окружения
 ├── requirements.txt
 ├── .env.example
 ├── README.md
-└── src/
-    ├── __init__.py
-    ├── agent.py          # Основной цикл агента
-    ├── llm_client.py # Фасад LLM для агента
-    ├── local_openai_client.py # Локальный OpenAI-compatible клиент
-    ├── jira_client.py    # Создание дефектов в Jira
-    ├── page_analyzer.py  # Сбор консоли, сети, DOM
-    └── visible_actions.py # Курсор и подсветка элементов
+├── agent/                # Код браузерного агента
+│   ├── __init__.py
+│   ├── core/             # Основной цикл, память, наблюдения, oracle
+│   ├── actions/          # Выбор, preflight и выполнение действий
+│   ├── browser/          # Playwright, DOM/page-анализ, page objects
+│   ├── defects/          # Jira, дефекты, дедупликация, ретест
+│   ├── llm/              # LLM-клиент и парсинг ответов
+│   ├── checks/           # A11y/perf/visual/session checks
+│   └── tasks/            # Тестирование Jira-задач
+├── scripts/              # Точки входа и разовые утилиты
+│   ├── main.py           # python scripts/main.py [URL]
+│   ├── daemon.py
+│   └── release_checker.py
+├── tests/
+└── trash/                # Временные файлы и мусор
 ```
 
 ## Остановка

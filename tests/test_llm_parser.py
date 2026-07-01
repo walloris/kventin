@@ -1,4 +1,4 @@
-from src.llm_parser import parse_llm_action
+from agent.llm.llm_parser import parse_llm_action
 
 
 def test_parse_llm_action_accepts_plain_json() -> None:
