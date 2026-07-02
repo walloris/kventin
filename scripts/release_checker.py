@@ -74,6 +74,9 @@ ZEPHYR_TESTING_TYPE_FIELD = "Вид тестирования"
 ZEPHYR_TESTING_TYPE_NEW = "Новый функционал"
 ZEPHYR_TESTING_TYPE_REGRESSION = "Регресс"
 
+# В релизе и каждой Story/Bug должен быть указан технический контур.
+REQUIRED_PLATFORM_LABELS = {'web', 'back', 'mobile'}
+
 
 def is_allowed_tester(author_name):
     if not author_name or author_name == 'Неизвестно':
@@ -531,6 +534,27 @@ class ReleaseValidator:
         else:
             self.report_data[issue_key]['success'].append(message)
 
+    def _check_required_platform_label(self, issue_obj, issue_kind: str) -> bool:
+        """Проверить наличие одного из обязательных лейблов web/back/mobile без учёта регистра."""
+        labels = getattr(issue_obj.fields, 'labels', []) or []
+        normalized_labels = {str(label).strip().casefold() for label in labels}
+        if normalized_labels & REQUIRED_PLATFORM_LABELS:
+            matched = sorted(normalized_labels & REQUIRED_PLATFORM_LABELS)[0]
+            self._log_issue(
+                issue_obj,
+                "success",
+                f"{issue_kind}: лейбл контура '{matched}' указан ✓"
+            )
+            return True
+
+        expected = "/".join(sorted(REQUIRED_PLATFORM_LABELS))
+        self._log_issue(
+            issue_obj,
+            "error",
+            f"{issue_kind}: отсутствует обязательный лейбл контура. Должен быть один из: {expected}"
+        )
+        return False
+
     def check_release(self, release_key):
         self.report_data.clear()
         print(f"🔍 Проверка релиза: {release_key}")
@@ -542,6 +566,8 @@ class ReleaseValidator:
         except Exception as e:
             self._log_issue("GENERAL", "error", f"Критическая ошибка: Не удалось получить тикет релиза: {str(e)}")
             return False
+
+        self._check_required_platform_label(release, "Release")
 
         # Определяем тип релиза: Hotfix или обычный
         release_type_raw = getattr(release.fields, 'customfield_23500', None)
@@ -1584,7 +1610,7 @@ class ReleaseValidator:
 
         keys_str = ",".join(linked_keys)
         fields_req = (
-            f"summary,description,issuetype,status,assignee,issuelinks,"
+            f"summary,description,issuetype,status,assignee,labels,issuelinks,"
             f"{','.join(STORY_FIELDS.keys())},{EPIC_LINK_FIELD},"
             f"{REQUIREMENTS_FIELD},{ARCHITECTURE_IMPACT_FIELD}"
         )
@@ -1607,6 +1633,9 @@ class ReleaseValidator:
 
         for story in story_issues:
             story_project = story.key.split('-')[0]
+
+            # --- 0. Проверка обязательного лейбла контура ---
+            self._check_required_platform_label(story, "Story")
 
             # --- 1. Проверка описания Story ---
             description = getattr(story.fields, 'description', None)
@@ -2269,6 +2298,8 @@ class ReleaseValidator:
 
         for bug in bugs:
             bug_keys.append(bug.key)
+
+            self._check_required_platform_label(bug, "Bug")
 
             bug_status = bug.fields.status.name if getattr(bug.fields, 'status', None) else ''
             bug_status_normalized = normalize_status_name(bug_status)
