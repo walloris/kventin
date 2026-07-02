@@ -6,18 +6,22 @@
 import json
 import logging
 import re
+import sys
 import time
 import warnings
+from pathlib import Path
 from typing import List, Dict, Optional
 
 import requests
 import urllib3
 from urllib3.exceptions import InsecureRequestWarning
 
-try:
-    from scripts import _bootstrap  # noqa: F401
-except ImportError:
-    import _bootstrap  # noqa: F401
+script_dir = Path(__file__).resolve().parent
+parent_dir = script_dir.parent
+if str(parent_dir) not in sys.path:
+    sys.path.insert(0, str(parent_dir))
+if str(script_dir) not in sys.path:
+    sys.path.insert(0, str(script_dir))
 
 from config import config
 

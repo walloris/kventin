@@ -26,10 +26,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
 
-try:
-    from scripts import _bootstrap  # noqa: F401
-except ImportError:
-    import _bootstrap  # noqa: F401
+script_dir = Path(__file__).resolve().parent
+parent_dir = script_dir.parent
+if str(parent_dir) not in sys.path:
+    sys.path.insert(0, str(parent_dir))
+if str(script_dir) not in sys.path:
+    sys.path.insert(0, str(script_dir))
 
 DEFAULT_PROJECT_KEYS: tuple[str, ...] = (
     "HRM",

@@ -10,11 +10,14 @@ Exit code: 0 — ок (дефектов в пределах порога); 1 —
 import argparse
 import json
 import sys
+from pathlib import Path
 
-try:
-    from scripts import _bootstrap  # noqa: F401
-except ImportError:
-    import _bootstrap  # noqa: F401
+script_dir = Path(__file__).resolve().parent
+parent_dir = script_dir.parent
+if str(parent_dir) not in sys.path:
+    sys.path.insert(0, str(parent_dir))
+if str(script_dir) not in sys.path:
+    sys.path.insert(0, str(script_dir))
 
 from agent.core.agent import run_agent
 from config import FAIL_ON_DEFECTS, CI_MODE, START_URL, START_URLS

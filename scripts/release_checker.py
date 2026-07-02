@@ -13,10 +13,12 @@ from pathlib import Path
 from collections import defaultdict
 from typing import Optional
 
-try:
-    from scripts import _bootstrap  # noqa: F401
-except ImportError:
-    import _bootstrap  # noqa: F401
+script_dir = Path(__file__).resolve().parent
+parent_dir = script_dir.parent
+if str(parent_dir) not in sys.path:
+    sys.path.insert(0, str(parent_dir))
+if str(script_dir) not in sys.path:
+    sys.path.insert(0, str(script_dir))
 
 try:
     from bugsAnalyse import analyze_bugs_standalone
@@ -38,10 +40,6 @@ logging.getLogger("jira").setLevel(logging.ERROR)
 logging.getLogger("urllib3").setLevel(logging.ERROR)
 logging.getLogger("atlassian").setLevel(logging.ERROR)
 logging.getLogger("requests").setLevel(logging.ERROR)
-
-script_dir = Path(__file__).parent
-parent_dir = script_dir.parent
-sys.path.insert(0, str(parent_dir))
 
 from config import config
 
