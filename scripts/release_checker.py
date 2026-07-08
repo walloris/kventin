@@ -97,6 +97,11 @@ ZEPHYR_ENABLE_FULL_CYCLE_SCAN = os.getenv("ZEPHYR_ENABLE_FULL_CYCLE_SCAN", "0").
     "true",
     "yes",
 )
+ZEPHYR_EXTENDED_CYCLE_DIAG = os.getenv("ZEPHYR_EXTENDED_CYCLE_DIAG", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 # Имя кастомного поля "Вид тестирования" в Zephyr Scale ТК/ТЦ.
 # Поле ищется в customFields ответа API GET /rest/atm/1.0/testcase/{key}
@@ -529,8 +534,12 @@ class ZephyrScaleClient:
 
     @staticmethod
     def _issue_link_endpoint_paths(issue_key: str) -> list[tuple[str, str]]:
-        return [
+        primary_paths = [
             ('issuelink/testruns', f'/rest/atm/1.0/issuelink/{issue_key}/testruns'),
+        ]
+        if not ZEPHYR_EXTENDED_CYCLE_DIAG:
+            return primary_paths
+        return primary_paths + [
             ('issuelink/testRuns', f'/rest/atm/1.0/issuelink/{issue_key}/testRuns'),
             ('issuelink/testrun', f'/rest/atm/1.0/issuelink/{issue_key}/testrun'),
             ('issuelink/testcycles', f'/rest/atm/1.0/issuelink/{issue_key}/testcycles'),
@@ -569,7 +578,7 @@ class ZephyrScaleClient:
             + list(ZEPHYR_TEST_CYCLE_PROJECT_KEYS)
         )
 
-        for item in self._get_test_cycles_by_issue_link(issue_key):
+        for item in self._get_test_cycles_by_issue_query_params(issue_key, project_keys_to_try):
             key = self.get_test_cycle_key(item)
             dedupe_key = key or f"name:{self.get_test_cycle_name(item)}"
             if dedupe_key and dedupe_key not in seen_keys:
@@ -579,7 +588,7 @@ class ZephyrScaleClient:
         if result:
             return result
 
-        for item in self._get_test_cycles_by_issue_query_params(issue_key, project_keys_to_try):
+        for item in self._get_test_cycles_by_issue_link(issue_key):
             key = self.get_test_cycle_key(item)
             dedupe_key = key or f"name:{self.get_test_cycle_name(item)}"
             if dedupe_key and dedupe_key not in seen_keys:
@@ -698,12 +707,16 @@ class ZephyrScaleClient:
     @staticmethod
     def _issue_query_param_candidates(issue_key: str, project_key: str) -> list[tuple[str, str, dict]]:
         project_query = f'projectKey = "{project_key}"'
-        return [
+        primary_candidates = [
             (
                 'testrun/search issueKey',
                 '/rest/atm/1.0/testrun/search',
                 {'query': project_query, 'issueKey': issue_key, 'maxResults': 50, 'startAt': 0},
             ),
+        ]
+        if not ZEPHYR_EXTENDED_CYCLE_DIAG:
+            return primary_candidates
+        return primary_candidates + [
             (
                 'testrun/search issueKeys',
                 '/rest/atm/1.0/testrun/search',
