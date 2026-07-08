@@ -4369,6 +4369,61 @@ def _diag_search(validator: 'ReleaseValidator', release_key: str, expected_cycle
         print(f"  -> {validator.zephyr.get_test_cycle_key(cycle)} | {validator.zephyr.get_test_cycle_name(cycle)}")
 
 
+def _diag_gigacode(validator: 'ReleaseValidator', issue_key: str):
+    try:
+        issue = validator.jira_main.issue(issue_key, fields='summary,issuetype,labels')
+    except Exception as e:
+        print(f"Не удалось получить issue {issue_key}: {e}")
+        return
+
+    issue_id = str(getattr(issue, 'id', '') or '')
+    print(f"Jira issue id: {issue_id}  type: {issue.fields.issuetype.name}  summary: {issue.fields.summary}")
+    print(f"Labels: {', '.join(getattr(issue.fields, 'labels', []) or []) or 'None'}")
+
+    base_url = config['jira']['url'].rstrip('/')
+    application_types = ('stash', 'bitbucket', 'bitbucket-server', 'git')
+    data_types = ('pullrequest', 'commit', 'repository')
+
+    for application_type in application_types:
+        for data_type in data_types:
+            url = f"{base_url}/rest/dev-status/latest/issue/detail"
+            params = {
+                'issueId': issue_id,
+                'applicationType': application_type,
+                'dataType': data_type,
+            }
+            print(f"\nGET dev-status applicationType={application_type} dataType={data_type}")
+            try:
+                response = validator.jira_http.get(url, params=params, timeout=12)
+            except Exception as e:
+                print(f"  exception={e}")
+                continue
+
+            print(f"  status={response.status_code} bytes={len(response.text)}")
+            if response.status_code != 200:
+                print(f"  body={response.text[:500]}")
+                continue
+
+            try:
+                payload = response.json()
+            except Exception as e:
+                print(f"  json_error={e}")
+                print(f"  body={response.text[:1000]}")
+                continue
+
+            raw = json.dumps(payload, ensure_ascii=False)
+            raw_casefold = raw.casefold()
+            marker = validator._find_gigacode_marker(payload)
+            print(f"  top-level={', '.join(sorted(payload.keys())) if isinstance(payload, dict) else type(payload).__name__}")
+            print(f"  contains GigaCode={'yes' if 'gigacode' in raw_casefold else 'no'}")
+            print(f"  contains Co-authored={'yes' if 'co-authored' in raw_casefold or 'co-authorer' in raw_casefold else 'no'}")
+            print(f"  contains #GigaCode={'yes' if '#gigacode' in raw_casefold else 'no'}")
+            print(f"  parser marker={marker or 'None'}")
+            if marker or 'gigacode' in raw_casefold:
+                for matched in re.finditer(r'.{0,80}(gigacode|co-authored|co-authorer|#gigacode).{0,160}', raw, flags=re.IGNORECASE):
+                    print(f"  snippet={matched.group(0)}")
+
+
 if __name__ == "__main__":
     validator = ReleaseValidator()
 
@@ -4380,6 +4435,11 @@ if __name__ == "__main__":
     # Диагностика: python scripts/release_checker.py --diag-search HRPRELEASE-120111 [HRPQA-C133028]
     if len(sys.argv) >= 3 and sys.argv[1] == '--diag-search':
         _diag_search(validator, sys.argv[2], sys.argv[3] if len(sys.argv) >= 4 else '')
+        sys.exit(0)
+
+    # Диагностика: python scripts/release_checker.py --diag-gigacode SFILE-12345
+    if len(sys.argv) >= 3 and sys.argv[1] == '--diag-gigacode':
+        _diag_gigacode(validator, sys.argv[2])
         sys.exit(0)
 
     if len(sys.argv) > 1:
