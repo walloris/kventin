@@ -202,6 +202,18 @@ def normalize_test_cycle_name(value: object) -> str:
     return text.strip(' .')
 
 
+def normalize_test_cycle_name_without_parenthesized_ids(value: object) -> str:
+    """
+    Дополнительная нормализация для КЭ вида SmartProfile(2295205).
+    ID в скобках в имени КЭ не должен ломать матчинг маски ТЦ.
+    """
+    text = normalize_test_cycle_name(value)
+    text = re.sub(r'\s*\([^)]*\)', '', text)
+    text = re.sub(r'\s*\.\s*', '.', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip(' .')
+
+
 def test_cycle_name_matches_mask(
     cycle_name: object,
     release_key: str,
@@ -210,11 +222,18 @@ def test_cycle_name_matches_mask(
     cycle_type_aliases: tuple[str, ...],
 ) -> bool:
     """Проверить имя ТЦ по маске {release}.{КЭ}.{канал}.{тип} с учетом пробелов/регистра."""
-    actual = normalize_test_cycle_name(cycle_name)
+    actual_variants = {
+        normalize_test_cycle_name(cycle_name),
+        normalize_test_cycle_name_without_parenthesized_ids(cycle_name),
+    }
     for channel in channel_aliases:
         for cycle_type in cycle_type_aliases:
-            expected = normalize_test_cycle_name(f"{release_key}.{service_ke}.{channel}.{cycle_type}")
-            if actual == expected:
+            expected_raw = f"{release_key}.{service_ke}.{channel}.{cycle_type}"
+            expected_variants = {
+                normalize_test_cycle_name(expected_raw),
+                normalize_test_cycle_name_without_parenthesized_ids(expected_raw),
+            }
+            if actual_variants & expected_variants:
                 return True
     return False
 
