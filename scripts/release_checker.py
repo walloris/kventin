@@ -21,12 +21,6 @@ if str(script_dir) not in sys.path:
     sys.path.insert(0, str(script_dir))
 
 try:
-    from bugsAnalyse import analyze_bugs_standalone
-except ImportError:
-    print("⚠️ Внимание: не удалось импортировать analyze_bugs_standalone из bugsAnalyse.py")
-    def analyze_bugs_standalone(*args, **kwargs): return []
-
-try:
     from gigachat import get_gigachat_token, check_summary_description_match
 except ImportError:
     print("⚠️ Внимание: не удалось импортировать функции из gigachat.py")
@@ -37,6 +31,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Глушим все WARNING логи (jira rate-limit, confluence, requests и т.д.)
 logging.getLogger("jira").setLevel(logging.ERROR)
+logging.getLogger("jira.client").setLevel(logging.ERROR)
+logging.getLogger("jira.resilientsession").setLevel(logging.ERROR)
 logging.getLogger("urllib3").setLevel(logging.ERROR)
 logging.getLogger("atlassian").setLevel(logging.ERROR)
 logging.getLogger("requests").setLevel(logging.ERROR)
@@ -570,6 +566,12 @@ class ReleaseValidator:
         })
         self._jira_field_name_to_id_cache: Optional[dict[str, str]] = None
         self._zephyr_release_cycles_cache: dict[str, list[tuple[str, str]]] = {}
+        self._consist_of_cache: dict[str, list[str]] = {}
+        self._release_service_infos_cache: dict[str, Optional[dict[str, dict[str, object]]]] = {}
+        self._zephyr_cycle_details_cache: dict[str, Optional[dict]] = {}
+        self._zephyr_test_case_details_cache: dict[str, Optional[dict]] = {}
+        self._zephyr_cycle_approved_checked: set[str] = set()
+        self._zephyr_cycle_testing_type_checked: set[tuple[str, str]] = set()
 
         try:
             self.myself = self.jira_main.myself()
@@ -710,6 +712,159 @@ class ReleaseValidator:
             ]
         return self._zephyr_release_cycles_cache[release_key]
 
+    def _get_test_cycle_details_cached(self, cycle_key: str) -> Optional[dict]:
+        if cycle_key not in self._zephyr_cycle_details_cache:
+            self._zephyr_cycle_details_cache[cycle_key] = self.zephyr.get_test_cycle_details(cycle_key)
+        return self._zephyr_cycle_details_cache[cycle_key]
+
+    def _get_test_case_details_cached(self, tc_key: str) -> Optional[dict]:
+        if tc_key not in self._zephyr_test_case_details_cache:
+            self._zephyr_test_case_details_cache[tc_key] = self.zephyr.get_test_case_details(tc_key)
+        return self._zephyr_test_case_details_cache[tc_key]
+
+    @staticmethod
+    def _extract_test_case_key_from_cycle_result(test_result: dict) -> str:
+        direct_key = test_result.get('testCaseKey') or test_result.get('key') or ''
+        if direct_key:
+            return str(direct_key)
+        test_case = test_result.get('testCase') or test_result.get('testcase')
+        if isinstance(test_case, dict):
+            return str(test_case.get('key') or test_case.get('testCaseKey') or '')
+        if isinstance(test_case, str):
+            return test_case
+        return ''
+
+    def _check_test_cycle_cases_approved(self, release_key: str, cycle_key: str, cycle_name: str) -> None:
+        """Проверить, что все ТК внутри ТЦ находятся в статусе Approved."""
+        check_key = cycle_key or normalize_test_cycle_name(cycle_name)
+        if check_key in self._zephyr_cycle_approved_checked:
+            return
+        self._zephyr_cycle_approved_checked.add(check_key)
+
+        if not cycle_key:
+            self._log_issue(
+                release_key,
+                "warning",
+                f"ТЦ '{cycle_name}': нет key, невозможно проверить статусы ТК внутри ТЦ"
+            )
+            return
+
+        details = self._get_test_cycle_details_cached(cycle_key)
+        if not details:
+            self._log_issue(
+                release_key,
+                "error",
+                f"ТЦ [{cycle_key}] '{cycle_name}': не удалось получить детали ТЦ для проверки статусов ТК"
+            )
+            return
+
+        test_results = self.zephyr.get_test_cycle_test_results(details)
+        if not test_results:
+            self._log_issue(
+                release_key,
+                "error",
+                f"ТЦ [{cycle_key}] '{cycle_name}': внутри ТЦ не найдены ТК"
+            )
+            return
+
+        not_approved = []
+        unresolved = []
+        seen_tc_keys = set()
+        for test_result in test_results:
+            tc_key = self._extract_test_case_key_from_cycle_result(test_result)
+            if not tc_key or tc_key in seen_tc_keys:
+                continue
+            seen_tc_keys.add(tc_key)
+
+            tc_details = self._get_test_case_details_cached(tc_key)
+            if not tc_details:
+                unresolved.append(tc_key)
+                continue
+
+            tc_status = self.zephyr.get_test_case_status(tc_details)
+            if tc_status.casefold() != ZEPHYR_APPROVED_STATUS.casefold():
+                tc_name = self.zephyr.get_test_case_name(tc_details)
+                not_approved.append((tc_key, tc_name, tc_status or '—'))
+
+        for tc_key, tc_name, tc_status in not_approved:
+            self._log_issue(
+                release_key,
+                "error",
+                f"ТЦ [{cycle_key}] '{cycle_name}': ТК [{tc_key}] '{tc_name}' "
+                f"не в статусе '{ZEPHYR_APPROVED_STATUS}' (текущий: '{tc_status}')"
+            )
+
+        if unresolved:
+            self._log_issue(
+                release_key,
+                "warning",
+                f"ТЦ [{cycle_key}] '{cycle_name}': не удалось получить детали ТК: "
+                + ", ".join(sorted(unresolved))
+            )
+
+        if not not_approved:
+            self._log_issue(
+                release_key,
+                "success",
+                f"ТЦ [{cycle_key}] '{cycle_name}': все ТК внутри ТЦ в статусе '{ZEPHYR_APPROVED_STATUS}' ✓"
+            )
+
+    def _check_test_cycle_testing_type(
+        self,
+        release_key: str,
+        cycle_key: str,
+        cycle_name: str,
+        expected_testing_type: str,
+    ) -> None:
+        """Проверить поле 'Вид тестирования' у ТЦ."""
+        check_key = (cycle_key or normalize_test_cycle_name(cycle_name), expected_testing_type.casefold())
+        if check_key in self._zephyr_cycle_testing_type_checked:
+            return
+        self._zephyr_cycle_testing_type_checked.add(check_key)
+
+        if not cycle_key:
+            self._log_issue(
+                release_key,
+                "warning",
+                f"ТЦ '{cycle_name}': нет key, невозможно проверить поле '{ZEPHYR_TESTING_TYPE_FIELD}'"
+            )
+            return
+
+        details = self._get_test_cycle_details_cached(cycle_key)
+        if not details:
+            self._log_issue(
+                release_key,
+                "error",
+                f"ТЦ [{cycle_key}] '{cycle_name}': не удалось получить детали ТЦ "
+                f"для проверки поля '{ZEPHYR_TESTING_TYPE_FIELD}'"
+            )
+            return
+
+        actual_testing_type = self.zephyr.get_test_case_custom_field(details, ZEPHYR_TESTING_TYPE_FIELD)
+        if actual_testing_type is None:
+            self._log_issue(
+                release_key,
+                "error",
+                f"ТЦ [{cycle_key}] '{cycle_name}': поле '{ZEPHYR_TESTING_TYPE_FIELD}' не найдено, "
+                f"ожидается '{expected_testing_type}'"
+            )
+            return
+
+        if normalize_field_text(actual_testing_type).casefold() != expected_testing_type.casefold():
+            self._log_issue(
+                release_key,
+                "error",
+                f"ТЦ [{cycle_key}] '{cycle_name}': '{ZEPHYR_TESTING_TYPE_FIELD}' = "
+                f"'{actual_testing_type}', ожидается '{expected_testing_type}'"
+            )
+            return
+
+        self._log_issue(
+            release_key,
+            "success",
+            f"ТЦ [{cycle_key}] '{cycle_name}': {ZEPHYR_TESTING_TYPE_FIELD} = '{actual_testing_type}' ✓"
+        )
+
     def _find_matching_cycle(
         self,
         cycles: list[tuple[str, str]],
@@ -736,6 +891,9 @@ class ReleaseValidator:
         check_label: str,
     ) -> Optional[dict[str, dict[str, object]]]:
         """Собрать КЭ из Story/Bug состава релиза и отметить, где есть НФ Story."""
+        if release_key in self._release_service_infos_cache:
+            return self._release_service_infos_cache[release_key]
+
         linked_keys = self._get_consist_of_issues(release_key)
         if not linked_keys:
             self._log_issue(
@@ -743,6 +901,7 @@ class ReleaseValidator:
                 "warning",
                 f"{check_label}: нет задач со связью 'consist of' — проверка ТЦ по КЭ пропущена"
             )
+            self._release_service_infos_cache[release_key] = None
             return None
 
         service_ke_field_id = self._get_jira_field_id_by_names(SERVICE_KE_FIELD_NAME_CANDIDATES)
@@ -752,6 +911,7 @@ class ReleaseValidator:
                 "error",
                 f"{check_label}: не удалось определить Jira field id для поля КЭ/КЭ сервиса"
             )
+            self._release_service_infos_cache[release_key] = None
             return None
 
         keys_str = ",".join(linked_keys)
@@ -768,6 +928,7 @@ class ReleaseValidator:
                 "error",
                 f"{check_label}: ошибка получения задач состава релиза для проверки КЭ: {e}"
             )
+            self._release_service_infos_cache[release_key] = None
             return None
 
         services: dict[str, dict[str, object]] = {}
@@ -806,8 +967,10 @@ class ReleaseValidator:
                 "error",
                 f"{check_label}: в составе релиза не найдено ни одной Story/Bug с заполненной КЭ сервиса"
             )
+            self._release_service_infos_cache[release_key] = None
             return None
 
+        self._release_service_infos_cache[release_key] = services
         return services
 
     def check_release(self, release_key):
@@ -839,6 +1002,10 @@ class ReleaseValidator:
         is_hotfix = release_type_str.strip().lower() == 'hotfix'
         if is_hotfix:
             print("   🔥 Тип релиза: Hotfix — применяются дополнительные проверки")
+
+        release_consist_of = self._extract_consist_of_issues(release)
+        if release_consist_of is not None:
+            self._consist_of_cache[release_key] = release_consist_of
 
         self._check_test_subtask(release)
         self._check_artifacts(release_key)
@@ -1196,6 +1363,8 @@ class ReleaseValidator:
                     f"Back release: для КЭ '{service_ke}' найден iPad/PWA/Safari/SberBrowser Регресс ТЦ "
                     f"[{tc_key}] '{tc_name}' ✓"
                 )
+                self._check_test_cycle_testing_type(release_key, tc_key, tc_name, 'Регресс')
+                self._check_test_cycle_cases_approved(release_key, tc_key, tc_name)
             else:
                 self._log_issue(
                     release_key,
@@ -1219,6 +1388,8 @@ class ReleaseValidator:
                     f"Back release: для КЭ '{service_ke}' найден API Регресс ТЦ "
                     f"[{tc_key}] '{tc_name}' ✓"
                 )
+                self._check_test_cycle_testing_type(release_key, tc_key, tc_name, 'Регресс')
+                self._check_test_cycle_cases_approved(release_key, tc_key, tc_name)
             else:
                 self._log_issue(
                     release_key,
@@ -1243,6 +1414,8 @@ class ReleaseValidator:
                         f"Back release: для КЭ '{service_ke}' найден API НФ ТЦ "
                         f"[{tc_key}] '{tc_name}' ✓"
                     )
+                    self._check_test_cycle_testing_type(release_key, tc_key, tc_name, 'НФ')
+                    self._check_test_cycle_cases_approved(release_key, tc_key, tc_name)
                 else:
                     self._log_issue(
                         release_key,
@@ -1307,6 +1480,8 @@ class ReleaseValidator:
                         f"Web release: для КЭ '{service_ke}' найден iPad/PWA/Safari/SberBrowser НФ ТЦ "
                         f"[{tc_key}] '{tc_name}' ✓"
                     )
+                    self._check_test_cycle_testing_type(release_key, tc_key, tc_name, 'НФ')
+                    self._check_test_cycle_cases_approved(release_key, tc_key, tc_name)
                 else:
                     self._log_issue(
                         release_key,
@@ -1338,6 +1513,8 @@ class ReleaseValidator:
                         f"Web release: для КЭ '{service_ke}' найден {channel_name} Регресс ТЦ "
                         f"[{tc_key}] '{tc_name}' ✓"
                     )
+                    self._check_test_cycle_testing_type(release_key, tc_key, tc_name, 'Регресс')
+                    self._check_test_cycle_cases_approved(release_key, tc_key, tc_name)
                 else:
                     self._log_issue(
                         release_key,
@@ -1725,21 +1902,30 @@ class ReleaseValidator:
                 task_keys.append(linked_full.key)
         return task_keys
 
-    def _get_consist_of_issues(self, release_key):
+    def _extract_consist_of_issues(self, release) -> Optional[list[str]]:
+        if not hasattr(release.fields, 'issuelinks'):
+            return None
         consist_of_issues = []
+        for link in release.fields.issuelinks or []:
+            link_type_name = link.type.name.lower() if hasattr(link.type, 'name') else ''
+            if 'consist' in link_type_name or 'part' in link_type_name:
+                if hasattr(link, 'outwardIssue'):
+                    consist_of_issues.append(link.outwardIssue.key)
+                elif hasattr(link, 'inwardIssue'):
+                    consist_of_issues.append(link.inwardIssue.key)
+        return list(dict.fromkeys(consist_of_issues))
+
+    def _get_consist_of_issues(self, release_key):
+        if release_key in self._consist_of_cache:
+            return list(self._consist_of_cache[release_key])
         try:
-            release = self.jira_main.issue(release_key)
-            if hasattr(release.fields, 'issuelinks') and release.fields.issuelinks:
-                for link in release.fields.issuelinks:
-                    link_type_name = link.type.name.lower() if hasattr(link.type, 'name') else ''
-                    if 'consist' in link_type_name or 'part' in link_type_name:
-                        if hasattr(link, 'outwardIssue'):
-                            consist_of_issues.append(link.outwardIssue.key)
-                        elif hasattr(link, 'inwardIssue'):
-                            consist_of_issues.append(link.inwardIssue.key)
+            release = self.jira_main.issue(release_key, fields='issuelinks')
+            consist_of_issues = self._extract_consist_of_issues(release) or []
+            self._consist_of_cache[release_key] = consist_of_issues
+            return list(consist_of_issues)
         except Exception as e:
             self._log_issue("GENERAL", "error", f"Ошибка получения связей: {str(e)}")
-        return consist_of_issues
+            return []
 
     def _check_artifacts(self, release_key: str) -> None:
         """
@@ -2424,18 +2610,52 @@ class ReleaseValidator:
         if not issue_id:
             return False
 
-        payloads = self._get_dev_status_payloads(issue_id)
-        has_pull_request = any(self._json_contains_pull_request(payload) for payload in payloads)
-        has_commit = any(self._json_contains_commit(payload) for payload in payloads)
-        has_gigacode_marker = any(self._json_contains_gigacode_marker(payload) for payload in payloads)
-        return has_gigacode_marker and (has_pull_request or has_commit)
+        base_url = config['jira']['url'].rstrip('/')
+        application_types = ('stash', 'bitbucket', 'git')
+        data_types = ('pullrequest', 'commit')
+
+        for application_type in application_types:
+            for data_type in data_types:
+                url = f"{base_url}/rest/dev-status/latest/issue/detail"
+                try:
+                    response = self.jira_http.get(
+                        url,
+                        params={
+                            'issueId': issue_id,
+                            'applicationType': application_type,
+                            'dataType': data_type,
+                        },
+                        timeout=12,
+                    )
+                    if response.status_code != 200:
+                        continue
+                    payload = response.json()
+                except Exception:
+                    continue
+
+                has_pull_request = self._json_contains_pull_request(payload)
+                has_commit = self._json_contains_commit(payload)
+                has_gigacode_marker = self._json_contains_gigacode_marker(payload)
+                if has_gigacode_marker and (has_pull_request or has_commit):
+                    return True
+
+        return False
 
     def _add_label_if_missing(self, issue, label: str) -> bool:
         labels = list(getattr(issue.fields, 'labels', []) or [])
         if label.casefold() in {existing_label.casefold() for existing_label in labels}:
             return False
 
-        issue.update(fields={'labels': labels + [label]})
+        issue_key = getattr(issue, 'key', None)
+        if not issue_key:
+            raise RuntimeError("У задачи нет key для обновления labels")
+        response = self.jira_http.put(
+            f"{config['jira']['url'].rstrip('/')}/rest/api/2/issue/{issue_key}",
+            json={'fields': {'labels': labels + [label]}},
+            timeout=12,
+        )
+        if response.status_code not in (200, 204):
+            raise RuntimeError(f"HTTP {response.status_code}: {response.text[:250]}")
         issue.fields.labels = labels + [label]
         return True
 
@@ -2479,18 +2699,37 @@ class ReleaseValidator:
 
         print(f"   Проверка Pull Request с GigaCode для {len(target_issues)} Story/Bug...")
 
+        task_keys_by_story: dict[str, list[str]] = {}
+        all_task_keys: list[str] = []
+        for target_issue in target_issues:
+            if target_issue.fields.issuetype.name.casefold() != 'story':
+                continue
+            task_keys = self._get_story_task_keys(target_issue)
+            task_keys_by_story[target_issue.key] = task_keys
+            all_task_keys.extend(task_keys)
+
+        tasks_by_key = {}
+        unique_task_keys = sorted(set(all_task_keys))
+        if unique_task_keys:
+            try:
+                task_keys_str = ",".join(unique_task_keys)
+                task_issues = self.jira_main.search_issues(
+                    f'key in ({task_keys_str})',
+                    fields='summary,issuetype,assignee,labels',
+                    maxResults=500
+                )
+                tasks_by_key = {task.key: task for task in task_issues}
+            except Exception as e:
+                self._log_issue("GENERAL", "warning", f"GigaCode PR/commit: не удалось bulk-получить Task: {e}")
+
         for target_issue in target_issues:
             issues_to_check = [target_issue]
 
             if target_issue.fields.issuetype.name.casefold() == 'story':
-                for task_key in self._get_story_task_keys(target_issue):
-                    try:
-                        task = self.jira_main.issue(
-                            task_key,
-                            fields='summary,issuetype,assignee,labels'
-                        )
-                    except Exception as e:
-                        self._log_issue(target_issue, "warning", f"GigaCode PR/commit: не удалось получить Task {task_key}: {e}")
+                for task_key in task_keys_by_story.get(target_issue.key, []):
+                    task = tasks_by_key.get(task_key)
+                    if task is None:
+                        self._log_issue(target_issue, "warning", f"GigaCode PR/commit: не удалось получить Task {task_key}")
                         continue
                     if task.fields.issuetype and task.fields.issuetype.name.casefold() == 'task':
                         issues_to_check.append(task)
@@ -2844,11 +3083,8 @@ class ReleaseValidator:
         print(f"   Проверка {len(bugs)} багов...")
 
         prod_bugs = []
-        bug_keys = []
 
         for bug in bugs:
-            bug_keys.append(bug.key)
-
             self._check_required_platform_label(bug, "Bug")
 
             bug_status = bug.fields.status.name if getattr(bug.fields, 'status', None) else ''
@@ -2955,32 +3191,6 @@ class ReleaseValidator:
 
             if stand_type in ["ПРОМ", "ПРОМ (Stand-in)"]:
                 prod_bugs.append(bug)
-
-        if bug_keys:
-            try:
-                analysis_results = analyze_bugs_standalone(self.jira_main, bug_keys, env='ift')
-                for res in analysis_results:
-                    bk = res['key']
-                    bug_obj = next((b for b in bugs if b.key == bk), None)
-                    if not bug_obj:
-                        continue
-
-                    if not res['is_priority_correct']:
-                        self._log_issue(bug_obj, "error",
-                                        f"AI: Некорректный приоритет. {res['recommendations'].get('priority_analysis', '')}")
-
-                    if not res['is_description_good']:
-                        self._log_issue(bug_obj, "error",
-                                        f"AI: Плохое описание. {res['recommendations'].get('description_analysis', '')}")
-
-                    is_prod = any(b.key == bk for b in prod_bugs)
-                    if is_prod:
-                        rec_cause = res['recommendations'].get('missing_cause', '')
-                        if '[ERROR]' in rec_cause or '[WARN]' in rec_cause:
-                            self._log_issue(bug_obj, "error", f"AI: Проблема с причиной пропуска. {rec_cause}")
-
-            except Exception as e:
-                self._log_issue("GENERAL", "error", f"Сбой AI анализатора: {e}")
 
         if prod_bugs:
             self._check_confluence(prod_bugs)
