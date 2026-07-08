@@ -37,7 +37,30 @@ logging.getLogger("urllib3").setLevel(logging.ERROR)
 logging.getLogger("atlassian").setLevel(logging.ERROR)
 logging.getLogger("requests").setLevel(logging.ERROR)
 
-from config import config
+try:
+    from config import config
+except ImportError:
+    import config as env_config
+
+    jira_url = getattr(env_config, "JIRA_URL", os.getenv("JIRA_URL", "")).rstrip("/")
+    jira_verify_ssl = getattr(
+        env_config,
+        "JIRA_VERIFY_SSL",
+        os.getenv("JIRA_VERIFY_SSL", "1").lower() in ("1", "true", "yes"),
+    )
+    config = {
+        "jira": {
+            "url": jira_url,
+            "token": getattr(env_config, "JIRA_API_TOKEN", os.getenv("JIRA_API_TOKEN", "")),
+            "options": {"server": jira_url, "verify": jira_verify_ssl},
+        },
+        "confluence": {
+            "url": os.getenv("CONFLUENCE_URL", "").rstrip("/"),
+            "token": os.getenv("CONFLUENCE_TOKEN", ""),
+            "verify_ssl": os.getenv("CONFLUENCE_VERIFY_SSL", "1").lower() in ("1", "true", "yes"),
+            "parent_page_id": os.getenv("CONFLUENCE_PARENT_PAGE_ID", ""),
+        },
+    }
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.ERROR)
@@ -406,9 +429,26 @@ class ZephyrScaleClient:
             return [item for item in data if isinstance(item, dict)]
         if not isinstance(data, dict):
             return []
-        for collection_key in ('results', 'testRuns', 'values', 'items'):
+        collection_keys = (
+            'results',
+            'testRuns',
+            'testRunLinks',
+            'testCycles',
+            'testCycleLinks',
+            'values',
+            'items',
+            'data',
+        )
+        for collection_key in collection_keys:
             collection = data.get(collection_key)
             if isinstance(collection, list):
+                return [item for item in collection if isinstance(item, dict)]
+            if isinstance(collection, dict):
+                nested = ZephyrScaleClient._extract_zephyr_collection(collection)
+                if nested:
+                    return nested
+        for collection in data.values():
+            if isinstance(collection, list) and any(isinstance(item, dict) for item in collection):
                 return [item for item in collection if isinstance(item, dict)]
             if isinstance(collection, dict):
                 nested = ZephyrScaleClient._extract_zephyr_collection(collection)
@@ -422,7 +462,7 @@ class ZephyrScaleClient:
             value = cycle.get(key_field)
             if value:
                 return str(value)
-        for nested_field in ('testRun', 'testCycle', 'cycle'):
+        for nested_field in ('testRun', 'testCycle', 'cycle', 'target', 'entity', 'object'):
             nested = cycle.get(nested_field)
             if isinstance(nested, dict):
                 nested_key = ZephyrScaleClient.get_test_cycle_key(nested)
@@ -436,7 +476,7 @@ class ZephyrScaleClient:
             value = cycle.get(name_field)
             if value:
                 return str(value)
-        for nested_field in ('testRun', 'testCycle', 'cycle'):
+        for nested_field in ('testRun', 'testCycle', 'cycle', 'target', 'entity', 'object'):
             nested = cycle.get(nested_field)
             if isinstance(nested, dict):
                 nested_name = ZephyrScaleClient.get_test_cycle_name(nested)
@@ -544,6 +584,10 @@ class ZephyrScaleClient:
         Пагинация по 50, фильтруем на стороне клиента по issue_key в name.
         API поддерживает только поля projectKey и folder в query.
         """
+        targeted = self._search_test_cycles_by_name_query(project_key, issue_key)
+        if targeted:
+            return targeted
+
         url = f"{self.base_url}/rest/atm/1.0/testrun/search"
         query = f'projectKey = "{project_key}"'
         page_size = 50
@@ -596,6 +640,59 @@ class ZephyrScaleClient:
         })
         return matched
 
+    def _search_test_cycles_by_name_query(self, project_key: str, issue_key: str) -> list[dict]:
+        """
+        Быстрый targeted-поиск по имени. На части инсталляций Zephyr Scale это
+        работает, на части возвращает 400 — тогда ниже остается полный fallback
+        по projectKey.
+        """
+        url = f"{self.base_url}/rest/atm/1.0/testrun/search"
+        query = f'projectKey = "{project_key}" AND name ~ "{issue_key}"'
+        try:
+            response = self._get_with_retries(
+                url,
+                params={'query': query, 'maxResults': 50, 'startAt': 0},
+            )
+        except Exception as e:
+            self.last_test_cycle_search_stats.append({
+                'mode': 'search-name',
+                'project_key': project_key,
+                'query': query,
+                'status': 'exception',
+                'count': 0,
+                'error': str(e),
+            })
+            return []
+
+        body_snippet = ''
+        if response.status_code == 200:
+            try:
+                items = self._extract_zephyr_collection(response.json())
+            except Exception:
+                items = []
+                body_snippet = response.text[:300]
+        else:
+            items = []
+            body_snippet = response.text[:300]
+
+        issue_key_lower = issue_key.lower()
+        matched = []
+        for item in items:
+            name = self.get_test_cycle_name(item)
+            if not name or issue_key_lower in name.lower():
+                matched.append(item)
+
+        self.last_test_cycle_search_stats.append({
+            'mode': 'search-name',
+            'project_key': project_key,
+            'query': query,
+            'status': response.status_code,
+            'seen': len(items),
+            'count': len(matched),
+            'body': body_snippet,
+        })
+        return matched
+
     def _print_test_cycle_search_debug(self, issue_key: str, project_keys_to_try: list[str]) -> None:
         checked_projects = ", ".join(project_keys_to_try) if project_keys_to_try else "—"
         print(f"   ⚠️ Zephyr: ТЦ по ключу {issue_key} не найдены. Пространства ТЦ: {checked_projects}")
@@ -604,6 +701,14 @@ class ZephyrScaleClient:
             if mode == 'issuelink':
                 suffix = f", error={stat.get('error')}" if stat.get('error') else ""
                 print(f"      issuelink: status={stat.get('status')}, found={stat.get('count')}{suffix}")
+            elif mode == 'search-name':
+                suffix = f", error={stat.get('error')}" if stat.get('error') else ""
+                body = f", body={stat.get('body')}" if stat.get('body') else ""
+                print(
+                    f"      search-name projectKey={stat.get('project_key')}: "
+                    f"status={stat.get('status')}, seen={stat.get('seen', 0)}, "
+                    f"matched={stat.get('count')}{suffix}{body}"
+                )
             elif mode == 'search':
                 print(
                     f"      search projectKey={stat.get('project_key')}: "
@@ -726,6 +831,7 @@ class ReleaseValidator:
         self._zephyr_test_case_details_cache: dict[str, Optional[dict]] = {}
         self._zephyr_cycle_approved_checked: set[str] = set()
         self._zephyr_cycle_testing_type_checked: set[tuple[str, str]] = set()
+        self._zephyr_cycle_search_debug_logged: set[str] = set()
 
         try:
             self.myself = self.jira_main.myself()
@@ -864,7 +970,39 @@ class ReleaseValidator:
             self._zephyr_release_cycles_cache[release_key] = [
                 (key, name) for key, name in cycles if key or name
             ]
+            if not self._zephyr_release_cycles_cache[release_key]:
+                self._log_test_cycle_search_debug(release_key)
         return self._zephyr_release_cycles_cache[release_key]
+
+    def _log_test_cycle_search_debug(self, release_key: str) -> None:
+        if release_key in self._zephyr_cycle_search_debug_logged:
+            return
+        self._zephyr_cycle_search_debug_logged.add(release_key)
+        stats = self._format_test_cycle_search_stats()
+        if stats:
+            self._log_issue(
+                release_key,
+                "warning",
+                f"Zephyr debug: ТЦ по ключу релиза не найдены. {stats}"
+            )
+
+    def _format_test_cycle_search_stats(self) -> str:
+        parts = []
+        for stat in self.zephyr.last_test_cycle_search_stats:
+            mode = stat.get('mode')
+            if mode == 'issuelink':
+                parts.append(f"issuelink status={stat.get('status')} found={stat.get('count')}")
+            elif mode == 'search-name':
+                parts.append(
+                    f"search-name projectKey={stat.get('project_key')} "
+                    f"status={stat.get('status')} seen={stat.get('seen', 0)} matched={stat.get('count')}"
+                )
+            elif mode == 'search':
+                parts.append(
+                    f"search projectKey={stat.get('project_key')} status={stat.get('status')} "
+                    f"pages={stat.get('pages')} seen={stat.get('total_seen')} matched={stat.get('count')}"
+                )
+        return "; ".join(parts)
 
     def _get_test_cycle_details_cached(self, cycle_key: str) -> Optional[dict]:
         if cycle_key not in self._zephyr_cycle_details_cache:
@@ -3445,13 +3583,37 @@ def _diag_tc(validator: 'ReleaseValidator', tc_key: str):
         print(resp.text[:2000])
 
 
-def _diag_search(validator: 'ReleaseValidator', release_key: str):
+def _diag_search(validator: 'ReleaseValidator', release_key: str, expected_cycle_key: str = ''):
     """Диагностика: показать реальный алгоритм поиска ТЦ по ключу релиза."""
+    import json
+
     try:
         ri = validator.jira_main.issue(release_key, fields='id,summary')
         print(f"Jira issue id: {ri.id}  summary: {ri.fields.summary}")
     except Exception as e:
         print(f"Failed to get issue id: {e}")
+
+    if expected_cycle_key:
+        url = f"{validator.zephyr.base_url}/rest/atm/1.0/testrun/{expected_cycle_key}"
+        print(f"\nDirect cycle lookup: {url}")
+        try:
+            response = validator.zephyr._get_with_retries(url)
+            print(f"  status={response.status_code}")
+            if response.status_code == 200:
+                data = response.json()
+                raw = json.dumps(data, ensure_ascii=False)
+                print(f"  key={validator.zephyr.get_test_cycle_key(data) or data.get('key', '')}")
+                print(f"  name={validator.zephyr.get_test_cycle_name(data) or data.get('name', '')}")
+                print(f"  projectKey={data.get('projectKey', data.get('project', ''))}")
+                print(f"  top-level keys={', '.join(sorted(data.keys()))}")
+                print(f"  contains release key in raw json={'yes' if release_key in raw else 'no'}")
+                custom_fields = data.get('customFields')
+                if isinstance(custom_fields, dict):
+                    print(f"  customFields={', '.join(sorted(custom_fields.keys()))}")
+            else:
+                print(f"  body={response.text[:1000]}")
+        except Exception as e:
+            print(f"  direct lookup failed: {e}")
 
     cycles = validator.zephyr.get_test_cycles_for_issue(release_key)
     print("\nZephyr search stats:")
@@ -3460,6 +3622,14 @@ def _diag_search(validator: 'ReleaseValidator', release_key: str):
         if mode == 'issuelink':
             suffix = f", error={stat.get('error')}" if stat.get('error') else ""
             print(f"  issuelink: status={stat.get('status')}, found={stat.get('count')}{suffix}")
+        elif mode == 'search-name':
+            suffix = f", error={stat.get('error')}" if stat.get('error') else ""
+            body = f", body={stat.get('body')}" if stat.get('body') else ""
+            print(
+                f"  search-name projectKey={stat.get('project_key')}: "
+                f"status={stat.get('status')}, seen={stat.get('seen', 0)}, "
+                f"matched={stat.get('count')}{suffix}{body}"
+            )
         elif mode == 'search':
             print(
                 f"  search projectKey={stat.get('project_key')}: "
@@ -3482,9 +3652,9 @@ if __name__ == "__main__":
         _diag_tc(validator, sys.argv[2])
         sys.exit(0)
 
-    # Диагностика: python scripts/release_checker.py --diag-search HRPRELEASE-120111
+    # Диагностика: python scripts/release_checker.py --diag-search HRPRELEASE-120111 [HRPRELEASE-C967]
     if len(sys.argv) >= 3 and sys.argv[1] == '--diag-search':
-        _diag_search(validator, sys.argv[2])
+        _diag_search(validator, sys.argv[2], sys.argv[3] if len(sys.argv) >= 4 else '')
         sys.exit(0)
 
     if len(sys.argv) > 1:
