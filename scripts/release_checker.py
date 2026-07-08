@@ -85,8 +85,10 @@ SERVICE_KE_FIELD_NAME_CANDIDATES = (
     'Конфигурационная единица',
     'Configuration item',
 )
-BACK_API_REGRESS_CYCLE_ALIASES = ('Регресс', 'Regress', 'Regression')
-BACK_API_NF_CYCLE_ALIASES = ('НФ', 'NF', 'Новый функционал', 'Новая функциональность')
+BACK_REGRESS_CYCLE_ALIASES = ('Регресс', 'Regress', 'Regression')
+BACK_NF_CYCLE_ALIASES = ('НФ', 'NF', 'Новый функционал', 'Новая функциональность')
+BACK_API_CHANNEL_ALIASES = ('api',)
+BACK_DEVICE_BROWSER_CHANNEL_ALIASES = ('ipad/pwa/safari/sberbrowser',)
 
 
 def is_allowed_tester(author_name):
@@ -130,23 +132,39 @@ def normalize_test_cycle_name(value: object) -> str:
     """Нормализация имени ТЦ для проверки масок: регистр, пробелы и точки."""
     text = normalize_field_text(value).casefold()
     text = re.sub(r'\s*\.\s*', '.', text)
+    text = re.sub(r'\s*/\s*', '/', text)
     text = re.sub(r'\s+', ' ', text)
     return text.strip(' .')
 
 
-def test_cycle_name_matches_api_mask(
+def test_cycle_name_matches_mask(
     cycle_name: object,
     release_key: str,
     service_ke: str,
+    channel_aliases: tuple[str, ...],
     cycle_type_aliases: tuple[str, ...],
 ) -> bool:
-    """Проверить имя ТЦ по маске {release}.{КЭ}.api.{тип} с учетом человеческих пробелов/регистра."""
+    """Проверить имя ТЦ по маске {release}.{КЭ}.{канал}.{тип} с учетом пробелов/регистра."""
     actual = normalize_test_cycle_name(cycle_name)
-    for cycle_type in cycle_type_aliases:
-        expected = normalize_test_cycle_name(f"{release_key}.{service_ke}.api.{cycle_type}")
-        if actual == expected:
-            return True
+    for channel in channel_aliases:
+        for cycle_type in cycle_type_aliases:
+            expected = normalize_test_cycle_name(f"{release_key}.{service_ke}.{channel}.{cycle_type}")
+            if actual == expected:
+                return True
     return False
+
+
+def build_cycle_mask_hint(
+    release_key: str,
+    service_aliases: list[str],
+    channel_aliases: tuple[str, ...],
+    cycle_type_hint: str,
+) -> str:
+    masks = []
+    for service_alias in service_aliases:
+        for channel_alias in channel_aliases:
+            masks.append(f"{release_key}.{service_alias}.{channel_alias}.{cycle_type_hint}")
+    return " / ".join(masks)
 
 
 def service_ke_name_aliases(service_ke: str) -> list[str]:
@@ -669,16 +687,23 @@ class ReleaseValidator:
                 cycle_name = details.get('name', '')
         return cycle_key, cycle_name
 
-    def _find_matching_api_cycle(
+    def _find_matching_cycle(
         self,
         cycles: list[tuple[str, str]],
         release_key: str,
         service_ke: str,
-        aliases: tuple[str, ...],
+        channel_aliases: tuple[str, ...],
+        cycle_type_aliases: tuple[str, ...],
     ) -> Optional[tuple[str, str]]:
         for service_alias in service_ke_name_aliases(service_ke):
             for cycle_key, cycle_name in cycles:
-                if test_cycle_name_matches_api_mask(cycle_name, release_key, service_alias, aliases):
+                if test_cycle_name_matches_mask(
+                    cycle_name,
+                    release_key,
+                    service_alias,
+                    channel_aliases,
+                    cycle_type_aliases,
+                ):
                     return cycle_key, cycle_name
         return None
 
@@ -935,7 +960,8 @@ class ReleaseValidator:
     def _check_back_release_service_test_cycles(self, release_key: str) -> None:
         """
         Для back-релизов проверяет наличие Zephyr ТЦ по каждой КЭ:
-          - {release}.{КЭ}.api.Регресс — обязательно для каждой КЭ в составе релиза;
+          - {release}.{КЭ}.ipad/pwa/safari/sberbrowser.Регресс — обязательно;
+          - {release}.{КЭ}.api.Регресс — обязательно;
           - {release}.{КЭ}.api.НФ — дополнительно, если внутри этой КЭ есть Story
             с "Новая функциональность" = "Да".
 
@@ -1030,18 +1056,58 @@ class ReleaseValidator:
             service_ke = str(service_info['display'])
             issue_list = ', '.join(sorted(service_info['issue_keys']))
             service_aliases = service_ke_name_aliases(service_ke)
-            service_mask_hint = " / ".join(
-                f"{release_key}.{alias}.api.{{тип}}" for alias in service_aliases
+
+            device_regress_mask_hint = build_cycle_mask_hint(
+                release_key,
+                service_aliases,
+                BACK_DEVICE_BROWSER_CHANNEL_ALIASES,
+                'Регресс',
+            )
+            api_regress_mask_hint = build_cycle_mask_hint(
+                release_key,
+                service_aliases,
+                BACK_API_CHANNEL_ALIASES,
+                'Регресс',
+            )
+            api_nf_mask_hint = build_cycle_mask_hint(
+                release_key,
+                service_aliases,
+                BACK_API_CHANNEL_ALIASES,
+                'НФ',
             )
 
-            regress_match = self._find_matching_api_cycle(
+            device_regress_match = self._find_matching_cycle(
                 cycles,
                 release_key,
                 service_ke,
-                BACK_API_REGRESS_CYCLE_ALIASES,
+                BACK_DEVICE_BROWSER_CHANNEL_ALIASES,
+                BACK_REGRESS_CYCLE_ALIASES,
             )
-            if regress_match:
-                tc_key, tc_name = regress_match
+            if device_regress_match:
+                tc_key, tc_name = device_regress_match
+                self._log_issue(
+                    release_key,
+                    "success",
+                    f"Back release: для КЭ '{service_ke}' найден iPad/PWA/Safari/SberBrowser Регресс ТЦ "
+                    f"[{tc_key}] '{tc_name}' ✓"
+                )
+            else:
+                self._log_issue(
+                    release_key,
+                    "error",
+                    f"Back release: для КЭ '{service_ke}' ({issue_list}) отсутствует ТЦ Zephyr "
+                    f"по маске '{device_regress_mask_hint}'"
+                )
+
+            api_regress_match = self._find_matching_cycle(
+                cycles,
+                release_key,
+                service_ke,
+                BACK_API_CHANNEL_ALIASES,
+                BACK_REGRESS_CYCLE_ALIASES,
+            )
+            if api_regress_match:
+                tc_key, tc_name = api_regress_match
                 self._log_issue(
                     release_key,
                     "success",
@@ -1053,15 +1119,16 @@ class ReleaseValidator:
                     release_key,
                     "error",
                     f"Back release: для КЭ '{service_ke}' ({issue_list}) отсутствует ТЦ Zephyr "
-                    f"по маске '{service_mask_hint}', где тип = Регресс"
+                    f"по маске '{api_regress_mask_hint}'"
                 )
 
             if service_info['has_nf_story']:
-                nf_match = self._find_matching_api_cycle(
+                nf_match = self._find_matching_cycle(
                     cycles,
                     release_key,
                     service_ke,
-                    BACK_API_NF_CYCLE_ALIASES,
+                    BACK_API_CHANNEL_ALIASES,
+                    BACK_NF_CYCLE_ALIASES,
                 )
                 if nf_match:
                     tc_key, tc_name = nf_match
@@ -1076,7 +1143,7 @@ class ReleaseValidator:
                         release_key,
                         "error",
                         f"Back release: для КЭ '{service_ke}' есть Story с 'Новая функциональность' = 'Да', "
-                        f"но отсутствует ТЦ Zephyr по маске '{service_mask_hint}', где тип = НФ"
+                        f"но отсутствует ТЦ Zephyr по маске '{api_nf_mask_hint}'"
                     )
 
     def _check_test_cycles(self, release_key: str):
