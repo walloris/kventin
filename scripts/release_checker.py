@@ -75,6 +75,19 @@ ZEPHYR_TESTING_TYPE_REGRESSION = "Регресс"
 # В релизе и каждой Story/Bug должен быть указан технический контур.
 REQUIRED_PLATFORM_LABELS = {'web', 'back', 'mobile'}
 
+# Название Jira-поля с КЭ в разных инсталляциях может отличаться, поэтому
+# ищем field id по metadata Jira, а не хардкодим customfield_*.
+SERVICE_KE_FIELD_NAME_CANDIDATES = (
+    'КЭ',
+    'КЕ',
+    'КЭ сервиса',
+    'КЕ сервиса',
+    'Конфигурационная единица',
+    'Configuration item',
+)
+BACK_API_REGRESS_CYCLE_ALIASES = ('Регресс', 'Regress', 'Regression')
+BACK_API_NF_CYCLE_ALIASES = ('НФ', 'NF', 'Новый функционал', 'Новая функциональность')
+
 
 def is_allowed_tester(author_name):
     if not author_name or author_name == 'Неизвестно':
@@ -111,6 +124,39 @@ def normalize_status_name(status: str) -> str:
 
 def normalize_field_text(value: object) -> str:
     return re.sub(r'\s+', ' ', str(value or '')).strip()
+
+
+def normalize_test_cycle_name(value: object) -> str:
+    """Нормализация имени ТЦ для проверки масок: регистр, пробелы и точки."""
+    text = normalize_field_text(value).casefold()
+    text = re.sub(r'\s*\.\s*', '.', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip(' .')
+
+
+def test_cycle_name_matches_api_mask(
+    cycle_name: object,
+    release_key: str,
+    service_ke: str,
+    cycle_type_aliases: tuple[str, ...],
+) -> bool:
+    """Проверить имя ТЦ по маске {release}.{КЭ}.api.{тип} с учетом человеческих пробелов/регистра."""
+    actual = normalize_test_cycle_name(cycle_name)
+    for cycle_type in cycle_type_aliases:
+        expected = normalize_test_cycle_name(f"{release_key}.{service_ke}.api.{cycle_type}")
+        if actual == expected:
+            return True
+    return False
+
+
+def service_ke_name_aliases(service_ke: str) -> list[str]:
+    """Варианты имени КЭ для ТЦ: полное значение Jira и имя без хвостового ID в скобках."""
+    original = normalize_field_text(service_ke)
+    aliases = [original] if original else []
+    without_parenthesized_id = normalize_field_text(re.sub(r'\s*\([^)]*\)\s*$', '', original))
+    if without_parenthesized_id and without_parenthesized_id.casefold() not in {a.casefold() for a in aliases}:
+        aliases.append(without_parenthesized_id)
+    return aliases
 
 
 def extract_jira_field_value(raw_val: object) -> Optional[str]:
@@ -492,6 +538,7 @@ class ReleaseValidator:
             'warnings': [],
             'success': []
         })
+        self._jira_field_name_to_id_cache: Optional[dict[str, str]] = None
 
         try:
             self.myself = self.jira_main.myself()
@@ -532,10 +579,13 @@ class ReleaseValidator:
         else:
             self.report_data[issue_key]['success'].append(message)
 
+    def _issue_labels_casefold(self, issue_obj) -> set[str]:
+        labels = getattr(issue_obj.fields, 'labels', []) or []
+        return {str(label).strip().casefold() for label in labels if str(label).strip()}
+
     def _check_required_platform_label(self, issue_obj, issue_kind: str) -> bool:
         """Проверить наличие одного из обязательных лейблов web/back/mobile без учёта регистра."""
-        labels = getattr(issue_obj.fields, 'labels', []) or []
-        normalized_labels = {str(label).strip().casefold() for label in labels}
+        normalized_labels = self._issue_labels_casefold(issue_obj)
         if normalized_labels & REQUIRED_PLATFORM_LABELS:
             matched = sorted(normalized_labels & REQUIRED_PLATFORM_LABELS)[0]
             self._log_issue(
@@ -552,6 +602,85 @@ class ReleaseValidator:
             f"{issue_kind}: отсутствует обязательный лейбл контура. Должен быть один из: {expected}"
         )
         return False
+
+    def _get_jira_field_id_by_names(self, names: tuple[str, ...]) -> Optional[str]:
+        """Найти id Jira-поля по имени через metadata, с кэшем на запуск."""
+        if self._jira_field_name_to_id_cache is None:
+            self._jira_field_name_to_id_cache = {}
+            try:
+                for field in self.jira_main.fields():
+                    field_name = normalize_field_text(field.get('name', '')).casefold()
+                    field_id = field.get('id')
+                    if field_name and field_id:
+                        self._jira_field_name_to_id_cache[field_name] = field_id
+            except Exception as e:
+                self._log_issue("GENERAL", "warning", f"Не удалось загрузить metadata полей Jira: {e}")
+
+        if not self._jira_field_name_to_id_cache:
+            return None
+
+        wanted = [normalize_field_text(name).casefold() for name in names]
+        for name in wanted:
+            field_id = self._jira_field_name_to_id_cache.get(name)
+            if field_id:
+                return field_id
+
+        # Fallback: иногда поле называется "КЭ сервиса (новое)" или похоже.
+        for name in sorted((x for x in wanted if len(x) > 2), key=len, reverse=True):
+            for field_name, field_id in self._jira_field_name_to_id_cache.items():
+                if name in field_name:
+                    return field_id
+        for name in (x for x in wanted if len(x) <= 2):
+            for field_name, field_id in self._jira_field_name_to_id_cache.items():
+                if field_name == name or field_name.startswith(f"{name} ") or field_name.startswith(f"{name}("):
+                    return field_id
+        return None
+
+    def _extract_issue_service_ke_values(self, issue, service_ke_field_id: str) -> list[str]:
+        raw_val = getattr(issue.fields, service_ke_field_id, None)
+        if raw_val is None and hasattr(issue, 'raw'):
+            raw_val = issue.raw.get('fields', {}).get(service_ke_field_id)
+        values = extract_jira_field_values(raw_val)
+        cleaned = []
+        seen = set()
+        for value in values:
+            value_clean = normalize_field_text(value)
+            if not value_clean:
+                continue
+            key = value_clean.casefold()
+            if key not in seen:
+                seen.add(key)
+                cleaned.append(value_clean)
+        return cleaned
+
+    def _story_has_new_functionality(self, issue) -> bool:
+        raw_val = getattr(issue.fields, 'customfield_24000', None)
+        if raw_val is None and hasattr(issue, 'raw'):
+            raw_val = issue.raw.get('fields', {}).get('customfield_24000')
+        value = extract_jira_field_value(raw_val)
+        return normalize_field_text(value).casefold() == 'да'
+
+    def _get_cycle_name_from_zephyr_item(self, cycle: dict) -> tuple[str, str]:
+        cycle_key = cycle.get('key', '')
+        cycle_name = cycle.get('name', '')
+        if cycle_key and not cycle_name:
+            details = self.zephyr.get_test_cycle_details(cycle_key)
+            if details:
+                cycle_name = details.get('name', '')
+        return cycle_key, cycle_name
+
+    def _find_matching_api_cycle(
+        self,
+        cycles: list[tuple[str, str]],
+        release_key: str,
+        service_ke: str,
+        aliases: tuple[str, ...],
+    ) -> Optional[tuple[str, str]]:
+        for service_alias in service_ke_name_aliases(service_ke):
+            for cycle_key, cycle_name in cycles:
+                if test_cycle_name_matches_api_mask(cycle_name, release_key, service_alias, aliases):
+                    return cycle_key, cycle_name
+        return None
 
     def check_release(self, release_key):
         self.report_data.clear()
@@ -587,6 +716,8 @@ class ReleaseValidator:
         self._check_artifacts(release_key)
         self._check_release_coverage(release_key)
         self._check_zephyr_test_cases(release_key, is_hotfix=is_hotfix)
+        if not is_hotfix and 'back' in self._issue_labels_casefold(release):
+            self._check_back_release_service_test_cycles(release_key)
         self._check_bugs(release_key, is_hotfix=is_hotfix)
         self._check_stories(release_key)
         self._check_gigacode_pull_requests(release_key)
@@ -800,6 +931,153 @@ class ReleaseValidator:
                     result[issue.key] = ZEPHYR_TESTING_TYPE_REGRESSION
 
         return result
+
+    def _check_back_release_service_test_cycles(self, release_key: str) -> None:
+        """
+        Для back-релизов проверяет наличие Zephyr ТЦ по каждой КЭ:
+          - {release}.{КЭ}.api.Регресс — обязательно для каждой КЭ в составе релиза;
+          - {release}.{КЭ}.api.НФ — дополнительно, если внутри этой КЭ есть Story
+            с "Новая функциональность" = "Да".
+
+        Zephyr ищем один раз по ключу релиза, затем матчим названия локально.
+        """
+        print(f"\n📋 Проверка API ТЦ Zephyr Scale для back-релиза...")
+
+        linked_keys = self._get_consist_of_issues(release_key)
+        if not linked_keys:
+            self._log_issue(
+                release_key,
+                "warning",
+                "Back release: нет задач со связью 'consist of' — проверка API ТЦ по КЭ пропущена"
+            )
+            return
+
+        service_ke_field_id = self._get_jira_field_id_by_names(SERVICE_KE_FIELD_NAME_CANDIDATES)
+        if not service_ke_field_id:
+            self._log_issue(
+                release_key,
+                "error",
+                "Back release: не удалось определить Jira field id для поля КЭ/КЭ сервиса"
+            )
+            return
+
+        keys_str = ",".join(linked_keys)
+        issue_types_to_check = {'story', 'bug', 'defect', 'ошибка'}
+        try:
+            release_items = self.jira_main.search_issues(
+                f'key in ({keys_str})',
+                fields=f'summary,issuetype,assignee,{service_ke_field_id},customfield_24000',
+                maxResults=500
+            )
+        except Exception as e:
+            self._log_issue(
+                release_key,
+                "error",
+                f"Back release: ошибка получения задач состава релиза для проверки КЭ: {e}"
+            )
+            return
+
+        services: dict[str, dict[str, object]] = {}
+        for issue in release_items:
+            issue_type = issue.fields.issuetype.name.casefold() if issue.fields.issuetype else ''
+            if issue_type not in issue_types_to_check:
+                continue
+
+            service_values = self._extract_issue_service_ke_values(issue, service_ke_field_id)
+            if not service_values:
+                self._log_issue(
+                    issue,
+                    "error",
+                    f"Back release: не заполнено поле КЭ сервиса ({service_ke_field_id}); "
+                    "невозможно проверить обязательные API ТЦ"
+                )
+                continue
+
+            for service_ke in service_values:
+                service_key = normalize_field_text(service_ke).casefold()
+                service_info = services.setdefault(service_key, {
+                    'display': service_ke,
+                    'issue_keys': set(),
+                    'has_nf_story': False,
+                })
+                service_info['issue_keys'].add(issue.key)
+                if issue_type == 'story' and self._story_has_new_functionality(issue):
+                    service_info['has_nf_story'] = True
+
+        if not services:
+            self._log_issue(
+                release_key,
+                "error",
+                "Back release: в составе релиза не найдено ни одной Story/Bug с заполненной КЭ сервиса"
+            )
+            return
+
+        raw_cycles = self.zephyr.get_test_cycles_for_issue(release_key)
+        cycles = [self._get_cycle_name_from_zephyr_item(cycle) for cycle in raw_cycles]
+        cycles = [(key, name) for key, name in cycles if key or name]
+
+        if not cycles:
+            self._log_issue(
+                release_key,
+                "error",
+                f"Back release: Zephyr не вернул ТЦ по ключу релиза {release_key}"
+            )
+            return
+
+        print(f"   Back release: найдено КЭ={len(services)}, ТЦ по ключу релиза={len(cycles)}")
+
+        for service_info in services.values():
+            service_ke = str(service_info['display'])
+            issue_list = ', '.join(sorted(service_info['issue_keys']))
+            service_aliases = service_ke_name_aliases(service_ke)
+            service_mask_hint = " / ".join(
+                f"{release_key}.{alias}.api.{{тип}}" for alias in service_aliases
+            )
+
+            regress_match = self._find_matching_api_cycle(
+                cycles,
+                release_key,
+                service_ke,
+                BACK_API_REGRESS_CYCLE_ALIASES,
+            )
+            if regress_match:
+                tc_key, tc_name = regress_match
+                self._log_issue(
+                    release_key,
+                    "success",
+                    f"Back release: для КЭ '{service_ke}' найден API Регресс ТЦ "
+                    f"[{tc_key}] '{tc_name}' ✓"
+                )
+            else:
+                self._log_issue(
+                    release_key,
+                    "error",
+                    f"Back release: для КЭ '{service_ke}' ({issue_list}) отсутствует ТЦ Zephyr "
+                    f"по маске '{service_mask_hint}', где тип = Регресс"
+                )
+
+            if service_info['has_nf_story']:
+                nf_match = self._find_matching_api_cycle(
+                    cycles,
+                    release_key,
+                    service_ke,
+                    BACK_API_NF_CYCLE_ALIASES,
+                )
+                if nf_match:
+                    tc_key, tc_name = nf_match
+                    self._log_issue(
+                        release_key,
+                        "success",
+                        f"Back release: для КЭ '{service_ke}' найден API НФ ТЦ "
+                        f"[{tc_key}] '{tc_name}' ✓"
+                    )
+                else:
+                    self._log_issue(
+                        release_key,
+                        "error",
+                        f"Back release: для КЭ '{service_ke}' есть Story с 'Новая функциональность' = 'Да', "
+                        f"но отсутствует ТЦ Zephyr по маске '{service_mask_hint}', где тип = НФ"
+                    )
 
     def _check_test_cycles(self, release_key: str):
         """
