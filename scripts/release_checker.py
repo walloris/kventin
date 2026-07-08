@@ -3482,20 +3482,48 @@ class ReleaseValidator:
                 except Exception as e:
                     self._log_issue(task_key, "error", f"Ошибка проверки Task {task_key}: {e}")
 
-    def _json_contains_gigacode_marker(self, value: object) -> bool:
-        markers = (
-            '#gigacode agent',
-            'co-authored-by: gigacode',
-            'co-authorer-by: gigacode',
+    @staticmethod
+    def _normalize_gigacode_marker_text(value: str) -> str:
+        text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', value)
+        text = re.sub(r'<([^>]+)>', r'\1', text)
+        return normalize_field_text(text)
+
+    def _find_gigacode_marker(self, value: object) -> Optional[str]:
+        marker_patterns = (
+            r'co-authored-by\s*:\s*gigacode\s+assistant\b',
+            r'co-authored-by\s*:\s*gigacode\b',
+            r'co-authorer-by\s*:\s*gigacode\s+assistant\b',
+            r'co-authorer-by\s*:\s*gigacode\b',
+            r'#\s*gigacode\s+agent\b',
         )
         if isinstance(value, str):
-            value_normalized = value.casefold()
-            return any(marker in value_normalized for marker in markers)
+            value_normalized = self._normalize_gigacode_marker_text(value)
+            matches = []
+            match_spans = []
+            for pattern in marker_patterns:
+                match = re.search(pattern, value_normalized, flags=re.IGNORECASE)
+                if match:
+                    span = match.span()
+                    if any(span[0] >= existing[0] and span[1] <= existing[1] for existing in match_spans):
+                        continue
+                    match_spans.append(span)
+                    matches.append(match.group(0))
+            return ', '.join(dict.fromkeys(matches)) if matches else None
         if isinstance(value, dict):
-            return any(self._json_contains_gigacode_marker(item) for item in value.values())
+            markers = []
+            for item in value.values():
+                marker = self._find_gigacode_marker(item)
+                if marker:
+                    markers.extend(part.strip() for part in marker.split(',') if part.strip())
+            return ', '.join(dict.fromkeys(markers)) if markers else None
         if isinstance(value, list):
-            return any(self._json_contains_gigacode_marker(item) for item in value)
-        return False
+            markers = []
+            for item in value:
+                marker = self._find_gigacode_marker(item)
+                if marker:
+                    markers.extend(part.strip() for part in marker.split(',') if part.strip())
+            return ', '.join(dict.fromkeys(markers)) if markers else None
+        return None
 
     def _json_contains_pull_request(self, value: object) -> bool:
         if isinstance(value, dict):
@@ -3548,10 +3576,10 @@ class ReleaseValidator:
 
         return payloads
 
-    def _issue_has_gigacode_pull_request(self, issue) -> bool:
+    def _issue_has_gigacode_pull_request(self, issue) -> Optional[str]:
         issue_id = str(getattr(issue, 'id', '') or '')
         if not issue_id:
-            return False
+            return None
 
         base_url = config['jira']['url'].rstrip('/')
         application_types = ('stash', 'bitbucket', 'git')
@@ -3578,11 +3606,11 @@ class ReleaseValidator:
 
                 has_pull_request = self._json_contains_pull_request(payload)
                 has_commit = self._json_contains_commit(payload)
-                has_gigacode_marker = self._json_contains_gigacode_marker(payload)
-                if has_gigacode_marker and (has_pull_request or has_commit):
-                    return True
+                gigacode_marker = self._find_gigacode_marker(payload)
+                if gigacode_marker and (has_pull_request or has_commit):
+                    return gigacode_marker
 
-        return False
+        return None
 
     def _add_label_if_missing(self, issue, label: str) -> bool:
         labels = list(getattr(issue.fields, 'labels', []) or [])
@@ -3678,10 +3706,13 @@ class ReleaseValidator:
                         issues_to_check.append(task)
 
             matched_issue = None
+            matched_marker = None
             for issue_to_check in issues_to_check:
                 try:
-                    if self._issue_has_gigacode_pull_request(issue_to_check):
+                    gigacode_marker = self._issue_has_gigacode_pull_request(issue_to_check)
+                    if gigacode_marker:
                         matched_issue = issue_to_check
+                        matched_marker = gigacode_marker
                         break
                 except Exception as e:
                     self._log_issue(
@@ -3700,19 +3731,22 @@ class ReleaseValidator:
                     self._log_issue(
                         target_issue,
                         "success",
-                        f"GigaCode PR/commit найден в {matched_issue.key}; лейбл {AIFIXED_LABEL} добавлен ✓"
+                        f"GigaCode PR/commit найден в {matched_issue.key} "
+                        f"(маркер: '{matched_marker}'); лейбл {AIFIXED_LABEL} добавлен ✓"
                     )
                 else:
                     self._log_issue(
                         target_issue,
                         "success",
-                        f"GigaCode PR/commit найден в {matched_issue.key}; лейбл {AIFIXED_LABEL} уже есть ✓"
+                        f"GigaCode PR/commit найден в {matched_issue.key} "
+                        f"(маркер: '{matched_marker}'); лейбл {AIFIXED_LABEL} уже есть ✓"
                     )
             except Exception as e:
                 self._log_issue(
                     target_issue,
                     "error",
-                    f"GigaCode PR/commit найден в {matched_issue.key}, но не удалось добавить лейбл {AIFIXED_LABEL}: {e}"
+                    f"GigaCode PR/commit найден в {matched_issue.key} "
+                    f"(маркер: '{matched_marker}'), но не удалось добавить лейбл {AIFIXED_LABEL}: {e}"
                 )
 
     def _check_cloud_label(self, release_key: str, release_summary: str):
