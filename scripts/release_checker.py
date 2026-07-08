@@ -3582,7 +3582,7 @@ class ReleaseValidator:
             return None
 
         base_url = config['jira']['url'].rstrip('/')
-        application_types = ('stash', 'bitbucket', 'bitbucket-server', 'git')
+        application_types = ('stash', 'bitbucket', 'bitbucket-server')
         data_types = ('pullrequest', 'commit', 'repository')
 
         for application_type in application_types:
@@ -4381,7 +4381,7 @@ def _diag_gigacode(validator: 'ReleaseValidator', issue_key: str):
     print(f"Labels: {', '.join(getattr(issue.fields, 'labels', []) or []) or 'None'}")
 
     base_url = config['jira']['url'].rstrip('/')
-    application_types = ('stash', 'bitbucket', 'bitbucket-server', 'git')
+    application_types = ('stash', 'bitbucket', 'bitbucket-server')
     data_types = ('pullrequest', 'commit', 'repository')
 
     for application_type in application_types:
