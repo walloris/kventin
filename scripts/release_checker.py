@@ -3582,8 +3582,8 @@ class ReleaseValidator:
             return None
 
         base_url = config['jira']['url'].rstrip('/')
-        application_types = ('stash', 'bitbucket', 'git')
-        data_types = ('pullrequest', 'commit')
+        application_types = ('stash', 'bitbucket', 'bitbucket-server', 'git')
+        data_types = ('pullrequest', 'commit', 'repository')
 
         for application_type in application_types:
             for data_type in data_types:
@@ -3604,10 +3604,8 @@ class ReleaseValidator:
                 except Exception:
                     continue
 
-                has_pull_request = self._json_contains_pull_request(payload)
-                has_commit = self._json_contains_commit(payload)
                 gigacode_marker = self._find_gigacode_marker(payload)
-                if gigacode_marker and (has_pull_request or has_commit):
+                if gigacode_marker:
                     return gigacode_marker
 
         return None
