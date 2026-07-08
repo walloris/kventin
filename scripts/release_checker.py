@@ -106,9 +106,10 @@ ZEPHYR_DIRECT_CYCLE_SCAN_ENABLED = os.getenv("ZEPHYR_DIRECT_CYCLE_SCAN_ENABLED",
     "true",
     "yes",
 )
-ZEPHYR_DIRECT_CYCLE_SCAN_LIMIT = int(os.getenv("ZEPHYR_DIRECT_CYCLE_SCAN_LIMIT", "120"))
-ZEPHYR_DIRECT_CYCLE_SCAN_FORWARD_LIMIT = int(os.getenv("ZEPHYR_DIRECT_CYCLE_SCAN_FORWARD_LIMIT", "20"))
-ZEPHYR_DIRECT_CYCLE_SCAN_START = os.getenv("ZEPHYR_DIRECT_CYCLE_SCAN_START", "").strip()
+ZEPHYR_DIRECT_CYCLE_SCAN_LIMIT = int(os.getenv("ZEPHYR_DIRECT_CYCLE_SCAN_LIMIT", "300"))
+ZEPHYR_DIRECT_CYCLE_SCAN_FORWARD_LIMIT = int(os.getenv("ZEPHYR_DIRECT_CYCLE_SCAN_FORWARD_LIMIT", "300"))
+ZEPHYR_DIRECT_CYCLE_SCAN_FORWARD_MISS_LIMIT = int(os.getenv("ZEPHYR_DIRECT_CYCLE_SCAN_FORWARD_MISS_LIMIT", "20"))
+ZEPHYR_DIRECT_CYCLE_SCAN_START = os.getenv("ZEPHYR_DIRECT_CYCLE_SCAN_START", "133028").strip()
 ZEPHYR_CYCLE_CACHE_PATH = Path(
     os.getenv("ZEPHYR_CYCLE_CACHE_PATH", str(parent_dir / "trash" / "zephyr_cycle_cache.json"))
 )
@@ -1238,7 +1239,7 @@ class ReleaseValidator:
                 release_key,
                 "warning",
                 "Zephyr direct scan: нет стартового C-номера. "
-                "Запусти --diag-search с известным ключом ТЦ или задай ZEPHYR_DIRECT_CYCLE_SCAN_START."
+                "Задай ZEPHYR_DIRECT_CYCLE_SCAN_START, например номер из HRPQA-C133028."
             )
             return []
 
@@ -1321,7 +1322,7 @@ class ReleaseValidator:
                 misses = 0
                 continue
             misses += 1
-            if misses >= 5:
+            if misses >= ZEPHYR_DIRECT_CYCLE_SCAN_FORWARD_MISS_LIMIT:
                 break
         return current
 
