@@ -56,11 +56,22 @@ ALLOWED_TESTERS = {
 # Статус ТК, который считается утверждённым (Approved)
 ZEPHYR_APPROVED_STATUS = "Approved"
 
-# Пространство проекта, в котором лежат тест-кейсы
-ZEPHYR_TC_PROJECT_KEY = "HRPQA"
+# Пространство проекта, в котором лежат тест-кейсы.
+# Важно: ТЦ живут в отдельном Zephyr-пространстве, обычно в projectKey релиза
+# (например, HRPRELEASE-C1181), а не в HRPQA.
+ZEPHYR_TEST_CASE_PROJECT_KEY = "HRPQA"
+ZEPHYR_TC_PROJECT_KEY = ZEPHYR_TEST_CASE_PROJECT_KEY
+ZEPHYR_TEST_CYCLE_PROJECT_KEYS = tuple(
+    dict.fromkeys(
+        project_key.strip()
+        for project_key in os.getenv("ZEPHYR_TEST_CYCLE_PROJECT_KEYS", "").split(",")
+        if project_key.strip()
+    )
+)
 
-# Имя кастомного поля "Вид тестирования" в Zephyr Scale ТК.
-# Поле ищется в customFields ответа API GET /rest/atm/1.0/testcase/{key}.
+# Имя кастомного поля "Вид тестирования" в Zephyr Scale ТК/ТЦ.
+# Поле ищется в customFields ответа API GET /rest/atm/1.0/testcase/{key}
+# и GET /rest/atm/1.0/testrun/{key}.
 # Если на вашем инстансе поле называется иначе — подставьте нужное значение.
 ZEPHYR_TESTING_TYPE_FIELD = "Вид тестирования"
 
@@ -285,6 +296,7 @@ class ZephyrScaleClient:
             'Authorization': f'Bearer {token}',
             'Content-Type': 'application/json',
         })
+        self.last_test_cycle_search_stats: list[dict] = []
 
     def _get_with_retries(self, url: str, **kwargs) -> requests.Response:
         kwargs.setdefault('timeout', 30)
@@ -387,31 +399,144 @@ class ZephyrScaleClient:
             return val.get('name', val.get('value', str(val)))
         return str(val).strip()
 
-    def get_test_cycles_for_issue(self, issue_key: str, issue_id: Optional[str] = None) -> list[dict]:
+    @staticmethod
+    def _extract_zephyr_collection(data: object) -> list[dict]:
+        """Достать список сущностей из разных форматов ответа Zephyr Scale."""
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+        if not isinstance(data, dict):
+            return []
+        for collection_key in ('results', 'testRuns', 'values', 'items'):
+            collection = data.get(collection_key)
+            if isinstance(collection, list):
+                return [item for item in collection if isinstance(item, dict)]
+            if isinstance(collection, dict):
+                nested = ZephyrScaleClient._extract_zephyr_collection(collection)
+                if nested:
+                    return nested
+        return []
+
+    @staticmethod
+    def get_test_cycle_key(cycle: dict) -> str:
+        for key_field in ('key', 'testRunKey', 'testCycleKey'):
+            value = cycle.get(key_field)
+            if value:
+                return str(value)
+        for nested_field in ('testRun', 'testCycle', 'cycle'):
+            nested = cycle.get(nested_field)
+            if isinstance(nested, dict):
+                nested_key = ZephyrScaleClient.get_test_cycle_key(nested)
+                if nested_key:
+                    return nested_key
+        return ''
+
+    @staticmethod
+    def get_test_cycle_name(cycle: dict) -> str:
+        for name_field in ('name', 'testRunName', 'testCycleName'):
+            value = cycle.get(name_field)
+            if value:
+                return str(value)
+        for nested_field in ('testRun', 'testCycle', 'cycle'):
+            nested = cycle.get(nested_field)
+            if isinstance(nested, dict):
+                nested_name = ZephyrScaleClient.get_test_cycle_name(nested)
+                if nested_name:
+                    return nested_name
+        return ''
+
+    @staticmethod
+    def _dedupe_project_keys(project_keys: list[object]) -> list[str]:
+        result = []
+        seen = set()
+        for project_key in project_keys:
+            normalized = str(project_key or '').strip()
+            if not normalized:
+                continue
+            dedupe_key = normalized.casefold()
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            result.append(normalized)
+        return result
+
+    def get_test_cycles_for_issue(
+        self,
+        issue_key: str,
+        issue_id: Optional[str] = None,
+        cycle_project_keys: Optional[list[str]] = None,
+    ) -> list[dict]:
         """
         Возвращает список ТЦ, привязанных к релизу.
 
-        API testrun/search поддерживает только фильтры 'projectKey' и 'folder'.
-        Поэтому получаем все ТЦ проекта постранично и фильтруем по наличию
-        issue_key в названии ТЦ — связь хранится только в name.
+        ТЦ лежат в Zephyr-пространстве релиза (например, HRPRELEASE-C1181),
+        а ТК — в отдельном пространстве HRPQA. Поэтому сначала берем быстрый
+        issuelink по release key, а fallback-поиск по name делаем только в
+        projectKey ТЦ, не в projectKey ТК.
         """
-        issue_project = issue_key.split('-')[0] if '-' in issue_key else ''
-        project_keys_to_try = [issue_project] if issue_project else []
-        if ZEPHYR_TC_PROJECT_KEY not in project_keys_to_try:
-            project_keys_to_try.append(ZEPHYR_TC_PROJECT_KEY)
+        del issue_id  # Zephyr Server/DC на этом инстансе ищем по ключу релиза.
+        self.last_test_cycle_search_stats = []
 
         seen_keys: set[str] = set()
         result: list[dict] = []
 
+        for item in self._get_test_cycles_by_issue_link(issue_key):
+            key = self.get_test_cycle_key(item)
+            dedupe_key = key or f"name:{self.get_test_cycle_name(item)}"
+            if dedupe_key and dedupe_key not in seen_keys:
+                seen_keys.add(dedupe_key)
+                result.append(item)
+
+        if result:
+            return result
+
+        issue_project = issue_key.split('-')[0] if '-' in issue_key else ''
+        project_keys_to_try = self._dedupe_project_keys(
+            [issue_project]
+            + list(cycle_project_keys or [])
+            + list(ZEPHYR_TEST_CYCLE_PROJECT_KEYS)
+        )
+
         for proj in project_keys_to_try:
             found = self._search_test_cycles_by_name(proj, issue_key)
             for item in found:
-                key = item.get('key', '')
-                if key and key not in seen_keys:
-                    seen_keys.add(key)
+                key = self.get_test_cycle_key(item)
+                dedupe_key = key or f"name:{self.get_test_cycle_name(item)}"
+                if dedupe_key and dedupe_key not in seen_keys:
+                    seen_keys.add(dedupe_key)
                     result.append(item)
 
+        if not result:
+            self._print_test_cycle_search_debug(issue_key, project_keys_to_try)
+
         return result
+
+    def _get_test_cycles_by_issue_link(self, issue_key: str) -> list[dict]:
+        """Быстрый поиск ТЦ, связанных с Jira-задачей, через Zephyr issuelink."""
+        url = f"{self.base_url}/rest/atm/1.0/issuelink/{issue_key}/testruns"
+        try:
+            response = self._get_with_retries(url)
+            if response.status_code != 200:
+                self.last_test_cycle_search_stats.append({
+                    'mode': 'issuelink',
+                    'status': response.status_code,
+                    'count': 0,
+                })
+                return []
+            items = self._extract_zephyr_collection(response.json())
+            self.last_test_cycle_search_stats.append({
+                'mode': 'issuelink',
+                'status': response.status_code,
+                'count': len(items),
+            })
+            return items
+        except Exception as e:
+            self.last_test_cycle_search_stats.append({
+                'mode': 'issuelink',
+                'status': 'exception',
+                'count': 0,
+                'error': str(e),
+            })
+            return []
 
     def _search_test_cycles_by_name(self, project_key: str, issue_key: str) -> list[dict]:
         """
@@ -425,6 +550,9 @@ class ZephyrScaleClient:
         start_at = 0
         matched: list[dict] = []
         issue_key_lower = issue_key.lower()
+        pages = 0
+        total_seen = 0
+        status = None
 
         while True:
             try:
@@ -435,17 +563,20 @@ class ZephyrScaleClient:
             except Exception:
                 break
 
+            status = response.status_code
             if response.status_code != 200:
                 break
 
             data = response.json()
-            items = data if isinstance(data, list) else data.get('results', data.get('testRuns', data.get('values', [])))
+            items = self._extract_zephyr_collection(data)
 
             if not items:
                 break
 
+            pages += 1
+            total_seen += len(items)
             for item in items:
-                name = item.get('name', '')
+                name = self.get_test_cycle_name(item)
                 if issue_key_lower in name.lower():
                     matched.append(item)
 
@@ -455,7 +586,30 @@ class ZephyrScaleClient:
 
             start_at += page_size
 
+        self.last_test_cycle_search_stats.append({
+            'mode': 'search',
+            'project_key': project_key,
+            'status': status,
+            'pages': pages,
+            'total_seen': total_seen,
+            'count': len(matched),
+        })
         return matched
+
+    def _print_test_cycle_search_debug(self, issue_key: str, project_keys_to_try: list[str]) -> None:
+        checked_projects = ", ".join(project_keys_to_try) if project_keys_to_try else "—"
+        print(f"   ⚠️ Zephyr: ТЦ по ключу {issue_key} не найдены. Пространства ТЦ: {checked_projects}")
+        for stat in self.last_test_cycle_search_stats:
+            mode = stat.get('mode', 'unknown')
+            if mode == 'issuelink':
+                suffix = f", error={stat.get('error')}" if stat.get('error') else ""
+                print(f"      issuelink: status={stat.get('status')}, found={stat.get('count')}{suffix}")
+            elif mode == 'search':
+                print(
+                    f"      search projectKey={stat.get('project_key')}: "
+                    f"status={stat.get('status')}, pages={stat.get('pages')}, "
+                    f"seen={stat.get('total_seen')}, matched={stat.get('count')}"
+                )
 
     def get_test_cycle_details(self, tc_key: str) -> Optional[dict]:
         """
@@ -694,8 +848,8 @@ class ReleaseValidator:
         return normalize_field_text(value).casefold() == 'да'
 
     def _get_cycle_name_from_zephyr_item(self, cycle: dict) -> tuple[str, str]:
-        cycle_key = cycle.get('key', '')
-        cycle_name = cycle.get('name', '')
+        cycle_key = self.zephyr.get_test_cycle_key(cycle)
+        cycle_name = self.zephyr.get_test_cycle_name(cycle)
         if cycle_key and not cycle_name:
             details = self.zephyr.get_test_cycle_details(cycle_key)
             if details:
@@ -3292,55 +3446,32 @@ def _diag_tc(validator: 'ReleaseValidator', tc_key: str):
 
 
 def _diag_search(validator: 'ReleaseValidator', release_key: str):
-    """Диагностика: перебрать все варианты поиска ТЦ с детальным логом."""
-    import json
-    import re
-
-    issue_project = release_key.split('-')[0]
-    release_id = None
+    """Диагностика: показать реальный алгоритм поиска ТЦ по ключу релиза."""
     try:
         ri = validator.jira_main.issue(release_key, fields='id,summary')
-        release_id = str(ri.id)
-        print(f"Jira issue id: {release_id}  summary: {ri.fields.summary}")
+        print(f"Jira issue id: {ri.id}  summary: {ri.fields.summary}")
     except Exception as e:
         print(f"Failed to get issue id: {e}")
 
-    base = validator.zephyr.base_url
+    cycles = validator.zephyr.get_test_cycles_for_issue(release_key)
+    print("\nZephyr search stats:")
+    for stat in validator.zephyr.last_test_cycle_search_stats:
+        mode = stat.get('mode', 'unknown')
+        if mode == 'issuelink':
+            suffix = f", error={stat.get('error')}" if stat.get('error') else ""
+            print(f"  issuelink: status={stat.get('status')}, found={stat.get('count')}{suffix}")
+        elif mode == 'search':
+            print(
+                f"  search projectKey={stat.get('project_key')}: "
+                f"status={stat.get('status')}, pages={stat.get('pages')}, "
+                f"seen={stat.get('total_seen')}, matched={stat.get('count')}"
+            )
 
-    queries = [
-        f'projectKey = "{issue_project}" AND issueId = "{release_id}"',
-        f'projectKey = "{issue_project}" AND issueKey = "{release_key}"',
-        f'projectKey = "{issue_project}" AND issueKeys IN ("{release_key}")',
-        f'projectKey = "{issue_project}" AND relatedIssues IN ("{release_key}")',
-        f'projectKey = "{issue_project}"',
-    ]
-
-    for q in queries:
-        url = f"{base}/rest/atm/1.0/testrun/search"
-        resp = validator.zephyr._get_with_retries(url, params={'query': q, 'maxResults': 10})
-        data = None
-        try:
-            data = resp.json()
-        except Exception:
-            pass
-        count = len(data) if isinstance(data, list) else (
-            len(data.get('results', data.get('testRuns', []))) if isinstance(data, dict) else '?'
-        )
-        print(f"  [{resp.status_code}] count={count}  query: {q}")
-        if isinstance(count, int) and count > 0:
-            items = data if isinstance(data, list) else data.get('results', data.get('testRuns', []))
-            for item in items[:3]:
-                print(f"    -> {item.get('key','')} | {item.get('name','')[:60]}")
-
-    # Также пробуем issuelink
-    url2 = f"{base}/rest/atm/1.0/issuelink/{release_key}/testruns"
-    resp2 = validator.zephyr._get_with_retries(url2)
-    try:
-        d2 = resp2.json()
-    except Exception:
-        d2 = resp2.text
-    c2 = len(d2) if isinstance(d2, list) else '?'
-    print(f"  [{resp2.status_code}] count={c2}  issuelink: {url2}")
+    print(f"\nFound cycles: {len(cycles)}")
+    for cycle in cycles[:50]:
+        cycle_key = validator.zephyr.get_test_cycle_key(cycle)
+        cycle_name = validator.zephyr.get_test_cycle_name(cycle)
+        print(f"  -> {cycle_key} | {cycle_name}")
 
 
 if __name__ == "__main__":
