@@ -1578,6 +1578,75 @@ class ReleaseValidator:
             return test_case
         return ''
 
+    @staticmethod
+    def _payload_mentions_issue(payload: object, issue_key: str) -> bool:
+        if not payload:
+            return False
+        try:
+            payload_text = json.dumps(payload, ensure_ascii=False).casefold()
+        except Exception:
+            payload_text = str(payload).casefold()
+        return issue_key.casefold() in payload_text
+
+    @staticmethod
+    def _payload_mentions_issue_in_direct_link_fields(payload: dict, issue_key: str) -> bool:
+        if not isinstance(payload, dict):
+            return False
+
+        direct_fields = (
+            'issueKey',
+            'jiraIssueKey',
+            'issueKeys',
+            'jiraIssueKeys',
+            'issues',
+            'jiraIssues',
+            'issueLinks',
+            'jiraIssueLinks',
+            'linkedIssues',
+            'links',
+            'requirements',
+            'requirementKeys',
+            'testCaseIssueLinks',
+        )
+        for field_name in direct_fields:
+            if field_name in payload and ReleaseValidator._payload_mentions_issue(payload.get(field_name), issue_key):
+                return True
+        return False
+
+    def _is_directly_linked_test_case_for_issue(
+        self,
+        issue_key: str,
+        test_case_link: dict,
+        test_case_details: Optional[dict],
+    ) -> bool:
+        """
+        Zephyr issue-link endpoint может вернуть ТК из контекста ТЦ/результата
+        выполнения. Для проверки задачи нам нужны только ТК, прямо связанные
+        с этой Story/Bug/Defect, а не ТК из релизного ТЦ.
+        """
+        return (
+            self._payload_mentions_issue_in_direct_link_fields(test_case_link, issue_key)
+            or self._payload_mentions_issue_in_direct_link_fields(test_case_details or {}, issue_key)
+        )
+
+    def _get_issue_type_map(self, issue_keys: list[str]) -> dict[str, str]:
+        if not issue_keys:
+            return {}
+        keys_str = ",".join(issue_keys)
+        try:
+            issues = self.jira_main.search_issues(
+                f'key in ({keys_str})',
+                fields='issuetype',
+                maxResults=500
+            )
+        except Exception:
+            return {}
+        return {
+            issue.key: issue.fields.issuetype.name.casefold()
+            for issue in issues
+            if getattr(issue.fields, 'issuetype', None)
+        }
+
     def _check_test_cycle_cases_approved(self, release_key: str, cycle_key: str, cycle_name: str) -> None:
         """Проверить, что все ТК внутри ТЦ находятся в статусе Approved."""
         check_key = cycle_key or normalize_test_cycle_name(cycle_name)
@@ -1894,6 +1963,8 @@ class ReleaseValidator:
 
         # Маппинг issue_key → ожидаемый «Вид тестирования»
         expected_type_map = self._build_expected_testing_type_map(linked_keys)
+        issue_type_map = self._get_issue_type_map(linked_keys)
+        bug_types = {'bug', 'defect', 'ошибка'}
 
         total_tc_checked = 0
         total_not_approved = 0
@@ -1922,9 +1993,10 @@ class ReleaseValidator:
                 continue
 
             expected_testing_type = expected_type_map.get(issue_key)
+            issue_type = issue_type_map.get(issue_key, '')
+            require_direct_test_case_link = issue_type == 'story' or issue_type in bug_types
 
             for tc in hrpqa_test_cases:
-                total_tc_checked += 1
                 tc_key = self.zephyr.get_test_case_key(tc)
                 tc_name = self.zephyr.get_test_case_name(tc)
                 tc_details = self.zephyr.get_test_case_details(tc_key)
@@ -1938,6 +2010,17 @@ class ReleaseValidator:
                         f"Zephyr ТК [{tc_key}] «{tc_name}»: не удалось получить детали ТК, "
                         "статус проверяется по короткому ответу issuelink"
                     )
+
+                if require_direct_test_case_link and not self._is_directly_linked_test_case_for_issue(issue_key, tc, tc_details):
+                    self._log_issue(
+                        issue_key,
+                        "warning",
+                        f"Zephyr ТК [{tc_key}] «{tc_name}» пропущен: в данных ТК нет прямой связи "
+                        f"с задачей {issue_key}; вероятно, ТК пришел из ТЦ/результата выполнения"
+                    )
+                    continue
+
+                total_tc_checked += 1
 
                 # --- Проверка 1: статус Approved ---
                 if tc_status.casefold() != ZEPHYR_APPROVED_STATUS.casefold():
