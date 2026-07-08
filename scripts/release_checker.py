@@ -812,7 +812,7 @@ class ZephyrScaleClient:
             total_seen += len(items)
             for item in items:
                 name = self.get_test_cycle_name(item)
-                if issue_key_lower in name.lower():
+                if issue_key_lower in name.casefold():
                     matched.append(item)
 
             # Если вернулось меньше page_size — достигли конца
@@ -871,7 +871,7 @@ class ZephyrScaleClient:
         matched = []
         for item in items:
             name = self.get_test_cycle_name(item)
-            if not name or issue_key_lower in name.lower():
+            if not name or issue_key_lower in name.casefold():
                 matched.append(item)
 
         self.last_test_cycle_search_stats.append({
@@ -1939,7 +1939,7 @@ class ReleaseValidator:
                     )
 
                 # --- Проверка 1: статус Approved ---
-                if tc_status.lower() != ZEPHYR_APPROVED_STATUS.lower():
+                if tc_status.casefold() != ZEPHYR_APPROVED_STATUS.casefold():
                     total_not_approved += 1
                     self._log_issue(
                         issue_key, "error",
@@ -2399,7 +2399,7 @@ class ReleaseValidator:
         print(f"   Найдено {len(cycles)} ТЦ")
 
         # Собираем детали каждого ТЦ
-        cycle_details = []  # список (key, name, name_lower, details)
+        cycle_details = []  # список (key, name, name_casefold, details)
         for tc_raw in cycles:
             tc_key = self.zephyr.get_test_cycle_key(tc_raw)
             details = self.zephyr.get_test_cycle_details(tc_key) if tc_key else None
@@ -2407,7 +2407,7 @@ class ReleaseValidator:
                 name = self.zephyr.get_test_cycle_name(details) or self.zephyr.get_test_cycle_name(tc_raw)
             else:
                 name = self.zephyr.get_test_cycle_name(tc_raw)
-            cycle_details.append((tc_key, name, name.lower(), details))
+            cycle_details.append((tc_key, name, name.casefold(), details))
 
         # --- Проверяем Story с НФ для правила 2 ---
         linked_keys = self._get_consist_of_issues(release_key)
@@ -2434,14 +2434,14 @@ class ReleaseValidator:
         has_pwa_cycle = False
         has_ipad_cycle = False
 
-        for tc_key, name, name_lower, details in cycle_details:
+        for tc_key, name, name_casefold, details in cycle_details:
 
             # Классификация
-            is_nf = ('нф' in name_lower or 'nf' in name_lower)
-            is_regress = ('регресс' in name_lower or 'regress' in name_lower)
-            is_web = ('web' in name_lower or 'вэб' in name_lower)
-            is_pwa = ('pwa' in name_lower)
-            is_ipad = ('ipad' in name_lower)
+            is_nf = ('нф' in name_casefold or 'nf' in name_casefold)
+            is_regress = ('регресс' in name_casefold or 'regress' in name_casefold)
+            is_web = ('web' in name_casefold or 'вэб' in name_casefold)
+            is_pwa = ('pwa' in name_casefold)
+            is_ipad = ('ipad' in name_casefold)
 
             if is_nf:
                 has_nf_cycle = True
@@ -2465,7 +2465,7 @@ class ReleaseValidator:
                     tc_detail = self.zephyr.get_test_case_details(tr_tc_key)
                     if tc_detail:
                         tc_status = self.zephyr.get_test_case_status(tc_detail)
-                        if tc_status.lower() != ZEPHYR_APPROVED_STATUS.lower():
+                        if tc_status.casefold() != ZEPHYR_APPROVED_STATUS.casefold():
                             tc_name = tc_detail.get('name', tr_tc_key)
                             not_approved_in_cycle.append((tr_tc_key, tc_name, tc_status))
 
@@ -2491,7 +2491,7 @@ class ReleaseValidator:
                         release_key, "warning",
                         f"ТЦ [{tc_key}] '{name}': поле '{ZEPHYR_TESTING_TYPE_FIELD}' не найдено"
                     )
-                elif vt.strip().lower() != 'нф':
+                elif vt.strip().casefold() != 'нф':
                     self._log_issue(
                         release_key, "error",
                         f"ТЦ [{tc_key}] '{name}': '{ZEPHYR_TESTING_TYPE_FIELD}' = '{vt}', ожидается 'НФ'"
@@ -2531,7 +2531,7 @@ class ReleaseValidator:
                         release_key, "warning",
                         f"ТЦ [{tc_key}] '{name}': поле '{ZEPHYR_TESTING_TYPE_FIELD}' не найдено"
                     )
-                elif vt.strip().lower() != 'регресс':
+                elif vt.strip().casefold() != 'регресс':
                     self._log_issue(
                         release_key, "error",
                         f"ТЦ [{tc_key}] '{name}': '{ZEPHYR_TESTING_TYPE_FIELD}' = '{vt}', ожидается 'Регресс'"
