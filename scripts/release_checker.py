@@ -89,6 +89,18 @@ BACK_REGRESS_CYCLE_ALIASES = ('Регресс', 'Regress', 'Regression')
 BACK_NF_CYCLE_ALIASES = ('НФ', 'NF', 'Новый функционал', 'Новая функциональность')
 BACK_API_CHANNEL_ALIASES = ('api',)
 BACK_DEVICE_BROWSER_CHANNEL_ALIASES = ('ipad/pwa/safari/sberbrowser',)
+WEB_DEVICE_BROWSER_NF_CHANNEL_ALIASES = ('ipad/pwa/safari/sberbrowser',)
+WEB_REGRESS_CHANNELS = (
+    ('ipad', ('ipad',)),
+    ('pwa', ('pwa',)),
+    ('safari', ('safari',)),
+    ('sberbrowser', ('sberbrowser',)),
+)
+WEB_REGRESS_CHANNELS_NEUROUI = (
+    ('ipad', ('ipad',)),
+    ('safari', ('safari',)),
+    ('sberbrowser', ('sberbrowser',)),
+)
 
 
 def is_allowed_tester(author_name):
@@ -557,6 +569,7 @@ class ReleaseValidator:
             'success': []
         })
         self._jira_field_name_to_id_cache: Optional[dict[str, str]] = None
+        self._zephyr_release_cycles_cache: dict[str, list[tuple[str, str]]] = {}
 
         try:
             self.myself = self.jira_main.myself()
@@ -687,6 +700,16 @@ class ReleaseValidator:
                 cycle_name = details.get('name', '')
         return cycle_key, cycle_name
 
+    def _get_release_test_cycles(self, release_key: str) -> list[tuple[str, str]]:
+        """Один кэшированный Zephyr-поиск ТЦ по ключу релиза."""
+        if release_key not in self._zephyr_release_cycles_cache:
+            raw_cycles = self.zephyr.get_test_cycles_for_issue(release_key)
+            cycles = [self._get_cycle_name_from_zephyr_item(cycle) for cycle in raw_cycles]
+            self._zephyr_release_cycles_cache[release_key] = [
+                (key, name) for key, name in cycles if key or name
+            ]
+        return self._zephyr_release_cycles_cache[release_key]
+
     def _find_matching_cycle(
         self,
         cycles: list[tuple[str, str]],
@@ -706,6 +729,86 @@ class ReleaseValidator:
                 ):
                     return cycle_key, cycle_name
         return None
+
+    def _collect_release_service_infos(
+        self,
+        release_key: str,
+        check_label: str,
+    ) -> Optional[dict[str, dict[str, object]]]:
+        """Собрать КЭ из Story/Bug состава релиза и отметить, где есть НФ Story."""
+        linked_keys = self._get_consist_of_issues(release_key)
+        if not linked_keys:
+            self._log_issue(
+                release_key,
+                "warning",
+                f"{check_label}: нет задач со связью 'consist of' — проверка ТЦ по КЭ пропущена"
+            )
+            return None
+
+        service_ke_field_id = self._get_jira_field_id_by_names(SERVICE_KE_FIELD_NAME_CANDIDATES)
+        if not service_ke_field_id:
+            self._log_issue(
+                release_key,
+                "error",
+                f"{check_label}: не удалось определить Jira field id для поля КЭ/КЭ сервиса"
+            )
+            return None
+
+        keys_str = ",".join(linked_keys)
+        issue_types_to_check = {'story', 'bug', 'defect', 'ошибка'}
+        try:
+            release_items = self.jira_main.search_issues(
+                f'key in ({keys_str})',
+                fields=f'summary,issuetype,assignee,{service_ke_field_id},customfield_24000',
+                maxResults=500
+            )
+        except Exception as e:
+            self._log_issue(
+                release_key,
+                "error",
+                f"{check_label}: ошибка получения задач состава релиза для проверки КЭ: {e}"
+            )
+            return None
+
+        services: dict[str, dict[str, object]] = {}
+        for issue in release_items:
+            issue_type = issue.fields.issuetype.name.casefold() if issue.fields.issuetype else ''
+            if issue_type not in issue_types_to_check:
+                continue
+
+            service_values = self._extract_issue_service_ke_values(issue, service_ke_field_id)
+            if not service_values:
+                self._log_issue(
+                    issue,
+                    "error",
+                    f"{check_label}: не заполнено поле КЭ сервиса ({service_ke_field_id}); "
+                    "невозможно проверить обязательные ТЦ"
+                )
+                continue
+
+            issue_project_key = issue.key.split('-', 1)[0].casefold()
+            for service_ke in service_values:
+                service_key = normalize_field_text(service_ke).casefold()
+                service_info = services.setdefault(service_key, {
+                    'display': service_ke,
+                    'issue_keys': set(),
+                    'project_keys': set(),
+                    'has_nf_story': False,
+                })
+                service_info['issue_keys'].add(issue.key)
+                service_info['project_keys'].add(issue_project_key)
+                if issue_type == 'story' and self._story_has_new_functionality(issue):
+                    service_info['has_nf_story'] = True
+
+        if not services:
+            self._log_issue(
+                release_key,
+                "error",
+                f"{check_label}: в составе релиза не найдено ни одной Story/Bug с заполненной КЭ сервиса"
+            )
+            return None
+
+        return services
 
     def check_release(self, release_key):
         self.report_data.clear()
@@ -741,8 +844,12 @@ class ReleaseValidator:
         self._check_artifacts(release_key)
         self._check_release_coverage(release_key)
         self._check_zephyr_test_cases(release_key, is_hotfix=is_hotfix)
-        if not is_hotfix and 'back' in self._issue_labels_casefold(release):
-            self._check_back_release_service_test_cycles(release_key)
+        if not is_hotfix:
+            release_labels = self._issue_labels_casefold(release)
+            if 'back' in release_labels:
+                self._check_back_release_service_test_cycles(release_key)
+            if 'web' in release_labels:
+                self._check_web_release_service_test_cycles(release_key)
         self._check_bugs(release_key, is_hotfix=is_hotfix)
         self._check_stories(release_key)
         self._check_gigacode_pull_requests(release_key)
@@ -1038,9 +1145,7 @@ class ReleaseValidator:
             )
             return
 
-        raw_cycles = self.zephyr.get_test_cycles_for_issue(release_key)
-        cycles = [self._get_cycle_name_from_zephyr_item(cycle) for cycle in raw_cycles]
-        cycles = [(key, name) for key, name in cycles if key or name]
+        cycles = self._get_release_test_cycles(release_key)
 
         if not cycles:
             self._log_issue(
@@ -1145,6 +1250,108 @@ class ReleaseValidator:
                         f"Back release: для КЭ '{service_ke}' есть Story с 'Новая функциональность' = 'Да', "
                         f"но отсутствует ТЦ Zephyr по маске '{api_nf_mask_hint}'"
                     )
+
+    def _check_web_release_service_test_cycles(self, release_key: str) -> None:
+        """
+        Для web-релизов проверяет наличие Zephyr ТЦ по каждой КЭ:
+          - {release}.{КЭ}.ipad/pwa/safari/sberbrowser.НФ — если внутри КЭ есть Story
+            с "Новая функциональность" = "Да";
+          - {release}.{КЭ}.ipad.Регресс — обязательно;
+          - {release}.{КЭ}.pwa.Регресс — обязательно, кроме проекта NEUROUI;
+          - {release}.{КЭ}.safari.Регресс — обязательно;
+          - {release}.{КЭ}.sberbrowser.Регресс — обязательно.
+        """
+        print(f"\n📋 Проверка Web ТЦ Zephyr Scale по КЭ...")
+
+        services = self._collect_release_service_infos(release_key, "Web release")
+        if not services:
+            return
+
+        cycles = self._get_release_test_cycles(release_key)
+        if not cycles:
+            self._log_issue(
+                release_key,
+                "error",
+                f"Web release: Zephyr не вернул ТЦ по ключу релиза {release_key}"
+            )
+            return
+
+        print(f"   Web release: найдено КЭ={len(services)}, ТЦ по ключу релиза={len(cycles)}")
+
+        for service_info in services.values():
+            service_ke = str(service_info['display'])
+            issue_list = ', '.join(sorted(service_info['issue_keys']))
+            service_aliases = service_ke_name_aliases(service_ke)
+            project_keys = {str(project_key).casefold() for project_key in service_info.get('project_keys', set())}
+            is_neuroui = bool(project_keys) and project_keys <= {'neuroui'}
+
+            if service_info['has_nf_story']:
+                nf_mask_hint = build_cycle_mask_hint(
+                    release_key,
+                    service_aliases,
+                    WEB_DEVICE_BROWSER_NF_CHANNEL_ALIASES,
+                    'НФ',
+                )
+                nf_match = self._find_matching_cycle(
+                    cycles,
+                    release_key,
+                    service_ke,
+                    WEB_DEVICE_BROWSER_NF_CHANNEL_ALIASES,
+                    BACK_NF_CYCLE_ALIASES,
+                )
+                if nf_match:
+                    tc_key, tc_name = nf_match
+                    self._log_issue(
+                        release_key,
+                        "success",
+                        f"Web release: для КЭ '{service_ke}' найден iPad/PWA/Safari/SberBrowser НФ ТЦ "
+                        f"[{tc_key}] '{tc_name}' ✓"
+                    )
+                else:
+                    self._log_issue(
+                        release_key,
+                        "error",
+                        f"Web release: для КЭ '{service_ke}' есть Story с 'Новая функциональность' = 'Да', "
+                        f"но отсутствует ТЦ Zephyr по маске '{nf_mask_hint}'"
+                    )
+
+            regress_channels = WEB_REGRESS_CHANNELS_NEUROUI if is_neuroui else WEB_REGRESS_CHANNELS
+            for channel_name, channel_aliases in regress_channels:
+                regress_mask_hint = build_cycle_mask_hint(
+                    release_key,
+                    service_aliases,
+                    channel_aliases,
+                    'Регресс',
+                )
+                regress_match = self._find_matching_cycle(
+                    cycles,
+                    release_key,
+                    service_ke,
+                    channel_aliases,
+                    BACK_REGRESS_CYCLE_ALIASES,
+                )
+                if regress_match:
+                    tc_key, tc_name = regress_match
+                    self._log_issue(
+                        release_key,
+                        "success",
+                        f"Web release: для КЭ '{service_ke}' найден {channel_name} Регресс ТЦ "
+                        f"[{tc_key}] '{tc_name}' ✓"
+                    )
+                else:
+                    self._log_issue(
+                        release_key,
+                        "error",
+                        f"Web release: для КЭ '{service_ke}' ({issue_list}) отсутствует ТЦ Zephyr "
+                        f"по маске '{regress_mask_hint}'"
+                    )
+
+            if is_neuroui:
+                self._log_issue(
+                    release_key,
+                    "success",
+                    f"Web release: для КЭ '{service_ke}' проект NEUROUI — pwa.Регресс не требуется ✓"
+                )
 
     def _check_test_cycles(self, release_key: str):
         """
