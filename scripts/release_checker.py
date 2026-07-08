@@ -1214,24 +1214,31 @@ class ReleaseValidator:
     def _get_test_cycles_from_direct_cache_or_scan(self, release_key: str) -> list[dict]:
         """Найти ТЦ через локальный кэш или bounded direct scan по ключам HRPRELEASE-C..."""
         cached_cycles = self._get_cached_test_cycles_for_release(release_key)
-        if cached_cycles:
-            self._log_issue(
-                release_key,
-                "success",
-                "Zephyr: ТЦ найдены в локальном кэше direct-lookup: "
-                + ", ".join(sorted(self.zephyr.get_test_cycle_key(cycle) for cycle in cached_cycles))
-            )
-            return cached_cycles
-
         if not ZEPHYR_DIRECT_CYCLE_SCAN_ENABLED:
-            return []
+            if cached_cycles:
+                self._log_issue(
+                    release_key,
+                    "success",
+                    "Zephyr: ТЦ найдены в локальном кэше direct-lookup: "
+                    + ", ".join(sorted(self.zephyr.get_test_cycle_key(cycle) for cycle in cached_cycles))
+                )
+            return cached_cycles
 
         project_key = release_key.split('-', 1)[0] if '-' in release_key else ''
         if not project_key:
-            return []
+            return cached_cycles
 
         high_watermark = self._get_direct_scan_high_watermark(project_key)
         if not high_watermark:
+            if cached_cycles:
+                self._log_issue(
+                    release_key,
+                    "success",
+                    "Zephyr: ТЦ найдены в локальном кэше direct-lookup: "
+                    + ", ".join(sorted(self.zephyr.get_test_cycle_key(cycle) for cycle in cached_cycles))
+                )
+                self._save_zephyr_cycle_cache()
+                return cached_cycles
             self._log_issue(
                 release_key,
                 "warning",
@@ -1252,14 +1259,23 @@ class ReleaseValidator:
             if self._test_cycle_belongs_to_release(details, release_key):
                 found.append(details)
 
-        if found:
-            self._cache_release_cycles(release_key, found)
+        combined_by_key = {}
+        for cycle in cached_cycles + found:
+            cycle_key = self.zephyr.get_test_cycle_key(cycle)
+            if cycle_key:
+                combined_by_key[cycle_key] = cycle
+        combined = list(combined_by_key.values())
+
+        if combined:
+            self._cache_release_cycles(release_key, combined)
             self._save_zephyr_cycle_cache()
+            source_note = "кэш + обновление" if cached_cycles and found else ("кэш" if cached_cycles else "обновление")
             self._log_issue(
                 release_key,
                 "success",
-                f"Zephyr direct scan: найдено ТЦ={len(found)} в окне "
-                f"{project_key}-C{min_number}..{project_key}-C{high_watermark}"
+                f"Zephyr direct scan: ТЦ найдены ({source_note}), всего={len(combined)}, "
+                f"окно {project_key}-C{min_number}..{project_key}-C{high_watermark}: "
+                + ", ".join(sorted(combined_by_key.keys()))
             )
         else:
             self._save_zephyr_cycle_cache()
@@ -1269,7 +1285,7 @@ class ReleaseValidator:
                 f"Zephyr direct scan: в окне {project_key}-C{min_number}..{project_key}-C{high_watermark} "
                 "ТЦ релиза не найдены"
             )
-        return found
+        return combined
 
     def _get_cached_test_cycles_for_release(self, release_key: str) -> list[dict]:
         cycle_keys = self._zephyr_cycle_cache.get('release_map', {}).get(release_key, [])
@@ -4172,6 +4188,11 @@ def _diag_search(validator: 'ReleaseValidator', release_key: str, expected_cycle
     for cycle in cycles[:50]:
         cycle_key = validator.zephyr.get_test_cycle_key(cycle)
         cycle_name = validator.zephyr.get_test_cycle_name(cycle)
+        print(f"  -> {cycle_key} | {cycle_name}")
+
+    effective_cycles = validator._get_release_test_cycles(release_key)
+    print(f"\nEffective release cycles: {len(effective_cycles)}")
+    for cycle_key, cycle_name in effective_cycles[:50]:
         print(f"  -> {cycle_key} | {cycle_name}")
 
     metadata_sources = validator._collect_test_cycle_keys_from_jira_metadata_sources(release_key)
