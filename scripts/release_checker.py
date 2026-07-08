@@ -102,6 +102,17 @@ ZEPHYR_EXTENDED_CYCLE_DIAG = os.getenv("ZEPHYR_EXTENDED_CYCLE_DIAG", "0").lower(
     "true",
     "yes",
 )
+ZEPHYR_DIRECT_CYCLE_SCAN_ENABLED = os.getenv("ZEPHYR_DIRECT_CYCLE_SCAN_ENABLED", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+ZEPHYR_DIRECT_CYCLE_SCAN_LIMIT = int(os.getenv("ZEPHYR_DIRECT_CYCLE_SCAN_LIMIT", "120"))
+ZEPHYR_DIRECT_CYCLE_SCAN_FORWARD_LIMIT = int(os.getenv("ZEPHYR_DIRECT_CYCLE_SCAN_FORWARD_LIMIT", "20"))
+ZEPHYR_DIRECT_CYCLE_SCAN_START = os.getenv("ZEPHYR_DIRECT_CYCLE_SCAN_START", "").strip()
+ZEPHYR_CYCLE_CACHE_PATH = Path(
+    os.getenv("ZEPHYR_CYCLE_CACHE_PATH", str(parent_dir / "trash" / "zephyr_cycle_cache.json"))
+)
 
 # Имя кастомного поля "Вид тестирования" в Zephyr Scale ТК/ТЦ.
 # Поле ищется в customFields ответа API GET /rest/atm/1.0/testcase/{key}
@@ -1030,6 +1041,7 @@ class ReleaseValidator:
         self._zephyr_cycle_approved_checked: set[str] = set()
         self._zephyr_cycle_testing_type_checked: set[tuple[str, str]] = set()
         self._zephyr_cycle_search_debug_logged: set[str] = set()
+        self._zephyr_cycle_cache = self._load_zephyr_cycle_cache()
 
         try:
             self.myself = self.jira_main.myself()
@@ -1166,6 +1178,8 @@ class ReleaseValidator:
             raw_cycles = self.zephyr.get_test_cycles_for_issue(release_key)
             if not raw_cycles:
                 raw_cycles = self._get_test_cycles_from_jira_release_metadata(release_key)
+            if not raw_cycles:
+                raw_cycles = self._get_test_cycles_from_direct_cache_or_scan(release_key)
             cycles = [self._get_cycle_name_from_zephyr_item(cycle) for cycle in raw_cycles]
             self._zephyr_release_cycles_cache[release_key] = [
                 (key, name) for key, name in cycles if key or name
@@ -1196,6 +1210,161 @@ class ReleaseValidator:
                 + ", ".join(sorted(self.zephyr.get_test_cycle_key(cycle) for cycle in result))
             )
         return result
+
+    def _get_test_cycles_from_direct_cache_or_scan(self, release_key: str) -> list[dict]:
+        """Найти ТЦ через локальный кэш или bounded direct scan по ключам HRPRELEASE-C..."""
+        cached_cycles = self._get_cached_test_cycles_for_release(release_key)
+        if cached_cycles:
+            self._log_issue(
+                release_key,
+                "success",
+                "Zephyr: ТЦ найдены в локальном кэше direct-lookup: "
+                + ", ".join(sorted(self.zephyr.get_test_cycle_key(cycle) for cycle in cached_cycles))
+            )
+            return cached_cycles
+
+        if not ZEPHYR_DIRECT_CYCLE_SCAN_ENABLED:
+            return []
+
+        project_key = release_key.split('-', 1)[0] if '-' in release_key else ''
+        if not project_key:
+            return []
+
+        high_watermark = self._get_direct_scan_high_watermark(project_key)
+        if not high_watermark:
+            self._log_issue(
+                release_key,
+                "warning",
+                "Zephyr direct scan: нет стартового C-номера. "
+                "Запусти --diag-search с известным ключом ТЦ или задай ZEPHYR_DIRECT_CYCLE_SCAN_START."
+            )
+            return []
+
+        high_watermark = self._refresh_direct_scan_high_watermark(project_key, high_watermark)
+        min_number = max(1, high_watermark - ZEPHYR_DIRECT_CYCLE_SCAN_LIMIT + 1)
+        found = []
+
+        for cycle_number in range(high_watermark, min_number - 1, -1):
+            cycle_key = f"{project_key}-C{cycle_number}"
+            details = self._get_cached_or_fetch_cycle_details(project_key, cycle_key)
+            if not details:
+                continue
+            if self._test_cycle_belongs_to_release(details, release_key):
+                found.append(details)
+
+        if found:
+            self._cache_release_cycles(release_key, found)
+            self._save_zephyr_cycle_cache()
+            self._log_issue(
+                release_key,
+                "success",
+                f"Zephyr direct scan: найдено ТЦ={len(found)} в окне "
+                f"{project_key}-C{min_number}..{project_key}-C{high_watermark}"
+            )
+        else:
+            self._save_zephyr_cycle_cache()
+            self._log_issue(
+                release_key,
+                "warning",
+                f"Zephyr direct scan: в окне {project_key}-C{min_number}..{project_key}-C{high_watermark} "
+                "ТЦ релиза не найдены"
+            )
+        return found
+
+    def _get_cached_test_cycles_for_release(self, release_key: str) -> list[dict]:
+        cycle_keys = self._zephyr_cycle_cache.get('release_map', {}).get(release_key, [])
+        result = []
+        for cycle_key in cycle_keys:
+            details = self._get_cached_or_fetch_cycle_details(cycle_key.split('-C', 1)[0], cycle_key)
+            if details and self._test_cycle_belongs_to_release(details, release_key):
+                result.append(details)
+        return result
+
+    def _get_direct_scan_high_watermark(self, project_key: str) -> int:
+        if ZEPHYR_DIRECT_CYCLE_SCAN_START.isdigit():
+            return int(ZEPHYR_DIRECT_CYCLE_SCAN_START)
+        project_cache = self._zephyr_cycle_cache.get('projects', {}).get(project_key, {})
+        cached_max = project_cache.get('max_seen')
+        return int(cached_max) if str(cached_max).isdigit() else 0
+
+    def _refresh_direct_scan_high_watermark(self, project_key: str, high_watermark: int) -> int:
+        current = high_watermark
+        misses = 0
+        for cycle_number in range(high_watermark + 1, high_watermark + ZEPHYR_DIRECT_CYCLE_SCAN_FORWARD_LIMIT + 1):
+            cycle_key = f"{project_key}-C{cycle_number}"
+            details = self.zephyr.get_test_cycle_details(cycle_key)
+            if details:
+                self._cache_cycle_details(project_key, details)
+                current = cycle_number
+                misses = 0
+                continue
+            misses += 1
+            if misses >= 5:
+                break
+        return current
+
+    def _get_cached_or_fetch_cycle_details(self, project_key: str, cycle_key: str) -> Optional[dict]:
+        project_cache = self._zephyr_cycle_cache.setdefault('projects', {}).setdefault(project_key, {})
+        cycles_cache = project_cache.setdefault('cycles', {})
+        cached = cycles_cache.get(cycle_key)
+        if isinstance(cached, dict):
+            return cached
+
+        details = self.zephyr.get_test_cycle_details(cycle_key)
+        if details:
+            self._cache_cycle_details(project_key, details)
+        return details
+
+    def _cache_release_cycles(self, release_key: str, cycles: list[dict]) -> None:
+        release_map = self._zephyr_cycle_cache.setdefault('release_map', {})
+        cycle_keys = []
+        for cycle in cycles:
+            cycle_key = self.zephyr.get_test_cycle_key(cycle)
+            project_key = str(cycle.get('projectKey') or cycle_key.split('-C', 1)[0])
+            if not cycle_key:
+                continue
+            cycle_keys.append(cycle_key)
+            self._cache_cycle_details(project_key, cycle)
+        release_map[release_key] = sorted(set(cycle_keys))
+
+    def _cache_cycle_details(self, project_key: str, cycle_details: dict) -> None:
+        cycle_key = self.zephyr.get_test_cycle_key(cycle_details)
+        if not cycle_key:
+            return
+        project_cache = self._zephyr_cycle_cache.setdefault('projects', {}).setdefault(project_key, {})
+        cycles_cache = project_cache.setdefault('cycles', {})
+        cycles_cache[cycle_key] = cycle_details
+        match = re.search(r'-C(\d+)$', cycle_key)
+        if match:
+            project_cache['max_seen'] = max(int(project_cache.get('max_seen') or 0), int(match.group(1)))
+        issue_key = str(cycle_details.get('issueKey') or '')
+        if issue_key:
+            release_map = self._zephyr_cycle_cache.setdefault('release_map', {})
+            current = set(release_map.get(issue_key, []))
+            current.add(cycle_key)
+            release_map[issue_key] = sorted(current)
+
+    def _load_zephyr_cycle_cache(self) -> dict:
+        try:
+            if ZEPHYR_CYCLE_CACHE_PATH.exists():
+                data = json.loads(ZEPHYR_CYCLE_CACHE_PATH.read_text(encoding='utf-8'))
+                if isinstance(data, dict):
+                    data.setdefault('projects', {})
+                    data.setdefault('release_map', {})
+                    return data
+        except Exception:
+            pass
+        return {'projects': {}, 'release_map': {}}
+
+    def _save_zephyr_cycle_cache(self) -> None:
+        try:
+            ZEPHYR_CYCLE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            ZEPHYR_CYCLE_CACHE_PATH.write_text(
+                json.dumps(self._zephyr_cycle_cache, ensure_ascii=False, indent=2, sort_keys=True),
+                encoding='utf-8',
+            )
+        except Exception as e:
+            self._log_issue("GENERAL", "warning", f"Не удалось сохранить кэш Zephyr ТЦ: {e}")
 
     def _collect_test_cycle_keys_from_jira_metadata(self, release_key: str) -> set[str]:
         cycle_keys: set[str] = set()
@@ -2194,6 +2363,8 @@ class ReleaseValidator:
         cycles = self.zephyr.get_test_cycles_for_issue(release_key, issue_id=release_id)
         if not cycles:
             cycles = self._get_test_cycles_from_jira_release_metadata(release_key)
+        if not cycles:
+            cycles = self._get_test_cycles_from_direct_cache_or_scan(release_key)
 
         if not cycles:
             self._log_issue(
@@ -3945,6 +4116,10 @@ def _diag_search(validator: 'ReleaseValidator', release_key: str, expected_cycle
             if response.status_code == 200:
                 data = response.json()
                 raw = json.dumps(data, ensure_ascii=False)
+                if validator._test_cycle_belongs_to_release(data, release_key):
+                    validator._cache_release_cycles(release_key, [data])
+                    validator._save_zephyr_cycle_cache()
+                    print("  cached=yes")
                 print(f"  key={validator.zephyr.get_test_cycle_key(data) or data.get('key', '')}")
                 print(f"  name={validator.zephyr.get_test_cycle_name(data) or data.get('name', '')}")
                 print(f"  projectKey={data.get('projectKey', data.get('project', ''))}")
@@ -4013,6 +4188,11 @@ def _diag_search(validator: 'ReleaseValidator', release_key: str, expected_cycle
             print(f"  -> {cycle_key} | {validator.zephyr.get_test_cycle_name(details)} | belongs=no")
         else:
             print(f"  -> {cycle_key} | details=not found")
+
+    cached_cycles = validator._get_cached_test_cycles_for_release(release_key)
+    print(f"\nLocal Zephyr cycle cache: {len(cached_cycles)}")
+    for cycle in cached_cycles[:50]:
+        print(f"  -> {validator.zephyr.get_test_cycle_key(cycle)} | {validator.zephyr.get_test_cycle_name(cycle)}")
 
 
 if __name__ == "__main__":
