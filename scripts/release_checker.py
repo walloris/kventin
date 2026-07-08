@@ -5,6 +5,7 @@ import sys
 import re
 import time
 import html
+import json
 import urllib3
 import logging
 import requests
@@ -91,6 +92,11 @@ ZEPHYR_TEST_CYCLE_PROJECT_KEYS = tuple(
         if project_key.strip()
     )
 )
+ZEPHYR_ENABLE_FULL_CYCLE_SCAN = os.getenv("ZEPHYR_ENABLE_FULL_CYCLE_SCAN", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 # Имя кастомного поля "Вид тестирования" в Zephyr Scale ТК/ТЦ.
 # Поле ищется в customFields ответа API GET /rest/atm/1.0/testcase/{key}
@@ -104,6 +110,7 @@ ZEPHYR_TESTING_TYPE_REGRESSION = "Регресс"
 
 # В релизе и каждой Story/Bug должен быть указан технический контур.
 REQUIRED_PLATFORM_LABELS = {'web', 'back', 'mobile'}
+TEST_CYCLE_KEY_RE = re.compile(r'\b[A-Z][A-Z0-9]+-C\d+\b')
 
 # Название Jira-поля с КЭ в разных инсталляциях может отличаться, поэтому
 # ищем field id по metadata Jira, а не хардкодим customfield_*.
@@ -429,6 +436,8 @@ class ZephyrScaleClient:
             return [item for item in data if isinstance(item, dict)]
         if not isinstance(data, dict):
             return []
+        if ZephyrScaleClient.get_test_cycle_key(data):
+            return [data]
         collection_keys = (
             'results',
             'testRuns',
@@ -499,6 +508,21 @@ class ZephyrScaleClient:
             result.append(normalized)
         return result
 
+    @staticmethod
+    def _issue_link_endpoint_paths(issue_key: str) -> list[tuple[str, str]]:
+        return [
+            ('issuelink/testruns', f'/rest/atm/1.0/issuelink/{issue_key}/testruns'),
+            ('issuelink/testRuns', f'/rest/atm/1.0/issuelink/{issue_key}/testRuns'),
+            ('issuelink/testrun', f'/rest/atm/1.0/issuelink/{issue_key}/testrun'),
+            ('issuelink/testcycles', f'/rest/atm/1.0/issuelink/{issue_key}/testcycles'),
+            ('issuelink/testCycles', f'/rest/atm/1.0/issuelink/{issue_key}/testCycles'),
+            ('issuelink/testcycle', f'/rest/atm/1.0/issuelink/{issue_key}/testcycle'),
+            ('issue/testruns', f'/rest/atm/1.0/issue/{issue_key}/testruns'),
+            ('issue/testRuns', f'/rest/atm/1.0/issue/{issue_key}/testRuns'),
+            ('issue/testcycles', f'/rest/atm/1.0/issue/{issue_key}/testcycles'),
+            ('issue/testCycles', f'/rest/atm/1.0/issue/{issue_key}/testCycles'),
+        ]
+
     def get_test_cycles_for_issue(
         self,
         issue_key: str,
@@ -551,32 +575,39 @@ class ZephyrScaleClient:
         return result
 
     def _get_test_cycles_by_issue_link(self, issue_key: str) -> list[dict]:
-        """Быстрый поиск ТЦ, связанных с Jira-задачей, через Zephyr issuelink."""
-        url = f"{self.base_url}/rest/atm/1.0/issuelink/{issue_key}/testruns"
-        try:
-            response = self._get_with_retries(url)
-            if response.status_code != 200:
+        """Быстрый поиск ТЦ, связанных с Jira-задачей, через Zephyr issue endpoints."""
+        result = []
+        for endpoint_name, endpoint_path in self._issue_link_endpoint_paths(issue_key):
+            url = f"{self.base_url}{endpoint_path}"
+            try:
+                response = self._get_with_retries(url)
+                if response.status_code != 200:
+                    self.last_test_cycle_search_stats.append({
+                        'mode': 'issuelink',
+                        'endpoint': endpoint_name,
+                        'status': response.status_code,
+                        'count': 0,
+                        'body': response.text[:200] if response.status_code not in (401, 403, 404) else '',
+                    })
+                    continue
+                items = self._extract_zephyr_collection(response.json())
                 self.last_test_cycle_search_stats.append({
                     'mode': 'issuelink',
+                    'endpoint': endpoint_name,
                     'status': response.status_code,
-                    'count': 0,
+                    'count': len(items),
                 })
-                return []
-            items = self._extract_zephyr_collection(response.json())
-            self.last_test_cycle_search_stats.append({
-                'mode': 'issuelink',
-                'status': response.status_code,
-                'count': len(items),
-            })
-            return items
-        except Exception as e:
-            self.last_test_cycle_search_stats.append({
-                'mode': 'issuelink',
-                'status': 'exception',
-                'count': 0,
-                'error': str(e),
-            })
-            return []
+                if items:
+                    result.extend(items)
+            except Exception as e:
+                self.last_test_cycle_search_stats.append({
+                    'mode': 'issuelink',
+                    'endpoint': endpoint_name,
+                    'status': 'exception',
+                    'count': 0,
+                    'error': str(e),
+                })
+        return result
 
     def _search_test_cycles_by_name(self, project_key: str, issue_key: str) -> list[dict]:
         """
@@ -587,6 +618,17 @@ class ZephyrScaleClient:
         targeted = self._search_test_cycles_by_name_query(project_key, issue_key)
         if targeted:
             return targeted
+        if not ZEPHYR_ENABLE_FULL_CYCLE_SCAN:
+            self.last_test_cycle_search_stats.append({
+                'mode': 'search',
+                'project_key': project_key,
+                'status': 'skipped',
+                'pages': 0,
+                'total_seen': 0,
+                'count': 0,
+                'error': 'full project scan disabled',
+            })
+            return []
 
         url = f"{self.base_url}/rest/atm/1.0/testrun/search"
         query = f'projectKey = "{project_key}"'
@@ -604,7 +646,9 @@ class ZephyrScaleClient:
                     url,
                     params={'query': query, 'maxResults': page_size, 'startAt': start_at},
                 )
-            except Exception:
+            except Exception as e:
+                status = 'exception'
+                search_error = str(e)
                 break
 
             status = response.status_code
@@ -637,6 +681,7 @@ class ZephyrScaleClient:
             'pages': pages,
             'total_seen': total_seen,
             'count': len(matched),
+            'error': locals().get('search_error', ''),
         })
         return matched
 
@@ -700,7 +745,11 @@ class ZephyrScaleClient:
             mode = stat.get('mode', 'unknown')
             if mode == 'issuelink':
                 suffix = f", error={stat.get('error')}" if stat.get('error') else ""
-                print(f"      issuelink: status={stat.get('status')}, found={stat.get('count')}{suffix}")
+                body = f", body={stat.get('body')}" if stat.get('body') else ""
+                print(
+                    f"      {stat.get('endpoint', 'issuelink')}: "
+                    f"status={stat.get('status')}, found={stat.get('count')}{suffix}{body}"
+                )
             elif mode == 'search-name':
                 suffix = f", error={stat.get('error')}" if stat.get('error') else ""
                 body = f", body={stat.get('body')}" if stat.get('body') else ""
@@ -710,10 +759,11 @@ class ZephyrScaleClient:
                     f"matched={stat.get('count')}{suffix}{body}"
                 )
             elif mode == 'search':
+                suffix = f", error={stat.get('error')}" if stat.get('error') else ""
                 print(
                     f"      search projectKey={stat.get('project_key')}: "
                     f"status={stat.get('status')}, pages={stat.get('pages')}, "
-                    f"seen={stat.get('total_seen')}, matched={stat.get('count')}"
+                    f"seen={stat.get('total_seen')}, matched={stat.get('count')}{suffix}"
                 )
 
     def get_test_cycle_details(self, tc_key: str) -> Optional[dict]:
@@ -966,6 +1016,8 @@ class ReleaseValidator:
         """Один кэшированный Zephyr-поиск ТЦ по ключу релиза."""
         if release_key not in self._zephyr_release_cycles_cache:
             raw_cycles = self.zephyr.get_test_cycles_for_issue(release_key)
+            if not raw_cycles:
+                raw_cycles = self._get_test_cycles_from_jira_release_metadata(release_key)
             cycles = [self._get_cycle_name_from_zephyr_item(cycle) for cycle in raw_cycles]
             self._zephyr_release_cycles_cache[release_key] = [
                 (key, name) for key, name in cycles if key or name
@@ -973,6 +1025,105 @@ class ReleaseValidator:
             if not self._zephyr_release_cycles_cache[release_key]:
                 self._log_test_cycle_search_debug(release_key)
         return self._zephyr_release_cycles_cache[release_key]
+
+    def _get_test_cycles_from_jira_release_metadata(self, release_key: str) -> list[dict]:
+        """Попробовать найти ключи ТЦ в Jira metadata релиза и открыть ТЦ напрямую."""
+        cycle_keys = self._collect_test_cycle_keys_from_jira_metadata(release_key)
+        if not cycle_keys:
+            return []
+
+        result = []
+        for cycle_key in sorted(cycle_keys):
+            details = self._get_test_cycle_details_cached(cycle_key)
+            if not details:
+                continue
+            if self._test_cycle_belongs_to_release(details, release_key):
+                result.append(details)
+
+        if result:
+            self._log_issue(
+                release_key,
+                "success",
+                f"Zephyr: ТЦ найдены через Jira metadata релиза: "
+                + ", ".join(sorted(self.zephyr.get_test_cycle_key(cycle) for cycle in result))
+            )
+        return result
+
+    def _collect_test_cycle_keys_from_jira_metadata(self, release_key: str) -> set[str]:
+        cycle_keys: set[str] = set()
+        cycle_keys.update(self._collect_test_cycle_keys_from_remote_links(release_key))
+        cycle_keys.update(self._collect_test_cycle_keys_from_issue_properties(release_key))
+
+        release_project = release_key.split('-', 1)[0] if '-' in release_key else ''
+        if release_project:
+            return {
+                cycle_key for cycle_key in cycle_keys
+                if cycle_key.casefold().startswith(f"{release_project}-c".casefold())
+            }
+        return cycle_keys
+
+    def _collect_test_cycle_keys_from_remote_links(self, release_key: str) -> set[str]:
+        url = f"{config['jira']['url'].rstrip('/')}/rest/api/2/issue/{release_key}/remotelink"
+        try:
+            response = self.jira_http.get(url, timeout=12)
+            if response.status_code != 200:
+                return set()
+            return self._extract_test_cycle_keys(response.json())
+        except Exception:
+            return set()
+
+    def _collect_test_cycle_keys_from_issue_properties(self, release_key: str) -> set[str]:
+        base_url = config['jira']['url'].rstrip('/')
+        url = f"{base_url}/rest/api/2/issue/{release_key}/properties"
+        try:
+            response = self.jira_http.get(url, timeout=12)
+            if response.status_code != 200:
+                return set()
+            data = response.json()
+        except Exception:
+            return set()
+
+        cycle_keys = self._extract_test_cycle_keys(data)
+        property_keys = []
+        for item in data.get('keys', []) if isinstance(data, dict) else []:
+            property_key = item.get('key', '') if isinstance(item, dict) else ''
+            if property_key and self._is_relevant_jira_property_key(property_key):
+                property_keys.append(property_key)
+
+        for property_key in property_keys[:30]:
+            property_url = f"{url}/{property_key}"
+            try:
+                property_response = self.jira_http.get(property_url, timeout=12)
+                if property_response.status_code == 200:
+                    cycle_keys.update(self._extract_test_cycle_keys(property_response.json()))
+            except Exception:
+                continue
+        return cycle_keys
+
+    @staticmethod
+    def _is_relevant_jira_property_key(property_key: str) -> bool:
+        property_key_lower = property_key.casefold()
+        return any(
+            marker in property_key_lower
+            for marker in ('zephyr', 'tm4j', 'atm', 'test', 'cycle', 'run')
+        )
+
+    @staticmethod
+    def _extract_test_cycle_keys(payload: object) -> set[str]:
+        try:
+            text = json.dumps(payload, ensure_ascii=False)
+        except Exception:
+            text = str(payload)
+        return set(TEST_CYCLE_KEY_RE.findall(text))
+
+    @staticmethod
+    def _test_cycle_belongs_to_release(cycle_details: dict, release_key: str) -> bool:
+        if str(cycle_details.get('issueKey', '')).casefold() == release_key.casefold():
+            return True
+        try:
+            return release_key.casefold() in json.dumps(cycle_details, ensure_ascii=False).casefold()
+        except Exception:
+            return False
 
     def _log_test_cycle_search_debug(self, release_key: str) -> None:
         if release_key in self._zephyr_cycle_search_debug_logged:
@@ -991,7 +1142,10 @@ class ReleaseValidator:
         for stat in self.zephyr.last_test_cycle_search_stats:
             mode = stat.get('mode')
             if mode == 'issuelink':
-                parts.append(f"issuelink status={stat.get('status')} found={stat.get('count')}")
+                parts.append(
+                    f"{stat.get('endpoint', 'issuelink')} "
+                    f"status={stat.get('status')} found={stat.get('count')}"
+                )
             elif mode == 'search-name':
                 parts.append(
                     f"search-name projectKey={stat.get('project_key')} "
@@ -1001,6 +1155,7 @@ class ReleaseValidator:
                 parts.append(
                     f"search projectKey={stat.get('project_key')} status={stat.get('status')} "
                     f"pages={stat.get('pages')} seen={stat.get('total_seen')} matched={stat.get('count')}"
+                    + (f" error={stat.get('error')}" if stat.get('error') else "")
                 )
         return "; ".join(parts)
 
@@ -1851,6 +2006,8 @@ class ReleaseValidator:
 
         # --- Получаем ТЦ, привязанные к релизу ---
         cycles = self.zephyr.get_test_cycles_for_issue(release_key, issue_id=release_id)
+        if not cycles:
+            cycles = self._get_test_cycles_from_jira_release_metadata(release_key)
 
         if not cycles:
             self._log_issue(
@@ -1864,12 +2021,12 @@ class ReleaseValidator:
         # Собираем детали каждого ТЦ
         cycle_details = []  # список (key, name, name_lower, details)
         for tc_raw in cycles:
-            tc_key = tc_raw.get('key', '')
-            details = self.zephyr.get_test_cycle_details(tc_key)
+            tc_key = self.zephyr.get_test_cycle_key(tc_raw)
+            details = self.zephyr.get_test_cycle_details(tc_key) if tc_key else None
             if details:
-                name = details.get('name', tc_raw.get('name', ''))
+                name = self.zephyr.get_test_cycle_name(details) or self.zephyr.get_test_cycle_name(tc_raw)
             else:
-                name = tc_raw.get('name', '')
+                name = self.zephyr.get_test_cycle_name(tc_raw)
             cycle_details.append((tc_key, name, name.lower(), details))
 
         # --- Проверяем Story с НФ для правила 2 ---
@@ -3621,7 +3778,11 @@ def _diag_search(validator: 'ReleaseValidator', release_key: str, expected_cycle
         mode = stat.get('mode', 'unknown')
         if mode == 'issuelink':
             suffix = f", error={stat.get('error')}" if stat.get('error') else ""
-            print(f"  issuelink: status={stat.get('status')}, found={stat.get('count')}{suffix}")
+            body = f", body={stat.get('body')}" if stat.get('body') else ""
+            print(
+                f"  {stat.get('endpoint', 'issuelink')}: "
+                f"status={stat.get('status')}, found={stat.get('count')}{suffix}{body}"
+            )
         elif mode == 'search-name':
             suffix = f", error={stat.get('error')}" if stat.get('error') else ""
             body = f", body={stat.get('body')}" if stat.get('body') else ""
@@ -3631,10 +3792,11 @@ def _diag_search(validator: 'ReleaseValidator', release_key: str, expected_cycle
                 f"matched={stat.get('count')}{suffix}{body}"
             )
         elif mode == 'search':
+            suffix = f", error={stat.get('error')}" if stat.get('error') else ""
             print(
                 f"  search projectKey={stat.get('project_key')}: "
                 f"status={stat.get('status')}, pages={stat.get('pages')}, "
-                f"seen={stat.get('total_seen')}, matched={stat.get('count')}"
+                f"seen={stat.get('total_seen')}, matched={stat.get('count')}{suffix}"
             )
 
     print(f"\nFound cycles: {len(cycles)}")
@@ -3642,6 +3804,17 @@ def _diag_search(validator: 'ReleaseValidator', release_key: str, expected_cycle
         cycle_key = validator.zephyr.get_test_cycle_key(cycle)
         cycle_name = validator.zephyr.get_test_cycle_name(cycle)
         print(f"  -> {cycle_key} | {cycle_name}")
+
+    metadata_cycle_keys = validator._collect_test_cycle_keys_from_jira_metadata(release_key)
+    print(f"\nJira metadata cycle keys: {len(metadata_cycle_keys)}")
+    for cycle_key in sorted(metadata_cycle_keys)[:50]:
+        details = validator._get_test_cycle_details_cached(cycle_key)
+        if details and validator._test_cycle_belongs_to_release(details, release_key):
+            print(f"  -> {cycle_key} | {validator.zephyr.get_test_cycle_name(details)} | belongs=yes")
+        elif details:
+            print(f"  -> {cycle_key} | {validator.zephyr.get_test_cycle_name(details)} | belongs=no")
+        else:
+            print(f"  -> {cycle_key} | details=not found")
 
 
 if __name__ == "__main__":
