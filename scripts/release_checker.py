@@ -1876,12 +1876,11 @@ class ReleaseValidator:
         """
         Проверяет для каждой задачи внутри релиза:
           1. Все прилинкованные ТК из HRPQA в статусе 'Approved'.
-          2. «Вид тестирования» в ТК:
-             - Bug/Defect/Ошибка → всегда «Регресс»
+          2. «Вид тестирования» у прилинкованных ТК:
+             - Bug/Defect/Ошибка → «Регресс»
              - Story с customfield_24000 = «Да» → «Новый функционал»
              - Story с customfield_24000 = «Нет» → «Регресс»
              - Прочие типы задач → проверка не выполняется
-          3. Hotfix: ТК к багам не должны иметь «Новый функционал» (явная проверка)
         """
         print(f"\n🧪 Проверка статусов ТК Zephyr Scale (проект {ZEPHYR_TC_PROJECT_KEY})...")
 
@@ -1895,23 +1894,6 @@ class ReleaseValidator:
 
         # Маппинг issue_key → ожидаемый «Вид тестирования»
         expected_type_map = self._build_expected_testing_type_map(linked_keys)
-
-        # Для хотфикса собираем множество ключей багов — понадобится в цикле
-        hotfix_bug_keys: set[str] = set()
-        if is_hotfix:
-            BUG_TYPES_LOWER = {'bug', 'defect', 'ошибка'}
-            try:
-                keys_str = ",".join(linked_keys)
-                hotfix_issues = self.jira_main.search_issues(
-                    f'key in ({keys_str})',
-                    fields='issuetype',
-                    maxResults=500
-                )
-                for hi in hotfix_issues:
-                    if hi.fields.issuetype.name.lower() in BUG_TYPES_LOWER:
-                        hotfix_bug_keys.add(hi.key)
-            except Exception:
-                pass
 
         total_tc_checked = 0
         total_not_approved = 0
@@ -1972,7 +1954,7 @@ class ReleaseValidator:
                     )
 
                 # --- Проверка 2: «Вид тестирования» ---
-                if expected_testing_type or issue_key in hotfix_bug_keys:
+                if expected_testing_type:
                     if tc_details:
                         actual_type = self.zephyr.get_test_case_custom_field(
                             tc_details, ZEPHYR_TESTING_TYPE_FIELD
@@ -1984,15 +1966,7 @@ class ReleaseValidator:
                                 f"не найдено в кастомных полях ТК"
                             )
                         else:
-                            # Hotfix: ТК бага не должен иметь «Новый функционал»
-                            if issue_key in hotfix_bug_keys and actual_type.strip().lower() == ZEPHYR_TESTING_TYPE_NEW.strip().lower():
-                                self._log_issue(
-                                    issue_key, "error",
-                                    f"Hotfix: Zephyr ТК [{tc_key}] «{tc_name}»: "
-                                    f"'{ZEPHYR_TESTING_TYPE_FIELD}' = '{actual_type}' — "
-                                    f"для хотфикса запрещён '{ZEPHYR_TESTING_TYPE_NEW}', допустим только '{ZEPHYR_TESTING_TYPE_REGRESSION}'"
-                                )
-                            elif expected_testing_type and actual_type.strip().lower() != expected_testing_type.strip().lower():
+                            if actual_type.strip().lower() != expected_testing_type.strip().lower():
                                 self._log_issue(
                                     issue_key, "error",
                                     f"Zephyr ТК [{tc_key}] «{tc_name}»: '{ZEPHYR_TESTING_TYPE_FIELD}' = "
@@ -2018,20 +1992,21 @@ class ReleaseValidator:
 
     def _build_expected_testing_type_map(self, linked_keys: list[str]) -> dict[str, str]:
         """
-        Для каждой задачи из состава релиза определяет ожидаемый «Вид тестирования».
+        Для Story/Bug/Defect из состава релиза определяет ожидаемый
+        «Вид тестирования» у прилинкованных ТК.
 
         Правила:
-          Bug / Defect / Ошибка  → всегда 'Регресс'
+          Bug / Defect / Ошибка  → 'Регресс'
           Story, customfield_24000 = 'Да'  → 'Новый функционал'
           Story, customfield_24000 = 'Нет' → 'Регресс'
-          Прочие типы (если нет customfield_24000) → не попадают в маппинг
+          Прочие типы → не попадают в маппинг.
 
         Возвращает dict: issue_key → ожидаемый вид тестирования.
         Если задача не попала в словарь — проверка вида тестирования не выполняется.
         """
         result = {}
         keys_str = ",".join(linked_keys)
-        BUG_TYPES = {'bug', 'defect', 'ошибка'}
+        bug_types = {'bug', 'defect', 'ошибка'}
 
         try:
             issues = self.jira_main.search_issues(
@@ -2045,8 +2020,7 @@ class ReleaseValidator:
         for issue in issues:
             issue_type = issue.fields.issuetype.name.lower() if issue.fields.issuetype else ''
 
-            # Баги — всегда «Регресс»
-            if issue_type in BUG_TYPES:
+            if issue_type in bug_types:
                 result[issue.key] = ZEPHYR_TESTING_TYPE_REGRESSION
                 continue
 
