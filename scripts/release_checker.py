@@ -113,6 +113,9 @@ ZEPHYR_DIRECT_CYCLE_SCAN_START = os.getenv("ZEPHYR_DIRECT_CYCLE_SCAN_START", "13
 ZEPHYR_CYCLE_CACHE_PATH = Path(
     os.getenv("ZEPHYR_CYCLE_CACHE_PATH", str(parent_dir / "trash" / "zephyr_cycle_cache.json"))
 )
+ZEPHYR_REQUEST_TIMEOUT_SECONDS = int(os.getenv("ZEPHYR_REQUEST_TIMEOUT_SECONDS", "10"))
+ZEPHYR_MAX_RETRIES_PER_REQUEST = int(os.getenv("ZEPHYR_MAX_RETRIES_PER_REQUEST", "3"))
+ZEPHYR_MAX_FAILED_REQUESTS = int(os.getenv("ZEPHYR_MAX_FAILED_REQUESTS", "10"))
 
 # Имя кастомного поля "Вид тестирования" в Zephyr Scale ТК/ТЦ.
 # Поле ищется в customFields ответа API GET /rest/atm/1.0/testcase/{key}
@@ -352,8 +355,11 @@ class ZephyrScaleClient:
     def __init__(self, base_url: str, token: str, verify_ssl: bool = False):
         self.base_url = base_url.rstrip('/')
         self.verify_ssl = verify_ssl
-        self.max_retries = 3
+        self.max_retries = ZEPHYR_MAX_RETRIES_PER_REQUEST
         self.retry_backoff_seconds = 2
+        self.request_timeout_seconds = ZEPHYR_REQUEST_TIMEOUT_SECONDS
+        self.max_failed_requests = ZEPHYR_MAX_FAILED_REQUESTS
+        self.failed_requests = 0
         self.retry_status_codes = {429, 500, 502, 503, 504}
         self.session = requests.Session()
         self.session.verify = verify_ssl
@@ -363,18 +369,40 @@ class ZephyrScaleClient:
         })
         self.last_test_cycle_search_stats: list[dict] = []
 
+    def _raise_if_failed_request_limit_reached(self) -> None:
+        if self.failed_requests >= self.max_failed_requests:
+            raise RuntimeError(
+                "Zephyr API: лимит неуспешных запросов исчерпан "
+                f"({self.failed_requests}/{self.max_failed_requests}); "
+                "дальнейшие Zephyr-запросы остановлены"
+            )
+
+    def _mark_failed_request(self, reason: str) -> None:
+        self.failed_requests += 1
+        print(
+            f"   ⚠️ Zephyr API: неуспешный запрос {self.failed_requests}/{self.max_failed_requests}"
+            f" ({reason})"
+        )
+
     def _get_with_retries(self, url: str, **kwargs) -> requests.Response:
-        kwargs.setdefault('timeout', 30)
+        self._raise_if_failed_request_limit_reached()
+        kwargs.setdefault('timeout', self.request_timeout_seconds)
         last_exception = None
 
         for attempt in range(1, self.max_retries + 1):
             try:
                 response = self.session.get(url, **kwargs)
-                if response.status_code not in self.retry_status_codes or attempt == self.max_retries:
+                if response.status_code not in self.retry_status_codes:
+                    return response
+                if attempt == self.max_retries:
+                    self._mark_failed_request(f"HTTP {response.status_code}")
+                    self._raise_if_failed_request_limit_reached()
                     return response
             except requests.RequestException as e:
                 last_exception = e
                 if attempt == self.max_retries:
+                    self._mark_failed_request(str(e))
+                    self._raise_if_failed_request_limit_reached()
                     raise
 
             sleep_seconds = self.retry_backoff_seconds * attempt
@@ -390,8 +418,18 @@ class ZephyrScaleClient:
 
     def _get_once(self, url: str, **kwargs) -> requests.Response:
         """Один быстрый GET без ретраев для диагностических/спекулятивных endpoint'ов."""
-        kwargs.setdefault('timeout', 12)
-        return self.session.get(url, **kwargs)
+        self._raise_if_failed_request_limit_reached()
+        kwargs.setdefault('timeout', self.request_timeout_seconds)
+        try:
+            response = self.session.get(url, **kwargs)
+        except requests.RequestException as e:
+            self._mark_failed_request(str(e))
+            self._raise_if_failed_request_limit_reached()
+            raise
+        if response.status_code in self.retry_status_codes:
+            self._mark_failed_request(f"HTTP {response.status_code}")
+            self._raise_if_failed_request_limit_reached()
+        return response
 
     def get_test_cases_for_issue(self, issue_key: str) -> tuple[list[dict], Optional[str]]:
         """
