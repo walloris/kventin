@@ -80,15 +80,14 @@ ALLOWED_TESTERS = {
 # Статус ТК, который считается утверждённым (Approved)
 ZEPHYR_APPROVED_STATUS = "Approved"
 
-# Пространство проекта, в котором лежат тест-кейсы.
-# Важно: ТЦ живут в отдельном Zephyr-пространстве, обычно в projectKey релиза
-# (например, HRPRELEASE-C1181), а не в HRPQA.
+# Пространство Zephyr, в котором лежат тест-кейсы и тест-циклы.
+# Ключ ТЦ выглядит как HRPQA-C133028.
 ZEPHYR_TEST_CASE_PROJECT_KEY = "HRPQA"
 ZEPHYR_TC_PROJECT_KEY = ZEPHYR_TEST_CASE_PROJECT_KEY
 ZEPHYR_TEST_CYCLE_PROJECT_KEYS = tuple(
     dict.fromkeys(
         project_key.strip()
-        for project_key in os.getenv("ZEPHYR_TEST_CYCLE_PROJECT_KEYS", "").split(",")
+        for project_key in os.getenv("ZEPHYR_TEST_CYCLE_PROJECT_KEYS", ZEPHYR_TEST_CASE_PROJECT_KEY).split(",")
         if project_key.strip()
     )
 )
@@ -571,10 +570,8 @@ class ZephyrScaleClient:
         """
         Возвращает список ТЦ, привязанных к релизу.
 
-        ТЦ лежат в Zephyr-пространстве релиза (например, HRPRELEASE-C1181),
-        а ТК — в отдельном пространстве HRPQA. Поэтому сначала берем быстрый
-        issuelink по release key, а fallback-поиск по name делаем только в
-        projectKey ТЦ, не в projectKey ТК.
+        ТЦ и ТК лежат в Zephyr-пространстве HRPQA. Ключ ТЦ выглядит как
+        HRPQA-C133028; связь с релизом проверяем по issueKey внутри ТЦ.
         """
         del issue_id  # Zephyr Server/DC на этом инстансе ищем по ключу релиза.
         self.last_test_cycle_search_stats = []
@@ -582,10 +579,8 @@ class ZephyrScaleClient:
         seen_keys: set[str] = set()
         result: list[dict] = []
 
-        issue_project = issue_key.split('-')[0] if '-' in issue_key else ''
         project_keys_to_try = self._dedupe_project_keys(
-            [issue_project]
-            + list(cycle_project_keys or [])
+            list(cycle_project_keys or [])
             + list(ZEPHYR_TEST_CYCLE_PROJECT_KEYS)
         )
 
@@ -1212,7 +1207,7 @@ class ReleaseValidator:
         return result
 
     def _get_test_cycles_from_direct_cache_or_scan(self, release_key: str) -> list[dict]:
-        """Найти ТЦ через локальный кэш или bounded direct scan по ключам HRPRELEASE-C..."""
+        """Найти ТЦ через локальный кэш или bounded direct scan по ключам HRPQA-C..."""
         cached_cycles = self._get_cached_test_cycles_for_release(release_key)
         if not ZEPHYR_DIRECT_CYCLE_SCAN_ENABLED:
             if cached_cycles:
@@ -1224,7 +1219,7 @@ class ReleaseValidator:
                 )
             return cached_cycles
 
-        project_key = release_key.split('-', 1)[0] if '-' in release_key else ''
+        project_key = self._primary_test_cycle_project_key()
         if not project_key:
             return cached_cycles
 
@@ -1291,10 +1286,21 @@ class ReleaseValidator:
         cycle_keys = self._zephyr_cycle_cache.get('release_map', {}).get(release_key, [])
         result = []
         for cycle_key in cycle_keys:
+            if not self._is_allowed_test_cycle_key(cycle_key):
+                continue
             details = self._get_cached_or_fetch_cycle_details(cycle_key.split('-C', 1)[0], cycle_key)
             if details and self._test_cycle_belongs_to_release(details, release_key):
                 result.append(details)
         return result
+
+    @staticmethod
+    def _primary_test_cycle_project_key() -> str:
+        return ZEPHYR_TEST_CYCLE_PROJECT_KEYS[0] if ZEPHYR_TEST_CYCLE_PROJECT_KEYS else ZEPHYR_TEST_CASE_PROJECT_KEY
+
+    @staticmethod
+    def _is_allowed_test_cycle_key(cycle_key: str) -> bool:
+        allowed_prefixes = {f"{project_key}-c".casefold() for project_key in ZEPHYR_TEST_CYCLE_PROJECT_KEYS}
+        return not allowed_prefixes or any(str(cycle_key).casefold().startswith(prefix) for prefix in allowed_prefixes)
 
     def _get_direct_scan_high_watermark(self, project_key: str) -> int:
         if ZEPHYR_DIRECT_CYCLE_SCAN_START.isdigit():
@@ -1338,6 +1344,8 @@ class ReleaseValidator:
             cycle_key = self.zephyr.get_test_cycle_key(cycle)
             project_key = str(cycle.get('projectKey') or cycle_key.split('-C', 1)[0])
             if not cycle_key:
+                continue
+            if not self._is_allowed_test_cycle_key(cycle_key):
                 continue
             cycle_keys.append(cycle_key)
             self._cache_cycle_details(project_key, cycle)
@@ -1387,13 +1395,11 @@ class ReleaseValidator:
         for keys in self._collect_test_cycle_keys_from_jira_metadata_sources(release_key).values():
             cycle_keys.update(keys)
 
-        release_project = release_key.split('-', 1)[0] if '-' in release_key else ''
-        if release_project:
-            return {
-                cycle_key for cycle_key in cycle_keys
-                if cycle_key.casefold().startswith(f"{release_project}-c".casefold())
-            }
-        return cycle_keys
+        allowed_prefixes = {f"{project_key}-c".casefold() for project_key in ZEPHYR_TEST_CYCLE_PROJECT_KEYS}
+        return {
+            cycle_key for cycle_key in cycle_keys
+            if not allowed_prefixes or any(cycle_key.casefold().startswith(prefix) for prefix in allowed_prefixes)
+        }
 
     def _collect_test_cycle_keys_from_jira_metadata_sources(self, release_key: str) -> dict[str, set[str]]:
         return {
@@ -4219,12 +4225,12 @@ def _diag_search(validator: 'ReleaseValidator', release_key: str, expected_cycle
 if __name__ == "__main__":
     validator = ReleaseValidator()
 
-    # Диагностика: python scripts/release_checker.py --diag-tc HRPRELEASE-C967
+    # Диагностика: python scripts/release_checker.py --diag-tc HRPQA-C133028
     if len(sys.argv) >= 3 and sys.argv[1] == '--diag-tc':
         _diag_tc(validator, sys.argv[2])
         sys.exit(0)
 
-    # Диагностика: python scripts/release_checker.py --diag-search HRPRELEASE-120111 [HRPRELEASE-C967]
+    # Диагностика: python scripts/release_checker.py --diag-search HRPRELEASE-120111 [HRPQA-C133028]
     if len(sys.argv) >= 3 and sys.argv[1] == '--diag-search':
         _diag_search(validator, sys.argv[2], sys.argv[3] if len(sys.argv) >= 4 else '')
         sys.exit(0)
