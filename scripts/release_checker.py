@@ -377,6 +377,9 @@ class ZephyrScaleClient:
                 "дальнейшие Zephyr-запросы остановлены"
             )
 
+    def is_failed_request_limit_reached(self) -> bool:
+        return self.failed_requests >= self.max_failed_requests
+
     def _mark_failed_request(self, reason: str) -> None:
         self.failed_requests += 1
         print(
@@ -1089,6 +1092,7 @@ class ReleaseValidator:
         self._zephyr_release_cycles_cache: dict[str, list[tuple[str, str]]] = {}
         self._consist_of_cache: dict[str, list[str]] = {}
         self._release_service_infos_cache: dict[str, Optional[dict[str, dict[str, object]]]] = {}
+        self._zephyr_issue_test_cases_cache: dict[str, tuple[list[dict], Optional[str]]] = {}
         self._zephyr_cycle_details_cache: dict[str, Optional[dict]] = {}
         self._zephyr_test_case_details_cache: dict[str, Optional[dict]] = {}
         self._zephyr_cycle_approved_checked: set[str] = set()
@@ -1220,7 +1224,7 @@ class ReleaseValidator:
         cycle_key = self.zephyr.get_test_cycle_key(cycle)
         cycle_name = self.zephyr.get_test_cycle_name(cycle)
         if cycle_key and not cycle_name:
-            details = self.zephyr.get_test_cycle_details(cycle_key)
+            details = self._get_test_cycle_details_cached(cycle_key)
             if details:
                 cycle_name = details.get('name', '')
         return cycle_key, cycle_name
@@ -1594,6 +1598,37 @@ class ReleaseValidator:
                 )
         return "; ".join(parts)
 
+    def _zephyr_last_cycle_search_had_technical_failure(self) -> bool:
+        technical_statuses = {429, 500, 502, 503, 504}
+        for stat in self.zephyr.last_test_cycle_search_stats:
+            status = stat.get('status')
+            if status == 'exception':
+                return True
+            if isinstance(status, int) and status in technical_statuses:
+                return True
+            if isinstance(status, str) and status.isdigit() and int(status) in technical_statuses:
+                return True
+        return self.zephyr.is_failed_request_limit_reached()
+
+    def _log_missing_release_cycles(self, release_key: str, check_label: str) -> None:
+        if self._zephyr_last_cycle_search_had_technical_failure():
+            stats = self._format_test_cycle_search_stats()
+            self._log_issue(
+                release_key,
+                "warning",
+                f"{check_label}: Zephyr временно не отдал ТЦ по ключу релиза {release_key}; "
+                "проверка ТЦ пропущена, отсутствие ТЦ не зафиксировано как ошибка"
+                + (f". Диагностика: {stats}" if stats else "")
+            )
+            return
+
+        self._log_issue(
+            release_key,
+            "error",
+            f"{check_label}: Zephyr не вернул ТЦ по ключу релиза {release_key}"
+        )
+        self._log_test_cycle_search_debug(release_key)
+
     def _get_test_cycle_details_cached(self, cycle_key: str) -> Optional[dict]:
         if cycle_key not in self._zephyr_cycle_details_cache:
             self._zephyr_cycle_details_cache[cycle_key] = self.zephyr.get_test_cycle_details(cycle_key)
@@ -1603,6 +1638,11 @@ class ReleaseValidator:
         if tc_key not in self._zephyr_test_case_details_cache:
             self._zephyr_test_case_details_cache[tc_key] = self.zephyr.get_test_case_details(tc_key)
         return self._zephyr_test_case_details_cache[tc_key]
+
+    def _get_issue_test_cases_cached(self, issue_key: str) -> tuple[list[dict], Optional[str]]:
+        if issue_key not in self._zephyr_issue_test_cases_cache:
+            self._zephyr_issue_test_cases_cache[issue_key] = self.zephyr.get_test_cases_for_issue(issue_key)
+        return self._zephyr_issue_test_cases_cache[issue_key]
 
     @staticmethod
     def _extract_test_case_key_from_cycle_result(test_result: dict) -> str:
@@ -2008,9 +2048,24 @@ class ReleaseValidator:
         total_not_approved = 0
 
         for issue_key in linked_keys:
-            test_cases, tc_error = self.zephyr.get_test_cases_for_issue(issue_key)
+            if self.zephyr.is_failed_request_limit_reached():
+                self._log_issue(
+                    "GENERAL",
+                    "warning",
+                    "Zephyr: лимит неуспешных запросов исчерпан, дальнейшая проверка ТК пропущена"
+                )
+                break
+
+            test_cases, tc_error = self._get_issue_test_cases_cached(issue_key)
 
             if tc_error is not None:
+                if self.zephyr.is_failed_request_limit_reached():
+                    self._log_issue(
+                        "GENERAL",
+                        "warning",
+                        "Zephyr: лимит неуспешных запросов исчерпан, дальнейшая проверка ТК пропущена"
+                    )
+                    break
                 self._log_issue(
                     issue_key, "warning",
                     f"Zephyr: не удалось получить ТК ({tc_error})"
@@ -2037,7 +2092,7 @@ class ReleaseValidator:
             for tc in hrpqa_test_cases:
                 tc_key = self.zephyr.get_test_case_key(tc)
                 tc_name = self.zephyr.get_test_case_name(tc)
-                tc_details = self.zephyr.get_test_case_details(tc_key)
+                tc_details = self._get_test_case_details_cached(tc_key)
                 if tc_details:
                     tc_name = self.zephyr.get_test_case_name(tc_details)
                     tc_status = self.zephyr.get_test_case_status(tc_details)
@@ -2254,11 +2309,7 @@ class ReleaseValidator:
         cycles = self._get_release_test_cycles(release_key)
 
         if not cycles:
-            self._log_issue(
-                release_key,
-                "error",
-                f"Back release: Zephyr не вернул ТЦ по ключу релиза {release_key}"
-            )
+            self._log_missing_release_cycles(release_key, "Back release")
             return
 
         print(f"   Back release: найдено КЭ={len(services)}, ТЦ по ключу релиза={len(cycles)}")
@@ -2381,11 +2432,7 @@ class ReleaseValidator:
 
         cycles = self._get_release_test_cycles(release_key)
         if not cycles:
-            self._log_issue(
-                release_key,
-                "error",
-                f"Web release: Zephyr не вернул ТЦ по ключу релиза {release_key}"
-            )
+            self._log_missing_release_cycles(release_key, "Web release")
             return
 
         print(f"   Web release: найдено КЭ={len(services)}, ТЦ по ключу релиза={len(cycles)}")
