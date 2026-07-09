@@ -3576,6 +3576,14 @@ class ReleaseValidator:
         return None
 
     def _json_contains_pull_request(self, value: object) -> bool:
+        if isinstance(value, str):
+            value_normalized = value.casefold()
+            value_compact = re.sub(r'[^a-zа-я0-9/#-]+', '', value_normalized)
+            return (
+                bool(re.search(r'\bpull\s*request\s*#\d+', value_normalized, flags=re.IGNORECASE))
+                or '/pull-requests/' in value_normalized
+                or 'pullrequest' in value_compact
+            )
         if isinstance(value, dict):
             for key, item in value.items():
                 key_normalized = str(key).casefold()
