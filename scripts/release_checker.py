@@ -3579,7 +3579,8 @@ class ReleaseValidator:
         if isinstance(value, dict):
             for key, item in value.items():
                 key_normalized = str(key).casefold()
-                if 'pullrequest' in key_normalized or 'pull_request' in key_normalized or 'pull request' in key_normalized:
+                key_compact = re.sub(r'[^a-zа-я0-9]+', '', key_normalized)
+                if 'pullrequest' in key_compact or 'pullrequests' in key_compact:
                     if item:
                         return True
                 if self._json_contains_pull_request(item):
@@ -3633,14 +3634,16 @@ class ReleaseValidator:
     def _dev_status_payload_has_pull_request(self, data_type: str, payload: dict) -> bool:
         if self._json_contains_pull_request(payload):
             return True
-        if data_type != 'pullrequest':
-            return False
 
         details = payload.get('detail') if isinstance(payload, dict) else None
         if isinstance(details, list):
-            return any(bool(item) for item in details)
+            return any(self._json_contains_pull_request(item) for item in details)
         if isinstance(details, dict):
+            return self._json_contains_pull_request(details)
+
+        if data_type == 'pullrequest':
             return bool(details)
+
         return False
 
     def _issue_has_pull_request(self, issue) -> bool:
@@ -4529,6 +4532,33 @@ def _diag_gigacode(validator: 'ReleaseValidator', issue_key: str):
                     print(f"  snippet={matched.group(0)}")
 
 
+def _diag_pr(validator: 'ReleaseValidator', issue_key: str):
+    try:
+        issue = validator.jira_main.issue(issue_key, fields='summary,issuetype,labels')
+    except Exception as e:
+        print(f"Не удалось получить issue {issue_key}: {e}")
+        return
+
+    issue_id = str(getattr(issue, 'id', '') or '')
+    print(f"Jira issue id: {issue_id}  type: {issue.fields.issuetype.name}  summary: {issue.fields.summary}")
+    print(f"Labels: {', '.join(getattr(issue.fields, 'labels', []) or []) or 'None'}")
+    print(f"Parser verdict: has_pr={'yes' if validator._issue_has_pull_request(issue) else 'no'}")
+
+    for application_type, data_type, payload in validator._get_dev_status_payloads(issue_id):
+        raw = json.dumps(payload, ensure_ascii=False)
+        raw_casefold = raw.casefold()
+        has_pr = validator._dev_status_payload_has_pull_request(data_type, payload)
+        print(f"\nPayload applicationType={application_type} dataType={data_type}")
+        print(f"  has_pr={'yes' if has_pr else 'no'}")
+        print(f"  top-level={', '.join(sorted(payload.keys())) if isinstance(payload, dict) else type(payload).__name__}")
+        print(f"  contains pullrequest-ish={'yes' if 'pullrequest' in re.sub(r'[^a-z0-9]+', '', raw_casefold) else 'no'}")
+        print(f"  contains url={'yes' if 'url' in raw_casefold else 'no'}")
+        print(f"  contains files={'yes' if 'files' in raw_casefold else 'no'}")
+        if has_pr or 'pullrequest' in re.sub(r'[^a-z0-9]+', '', raw_casefold):
+            for matched in re.finditer(r'.{0,100}(pullrequest|pull_request|pull request|url|files).{0,180}', raw, flags=re.IGNORECASE):
+                print(f"  snippet={matched.group(0)}")
+
+
 if __name__ == "__main__":
     validator = ReleaseValidator()
 
@@ -4545,6 +4575,11 @@ if __name__ == "__main__":
     # Диагностика: python scripts/release_checker.py --diag-gigacode SFILE-12345
     if len(sys.argv) >= 3 and sys.argv[1] == '--diag-gigacode':
         _diag_gigacode(validator, sys.argv[2])
+        sys.exit(0)
+
+    # Диагностика: python scripts/release_checker.py --diag-pr SFILE-12345
+    if len(sys.argv) >= 3 and sys.argv[1] == '--diag-pr':
+        _diag_pr(validator, sys.argv[2])
         sys.exit(0)
 
     if len(sys.argv) > 1:
