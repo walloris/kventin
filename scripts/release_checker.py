@@ -146,6 +146,7 @@ BACK_NF_CYCLE_ALIASES = ('НФ', 'NF', 'Новый функционал', 'Но�
 BACK_API_CHANNEL_ALIASES = ('api',)
 BACK_DEVICE_BROWSER_CHANNEL_ALIASES = ('ipad/pwa/safari/sberbrowser',)
 WEB_DEVICE_BROWSER_NF_CHANNEL_ALIASES = ('ipad/pwa/safari/sberbrowser',)
+WEB_DEVICE_BROWSER_NF_CHANNEL_ALIASES_NEUROUI = ('ipad/safari/sberbrowser',)
 WEB_REGRESS_CHANNELS = (
     ('ipad', ('ipad',)),
     ('pwa', ('pwa',)),
@@ -2422,6 +2423,8 @@ class ReleaseValidator:
         Для web-релизов проверяет наличие Zephyr ТЦ по каждой КЭ:
           - {release}.{КЭ}.ipad/pwa/safari/sberbrowser.НФ — если внутри КЭ есть Story
             с "Новая функциональность" = "Да";
+          - для NEUROUI вместо НФ-маски с PWA используется
+            {release}.{КЭ}.ipad/safari/sberbrowser.НФ;
           - {release}.{КЭ}.ipad.Регресс — обязательно;
           - {release}.{КЭ}.pwa.Регресс — обязательно, кроме проекта NEUROUI;
           - {release}.{КЭ}.safari.Регресс — обязательно;
@@ -2448,17 +2451,22 @@ class ReleaseValidator:
             is_neuroui = bool(project_keys) and project_keys <= {'neuroui'}
 
             if service_info['has_nf_story']:
+                nf_channel_aliases = (
+                    WEB_DEVICE_BROWSER_NF_CHANNEL_ALIASES_NEUROUI
+                    if is_neuroui else WEB_DEVICE_BROWSER_NF_CHANNEL_ALIASES
+                )
+                nf_channel_name = 'iPad/Safari/SberBrowser' if is_neuroui else 'iPad/PWA/Safari/SberBrowser'
                 nf_mask_hint = build_cycle_mask_hint(
                     release_key,
                     service_aliases,
-                    WEB_DEVICE_BROWSER_NF_CHANNEL_ALIASES,
+                    nf_channel_aliases,
                     'НФ',
                 )
                 nf_match = self._find_matching_cycle(
                     cycles,
                     release_key,
                     service_ke,
-                    WEB_DEVICE_BROWSER_NF_CHANNEL_ALIASES,
+                    nf_channel_aliases,
                     BACK_NF_CYCLE_ALIASES,
                 )
                 if nf_match:
@@ -2466,7 +2474,7 @@ class ReleaseValidator:
                     self._log_issue(
                         release_key,
                         "success",
-                        f"Web release: для КЭ '{service_ke}' найден iPad/PWA/Safari/SberBrowser НФ ТЦ "
+                        f"Web release: для КЭ '{service_ke}' найден {nf_channel_name} НФ ТЦ "
                         f"[{tc_key}] '{tc_name}' ✓"
                     )
                     self._check_test_cycle_testing_type(release_key, tc_key, tc_name, 'НФ')
