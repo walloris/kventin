@@ -1098,6 +1098,8 @@ class ReleaseValidator:
         self._zephyr_cycle_approved_checked: set[str] = set()
         self._zephyr_cycle_testing_type_checked: set[tuple[str, str]] = set()
         self._zephyr_cycle_search_debug_logged: set[str] = set()
+        self._dev_status_payload_cache: dict[str, list[tuple[str, str, dict]]] = {}
+        self._release_pr_targets_cache: dict[str, list[tuple[object, list[object]]]] = {}
         self._zephyr_cycle_cache = self._load_zephyr_cycle_cache()
 
         try:
@@ -2010,7 +2012,8 @@ class ReleaseValidator:
                 self._check_web_release_service_test_cycles(release_key)
         self._check_bugs(release_key, is_hotfix=is_hotfix)
         self._check_stories(release_key)
-        self._check_gigacode_pull_requests(release_key)
+        self._check_required_pull_requests(release_key)
+        self._check_gigacode_aifixed_labels(release_key)
         self._check_cloud_label(release_key, release.fields.summary)
         self._check_sbrppl_third_party_label(release_key)
         self._check_sbrppl_story_points(release_key)
@@ -3597,9 +3600,12 @@ class ReleaseValidator:
             return any(self._json_contains_commit(item) for item in value)
         return False
 
-    def _get_dev_status_payloads(self, issue_id: str) -> list[dict]:
+    def _get_dev_status_payloads(self, issue_id: str) -> list[tuple[str, str, dict]]:
+        if issue_id in self._dev_status_payload_cache:
+            return self._dev_status_payload_cache[issue_id]
+
         base_url = config['jira']['url'].rstrip('/')
-        payloads = []
+        payloads: list[tuple[str, str, dict]] = []
         application_types = ('stash', 'bitbucket', 'bitbucket-server')
         data_types = ('pullrequest', 'repository', 'commit')
 
@@ -3617,43 +3623,46 @@ class ReleaseValidator:
                         timeout=30,
                     )
                     if response.status_code == 200:
-                        payloads.append(response.json())
+                        payloads.append((application_type, data_type, response.json()))
                 except Exception:
                     continue
 
+        self._dev_status_payload_cache[issue_id] = payloads
         return payloads
+
+    def _dev_status_payload_has_pull_request(self, data_type: str, payload: dict) -> bool:
+        if self._json_contains_pull_request(payload):
+            return True
+        if data_type != 'pullrequest':
+            return False
+
+        details = payload.get('detail') if isinstance(payload, dict) else None
+        if isinstance(details, list):
+            return any(bool(item) for item in details)
+        if isinstance(details, dict):
+            return bool(details)
+        return False
+
+    def _issue_has_pull_request(self, issue) -> bool:
+        issue_id = str(getattr(issue, 'id', '') or '')
+        if not issue_id:
+            return False
+
+        for _, data_type, payload in self._get_dev_status_payloads(issue_id):
+            if self._dev_status_payload_has_pull_request(data_type, payload):
+                return True
+
+        return False
 
     def _issue_has_gigacode_pull_request(self, issue) -> Optional[str]:
         issue_id = str(getattr(issue, 'id', '') or '')
         if not issue_id:
             return None
 
-        base_url = config['jira']['url'].rstrip('/')
-        application_types = ('stash', 'bitbucket', 'bitbucket-server')
-        data_types = ('pullrequest', 'commit', 'repository')
-
-        for application_type in application_types:
-            for data_type in data_types:
-                url = f"{base_url}/rest/dev-status/latest/issue/detail"
-                try:
-                    response = self.jira_http.get(
-                        url,
-                        params={
-                            'issueId': issue_id,
-                            'applicationType': application_type,
-                            'dataType': data_type,
-                        },
-                        timeout=12,
-                    )
-                    if response.status_code != 200:
-                        continue
-                    payload = response.json()
-                except Exception:
-                    continue
-
-                gigacode_marker = self._find_gigacode_marker(payload)
-                if gigacode_marker:
-                    return gigacode_marker
+        for _, _, payload in self._get_dev_status_payloads(issue_id):
+            gigacode_marker = self._find_gigacode_marker(payload)
+            if gigacode_marker:
+                return gigacode_marker
 
         return None
 
@@ -3689,13 +3698,16 @@ class ReleaseValidator:
                 task_keys.append(linked_issue.key)
         return task_keys
 
-    def _check_gigacode_pull_requests(self, release_key: str) -> None:
-        AIFIXED_LABEL = 'AIFIXED'
+    def _get_release_pr_targets(self, release_key: str) -> list[tuple[object, list[object]]]:
+        if release_key in self._release_pr_targets_cache:
+            return self._release_pr_targets_cache[release_key]
+
         issue_types = {'story', 'bug', 'defect', 'ошибка'}
 
         linked_keys = self._get_consist_of_issues(release_key)
         if not linked_keys:
-            return
+            self._release_pr_targets_cache[release_key] = []
+            return []
 
         keys_str = ",".join(linked_keys)
         try:
@@ -3705,15 +3717,14 @@ class ReleaseValidator:
                 maxResults=500
             )
         except Exception as e:
-            self._log_issue("GENERAL", "error", f"Ошибка проверки GigaCode PR/commit: {e}")
-            return
+            self._log_issue("GENERAL", "error", f"Ошибка получения Story/Bug для проверки PR: {e}")
+            self._release_pr_targets_cache[release_key] = []
+            return []
 
         target_issues = [
             issue for issue in release_issues
             if issue.fields.issuetype and issue.fields.issuetype.name.casefold() in issue_types
         ]
-
-        print(f"   Проверка Pull Request с GigaCode для {len(target_issues)} Story/Bug...")
 
         task_keys_by_story: dict[str, list[str]] = {}
         all_task_keys: list[str] = []
@@ -3736,8 +3747,9 @@ class ReleaseValidator:
                 )
                 tasks_by_key = {task.key: task for task in task_issues}
             except Exception as e:
-                self._log_issue("GENERAL", "warning", f"GigaCode PR/commit: не удалось bulk-получить Task: {e}")
+                self._log_issue("GENERAL", "warning", f"PR/AIFIXED: не удалось bulk-получить Task: {e}")
 
+        targets = []
         for target_issue in target_issues:
             issues_to_check = [target_issue]
 
@@ -3745,29 +3757,75 @@ class ReleaseValidator:
                 for task_key in task_keys_by_story.get(target_issue.key, []):
                     task = tasks_by_key.get(task_key)
                     if task is None:
-                        self._log_issue(target_issue, "warning", f"GigaCode PR/commit: не удалось получить Task {task_key}")
+                        self._log_issue(target_issue, "warning", f"PR/AIFIXED: не удалось получить Task {task_key}")
                         continue
                     if task.fields.issuetype and task.fields.issuetype.name.casefold() == 'task':
                         issues_to_check.append(task)
 
+            targets.append((target_issue, issues_to_check))
+
+        self._release_pr_targets_cache[release_key] = targets
+        return targets
+
+    def _check_required_pull_requests(self, release_key: str) -> None:
+        targets = self._get_release_pr_targets(release_key)
+        if not targets:
+            return
+
+        print(f"   Проверка Pull Request для {len(targets)} Story/Bug...")
+
+        for target_issue, issues_to_check in targets:
+            pr_issue = None
+            for issue_to_check in issues_to_check:
+                try:
+                    if pr_issue is None and self._issue_has_pull_request(issue_to_check):
+                        pr_issue = issue_to_check
+                except Exception as e:
+                    self._log_issue(
+                        target_issue,
+                        "warning",
+                        f"Pull Request: не удалось проверить {issue_to_check.key}: {e}"
+                    )
+
+            if pr_issue:
+                self._log_issue(
+                    target_issue,
+                    "success",
+                    f"Pull Request найден в {pr_issue.key} ✓"
+                )
+            else:
+                self._log_issue(
+                    target_issue,
+                    "error",
+                    "Pull Request не найден. Для каждой Story/Bug в составе релиза должен быть PR"
+                )
+
+    def _check_gigacode_aifixed_labels(self, release_key: str) -> None:
+        AIFIXED_LABEL = 'AIFIXED'
+        targets = self._get_release_pr_targets(release_key)
+        if not targets:
+            return
+
+        print(f"   Проверка AIFIXED по GigaCode PR/commit для {len(targets)} Story/Bug...")
+
+        for target_issue, issues_to_check in targets:
             matched_issue = None
             matched_marker = None
             for issue_to_check in issues_to_check:
                 try:
                     gigacode_marker = self._issue_has_gigacode_pull_request(issue_to_check)
-                    if gigacode_marker:
+                    if gigacode_marker and matched_issue is None:
                         matched_issue = issue_to_check
                         matched_marker = gigacode_marker
-                        break
                 except Exception as e:
                     self._log_issue(
                         target_issue,
                         "warning",
-                        f"GigaCode PR/commit: не удалось проверить {issue_to_check.key}: {e}"
+                        f"AIFIXED: не удалось проверить {issue_to_check.key}: {e}"
                     )
 
             if not matched_issue:
-                self._log_issue(target_issue, "success", "GigaCode PR/commit не найден — лейбл AIFIXED не требуется ✓")
+                self._log_issue(target_issue, "success", "AIFIXED: GigaCode PR/commit не найден — лейбл AIFIXED не требуется ✓")
                 continue
 
             try:
