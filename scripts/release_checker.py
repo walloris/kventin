@@ -202,6 +202,7 @@ def normalize_test_cycle_name(value: object) -> str:
     text = normalize_field_text(value).casefold()
     text = re.sub(r'\s*\.\s*', '.', text)
     text = re.sub(r'\s*/\s*', '/', text)
+    text = re.sub(r'\.{2,}', '.', text)
     text = re.sub(r'\s+', ' ', text)
     return text.strip(' .')
 
@@ -214,8 +215,22 @@ def normalize_test_cycle_name_without_parenthesized_ids(value: object) -> str:
     text = normalize_test_cycle_name(value)
     text = re.sub(r'\s*\([^)]*\)', '', text)
     text = re.sub(r'\s*\.\s*', '.', text)
+    text = re.sub(r'\.{2,}', '.', text)
     text = re.sub(r'\s+', ' ', text)
     return text.strip(' .')
+
+
+def test_cycle_name_matches_expected_variant(actual: str, expected: str) -> bool:
+    if actual == expected:
+        return True
+    if not actual.startswith(expected):
+        return False
+
+    suffix = actual[len(expected):].strip(' .')
+    if not suffix:
+        return True
+
+    return bool(re.match(r'^(\d{1,2}[./-]\d{1,2}([./-]\d{2,4})?|от\s+\d{1,2}[./-]\d{1,2}([./-]\d{2,4})?)\b', suffix))
 
 
 def test_cycle_name_matches_mask(
@@ -237,8 +252,10 @@ def test_cycle_name_matches_mask(
                 normalize_test_cycle_name(expected_raw),
                 normalize_test_cycle_name_without_parenthesized_ids(expected_raw),
             }
-            if actual_variants & expected_variants:
-                return True
+            for actual in actual_variants:
+                for expected in expected_variants:
+                    if test_cycle_name_matches_expected_variant(actual, expected):
+                        return True
     return False
 
 
@@ -1100,6 +1117,7 @@ class ReleaseValidator:
         self._zephyr_cycle_testing_type_checked: set[tuple[str, str]] = set()
         self._zephyr_cycle_search_debug_logged: set[str] = set()
         self._dev_status_payload_cache: dict[str, list[tuple[str, str, dict]]] = {}
+        self._pull_request_evidence_cache: dict[str, Optional[str]] = {}
         self._release_pr_targets_cache: dict[str, list[tuple[object, list[object]]]] = {}
         self._zephyr_cycle_cache = self._load_zephyr_cycle_cache()
 
@@ -3662,16 +3680,97 @@ class ReleaseValidator:
 
         return False
 
-    def _issue_has_pull_request(self, issue) -> bool:
+    def _find_issue_pull_request_evidence(self, issue) -> Optional[str]:
+        issue_key = str(getattr(issue, 'key', '') or '')
         issue_id = str(getattr(issue, 'id', '') or '')
-        if not issue_id:
-            return False
+        cache_key = issue_key or issue_id
+        if cache_key and cache_key in self._pull_request_evidence_cache:
+            return self._pull_request_evidence_cache[cache_key]
 
-        for _, data_type, payload in self._get_dev_status_payloads(issue_id):
-            if self._dev_status_payload_has_pull_request(data_type, payload):
-                return True
+        evidence = self._find_issue_pull_request_evidence_uncached(issue, issue_key, issue_id)
+        if cache_key:
+            self._pull_request_evidence_cache[cache_key] = evidence
+        return evidence
 
-        return False
+    def _find_issue_pull_request_evidence_uncached(
+        self,
+        issue,
+        issue_key: str,
+        issue_id: str,
+    ) -> Optional[str]:
+        if issue_id:
+            for application_type, data_type, payload in self._get_dev_status_payloads(issue_id):
+                if self._dev_status_payload_has_pull_request(data_type, payload):
+                    return f"dev-status {application_type}/{data_type}"
+
+        if issue_key:
+            base_url = config['jira']['url'].rstrip('/')
+
+            try:
+                response = self.jira_http.get(
+                    f"{base_url}/rest/api/2/issue/{issue_key}/remotelink",
+                    timeout=12,
+                )
+                if response.status_code == 200 and self._json_contains_pull_request(response.json()):
+                    return "Jira remote links"
+            except Exception:
+                pass
+
+            try:
+                properties_response = self.jira_http.get(
+                    f"{base_url}/rest/api/2/issue/{issue_key}/properties",
+                    timeout=12,
+                )
+                if properties_response.status_code == 200:
+                    properties_payload = properties_response.json()
+                    if self._json_contains_pull_request(properties_payload):
+                        return "Jira issue properties"
+                    for item in properties_payload.get('keys', []) if isinstance(properties_payload, dict) else []:
+                        property_key = item.get('key', '') if isinstance(item, dict) else ''
+                        if not property_key or not self._is_relevant_jira_property_key(property_key):
+                            continue
+                        property_response = self.jira_http.get(
+                            f"{base_url}/rest/api/2/issue/{issue_key}/properties/{property_key}",
+                            timeout=12,
+                        )
+                        if property_response.status_code == 200 and self._json_contains_pull_request(property_response.json()):
+                            return f"Jira issue property {property_key}"
+            except Exception:
+                pass
+
+            try:
+                issue_full = self.jira_main.issue(
+                    issue_key,
+                    fields='summary,description,issuelinks,*all',
+                    expand='renderedFields,names,schema',
+                )
+                if self._json_contains_pull_request(getattr(issue_full, 'raw', {})):
+                    return "Jira issue raw/rendered fields"
+            except Exception:
+                pass
+
+            try:
+                comments = self.jira_main.comments(issue_key)
+                if self._json_contains_pull_request([getattr(comment, 'body', '') for comment in comments]):
+                    return "Jira comments"
+            except Exception:
+                pass
+
+            try:
+                html_response = self.jira_http.get(
+                    f"{base_url}/browse/{issue_key}",
+                    headers={'Accept': 'text/html,application/xhtml+xml'},
+                    timeout=12,
+                )
+                if html_response.status_code == 200 and self._json_contains_pull_request(html_response.text):
+                    return "Jira issue HTML"
+            except Exception:
+                pass
+
+        return None
+
+    def _issue_has_pull_request(self, issue) -> bool:
+        return self._find_issue_pull_request_evidence(issue) is not None
 
     def _issue_has_gigacode_pull_request(self, issue) -> Optional[str]:
         issue_id = str(getattr(issue, 'id', '') or '')
@@ -3795,10 +3894,13 @@ class ReleaseValidator:
 
         for target_issue, issues_to_check in targets:
             pr_issue = None
+            pr_evidence = None
             for issue_to_check in issues_to_check:
                 try:
-                    if pr_issue is None and self._issue_has_pull_request(issue_to_check):
+                    evidence = self._find_issue_pull_request_evidence(issue_to_check)
+                    if pr_issue is None and evidence:
                         pr_issue = issue_to_check
+                        pr_evidence = evidence
                 except Exception as e:
                     self._log_issue(
                         target_issue,
@@ -3810,7 +3912,7 @@ class ReleaseValidator:
                 self._log_issue(
                     target_issue,
                     "success",
-                    f"Pull Request найден в {pr_issue.key} ✓"
+                    f"Pull Request найден в {pr_issue.key} ({pr_evidence}) ✓"
                 )
             else:
                 self._log_issue(
@@ -4558,7 +4660,9 @@ def _diag_pr(validator: 'ReleaseValidator', issue_key: str):
     issue_id = str(getattr(issue, 'id', '') or '')
     print(f"Jira issue id: {issue_id}  type: {issue.fields.issuetype.name}  summary: {issue.fields.summary}")
     print(f"Labels: {', '.join(getattr(issue.fields, 'labels', []) or []) or 'None'}")
-    print(f"Parser verdict: has_pr={'yes' if validator._issue_has_pull_request(issue) else 'no'}")
+    evidence = validator._find_issue_pull_request_evidence(issue)
+    print(f"Parser verdict: has_pr={'yes' if evidence else 'no'}")
+    print(f"Evidence: {evidence or 'None'}")
 
     for application_type, data_type, payload in validator._get_dev_status_payloads(issue_id):
         raw = json.dumps(payload, ensure_ascii=False)
