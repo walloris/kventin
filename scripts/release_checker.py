@@ -3079,7 +3079,7 @@ class ReleaseValidator:
 
         return total_seconds / 86400.0
 
-    # Целевое максимальное суммарное время (в днях) нахождения Story
+    # Целевое суммарное время (в днях) нахождения Story
     # в статусах тестирования по проектной области.
     STORY_MONITORED_STATUSES = ["READY FOR IFT", "IFT", "READY FOR UAT", "UAT"]
     STORY_MAX_TESTING_DAYS: dict[str, float] = {
@@ -3091,7 +3091,8 @@ class ReleaseValidator:
         "PERFREVIEW": 5.2,
         "HRPASSIST": 10.0,
     }
-    STORY_MIN_TESTING_RATIO = 0.5
+    STORY_MIN_TESTING_RATIO = 0.75
+    STORY_MAX_TESTING_RATIO = 1.25
 
     def _extract_story_requirements_rows(self, raw_val: object) -> dict[str, dict]:
         field_value = extract_jira_field_value(raw_val)
@@ -3463,9 +3464,10 @@ class ReleaseValidator:
                     )
 
             # --- 4. Проверка времени в тест-статусах ---
-            max_days = self.STORY_MAX_TESTING_DAYS.get(story_project)
-            if max_days is not None:
-                min_days = max_days * self.STORY_MIN_TESTING_RATIO
+            target_days = self.STORY_MAX_TESTING_DAYS.get(story_project)
+            if target_days is not None:
+                min_days = target_days * self.STORY_MIN_TESTING_RATIO
+                max_days = target_days * self.STORY_MAX_TESTING_RATIO
                 try:
                     if story_full is None:
                         story_full = self.jira_main.issue(story.key, expand='changelog')
@@ -3475,26 +3477,29 @@ class ReleaseValidator:
                     )
                     actual_days_rounded = round(actual_days, 2)
                     min_days_rounded = round(min_days, 2)
+                    max_days_rounded = round(max_days, 2)
+                    target_days_rounded = round(target_days, 2)
                     if actual_days > max_days:
                         self._log_issue(
                             story, "error",
                             f"Story: суммарное время в тест-статусах "
-                            f"({actual_days_rounded} д.) превышает целевое ({max_days} д.) "
+                            f"({actual_days_rounded} д.) больше 125% норматива "
+                            f"({max_days_rounded} д. из {target_days_rounded} д.) "
                             f"для проектной области {story_project}"
                         )
                     elif actual_days < min_days:
                         self._log_issue(
                             story, "error",
                             f"Story: суммарное время в тест-статусах "
-                            f"({actual_days_rounded} д.) меньше 50% норматива "
-                            f"({min_days_rounded} д. из {max_days} д.) "
+                            f"({actual_days_rounded} д.) меньше 75% норматива "
+                            f"({min_days_rounded} д. из {target_days_rounded} д.) "
                             f"для проектной области {story_project}"
                         )
                     else:
                         self._log_issue(
                             story, "success",
                             f"Story: время в тест-статусах {actual_days_rounded} д. "
-                            f"в пределах 50–100% норматива ({min_days_rounded}–{max_days} д.) ✓"
+                            f"в пределах 75–125% норматива ({min_days_rounded}–{max_days_rounded} д.) ✓"
                         )
                 except Exception as e:
                     self._log_issue(
@@ -3624,10 +3629,20 @@ class ReleaseValidator:
         return False
 
     def _json_contains_commit(self, value: object) -> bool:
+        if isinstance(value, str):
+            value_normalized = value.casefold()
+            value_compact = re.sub(r'[^a-zа-я0-9/#-]+', '', value_normalized)
+            return (
+                '/commits/' in value_normalized
+                or bool(re.search(r'\bcommit\s+[0-9a-f]{7,40}\b', value_normalized))
+                or bool(re.search(r'\b[0-9a-f]{40}\b', value_normalized))
+                or 'commits' in value_compact
+            )
         if isinstance(value, dict):
             for key, item in value.items():
                 key_normalized = str(key).casefold()
-                if key_normalized in {'commit', 'commits'} and item:
+                key_compact = re.sub(r'[^a-zа-я0-9]+', '', key_normalized)
+                if key_compact in {'commit', 'commits'} and item:
                     return True
                 if self._json_contains_commit(item):
                     return True
@@ -3680,6 +3695,21 @@ class ReleaseValidator:
 
         return False
 
+    def _dev_status_payload_has_commit(self, data_type: str, payload: dict) -> bool:
+        if self._json_contains_commit(payload):
+            return True
+
+        details = payload.get('detail') if isinstance(payload, dict) else None
+        if isinstance(details, list):
+            return any(self._json_contains_commit(item) for item in details)
+        if isinstance(details, dict):
+            return self._json_contains_commit(details)
+
+        if data_type in {'commit', 'repository'}:
+            return bool(details)
+
+        return False
+
     def _find_issue_pull_request_evidence(self, issue) -> Optional[str]:
         issue_key = str(getattr(issue, 'key', '') or '')
         issue_id = str(getattr(issue, 'id', '') or '')
@@ -3703,6 +3733,10 @@ class ReleaseValidator:
                 if self._dev_status_payload_has_pull_request(data_type, payload):
                     return f"dev-status {application_type}/{data_type}"
 
+            for application_type, data_type, payload in self._get_dev_status_payloads(issue_id):
+                if self._dev_status_payload_has_commit(data_type, payload):
+                    return f"dev-status {application_type}/{data_type} commit"
+
         if issue_key:
             base_url = config['jira']['url'].rstrip('/')
 
@@ -3711,8 +3745,12 @@ class ReleaseValidator:
                     f"{base_url}/rest/api/2/issue/{issue_key}/remotelink",
                     timeout=12,
                 )
-                if response.status_code == 200 and self._json_contains_pull_request(response.json()):
-                    return "Jira remote links"
+                if response.status_code == 200:
+                    remote_links_payload = response.json()
+                    if self._json_contains_pull_request(remote_links_payload):
+                        return "Jira remote links"
+                    if self._json_contains_commit(remote_links_payload):
+                        return "Jira remote links commit"
             except Exception:
                 pass
 
@@ -3725,6 +3763,8 @@ class ReleaseValidator:
                     properties_payload = properties_response.json()
                     if self._json_contains_pull_request(properties_payload):
                         return "Jira issue properties"
+                    if self._json_contains_commit(properties_payload):
+                        return "Jira issue properties commit"
                     for item in properties_payload.get('keys', []) if isinstance(properties_payload, dict) else []:
                         property_key = item.get('key', '') if isinstance(item, dict) else ''
                         if not property_key or not self._is_relevant_jira_property_key(property_key):
@@ -3733,8 +3773,12 @@ class ReleaseValidator:
                             f"{base_url}/rest/api/2/issue/{issue_key}/properties/{property_key}",
                             timeout=12,
                         )
-                        if property_response.status_code == 200 and self._json_contains_pull_request(property_response.json()):
-                            return f"Jira issue property {property_key}"
+                        if property_response.status_code == 200:
+                            property_payload = property_response.json()
+                            if self._json_contains_pull_request(property_payload):
+                                return f"Jira issue property {property_key}"
+                            if self._json_contains_commit(property_payload):
+                                return f"Jira issue property {property_key} commit"
             except Exception:
                 pass
 
@@ -3744,15 +3788,21 @@ class ReleaseValidator:
                     fields='summary,description,issuelinks,*all',
                     expand='renderedFields,names,schema',
                 )
-                if self._json_contains_pull_request(getattr(issue_full, 'raw', {})):
+                issue_raw = getattr(issue_full, 'raw', {})
+                if self._json_contains_pull_request(issue_raw):
                     return "Jira issue raw/rendered fields"
+                if self._json_contains_commit(issue_raw):
+                    return "Jira issue raw/rendered fields commit"
             except Exception:
                 pass
 
             try:
                 comments = self.jira_main.comments(issue_key)
-                if self._json_contains_pull_request([getattr(comment, 'body', '') for comment in comments]):
+                comment_bodies = [getattr(comment, 'body', '') for comment in comments]
+                if self._json_contains_pull_request(comment_bodies):
                     return "Jira comments"
+                if self._json_contains_commit(comment_bodies):
+                    return "Jira comments commit"
             except Exception:
                 pass
 
@@ -3762,8 +3812,11 @@ class ReleaseValidator:
                     headers={'Accept': 'text/html,application/xhtml+xml'},
                     timeout=12,
                 )
-                if html_response.status_code == 200 and self._json_contains_pull_request(html_response.text):
-                    return "Jira issue HTML"
+                if html_response.status_code == 200:
+                    if self._json_contains_pull_request(html_response.text):
+                        return "Jira issue HTML"
+                    if self._json_contains_commit(html_response.text):
+                        return "Jira issue HTML commit"
             except Exception:
                 pass
 
@@ -3890,7 +3943,7 @@ class ReleaseValidator:
         if not targets:
             return
 
-        print(f"   Проверка Pull Request для {len(targets)} Story/Bug...")
+        print(f"   Проверка Pull Request/commit для {len(targets)} Story/Bug...")
 
         for target_issue, issues_to_check in targets:
             pr_issue = None
@@ -3905,20 +3958,20 @@ class ReleaseValidator:
                     self._log_issue(
                         target_issue,
                         "warning",
-                        f"Pull Request: не удалось проверить {issue_to_check.key}: {e}"
+                        f"Pull Request/commit: не удалось проверить {issue_to_check.key}: {e}"
                     )
 
             if pr_issue:
                 self._log_issue(
                     target_issue,
                     "success",
-                    f"Pull Request найден в {pr_issue.key} ({pr_evidence}) ✓"
+                    f"Pull Request/commit найден в {pr_issue.key} ({pr_evidence}) ✓"
                 )
             else:
                 self._log_issue(
                     target_issue,
                     "error",
-                    "Pull Request не найден. Для каждой Story/Bug в составе релиза должен быть PR"
+                    "Pull Request/commit не найден. Для каждой Story/Bug в составе релиза должен быть PR или commit"
                 )
 
     def _check_gigacode_aifixed_labels(self, release_key: str) -> None:
