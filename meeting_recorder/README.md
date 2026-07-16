@@ -5,21 +5,21 @@
 Оно пишет два источника одновременно:
 
 - звук с микрофона;
-- звук компьютера через виртуальное аудиоустройство.
+- звук компьютера через нативный macOS ScreenCaptureKit helper.
 
 ## Важно про системный звук на macOS
 
-Python не может напрямую "подслушать" звук приложений macOS. Нужен виртуальный аудиодрайвер:
+Python не может напрямую "подслушать" звук приложений macOS через обычные
+аудиоустройства. Поэтому приложение использует нативный Swift helper на
+ScreenCaptureKit.
 
-- BlackHole 2ch: https://existential.audio/blackhole/
-- Loopback: https://rogueamoeba.com/loopback/
+При первом запуске macOS может запросить разрешение **Screen Recording**.
+Это нормально: Apple отдаёт системный звук через тот же privacy-механизм,
+что и захват экрана. Если разрешение не дали, включите его в:
 
-После установки BlackHole обычно нужно создать Multi-Output Device в `Audio MIDI Setup`, чтобы звук шёл одновременно в наушники/колонки и в BlackHole. В приложении выбирайте BlackHole как `--system-device`.
-
-Если в поле "Звук компьютера" выбран микрофон или обычное устройство ввода,
-в записи будет слышен только микрофон. Для звука из Zoom/Meet/Telegram нужно
-направить звук приложения или системы в BlackHole/Loopback и выбрать это
-устройство в приложении.
+```text
+System Settings -> Privacy & Security -> Screen & System Audio Recording
+```
 
 ## Установка
 
@@ -28,6 +28,7 @@ cd /Users/walloris/Documents/kventin/meeting_recorder
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+./build_native_audio.sh
 ```
 
 ## Запустить приложение с UI
@@ -39,7 +40,8 @@ python app.py
 В окне выберите:
 
 - микрофон;
-- источник звука компьютера, например `BlackHole 2ch`;
+
+Звук компьютера пишется автоматически через `Встроенный macOS system audio`.
 
 Файл сохраняется автоматически в:
 
@@ -67,6 +69,15 @@ python recorder.py list-devices
 ```
 
 ## Записать встречу
+
+CLI-режим пока оставлен для старого варианта с виртуальным аудиоустройством.
+Для записи системного звука без BlackHole/Loopback используйте UI:
+
+```bash
+python app.py
+```
+
+Старый CLI-вариант:
 
 ```bash
 python recorder.py record \

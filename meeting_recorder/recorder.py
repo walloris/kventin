@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import queue
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -21,6 +23,9 @@ import sounddevice as sd
 DEFAULT_SAMPLE_RATE = 48_000
 DEFAULT_BITRATE_KBPS = 192
 BLOCK_SECONDS = 0.1
+NATIVE_SYSTEM_AUDIO_HELPER = (
+    Path(__file__).resolve().parent / "native" / "system_audio_capture"
+)
 
 
 @dataclass(frozen=True)
@@ -128,6 +133,41 @@ def pop_or_silence(source_queue: queue.Queue[np.ndarray], frames: int) -> np.nda
     return padded
 
 
+def read_native_system_audio(
+    process: subprocess.Popen[bytes],
+    source_queue: queue.Queue[np.ndarray],
+    frames: int,
+    stop_event: threading.Event,
+    on_status: StatusCallback,
+) -> None:
+    bytes_per_frame = 2 * np.dtype(np.int16).itemsize
+    block_bytes = frames * bytes_per_frame
+    pending = b""
+
+    while not stop_event.is_set():
+        if process.stdout is None:
+            return
+
+        chunk = process.stdout.read(block_bytes - len(pending))
+        if not chunk:
+            if process.poll() is not None and not stop_event.is_set():
+                on_status("native system audio stopped")
+            return
+
+        pending += chunk
+        if len(pending) < block_bytes:
+            continue
+
+        raw_block = pending[:block_bytes]
+        pending = pending[block_bytes:]
+        block = np.frombuffer(raw_block, dtype=np.int16).reshape(-1, 2)
+        block = block.astype(np.float32) / np.iinfo(np.int16).max
+        try:
+            source_queue.put_nowait(block)
+        except queue.Full:
+            on_status("native system audio: input buffer is full; dropped audio block")
+
+
 def float_to_pcm16(block: np.ndarray) -> bytes:
     clipped = np.clip(block, -1.0, 1.0)
     pcm = (clipped * np.iinfo(np.int16).max).astype(np.int16)
@@ -138,11 +178,12 @@ class MeetingRecorder:
     def __init__(
         self,
         mic: InputSource,
-        system: InputSource,
+        system: Optional[InputSource],
         output: Path,
         duration: Optional[float] = None,
         sample_rate: int = DEFAULT_SAMPLE_RATE,
         bitrate_kbps: int = DEFAULT_BITRATE_KBPS,
+        native_system_audio: bool = False,
         on_status: Optional[StatusCallback] = None,
     ) -> None:
         self.mic = mic
@@ -151,6 +192,7 @@ class MeetingRecorder:
         self.duration = duration
         self.sample_rate = sample_rate
         self.bitrate_kbps = bitrate_kbps
+        self.native_system_audio = native_system_audio
         self.on_status = on_status or (lambda message: None)
 
         self._stop_event = threading.Event()
@@ -161,6 +203,7 @@ class MeetingRecorder:
         self._started_at: Optional[float] = None
         self._paused_at: Optional[float] = None
         self._paused_total = 0.0
+        self._native_process: Optional[subprocess.Popen[bytes]] = None
 
     @property
     def elapsed_seconds(self) -> float:
@@ -208,6 +251,7 @@ class MeetingRecorder:
     def stop(self) -> None:
         self._stop_event.set()
         self._pause_event.clear()
+        self._stop_native_process()
 
     def wait(self, timeout: Optional[float] = None) -> bool:
         return self._done_event.wait(timeout)
@@ -235,48 +279,104 @@ class MeetingRecorder:
         self.output.parent.mkdir(parents=True, exist_ok=True)
         self._started_at = time.monotonic()
 
-        with sd.InputStream(
-            device=self.mic.device,
-            channels=self.mic.channels,
-            samplerate=self.sample_rate,
-            blocksize=blocksize,
-            dtype="float32",
-            callback=make_callback("microphone", mic_queue, self.on_status),
-        ), sd.InputStream(
-            device=self.system.device,
-            channels=self.system.channels,
-            samplerate=self.sample_rate,
-            blocksize=blocksize,
-            dtype="float32",
-            callback=make_callback("system", system_queue, self.on_status),
-        ), self.output.open("wb") as mp3_file:
-            self.on_status("Recording")
+        try:
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(
+                    sd.InputStream(
+                        device=self.mic.device,
+                        channels=self.mic.channels,
+                        samplerate=self.sample_rate,
+                        blocksize=blocksize,
+                        dtype="float32",
+                        callback=make_callback("microphone", mic_queue, self.on_status),
+                    )
+                )
+                if self.native_system_audio:
+                    self._start_native_system_audio(system_queue, blocksize)
+                else:
+                    if self.system is None:
+                        raise RuntimeError("system audio device is not selected")
+                    stack.enter_context(
+                        sd.InputStream(
+                            device=self.system.device,
+                            channels=self.system.channels,
+                            samplerate=self.sample_rate,
+                            blocksize=blocksize,
+                            dtype="float32",
+                            callback=make_callback("system", system_queue, self.on_status),
+                        )
+                    )
 
-            while not self._stop_event.is_set():
-                if self.duration is not None and self.elapsed_seconds >= self.duration:
-                    break
+                mp3_file = stack.enter_context(self.output.open("wb"))
+                self.on_status("Recording")
 
-                mic_block = pop_or_silence(mic_queue, blocksize)
-                system_block = pop_or_silence(system_queue, blocksize)
+                while not self._stop_event.is_set():
+                    if self.duration is not None and self.elapsed_seconds >= self.duration:
+                        break
 
-                if self.is_paused:
-                    continue
+                    mic_block = pop_or_silence(mic_queue, blocksize)
+                    system_block = pop_or_silence(system_queue, blocksize)
 
-                mixed = (mic_block + system_block) * 0.5
-                encoded = encoder.encode(float_to_pcm16(mixed))
-                if encoded:
-                    mp3_file.write(encoded)
+                    if self.is_paused:
+                        continue
 
-            tail = encoder.flush()
-            if tail:
-                mp3_file.write(tail)
+                    mixed = (mic_block + system_block) * 0.5
+                    encoded = encoder.encode(float_to_pcm16(mixed))
+                    if encoded:
+                        mp3_file.write(encoded)
+
+                tail = encoder.flush()
+                if tail:
+                    mp3_file.write(tail)
+        finally:
+            self._stop_native_process()
 
         self.on_status(f"Saved {self.output} ({self.elapsed_seconds:.1f} sec)")
+
+    def _stop_native_process(self) -> None:
+        process = self._native_process
+        if process is None or process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+
+    def _start_native_system_audio(
+        self, system_queue: queue.Queue[np.ndarray], blocksize: int
+    ) -> None:
+        if not NATIVE_SYSTEM_AUDIO_HELPER.exists():
+            raise RuntimeError(
+                "native system audio helper is not built. Run build_native_audio.sh"
+            )
+
+        process = subprocess.Popen(
+            [str(NATIVE_SYSTEM_AUDIO_HELPER)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self._native_process = process
+        time.sleep(0.2)
+
+        if process.poll() is not None:
+            error = ""
+            if process.stderr is not None:
+                error = process.stderr.read().decode("utf-8", errors="replace").strip()
+            raise RuntimeError(error or "native system audio helper failed to start")
+
+        reader = threading.Thread(
+            target=read_native_system_audio,
+            args=(process, system_queue, blocksize, self._stop_event, self.on_status),
+            daemon=True,
+        )
+        reader.start()
+        self.on_status("Native macOS system audio enabled")
 
 
 def record(
     mic: InputSource,
-    system: InputSource,
+    system: Optional[InputSource],
     output: Path,
     duration: Optional[float],
     sample_rate: int,
@@ -303,7 +403,8 @@ def record(
 
     try:
         print(f"Recording microphone: {mic.name}")
-        print(f"Recording system audio: {system.name}")
+        if system is not None:
+            print(f"Recording system audio: {system.name}")
         print(f"Writing MP3: {output}")
         print("Press Ctrl+C to stop.")
         recorder.start()

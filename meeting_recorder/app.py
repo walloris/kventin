@@ -31,12 +31,11 @@ class RecorderApp(tk.Tk):
         self.messages: queue.Queue[str] = queue.Queue()
 
         self.mic_var = tk.StringVar()
-        self.system_var = tk.StringVar()
         self.output_var = tk.StringVar(value=str(self._next_output_path()))
         self.status_var = tk.StringVar(value="Ready")
         self.timer_var = tk.StringVar(value="00:00:00")
         self.hint_var = tk.StringVar(
-            value="Для системного звука на macOS нужен BlackHole/Loopback и вывод звука встречи в него."
+            value="Системный звук пишется встроенным macOS-захватом. При первом запуске разрешите Screen Recording."
         )
 
         self._build_ui()
@@ -67,10 +66,12 @@ class RecorderApp(tk.Tk):
         self.mic_combo.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(4, 12))
 
         ttk.Label(container, text="Звук компьютера").grid(row=4, column=0, sticky="w")
-        self.system_combo = ttk.Combobox(
-            container, textvariable=self.system_var, state="readonly"
+        system_label = ttk.Label(
+            container,
+            text="Встроенный macOS system audio",
+            foreground="#334155",
         )
-        self.system_combo.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(4, 12))
+        system_label.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(4, 12))
 
         refresh_button = ttk.Button(
             container, text="Обновить устройства", command=self.refresh_devices
@@ -133,58 +134,25 @@ class RecorderApp(tk.Tk):
 
         labels = [self._source_label(source) for source in self.sources]
         self.mic_combo["values"] = labels
-        self.system_combo["values"] = labels
 
         if labels and not self.mic_var.get():
-            mic_label = next(
-                (
-                    label
-                    for label in labels
-                    if not self._is_virtual_system_source(label)
-                ),
-                labels[0],
-            )
-            self.mic_var.set(mic_label)
-        if labels and not self.system_var.get():
-            blackhole = next(
-                (label for label in labels if self._is_virtual_system_source(label)),
-                "",
-            )
-            self.system_var.set(blackhole)
-            if not blackhole:
-                self.hint_var.set(
-                    "BlackHole/Loopback не найден. Без виртуального аудиодрайвера приложение запишет только микрофон."
-                )
+            self.mic_var.set(labels[0])
 
         self.status_var.set(f"Ready. Devices: {len(labels)}")
 
     def start_recording(self) -> None:
         try:
             mic = self._selected_source(self.mic_var.get())
-            system = self._selected_source(self.system_var.get())
-            if mic.device == system.device:
-                raise ValueError(
-                    "Для звука компьютера выбрано то же устройство, что и микрофон. "
-                    "Выберите BlackHole/Loopback в поле 'Звук компьютера'."
-                )
-
-            if not self._is_virtual_system_source(system.name):
-                if not messagebox.askyesno(
-                    "Проверить системный звук?",
-                    "Выбранный источник не похож на BlackHole/Loopback. "
-                    "Продолжить запись с этим устройством?",
-                ):
-                    return
-
             output = self._next_output_path()
             self.output_var.set(str(output))
 
             self.recorder = MeetingRecorder(
                 mic=mic,
-                system=system,
+                system=None,
                 output=output,
                 sample_rate=DEFAULT_SAMPLE_RATE,
                 bitrate_kbps=DEFAULT_BITRATE_KBPS,
+                native_system_audio=True,
                 on_status=self.messages.put,
             )
             self.recorder.start()
@@ -197,7 +165,6 @@ class RecorderApp(tk.Tk):
         self.pause_button.configure(state="normal", text="Пауза")
         self.stop_button.configure(state="normal")
         self.mic_combo.configure(state="disabled")
-        self.system_combo.configure(state="disabled")
         self.status_var.set(f"Recording: {Path(self.output_var.get()).name}")
 
     def toggle_pause(self) -> None:
@@ -246,7 +213,6 @@ class RecorderApp(tk.Tk):
         self.pause_button.configure(state="disabled", text="Пауза")
         self.stop_button.configure(state="disabled")
         self.mic_combo.configure(state="readonly")
-        self.system_combo.configure(state="readonly")
 
     def _selected_source(self, label: str) -> InputSource:
         for source in self.sources:
@@ -257,11 +223,6 @@ class RecorderApp(tk.Tk):
     @staticmethod
     def _source_label(source: InputSource) -> str:
         return f"{source.device}: {source.name}"
-
-    @staticmethod
-    def _is_virtual_system_source(value: str) -> bool:
-        value = value.lower()
-        return any(name in value for name in ("blackhole", "loopback", "soundflower"))
 
     @staticmethod
     def _recordings_dir() -> Path:
