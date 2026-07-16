@@ -197,6 +197,23 @@ def normalize_field_text(value: object) -> str:
     return re.sub(r'\s+', ' ', str(value or '')).strip()
 
 
+def clean_report_text(value: object) -> str:
+    """Декодировать HTML-энтити из Jira/рендеренных полей перед выводом отчета."""
+    text = normalize_field_text(value)
+    previous = None
+    while text and text != previous:
+        previous = text
+        text = html.unescape(text)
+    return text
+
+
+def trim_report_text(value: object, limit: int) -> str:
+    text = clean_report_text(value)
+    if len(text) <= limit:
+        return text
+    return text[:limit]
+
+
 def normalize_test_cycle_name(value: object) -> str:
     """Нормализация имени ТЦ для проверки масок: регистр, пробелы и точки."""
     text = normalize_field_text(value).casefold()
@@ -2806,21 +2823,19 @@ class ReleaseValidator:
             for key, data in sorted_items:
                 if not data['errors']:
                     continue
-                assignee = data['assignee']
-                summary = data['summary'][:50] if data['summary'] else "—"
+                assignee = clean_report_text(data['assignee'])
+                summary = trim_report_text(data['summary'], 50) if data['summary'] else "—"
                 url = data['url']
                 # В Jira wiki-разметке:
                 # • \\ — перенос строки внутри ячейки таблицы
                 # • | внутри текста ячейки ломает таблицу — заменяем на HTML-энтити
                 def _escape(text: str) -> str:
-                    safe_text = normalize_field_text(text)
+                    safe_text = clean_report_text(text)
                     safe_text = html.escape(safe_text, quote=False)
                     replacements = {
                         '|': '&#124;',
                         '{': '&#123;',
                         '}': '&#125;',
-                        '[': '&#91;',
-                        ']': '&#93;',
                         '*': '&#42;',
                         '_': '&#95;',
                         '#': '&#35;',
@@ -4503,19 +4518,19 @@ class ReleaseValidator:
                 continue
 
             status_icon = "❌" if data['errors'] else ("⚠️" if data['warnings'] else "✅")
-            assignee = data['assignee']
+            assignee = clean_report_text(data['assignee'])
 
             if key == "GENERAL":
                 print(f"{status_icon} ОБЩИЕ ПРОВЕРКИ:")
             else:
-                print(f"{status_icon} [{key}] {data['summary'][:60]}... ({assignee})")
+                print(f"{status_icon} [{key}] {trim_report_text(data['summary'], 60)}... ({assignee})")
                 print(f"   🔗 {data['url']}")
 
             for err in data['errors']:
-                print(f"   🔴 {err}")
+                print(f"   🔴 {clean_report_text(err)}")
 
             for warn in data['warnings']:
-                print(f"   ⚠️  {warn}")
+                print(f"   ⚠️  {clean_report_text(warn)}")
 
             print("-" * 40)
 
