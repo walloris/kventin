@@ -141,6 +141,30 @@ SERVICE_KE_FIELD_NAME_CANDIDATES = (
     'Конфигурационная единица',
     'Configuration item',
 )
+BUG_SKIP_REASON_FIELD_NAME_CANDIDATES = (
+    'Причина пропуска',
+    'Причина пропуска дефекта',
+    'Причина пропуска бага',
+    'Причина пропуска ошибки',
+    'Причина пропуска в ПРОМ',
+)
+BUG_SKIP_REASON_ALLOWED_VALUES = {
+    'неполнота тестовой модели',
+    'не выполнены требования кибербезопасности',
+    'тест-кейс не запланирован',
+    'тест-кейс не выполнен',
+    'некорректные тестовые данные',
+    'нарушение процедуры тестирования',
+    'несоответствие тестового окружения',
+    'ошибка при установке',
+    'неакцептованные изменения в ппо/спо',
+    'пропущен этап тестирования',
+    'ошибка в согласованных требованиях',
+    'несогласованные изменения требований',
+    'отсутствие требований',
+    'изменение/проблема на стороне партнеров/провайдеров',
+    'ошибка была известна в релизе',
+}
 BACK_REGRESS_CYCLE_ALIASES = ('Регресс', 'Regress', 'Regression')
 BACK_NF_CYCLE_ALIASES = ('НФ', 'NF', 'Новый функционал', 'Новая функциональность')
 BACK_API_CHANNEL_ALIASES = ('api',)
@@ -1136,6 +1160,7 @@ class ReleaseValidator:
         self._dev_status_payload_cache: dict[str, list[tuple[str, str, dict]]] = {}
         self._pull_request_evidence_cache: dict[str, Optional[str]] = {}
         self._release_pr_targets_cache: dict[str, list[tuple[object, list[object]]]] = {}
+        self._merged_pull_request_evidence_cache: dict[str, Optional[str]] = {}
         self._zephyr_cycle_cache = self._load_zephyr_cycle_cache()
 
         try:
@@ -2049,6 +2074,7 @@ class ReleaseValidator:
         self._check_bugs(release_key, is_hotfix=is_hotfix)
         self._check_stories(release_key)
         self._check_required_pull_requests(release_key)
+        self._check_unlinked_release_items_pull_requests(release_key)
         self._check_gigacode_aifixed_labels(release_key)
         self._check_cloud_label(release_key, release.fields.summary)
         self._check_sbrppl_third_party_label(release_key)
@@ -2834,11 +2860,11 @@ class ReleaseValidator:
                     safe_text = html.escape(safe_text, quote=False)
                     replacements = {
                         '|': '&#124;',
-                        '{': '&#123;',
-                        '}': '&#125;',
-                        '*': '&#42;',
-                        '_': '&#95;',
-                        '#': '&#35;',
+                        '{': r'\{',
+                        '}': r'\}',
+                        '*': r'\*',
+                        '_': r'\_',
+                        '#': r'\#',
                     }
                     for raw_char, escaped_char in replacements.items():
                         safe_text = safe_text.replace(raw_char, escaped_char)
@@ -3725,6 +3751,84 @@ class ReleaseValidator:
 
         return False
 
+    def _extract_merged_pull_request_evidence_from_payload(self, value: object) -> Optional[str]:
+        """Найти в dev-status payload PR со статусом merged/merged=true."""
+        if isinstance(value, list):
+            for item in value:
+                evidence = self._extract_merged_pull_request_evidence_from_payload(item)
+                if evidence:
+                    return evidence
+            return None
+
+        if not isinstance(value, dict):
+            return None
+
+        key_text = " ".join(str(key) for key in value.keys()).casefold()
+        raw_text = json.dumps(value, ensure_ascii=False, default=str)
+        raw_casefold = raw_text.casefold()
+        raw_compact = re.sub(r'[^a-zа-я0-9/-]+', '', raw_casefold)
+        looks_like_pr = (
+            'pullrequest' in re.sub(r'[^a-zа-я0-9]+', '', key_text)
+            or 'pullrequest' in raw_compact
+            or '/pull-requests/' in raw_casefold
+            or bool(re.search(r'\bpull\s*request\b', raw_casefold))
+        )
+
+        if looks_like_pr:
+            status_values = []
+            for status_key in ('status', 'state', 'pullRequestStatus', 'pullrequestStatus'):
+                status_value = value.get(status_key)
+                if status_value is not None:
+                    status_text = extract_jira_field_value(status_value) or normalize_field_text(status_value)
+                    status_values.append(status_text.casefold())
+
+            merged_flag = value.get('merged')
+            is_merged = (
+                any(status in {'merged', 'merge', 'влит', 'смёржен', 'смержен'} for status in status_values)
+                or merged_flag is True
+                or normalize_field_text(merged_flag).casefold() == 'true'
+            )
+
+            if is_merged:
+                pr_id = (
+                    value.get('id')
+                    or value.get('pullRequestId')
+                    or value.get('pullrequestId')
+                    or value.get('number')
+                    or value.get('displayId')
+                    or value.get('name')
+                    or value.get('title')
+                    or value.get('url')
+                    or 'PR'
+                )
+                status_display = ", ".join(status_values) if status_values else "merged=true"
+                return f"{pr_id} ({status_display})"
+
+        for item in value.values():
+            evidence = self._extract_merged_pull_request_evidence_from_payload(item)
+            if evidence:
+                return evidence
+        return None
+
+    def _find_issue_merged_pull_request_evidence(self, issue) -> Optional[str]:
+        issue_key = str(getattr(issue, 'key', '') or '')
+        issue_id = str(getattr(issue, 'id', '') or '')
+        cache_key = issue_key or issue_id
+        if cache_key and cache_key in self._merged_pull_request_evidence_cache:
+            return self._merged_pull_request_evidence_cache[cache_key]
+
+        evidence = None
+        if issue_id:
+            for application_type, data_type, payload in self._get_dev_status_payloads(issue_id):
+                payload_evidence = self._extract_merged_pull_request_evidence_from_payload(payload)
+                if payload_evidence:
+                    evidence = f"dev-status {application_type}/{data_type}: {payload_evidence}"
+                    break
+
+        if cache_key:
+            self._merged_pull_request_evidence_cache[cache_key] = evidence
+        return evidence
+
     def _find_issue_pull_request_evidence(self, issue) -> Optional[str]:
         issue_key = str(getattr(issue, 'key', '') or '')
         issue_id = str(getattr(issue, 'id', '') or '')
@@ -3987,6 +4091,100 @@ class ReleaseValidator:
                     target_issue,
                     "error",
                     "Pull Request/commit не найден. Для каждой Story/Bug в составе релиза должен быть PR или commit"
+                )
+
+    @staticmethod
+    def _extract_issue_keys_from_changelog_value(value: object) -> set[str]:
+        return set(re.findall(r'\b[A-Z][A-Z0-9]+-\d+\b', str(value or '')))
+
+    def _get_unlinked_release_issue_keys(self, release_key: str) -> set[str]:
+        try:
+            release = self.jira_main.issue(release_key, fields='issuelinks', expand='changelog')
+        except Exception as e:
+            self._log_issue(
+                release_key,
+                "warning",
+                f"Отлинкованные задачи: не удалось получить changelog релиза для проверки merged PR: {e}"
+            )
+            return set()
+
+        current_linked_keys = set(self._extract_consist_of_issues(release) or [])
+        removed_keys = set()
+
+        histories = getattr(getattr(release, 'changelog', None), 'histories', []) or []
+        for history in histories:
+            for item in getattr(history, 'items', []) or []:
+                field_name = normalize_field_text(getattr(item, 'field', '')).casefold()
+                field_id = normalize_field_text(getattr(item, 'fieldId', '')).casefold()
+                if 'link' not in field_name and 'link' not in field_id:
+                    continue
+
+                from_keys = self._extract_issue_keys_from_changelog_value(getattr(item, 'fromString', ''))
+                to_keys = self._extract_issue_keys_from_changelog_value(getattr(item, 'toString', ''))
+                if not from_keys:
+                    from_keys = self._extract_issue_keys_from_changelog_value(getattr(item, 'from', ''))
+                if not to_keys:
+                    to_keys = self._extract_issue_keys_from_changelog_value(getattr(item, 'to', ''))
+
+                removed_keys.update(from_keys - to_keys)
+
+        return removed_keys - current_linked_keys - {release_key}
+
+    def _check_unlinked_release_items_pull_requests(self, release_key: str) -> None:
+        unlinked_keys = sorted(self._get_unlinked_release_issue_keys(release_key))
+        if not unlinked_keys:
+            return
+
+        print(f"   Проверка merged PR у {len(unlinked_keys)} отлинкованных задач...")
+
+        keys_str = ",".join(unlinked_keys)
+        try:
+            issues = self.jira_main.search_issues(
+                f'key in ({keys_str})',
+                fields='summary,issuetype,assignee,labels',
+                maxResults=500
+            )
+        except Exception as e:
+            self._log_issue(
+                release_key,
+                "warning",
+                f"Отлинкованные задачи: не удалось получить задачи для проверки merged PR: {e}"
+            )
+            return
+
+        issue_types_to_check = {'story', 'task', 'задача', 'bug', 'defect', 'ошибка'}
+        issues_by_key = {
+            issue.key: issue
+            for issue in issues
+            if issue.fields.issuetype and issue.fields.issuetype.name.casefold() in issue_types_to_check
+        }
+
+        for issue_key in unlinked_keys:
+            issue = issues_by_key.get(issue_key)
+            if not issue:
+                continue
+            try:
+                merged_pr = self._find_issue_merged_pull_request_evidence(issue)
+            except Exception as e:
+                self._log_issue(
+                    issue,
+                    "warning",
+                    f"Отлинкованная задача: не удалось проверить статус PR: {e}"
+                )
+                continue
+
+            if merged_pr:
+                self._log_issue(
+                    issue,
+                    "error",
+                    f"Отлинкованная от релиза задача содержит PR в статусе merged ({merged_pr}). "
+                    "Если PR уже влит, задача/баг не должна быть отлинкована от релизного объекта"
+                )
+            else:
+                self._log_issue(
+                    issue,
+                    "success",
+                    "Отлинкованная от релиза задача: merged PR не найден ✓"
                 )
 
     def _check_gigacode_aifixed_labels(self, release_key: str) -> None:
@@ -4317,6 +4515,63 @@ class ReleaseValidator:
                 "GigaChat: не вернул вердикт по этой задаче — проверка summary↔description пропущена",
             )
 
+    def _get_bug_skip_reason_field_id(self) -> Optional[str]:
+        env_field_id = os.getenv("BUG_SKIP_REASON_FIELD_ID", "").strip()
+        if env_field_id:
+            return env_field_id
+        return self._get_jira_field_id_by_names(BUG_SKIP_REASON_FIELD_NAME_CANDIDATES)
+
+    def _check_prod_bug_skip_reason(self, bug, skip_reason_field_id: Optional[str]) -> None:
+        """Для ПРОМ-багов причина пропуска обязательна и должна быть из согласованного списка."""
+        if not skip_reason_field_id:
+            expected_names = ", ".join(BUG_SKIP_REASON_FIELD_NAME_CANDIDATES)
+            self._log_issue(
+                bug,
+                "error",
+                "ПРОМ Bug: не удалось определить Jira field id для поля причины пропуска. "
+                f"Ожидалось одно из названий: {expected_names}. "
+                "Можно задать BUG_SKIP_REASON_FIELD_ID"
+            )
+            return
+
+        raw_val = getattr(bug.fields, skip_reason_field_id, None)
+        if raw_val is None and hasattr(bug, 'raw'):
+            raw_val = bug.raw.get('fields', {}).get(skip_reason_field_id)
+
+        values = extract_jira_field_values(raw_val)
+        normalized_values = {
+            normalize_field_text(value).casefold()
+            for value in values
+            if normalize_field_text(value)
+        }
+        display_value = ", ".join(values) if values else "None"
+
+        if not normalized_values:
+            self._log_issue(
+                bug,
+                "error",
+                f"ПРОМ Bug: поле 'Причина пропуска' ({skip_reason_field_id}) не заполнено"
+            )
+            return
+
+        invalid_values = sorted(normalized_values - BUG_SKIP_REASON_ALLOWED_VALUES)
+        if invalid_values:
+            allowed_display = "; ".join(sorted(BUG_SKIP_REASON_ALLOWED_VALUES))
+            self._log_issue(
+                bug,
+                "error",
+                f"ПРОМ Bug: поле 'Причина пропуска' ({skip_reason_field_id}) = "
+                f"'{display_value}', содержит недопустимые значения: {', '.join(invalid_values)}. "
+                f"Допустимо: {allowed_display}"
+            )
+            return
+
+        self._log_issue(
+            bug,
+            "success",
+            f"ПРОМ Bug: причина пропуска заполнена корректно ({display_value}) ✓"
+        )
+
     def _check_bugs(self, release_key, is_hotfix: bool = False):
         VALID_DETECTION_METHODS = {"АТ НФ", "АТ Регресс", "Регрессионное тестирование", "Тестирование НФ"}
         SKIP_DETECTION_CHECK_STANDS = {"ПСИ", "ПРОМ", "ПРОМ (Stand-in)"}
@@ -4328,6 +4583,7 @@ class ReleaseValidator:
         HOTFIX_BUG_STATUS = normalize_status_name('подтверждение исправления')
         # Хотя бы один из этих лейблов должен быть у каждого бага
         REQUIRED_CONTOUR_LABELS = {'sigma', 'cloud', 'mobile'}
+        skip_reason_field_id = self._get_bug_skip_reason_field_id()
 
         linked_keys = self._get_consist_of_issues(release_key)
         if not linked_keys:
@@ -4337,7 +4593,12 @@ class ReleaseValidator:
             jql = f'parent = {release_key} OR key in ({keys_str})'
 
         try:
-            fields_req = f"summary,description,priority,labels,issuetype,status,assignee,customfield_16901,customfield_11507,{STAND_FIELD_ID},*all"
+            extra_fields = [field_id for field_id in (skip_reason_field_id,) if field_id]
+            fields_req = (
+                "summary,description,priority,labels,issuetype,status,assignee,"
+                f"customfield_16901,customfield_11507,{STAND_FIELD_ID},"
+                + ",".join(extra_fields + ["*all"])
+            )
             all_issues = self.jira_main.search_issues(jql, fields=fields_req, maxResults=100)
         except Exception as e:
             self._log_issue("GENERAL", "error", f"Ошибка поиска багов: {e}")
@@ -4459,6 +4720,7 @@ class ReleaseValidator:
                     )
 
             if stand_type in ["ПРОМ", "ПРОМ (Stand-in)"]:
+                self._check_prod_bug_skip_reason(bug, skip_reason_field_id)
                 prod_bugs.append(bug)
 
         if prod_bugs:
