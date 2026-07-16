@@ -3,10 +3,11 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 import queue
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import messagebox, ttk
 from typing import Optional
 
 from recorder import (
@@ -22,7 +23,7 @@ class RecorderApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Meeting Recorder")
-        self.geometry("720x420")
+        self.geometry("720x430")
         self.minsize(640, 380)
 
         self.sources: list[InputSource] = []
@@ -31,9 +32,12 @@ class RecorderApp(tk.Tk):
 
         self.mic_var = tk.StringVar()
         self.system_var = tk.StringVar()
-        self.output_var = tk.StringVar(value=str(Path.cwd() / "meeting.mp3"))
+        self.output_var = tk.StringVar(value=str(self._next_output_path()))
         self.status_var = tk.StringVar(value="Ready")
         self.timer_var = tk.StringVar(value="00:00:00")
+        self.hint_var = tk.StringVar(
+            value="Для системного звука на macOS нужен BlackHole/Loopback и вывод звука встречи в него."
+        )
 
         self._build_ui()
         self.refresh_devices()
@@ -73,12 +77,14 @@ class RecorderApp(tk.Tk):
         )
         refresh_button.grid(row=3, column=2, sticky="ew", padx=(12, 0), pady=(4, 12))
 
-        ttk.Label(container, text="Файл MP3").grid(row=6, column=0, sticky="w")
-        output_entry = ttk.Entry(container, textvariable=self.output_var)
-        output_entry.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(4, 18))
-
-        browse_button = ttk.Button(container, text="Выбрать файл", command=self.choose_output)
-        browse_button.grid(row=7, column=2, sticky="ew", padx=(12, 0), pady=(4, 18))
+        ttk.Label(container, text="Сохранение").grid(row=6, column=0, sticky="w")
+        output_label = ttk.Label(
+            container,
+            textvariable=self.output_var,
+            foreground="#334155",
+            wraplength=660,
+        )
+        output_label.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(4, 18))
 
         controls = ttk.Frame(container)
         controls.grid(row=8, column=0, columnspan=3, sticky="ew")
@@ -108,8 +114,9 @@ class RecorderApp(tk.Tk):
 
         hint = ttk.Label(
             container,
-            text="Для системного звука на macOS выберите BlackHole/Loopback как источник звука компьютера.",
+            textvariable=self.hint_var,
             foreground="#5b6472",
+            wraplength=660,
         )
         hint.grid(row=10, column=0, columnspan=3, sticky="w", pady=(20, 0))
 
@@ -129,33 +136,48 @@ class RecorderApp(tk.Tk):
         self.system_combo["values"] = labels
 
         if labels and not self.mic_var.get():
-            self.mic_var.set(labels[0])
+            mic_label = next(
+                (
+                    label
+                    for label in labels
+                    if not self._is_virtual_system_source(label)
+                ),
+                labels[0],
+            )
+            self.mic_var.set(mic_label)
         if labels and not self.system_var.get():
             blackhole = next(
-                (label for label in labels if "blackhole" in label.lower()), labels[0]
+                (label for label in labels if self._is_virtual_system_source(label)),
+                "",
             )
             self.system_var.set(blackhole)
+            if not blackhole:
+                self.hint_var.set(
+                    "BlackHole/Loopback не найден. Без виртуального аудиодрайвера приложение запишет только микрофон."
+                )
 
         self.status_var.set(f"Ready. Devices: {len(labels)}")
-
-    def choose_output(self) -> None:
-        filename = filedialog.asksaveasfilename(
-            title="Сохранить запись",
-            defaultextension=".mp3",
-            filetypes=[("MP3 audio", "*.mp3")],
-            initialfile="meeting.mp3",
-        )
-        if filename:
-            self.output_var.set(filename)
 
     def start_recording(self) -> None:
         try:
             mic = self._selected_source(self.mic_var.get())
             system = self._selected_source(self.system_var.get())
-            output = Path(self.output_var.get()).expanduser()
-            if output.suffix.lower() != ".mp3":
-                output = output.with_suffix(".mp3")
-                self.output_var.set(str(output))
+            if mic.device == system.device:
+                raise ValueError(
+                    "Для звука компьютера выбрано то же устройство, что и микрофон. "
+                    "Выберите BlackHole/Loopback в поле 'Звук компьютера'."
+                )
+
+            if not self._is_virtual_system_source(system.name):
+                if not messagebox.askyesno(
+                    "Проверить системный звук?",
+                    "Выбранный источник не похож на BlackHole/Loopback. "
+                    "Продолжить запись с этим устройством?",
+                ):
+                    return
+
+            output = self._next_output_path()
+            self.output_var.set(str(output))
 
             self.recorder = MeetingRecorder(
                 mic=mic,
@@ -176,7 +198,7 @@ class RecorderApp(tk.Tk):
         self.stop_button.configure(state="normal")
         self.mic_combo.configure(state="disabled")
         self.system_combo.configure(state="disabled")
-        self.status_var.set("Recording")
+        self.status_var.set(f"Recording: {Path(self.output_var.get()).name}")
 
     def toggle_pause(self) -> None:
         if self.recorder is None:
@@ -206,6 +228,8 @@ class RecorderApp(tk.Tk):
                 self._set_idle_controls()
                 if error is not None:
                     messagebox.showerror("Ошибка записи", str(error))
+                else:
+                    self.output_var.set(str(self._next_output_path()))
 
         self.after(200, self._tick)
 
@@ -233,6 +257,20 @@ class RecorderApp(tk.Tk):
     @staticmethod
     def _source_label(source: InputSource) -> str:
         return f"{source.device}: {source.name}"
+
+    @staticmethod
+    def _is_virtual_system_source(value: str) -> bool:
+        value = value.lower()
+        return any(name in value for name in ("blackhole", "loopback", "soundflower"))
+
+    @staticmethod
+    def _recordings_dir() -> Path:
+        return Path.home() / "Downloads" / "Записи встреч"
+
+    @classmethod
+    def _next_output_path(cls) -> Path:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return cls._recordings_dir() / f"meeting_{timestamp}.mp3"
 
     @staticmethod
     def _format_seconds(seconds: float) -> str:
