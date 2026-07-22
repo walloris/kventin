@@ -141,13 +141,7 @@ SERVICE_KE_FIELD_NAME_CANDIDATES = (
     'Конфигурационная единица',
     'Configuration item',
 )
-BUG_SKIP_REASON_FIELD_NAME_CANDIDATES = (
-    'Причина пропуска',
-    'Причина пропуска дефекта',
-    'Причина пропуска бага',
-    'Причина пропуска ошибки',
-    'Причина пропуска в ПРОМ',
-)
+BUG_SKIP_REASON_FIELD_ID = 'customfield_16801'
 BUG_SKIP_REASON_ALLOWED_VALUES = {
     'неполнота тестовой модели',
     'не выполнены требования кибербезопасности',
@@ -4130,18 +4124,55 @@ class ReleaseValidator:
 
         return removed_keys - current_linked_keys - {release_key}
 
+    def _get_release_story_bug_keys(self, release_key: str) -> set[str]:
+        linked_keys = self._get_consist_of_issues(release_key)
+        if not linked_keys:
+            return set()
+
+        keys_str = ",".join(linked_keys)
+        try:
+            issues = self.jira_main.search_issues(
+                f'key in ({keys_str})',
+                fields='issuetype',
+                maxResults=500,
+            )
+        except Exception as e:
+            self._log_issue(
+                release_key,
+                "warning",
+                f"Отлинкованные задачи: не удалось получить состав релиза для проверки связей: {e}"
+            )
+            return set()
+
+        issue_types_to_check = {'story', 'bug', 'defect', 'ошибка'}
+        return {
+            issue.key
+            for issue in issues
+            if issue.fields.issuetype and issue.fields.issuetype.name.casefold() in issue_types_to_check
+        }
+
+    @staticmethod
+    def _extract_linked_issue_keys(issue) -> set[str]:
+        linked_keys = set()
+        for link in getattr(issue.fields, 'issuelinks', []) or []:
+            linked_issue = getattr(link, 'outwardIssue', None) or getattr(link, 'inwardIssue', None)
+            if linked_issue and getattr(linked_issue, 'key', None):
+                linked_keys.add(linked_issue.key)
+        return linked_keys
+
     def _check_unlinked_release_items_pull_requests(self, release_key: str) -> None:
         unlinked_keys = sorted(self._get_unlinked_release_issue_keys(release_key))
         if not unlinked_keys:
             return
 
         print(f"   Проверка merged PR у {len(unlinked_keys)} отлинкованных задач...")
+        current_release_story_bug_keys = self._get_release_story_bug_keys(release_key)
 
         keys_str = ",".join(unlinked_keys)
         try:
             issues = self.jira_main.search_issues(
                 f'key in ({keys_str})',
-                fields='summary,issuetype,assignee,labels',
+                fields='summary,issuetype,assignee,labels,issuelinks',
                 maxResults=500
             )
         except Exception as e:
@@ -4163,6 +4194,27 @@ class ReleaseValidator:
             issue = issues_by_key.get(issue_key)
             if not issue:
                 continue
+
+            linked_release_keys = self._extract_linked_issue_keys(issue) & current_release_story_bug_keys
+            if linked_release_keys:
+                self._log_issue(
+                    issue,
+                    "success",
+                    "Отлинкованная от релиза задача связана с задачей/багом в составе релиза "
+                    f"({', '.join(sorted(linked_release_keys))}) — проверка merged PR пропущена ✓"
+                )
+                continue
+
+            issue_labels = {str(label).strip().casefold() for label in (getattr(issue.fields, 'labels', []) or [])}
+            if 'review_confirmed' in issue_labels:
+                self._log_issue(
+                    issue,
+                    "success",
+                    "Отлинкованная от релиза задача имеет лейбл review_confirmed — "
+                    "проверка merged PR пропущена ✓"
+                )
+                continue
+
             try:
                 merged_pr = self._find_issue_merged_pull_request_evidence(issue)
             except Exception as e:
@@ -4515,22 +4567,13 @@ class ReleaseValidator:
                 "GigaChat: не вернул вердикт по этой задаче — проверка summary↔description пропущена",
             )
 
-    def _get_bug_skip_reason_field_id(self) -> Optional[str]:
-        env_field_id = os.getenv("BUG_SKIP_REASON_FIELD_ID", "").strip()
-        if env_field_id:
-            return env_field_id
-        return self._get_jira_field_id_by_names(BUG_SKIP_REASON_FIELD_NAME_CANDIDATES)
-
     def _check_prod_bug_skip_reason(self, bug, skip_reason_field_id: Optional[str]) -> None:
         """Для ПРОМ-багов причина пропуска обязательна и должна быть из согласованного списка."""
         if not skip_reason_field_id:
-            expected_names = ", ".join(BUG_SKIP_REASON_FIELD_NAME_CANDIDATES)
             self._log_issue(
                 bug,
                 "error",
-                "ПРОМ Bug: не удалось определить Jira field id для поля причины пропуска. "
-                f"Ожидалось одно из названий: {expected_names}. "
-                "Можно задать BUG_SKIP_REASON_FIELD_ID"
+                "ПРОМ Bug: не задан Jira field id для поля причины пропуска"
             )
             return
 
@@ -4583,7 +4626,7 @@ class ReleaseValidator:
         HOTFIX_BUG_STATUS = normalize_status_name('подтверждение исправления')
         # Хотя бы один из этих лейблов должен быть у каждого бага
         REQUIRED_CONTOUR_LABELS = {'sigma', 'cloud', 'mobile'}
-        skip_reason_field_id = self._get_bug_skip_reason_field_id()
+        skip_reason_field_id = BUG_SKIP_REASON_FIELD_ID
 
         linked_keys = self._get_consist_of_issues(release_key)
         if not linked_keys:
