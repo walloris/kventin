@@ -55,3 +55,17 @@ def test_execute_browser_action_uses_escape_for_empty_press_key() -> None:
 
     assert result == "key_pressed"
     assert calls == [("key", "Escape")]
+
+
+def test_unknown_action_never_falls_back_to_click() -> None:
+    calls = []
+
+    result = execute_browser_action(
+        Page(),
+        {"action": "magic", "selector": "#danger"},
+        None,
+        _handlers(calls),
+    )
+
+    assert result == "unsupported_action: magic"
+    assert calls == []

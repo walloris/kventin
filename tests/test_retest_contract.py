@@ -6,7 +6,13 @@ from agent.defects.defect_builder import (
     memory_actions_to_retest_plan,
     parse_retest_plan_from_description,
 )
-from agent.defects.defect_retest import _assert_retest_oracle
+from agent.defects import defect_retest
+from agent.defects.defect_retest import (
+    _apply_plan_step,
+    _assert_retest_oracle,
+    _run_legacy_text_steps,
+    _run_loaded_plan_steps,
+)
 
 
 def test_retest_plan_parses_code_block_before_following_sections() -> None:
@@ -75,3 +81,107 @@ def test_retest_oracle_fails_on_repeated_signals() -> None:
 
     assert ok is False
     assert "network-сигнал" in msg
+
+
+def test_retest_fails_closed_for_empty_or_unknown_steps() -> None:
+    memory = AgentMemory()
+
+    assert _run_loaded_plan_steps(None, memory, {"steps": []})[0] is False
+    assert _apply_plan_step(None, memory, {"op": "magic"}, "")[0] is False
+    assert _run_legacy_text_steps(None, memory, [], "")[0] is False
+    assert _run_legacy_text_steps(None, memory, ["Сделать что-нибудь"], "")[0] is False
+
+
+def test_retest_in_qa_is_retriable_after_infrastructure_failure(monkeypatch) -> None:
+    transition_calls = []
+    monkeypatch.setattr(
+        defect_retest,
+        "get_issue_with_changelog",
+        lambda _key: (
+            200,
+            {
+                "fields": {"status": {"name": defect_retest.JIRA_RETEST_STATUS_QA}, "description": "x"},
+                "changelog": {},
+            },
+            "",
+        ),
+    )
+    monkeypatch.setattr(defect_retest, "start_qa_transition", lambda key: transition_calls.append(key))
+    monkeypatch.setattr(defect_retest, "extract_description_text", lambda _fields: "description")
+    monkeypatch.setattr(
+        defect_retest,
+        "run_retest_playwright",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("browser unavailable")),
+    )
+
+    assert defect_retest.process_retest_issue("QA-1") is False
+    assert transition_calls == []
+
+
+def test_inconclusive_retest_stays_in_qa(monkeypatch) -> None:
+    comments = []
+    reopened = []
+    monkeypatch.setattr(
+        defect_retest,
+        "get_issue_with_changelog",
+        lambda _key: (
+            200,
+            {
+                "fields": {
+                    "status": {"name": defect_retest.JIRA_RETEST_STATUS_QA},
+                    "description": "legacy steps",
+                    "comment": {"comments": []},
+                },
+                "changelog": {},
+            },
+            "",
+        ),
+    )
+    monkeypatch.setattr(defect_retest, "extract_description_text", lambda _fields: "legacy steps")
+    monkeypatch.setattr(
+        defect_retest,
+        "run_retest_playwright",
+        lambda *_args: (False, "Шаг 1 не распознан: сделать что-нибудь"),
+    )
+    monkeypatch.setattr(defect_retest, "add_issue_comment", lambda _key, body: comments.append(body) or True)
+    monkeypatch.setattr(
+        defect_retest,
+        "reopen_or_move_to_in_progress",
+        lambda *_args, **_kwargs: reopened.append(True) or True,
+    )
+
+    assert defect_retest.process_retest_issue("QA-2") is True
+    assert len(comments) == 1
+    assert defect_retest._INCONCLUSIVE_MARKER_PREFIX in comments[0]
+    assert reopened == []
+
+
+def test_same_inconclusive_retest_is_not_repeated(monkeypatch) -> None:
+    description = "legacy steps"
+    marker = defect_retest._inconclusive_marker(description)
+    runs = []
+    monkeypatch.setattr(
+        defect_retest,
+        "get_issue_with_changelog",
+        lambda _key: (
+            200,
+            {
+                "fields": {
+                    "status": {"name": defect_retest.JIRA_RETEST_STATUS_QA},
+                    "description": description,
+                    "comment": {"comments": [{"body": marker}]},
+                },
+                "changelog": {},
+            },
+            "",
+        ),
+    )
+    monkeypatch.setattr(defect_retest, "extract_description_text", lambda _fields: description)
+    monkeypatch.setattr(
+        defect_retest,
+        "run_retest_playwright",
+        lambda *_args: runs.append(True) or (True, "ok"),
+    )
+
+    assert defect_retest.process_retest_issue("QA-3") is True
+    assert runs == []

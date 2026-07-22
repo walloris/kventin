@@ -28,3 +28,11 @@ trace.zip
 # Прочее
 .DS_Store
 *.log
+.pytest_cache/
+.kventin_agent_memory.json
+.kventin-daemon.lock
+session_report.txt
+session_report.html
+session_steps.jsonl
+screenshots/
+kventin_steps/

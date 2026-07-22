@@ -24,7 +24,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Sequence
+from typing import Any, Iterable, Iterator, Optional, Sequence, Tuple
 
 script_dir = Path(__file__).resolve().parent
 parent_dir = script_dir.parent
@@ -169,7 +169,7 @@ def load_legacy_config() -> dict[str, Any]:
     return {}
 
 
-def load_jira_settings(auth_mode_arg: str | None = None) -> JiraSettings:
+def load_jira_settings(auth_mode_arg: Optional[str] = None) -> JiraSettings:
     """Load Jira connection settings from .env, env vars, or legacy config."""
 
     try:
@@ -238,7 +238,7 @@ def build_jql(project_key: str, issue_type: str, days_back: int) -> str:
     )
 
 
-def jira_auth(settings: JiraSettings) -> tuple[dict[str, str], tuple[str, str] | None]:
+def jira_auth(settings: JiraSettings) -> Tuple[dict[str, str], Optional[Tuple[str, str]]]:
     """Return headers and optional basic auth tuple for requests."""
 
     headers = {

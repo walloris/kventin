@@ -36,6 +36,30 @@ class FakePage:
         return ""
 
 
+class FakeLocator:
+    def __init__(self, state):
+        self.state = state
+
+    @property
+    def first(self):
+        return self
+
+    def count(self):
+        return 1
+
+    def evaluate(self, _script):
+        return dict(self.state)
+
+
+class CssPage(FakePage):
+    def __init__(self, state):
+        super().__init__()
+        self.state = state
+
+    def locator(self, _selector):
+        return FakeLocator(self.state)
+
+
 def test_ref_num_and_expected_stable_key() -> None:
     assert ref_num("ref:42") == 42
     assert ref_num("42") == 42
@@ -107,6 +131,42 @@ def test_preflight_rejects_background_ref_when_overlay_active() -> None:
         page,
         AgentMemory(),
         {"action": "click", "selector": "ref:1"},
+        has_overlay=True,
+    )
+
+    assert result.ok is False
+    assert result.reason == "outside_overlay"
+
+
+def test_preflight_rejects_background_css_selector_when_overlay_active() -> None:
+    page = CssPage(
+        {
+            "exists": True,
+            "visible": True,
+            "disabled": False,
+            "hidden_dom": False,
+            "inside_active_overlay": False,
+            "outside_overlay": True,
+            "occluded": True,
+        }
+    )
+
+    result = preflight_action(
+        page,
+        AgentMemory(),
+        {"action": "click", "selector": "#background-save"},
+        has_overlay=True,
+    )
+
+    assert result.ok is False
+    assert result.reason == "outside_overlay"
+
+
+def test_preflight_rejects_untargeted_page_action_under_overlay() -> None:
+    result = preflight_action(
+        FakePage(),
+        AgentMemory(),
+        {"action": "scroll", "selector": "down"},
         has_overlay=True,
     )
 

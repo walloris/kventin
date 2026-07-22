@@ -254,6 +254,19 @@ def rule_action_failure(
     res = result.strip()
     if not res:
         return None
+    if res.startswith("modal_close_failed"):
+        details = (
+            f"Действие: close_modal\n"
+            f"URL: {page_url}\n"
+            "Активный blocking overlay остался в DOM после scoped close-control, "
+            "Escape и безопасной попытки через backdrop. Основной экран остаётся недоступен.\n\n"
+            f"Результат DOM-проверки:\n{res[:1500]}"
+        )
+        return {
+            "title": "Активный оверлей невозможно закрыть",
+            "details": details,
+            "severity": "major",
+        }
     if not (res.startswith("click_error") or res.startswith("type_error") or res.startswith("hover_error")):
         return None
 

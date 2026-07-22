@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -23,14 +24,15 @@ from typing import List, Optional, Tuple
 
 from config import (
     DOC_AS_CODE_DIR,
+    JIRA_TASK_EXPLORATORY_STEPS,
     LLM_SKILLS_DIR,
-    MAX_STEPS,
     START_URL,
 )
 from agent.defects.jira_client import (
     add_issue_comment,
     attach_file_to_issue,
     extract_description_text,
+    extract_issue_comment_text,
     get_issue_with_changelog,
 )
 
@@ -38,10 +40,12 @@ LOG = logging.getLogger("kventin.task")
 
 _URL_RE = re.compile(r"https?://[^\s\)\]\}>«»\"']+")
 _TC_GEN_MAX_RETRIES = 3
+_SUCCESS_MARKER_PREFIX = "KVENTIN_TASK_TESTING_V1"
+_FAILURE_MARKER_PREFIX = "KVENTIN_TASK_TESTING_FAILED_V1"
 
 
 def _repo_root() -> Path:
-    return Path(__file__).resolve().parent.parent
+    return Path(__file__).resolve().parents[2]
 
 
 def _skills_dir() -> Path:
@@ -63,6 +67,20 @@ def _extract_feature_url(description: str) -> str:
     return START_URL or ""
 
 
+def _task_input_digest(summary: str, description: str) -> str:
+    return hashlib.sha256(
+        f"{summary}\n{description}".encode("utf-8", errors="replace")
+    ).hexdigest()
+
+
+def _task_marker(prefix: str, summary: str, description: str) -> str:
+    return f"{prefix}:{_task_input_digest(summary, description)[:16]}"
+
+
+def _source_digest_path(xml_path: Path) -> Path:
+    return xml_path.with_name(f"{xml_path.name}.source.sha256")
+
+
 def _strip_code_fences(text: str) -> str:
     """Убрать markdown-обёртку ```xml ... ``` и вытащить XML с первого <?xml/<тега."""
     t = (text or "").strip()
@@ -79,8 +97,9 @@ def _strip_code_fences(text: str) -> str:
 def _validate_xml(generated: Path, example: Path) -> Tuple[bool, str]:
     _, validator = _test_case_writer_paths()
     if not validator.is_file():
-        LOG.warning("validate_xml.py не найден: %s — пропускаю валидацию", validator)
-        return True, "validator missing"
+        message = f"validate_xml.py не найден: {validator}"
+        LOG.error(message)
+        return False, message
     try:
         proc = subprocess.run(
             [sys.executable, str(validator), str(generated), str(example)],
@@ -146,7 +165,11 @@ def generate_test_cases_xml(
 
     out_dir = _repo_root() / DOC_AS_CODE_DIR / "test-cases"
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_file = out_dir / f"{key}.xml"
+    safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", key).strip("._") or "issue"
+    out_file = out_dir / f"{safe_key}.xml"
+    temp_file = out_file.with_suffix(".xml.tmp")
+    digest_file = _source_digest_path(out_file)
+    temp_digest_file = digest_file.with_name(f"{digest_file.name}.tmp")
 
     from agent.llm.local_openai_client import LocalOpenAIClient
 
@@ -160,31 +183,48 @@ def generate_test_cases_xml(
             last_errors = "LLM вернула пустой/не-XML ответ"
             LOG.warning("%s: попытка %d — нет XML", key, attempt)
             continue
-        out_file.write_text(xml, encoding="utf-8")
-        ok, msg = _validate_xml(out_file, example_path)
+        temp_file.write_text(xml, encoding="utf-8")
+        ok, msg = _validate_xml(temp_file, example_path)
         if ok:
+            os.replace(temp_file, out_file)
+            temp_digest_file.write_text(
+                _task_input_digest(summary, description),
+                encoding="ascii",
+            )
+            os.replace(temp_digest_file, digest_file)
             LOG.info("%s: тест-кейсы VALID (попытка %d)", key, attempt)
             return out_file, "VALID"
         last_errors = msg
         LOG.warning("%s: попытка %d INVALID: %s", key, attempt, msg[:200])
 
+    try:
+        temp_file.unlink()
+    except FileNotFoundError:
+        pass
+    try:
+        temp_digest_file.unlink()
+    except FileNotFoundError:
+        pass
     return None, last_errors or "не удалось получить валидный XML"
 
 
 def _run_exploratory(feature_url: str) -> str:
     """
-    Фокусный exploratory-прогон. Запускается только при ограниченном MAX_STEPS,
-    чтобы демон не завис на бесконечном цикле.
+    Фокусный exploratory-прогон с отдельным ограниченным бюджетом задачи.
     """
     if not feature_url:
         return ""
-    if MAX_STEPS <= 0:
-        LOG.info("MAX_STEPS=0 (бесконечный цикл) — exploratory для задачи пропущен")
+    if JIRA_TASK_EXPLORATORY_STEPS <= 0:
+        LOG.info("JIRA_TASK_EXPLORATORY_STEPS=0 — exploratory для задачи отключен")
         return ""
     try:
         from agent.core.agent import run_agent
 
-        res = run_agent(start_url=feature_url) or {}
+        res = run_agent(
+            start_url=feature_url,
+            max_steps=JIRA_TASK_EXPLORATORY_STEPS,
+            enable_qa_retests=False,
+        ) or {}
         return (
             f"Шагов: {res.get('steps', 0)}, дефектов заведено: {res.get('defects', 0)}"
             + (f", ошибка: {res.get('error')}" if res.get("error") else "")
@@ -201,7 +241,7 @@ def process_task_issue(key: str) -> bool:
     Returns
     -------
     bool
-        True, если задача обработана (с кейсами или без); False — если не загрузилась.
+        True только после подтверждённой публикации актуального XML и комментария.
     """
     code, full, raw_tail = get_issue_with_changelog(key)
     if code != 200 or not full:
@@ -212,10 +252,34 @@ def process_task_issue(key: str) -> bool:
     summary = (fields.get("summary") or "").strip()
     description = extract_description_text(fields)
     feature_url = _extract_feature_url(description)
+    success_marker = _task_marker(_SUCCESS_MARKER_PREFIX, summary, description)
+    failure_marker = _task_marker(_FAILURE_MARKER_PREFIX, summary, description)
+    existing_comments = extract_issue_comment_text(fields)
+    if success_marker in existing_comments:
+        LOG.info("%s: текущая версия требований уже обработана", key)
+        return True
 
-    evidence = _run_exploratory(feature_url)
+    example_path, _ = _test_case_writer_paths()
+    safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", key).strip("._") or "issue"
+    existing_file = _repo_root() / DOC_AS_CODE_DIR / "test-cases" / f"{safe_key}.xml"
+    out_file = None
+    msg = ""
+    if existing_file.is_file() and example_path.is_file():
+        digest_file = _source_digest_path(existing_file)
+        cached_digest = ""
+        try:
+            cached_digest = digest_file.read_text(encoding="ascii").strip()
+        except (FileNotFoundError, OSError, UnicodeError):
+            pass
+        valid, _ = _validate_xml(existing_file, example_path)
+        if valid and cached_digest == _task_input_digest(summary, description):
+            LOG.info("%s: переиспользую валидные локальные тест-кейсы", key)
+            out_file, msg = existing_file, "VALID (cached)"
 
-    out_file, msg = generate_test_cases_xml(key, summary, description, evidence)
+    evidence = ""
+    if out_file is None:
+        evidence = _run_exploratory(feature_url)
+        out_file, msg = generate_test_cases_xml(key, summary, description, evidence)
 
     if out_file:
         rel = out_file.relative_to(_repo_root()) if out_file.is_relative_to(_repo_root()) else out_file
@@ -223,21 +287,33 @@ def process_task_issue(key: str) -> bool:
             "h3. Kventin — тест-кейсы сгенерированы\n"
             f"Сформированы тест-кейсы (Zephyr XML по образцу), валидация структуры: VALID.\n"
             f"Файл: {{{{{rel}}}}}\n"
+            f"{{noformat}}{success_marker}{{noformat}}\n"
         )
         if evidence:
             comment += f"Exploratory-прогон: {{quote}}{evidence}{{quote}}\n"
-        add_issue_comment(key, comment)
-        attach_file_to_issue(key, str(out_file))
-        print(f"[task] {key}: тест-кейсы готовы → {out_file}")
-    else:
-        add_issue_comment(
+        attached = attach_file_to_issue(key, str(out_file))
+        commented = add_issue_comment(key, comment) if attached else False
+        if attached and commented:
+            print(f"[task] {key}: тест-кейсы готовы → {out_file}")
+            return True
+        LOG.warning(
+            "%s: публикация не завершена (attachment=%s, comment=%s)",
             key,
-            "h3. Kventin — тест-кейсы не сгенерированы\n"
-            f"Автоматическая генерация не прошла Coverage Gate.\n{{quote}}{msg[:500]}{{quote}}",
+            attached,
+            commented,
         )
+        return False
+    else:
+        if failure_marker not in existing_comments:
+            add_issue_comment(
+                key,
+                "h3. Kventin — тест-кейсы не сгенерированы\n"
+                f"Автоматическая генерация не прошла Coverage Gate.\n{{quote}}{msg[:500]}{{quote}}\n"
+                f"{{noformat}}{failure_marker}{{noformat}}",
+            )
         print(f"[task] {key}: тест-кейсы НЕ готовы: {msg[:200]}")
 
-    return True
+    return False
 
 
 def collect_task_issue_keys(status_name: str, max_results: int = 10) -> List[str]:

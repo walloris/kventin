@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -23,7 +24,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from playwright.sync_api import Browser, BrowserContext, Page, Playwright, sync_playwright
 
-import agent.core.agent as agent_mod
 from config import (
     ACTION_TIMEOUT_MS,
     AUTH_PASSWORD,
@@ -39,17 +39,22 @@ from config import (
     HEADLESS,
     JIRA_RETEST_FALLBACK_ASSIGNEE,
     JIRA_RETEST_MAX_ISSUES,
+    JIRA_RETEST_STATUS_QA,
     JIRA_RETEST_STATUS_READY_FOR_QA,
     SESSION_STATE_RESTORE_PATH,
     START_URL,
     VIEWPORT_HEIGHT,
     VIEWPORT_WIDTH,
 )
-from agent.core.agent import AgentMemory, _do_auth_login, _inject_all, execute_action, smart_wait_after_goto
+from agent.actions.browser_actions import _do_auth_login, _inject_all, execute_action
+from agent.actions.action_result import action_failed
+from agent.actions.wait_utils import smart_wait_after_goto
+from agent.core.agent_memory import AgentMemory
 from agent.defects.jira_client import (
     add_issue_comment,
     author_to_assignee_value,
     extract_description_text,
+    extract_issue_comment_text,
     find_author_who_moved_to_status,
     get_issue_with_changelog,
     reopen_or_move_to_in_progress,
@@ -65,6 +70,56 @@ from agent.defects.defect_builder import (
 from agent.browser.page_analyzer import get_dom_summary
 
 LOG = logging.getLogger("kventin.retest")
+_INCONCLUSIVE_MARKER_PREFIX = "KVENTIN_RETEST_INCONCLUSIVE_V1"
+
+
+def _inconclusive_marker(description: str) -> str:
+    digest = hashlib.sha256(
+        (description or "").encode("utf-8", errors="replace")
+    ).hexdigest()[:16]
+    return f"{_INCONCLUSIVE_MARKER_PREFIX}:{digest}"
+
+
+def _is_inconclusive_retest(message: str) -> bool:
+    """True when automation could not decide whether the defect still exists."""
+    text = (message or "").casefold()
+    markers = (
+        "нет start_url",
+        "нет стартового url",
+        "не содержит шагов",
+        "нет распознаваемых шагов",
+        "не распознан",
+        "ожидается объект шага",
+        "неподдерживаемая операция",
+        "нет selector",
+        "нет url",
+        "нет path",
+        "not_found",
+        "element not_found",
+        "unsupported_action",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _comment_inconclusive_once(
+    key: str,
+    message: str,
+    description: str,
+    existing_comments: str,
+) -> None:
+    marker = _inconclusive_marker(description)
+    if marker in (existing_comments or ""):
+        return
+    add_issue_comment(
+        key,
+        (
+            "h3. Kventin retest — требуется ручная проверка\n"
+            "Автоматический ретест не может достоверно определить состояние дефекта; "
+            "задача оставлена в QA. Исправьте машинный сценарий или выполните ретест вручную.\n"
+            f"{{quote}}{message[:1000]}{{quote}}\n"
+            f"{{noformat}}{marker}{{noformat}}"
+        ),
+    )
 
 
 def _format_retest_lines(items: List[Dict[str, Any]], *, limit: int = 20) -> str:
@@ -378,7 +433,7 @@ def _apply_plan_step(
     if op == "navigate":
         url = (step.get("url") or "").strip()
         if not url:
-            return True, "skip empty navigate"
+            return False, "navigate: нет url"
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=25000)
             smart_wait_after_goto(page, timeout=5000)
@@ -434,11 +489,10 @@ def _apply_plan_step(
             return False, "upload_file: нет path"
         act = {"action": "upload_file", "selector": sel, "value": path, "reason": "retest"}
     else:
-        return True, f"skip unknown op={op!r}"
+        return False, f"неподдерживаемая операция op={op!r}"
 
     result = execute_action(page, act, memory)
-    low_res = (result or "").lower()
-    if any(x in low_res for x in ("error", "not_found", "not found", "click_error", "no_action")):
+    if action_failed(result):
         return False, f"{op} → {result}"
     return True, "ok"
 
@@ -446,13 +500,47 @@ def _apply_plan_step(
 def _run_loaded_plan_steps(page: Page, memory: AgentMemory, plan: Dict[str, Any]) -> Tuple[bool, str]:
     primary = (plan.get("primary_locator") or "").strip()
     steps = plan.get("steps") or []
+    if not steps:
+        return False, "План ретеста не содержит шагов"
     for idx, st in enumerate(steps):
         if not isinstance(st, dict):
-            continue
+            return False, f"План шаг {idx + 1}: ожидается объект шага"
         ok, msg = _apply_plan_step(page, memory, st, primary)
         if not ok:
             return False, f"План шаг {idx + 1}: {msg}"
         time.sleep(0.28)
+    return True, "ok"
+
+
+def _run_legacy_text_steps(
+    page: Page,
+    memory: AgentMemory,
+    steps: List[str],
+    canonical_selector: str,
+) -> Tuple[bool, str]:
+    """Execute old human-readable steps without silently skipping anything."""
+    if not steps:
+        return False, "В описании нет распознаваемых шагов воспроизведения"
+
+    for index, step in enumerate(steps, 1):
+        action = _interpret_step_to_action(step, canonical_selector)
+        if not action:
+            return False, f"Шаг {index} не распознан: {step[:120]}"
+        navigate_to = action.pop("_navigate", None)
+        if navigate_to:
+            try:
+                page.goto(navigate_to, wait_until="domcontentloaded", timeout=25000)
+                smart_wait_after_goto(page, timeout=5000)
+                _inject_all(page)
+                get_dom_summary(page, max_length=4000, include_shadow_dom=ENABLE_SHADOW_DOM)
+            except Exception as exc:
+                return False, f"Шаг {index} navigate {navigate_to[:80]}: {exc}"
+            continue
+
+        result = execute_action(page, action, memory)
+        if action_failed(result):
+            return False, f"Шаг {index} «{step[:100]}» -> {result}"
+        time.sleep(0.35)
     return True, "ok"
 
 
@@ -539,26 +627,7 @@ def run_retest_on_page(
         smart_wait_after_goto(page, timeout=5000)
         _inject_all(page)
         get_dom_summary(page, max_length=4000, include_shadow_dom=ENABLE_SHADOW_DOM)
-        for step in steps:
-            sl = step.lower()
-            if sl.startswith("открыть") and re.search(r"https?://", step):
-                url_m = re.search(r"https?://[^\s\)\]]+", step)
-                if url_m:
-                    u = url_m.group(0).rstrip(".,;)")
-                    page.goto(u, wait_until="domcontentloaded", timeout=25000)
-                    smart_wait_after_goto(page, timeout=5000)
-                    _inject_all(page)
-                    get_dom_summary(page, max_length=4000, include_shadow_dom=ENABLE_SHADOW_DOM)
-                continue
-            act = _interpret_step_to_action(step, canon_sel)
-            if not act:
-                continue
-            result = execute_action(page, act, memory)
-            low_res = (result or "").lower()
-            if any(x in low_res for x in ("error", "not_found", "not found", "click_error", "no_action")):
-                ok, msg = False, f"Шаг «{step[:100]}» → {result}"
-                break
-            time.sleep(0.35)
+        ok, msg = _run_legacy_text_steps(page, memory, steps, canon_sel)
     except Exception as exc:
         ok, msg = False, str(exc)
 
@@ -583,7 +652,6 @@ def run_retest_playwright(description: str, fallback_start_url: str) -> Tuple[bo
     use_plan = bool(plan and plan.get("steps"))
 
     memory = AgentMemory()
-    agent_mod._current_agent_memory = memory
     console_log: List[Dict[str, Any]] = []
     network_failures: List[Dict[str, Any]] = []
 
@@ -627,38 +695,7 @@ def run_retest_playwright(description: str, fallback_start_url: str) -> Tuple[bo
             _inject_all(page)
             get_dom_summary(page, max_length=4000, include_shadow_dom=ENABLE_SHADOW_DOM)
 
-            for step in steps:
-                sl = step.lower()
-                if sl.startswith("открыть") and re.search(r"https?://", step):
-                    url_m = re.search(r"https?://[^\s\)\]]+", step)
-                    if url_m:
-                        u = url_m.group(0).rstrip(".,;)")
-                        page.goto(u, wait_until="domcontentloaded", timeout=25000)
-                        smart_wait_after_goto(page, timeout=5000)
-                        _inject_all(page)
-                        get_dom_summary(page, max_length=4000, include_shadow_dom=ENABLE_SHADOW_DOM)
-                    continue
-
-                act = _interpret_step_to_action(step, canon_sel)
-                if not act:
-                    continue
-                nav = act.pop("_navigate", None)
-                if nav:
-                    page.goto(nav, wait_until="domcontentloaded", timeout=25000)
-                    smart_wait_after_goto(page, timeout=5000)
-                    _inject_all(page)
-                    get_dom_summary(page, max_length=4000, include_shadow_dom=ENABLE_SHADOW_DOM)
-                    continue
-                if not act:
-                    continue
-
-                result = execute_action(page, act, memory)
-                low_res = (result or "").lower()
-                if any(x in low_res for x in ("error", "not_found", "not found", "click_error", "no_action")):
-                    return False, f"Шаг «{step[:100]}» → {result}"
-                time.sleep(0.35)
-
-            return True, "ok"
+            return _run_legacy_text_steps(page, memory, steps, canon_sel)
         finally:
             try:
                 context.close()
@@ -699,15 +736,31 @@ def process_retest_issue(key: str) -> bool:
     author = find_author_who_moved_to_status(changelog, JIRA_RETEST_STATUS_READY_FOR_QA)
     assign_back = author_to_assignee_value(author) or JIRA_RETEST_FALLBACK_ASSIGNEE
 
-    if not start_qa_transition(key):
-        add_issue_comment(
-            key,
-            "h3. Kventin retest\nНе удалось перевести задачу в QA — проверьте workflow и JIRA_RETEST_STATUS_QA.",
-        )
-        return False
-
+    current_status = str((fields.get("status") or {}).get("name") or "").strip()
     desc_text = extract_description_text(fields)
-    ok, msg = run_retest_playwright(desc_text, START_URL)
+    existing_comments = extract_issue_comment_text(fields)
+    inconclusive_marker = _inconclusive_marker(desc_text)
+    if (
+        current_status.casefold() == JIRA_RETEST_STATUS_QA.casefold()
+        and inconclusive_marker in existing_comments
+    ):
+        LOG.info("retest %s: текущий сценарий уже помечен как inconclusive", key)
+        return True
+    if current_status.casefold() != JIRA_RETEST_STATUS_QA.casefold():
+        if not start_qa_transition(key):
+            add_issue_comment(
+                key,
+                "h3. Kventin retest\nНе удалось перевести задачу в QA — проверьте workflow и JIRA_RETEST_STATUS_QA.",
+            )
+            return False
+
+    try:
+        ok, msg = run_retest_playwright(desc_text, START_URL)
+    except Exception as exc:  # noqa: BLE001
+        # Keep the issue in QA. The daemon also polls QA and will retry after a
+        # transient browser/environment failure instead of losing the item.
+        LOG.exception("retest %s: infrastructure failure, will retry: %s", key, exc)
+        return False
 
     if ok:
         if resolve_issue_fixed(key):
@@ -722,6 +775,15 @@ def process_retest_issue(key: str) -> bool:
                 "h3. Kventin retest — пройден (статус)\nРетест ОК, но не удалось выставить Resolved/Fixed через API — переведите вручную.",
             )
             print(f"[retest] {key}: ретест OK, переход Resolved не удался")
+    elif _is_inconclusive_retest(msg):
+        _comment_inconclusive_once(
+            key,
+            msg,
+            desc_text,
+            existing_comments,
+        )
+        print(f"[retest] {key}: inconclusive, оставлен в QA")
+        return True
     else:
         body_comment = (
             f"h3. Kventin retest — не пройден\n{{quote}}{msg}{{quote}}\n"
@@ -762,6 +824,10 @@ def process_retest_issue_on_current_page(
     author = find_author_who_moved_to_status(changelog, JIRA_RETEST_STATUS_QA)
     assign_back = author_to_assignee_value(author) or JIRA_RETEST_FALLBACK_ASSIGNEE
     desc_text = extract_description_text(fields)
+    existing_comments = extract_issue_comment_text(fields)
+    if _inconclusive_marker(desc_text) in existing_comments:
+        LOG.info("retest monitor %s: текущий сценарий уже inconclusive", key)
+        return True
 
     retest = run_retest_on_page(
         page,
@@ -792,6 +858,16 @@ def process_retest_issue_on_current_page(
                 "h3. Kventin retest — пройден (статус)\n"
                 "Ретест ОК, но не удалось закрыть задачу через API — переведите вручную.",
             )
+        return True
+
+    if _is_inconclusive_retest(msg):
+        _comment_inconclusive_once(
+            key,
+            msg,
+            desc_text,
+            existing_comments,
+        )
+        LOG.info("retest monitor %s: inconclusive, оставлен в QA", key)
         return True
 
     comment = format_retest_failure_comment(

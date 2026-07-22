@@ -46,6 +46,24 @@ def test_policy_penalizes_repeated_candidate() -> None:
     assert best.id == "c2"
 
 
+def test_policy_returns_no_candidate_when_all_are_already_covered() -> None:
+    memory = AgentMemory()
+    memory.current_url_pattern = "/orders"
+    memory.done_by_url = {"/orders": {"click": {"tid:save"}}}
+    candidates = [
+        ActionCandidate(
+            id="c1",
+            action="click",
+            selector="ref:1",
+            label="Сохранить",
+            kind="button",
+            stable_key="tid:save",
+        )
+    ]
+
+    assert choose_best_candidate(candidates, memory) is None
+
+
 def test_llm_candidate_choice_returns_candidate_action() -> None:
     candidates = [
         ActionCandidate(id="c1", action="click", selector="ref:1", label="Open"),
@@ -70,7 +88,24 @@ def test_candidate_prompt_and_lookup() -> None:
 def test_policy_prefers_overlay_close_over_background_cta() -> None:
     candidates = [
         ActionCandidate(id="c0", action="close_modal", selector="ref:9", label="Закрыть активный оверлей", kind="overlay", priority=5),
-        ActionCandidate(id="c1", action="click", selector="ref:1", label="Сохранить", kind="button", priority=10),
+        ActionCandidate(
+            id="c1",
+            action="click",
+            selector="ref:1",
+            label="Сохранить",
+            kind="button",
+            priority=10,
+            risk_flags=["outside_overlay"],
+        ),
     ]
 
     assert choose_best_candidate(candidates).id == "c0"
+
+
+def test_policy_tests_modal_content_before_closing_it() -> None:
+    candidates = [
+        ActionCandidate(id="c0", action="close_modal", selector="ref:9", label="Закрыть активный оверлей", kind="overlay", priority=5),
+        ActionCandidate(id="c1", action="click", selector="ref:10", label="Продолжить", kind="button", priority=10),
+    ]
+
+    assert choose_best_candidate(candidates).id == "c1"

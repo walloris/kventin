@@ -1,7 +1,6 @@
 """
 Сбор и анализ консоли, сети и DOM страницы для передачи агенту и в Jira.
 """
-import base64
 from typing import List, Dict, Any, Optional
 
 from playwright.sync_api import Page
@@ -11,19 +10,7 @@ from config import (
     IGNORE_NETWORK_STATUSES,
     IGNORE_NETWORK_URL_PATTERNS,
     COOKIE_BANNER_BUTTON_TEXTS,
-    OVERLAY_IGNORE_PATTERNS,
 )
-
-
-def take_screenshot_b64(page: Page) -> Optional[str]:
-    """Сделать скриншот страницы и вернуть base64-строку."""
-    try:
-        if page.is_closed():
-            return None
-        raw = page.screenshot(type="png")
-        return base64.b64encode(raw).decode("ascii")
-    except Exception:
-        return None
 
 
 def _should_ignore_console(text: str) -> bool:
@@ -336,11 +323,19 @@ def get_dom_summary(page: Page, max_length: int = 8000, include_shadow_dom: bool
     include_shadow_dom: обходить Shadow DOM (Web Components).
     """
     try:
+        # Refresh the single authoritative overlay scope before assigning refs.
+        # Candidate collection and preflight consume these exact DOM marks.
+        detect_active_overlays(page)
         summary = page.evaluate("""
             (includeShadow) => {
                 // Сбрасываем предыдущие ref-ы
                 if (window.__agentRefs) {
-                    document.querySelectorAll('[data-agent-ref]').forEach(el => el.removeAttribute('data-agent-ref'));
+                    const clearRefs = root => {
+                        if (!root || !root.querySelectorAll) return;
+                        root.querySelectorAll('[data-agent-ref]').forEach(el => el.removeAttribute('data-agent-ref'));
+                        root.querySelectorAll('*').forEach(el => { if (el.shadowRoot) clearRefs(el.shadowRoot); });
+                    };
+                    clearRefs(document);
                 }
                 window.__agentRefs = {};
                 window.__agentRefMeta = {}; // ref -> stable_key
@@ -509,7 +504,7 @@ def get_dom_summary(page: Page, max_length: int = 8000, include_shadow_dom: bool
                     }
                     return false;
                 };
-                const servicePatterns = ['chat','чат','support','поддержк','help','консультант','jivo','intercom','crisp','drift','tawk','livechat','live-chat','widget-chat','chat-widget','feedback','обратн','звонок','callback','kventin','agent-llm','agent-banner','диалог с llm','ai-тестировщик','cookie','consent'];
+                const servicePatterns = ['chat','чат','support','поддержк','help','консультант','jivo','intercom','crisp','drift','tawk','livechat','live-chat','widget-chat','chat-widget','feedback','обратн','звонок','callback','kventin','agent-llm','agent-banner','диалог с llm','ai-тестировщик'];
                 const isServiceElement = (el) => {
                     if (!el) return true;
                     const combined = ((el.textContent||'')+(el.id||'')+(el.className||'')).toLowerCase();
@@ -536,42 +531,17 @@ def get_dom_summary(page: Page, max_length: int = 8000, include_shadow_dom: bool
                     }
                     return true;
                 };
-                const zOf = (el) => {
-                    let z = 0;
-                    let cur = el;
-                    while (cur && cur !== document.body) {
-                        const zi = parseInt(getComputedStyle(cur).zIndex, 10);
-                        if (!Number.isNaN(zi) && zi > z) z = zi;
-                        cur = cur.parentElement || (cur.getRootNode && cur.getRootNode().host) || null;
-                    }
-                    return z;
-                };
                 const activeOverlayRoots = (() => {
-                    const roots = [];
-                    const sels = [
-                        '[aria-modal="true"]', '[role="dialog"]', '[role="alertdialog"]', 'dialog[open]',
-                        '[class*="modal"][class*="open"]', '[class*="modal"][class*="show"]',
-                        '[class*="drawer"][class*="open"]', '[class*="drawer"][class*="show"]',
-                        '[class*="sidebar"][class*="open"]', '[class*="sidebar"][class*="show"]',
-                        '[class*="overlay"][class*="open"]', '[class*="overlay"][class*="show"]',
-                        '[role="menu"]', '[role="listbox"]', '.dropdown-menu.show'
-                    ];
                     const rootVisible = (node) => {
                         if (!node || hiddenByDomState(node)) return false;
                         const r = node.getBoundingClientRect();
                         if (r.width < 20 || r.height < 20) return false;
                         const s = getComputedStyle(node);
-                        return s.display !== 'none' && s.visibility !== 'hidden' && parseFloat(s.opacity) > 0.1;
+                        return s.display !== 'none' && s.visibility !== 'hidden' && parseFloat(s.opacity) > 0.01;
                     };
-                    for (const sel of sels) {
-                        try {
-                            document.querySelectorAll(sel).forEach(node => {
-                                if (isAgentUI(node) || isServiceElement(node) || !rootVisible(node)) return;
-                                if (zOf(node) >= 5 || node.getAttribute('aria-modal') === 'true' || node.open) roots.push(node);
-                            });
-                        } catch (e) {}
-                    }
-                    return roots.filter((node, idx) => roots.indexOf(node) === idx).slice(0, 8);
+                    return Array.from(window.__agentActiveOverlayRoots || [])
+                        .filter(node => !isAgentUI(node) && !isServiceElement(node) && rootVisible(node))
+                        .slice(0, 1);
                 })();
                 const inActiveOverlayScope = (el) => {
                     if (!activeOverlayRoots.length) return true;
@@ -645,7 +615,7 @@ def get_dom_summary(page: Page, max_length: int = 8000, include_shadow_dom: bool
                 // Табы
                 document.querySelectorAll('[role="tab"]').forEach(el => collect(el, 'tab'));
                 // Меню
-                document.querySelectorAll('[role="menuitem"], nav a, .nav-link, .menu-item').forEach(el => collect(el, 'menu'));
+                document.querySelectorAll('[role="menuitem"], [role="option"], nav a, .nav-link, .menu-item').forEach(el => collect(el, 'menu'));
                 // Модалки
                 document.querySelectorAll('[role="dialog"], [role="alertdialog"], dialog').forEach(el => collect(el, 'modal'));
 
@@ -659,7 +629,7 @@ def get_dom_summary(page: Page, max_length: int = 8000, include_shadow_dom: bool
                         collect(el, type);
                     });
                     root.querySelectorAll('[role="tab"]').forEach(el => collect(el, 'tab'));
-                    root.querySelectorAll('[role="menuitem"], nav a, .nav-link, .menu-item').forEach(el => collect(el, 'menu'));
+                    root.querySelectorAll('[role="menuitem"], [role="option"], nav a, .nav-link, .menu-item').forEach(el => collect(el, 'menu'));
                     root.querySelectorAll('[role="dialog"], [role="alertdialog"], dialog').forEach(el => collect(el, 'modal'));
                     if (includeShadow) root.querySelectorAll('*').forEach(el => { if (el.shadowRoot) processRoot(el.shadowRoot); });
                 };
@@ -775,214 +745,10 @@ def get_page_modules(page: Page) -> List[Dict[str, Any]]:
 
 
 def detect_active_overlays(page: Page) -> Dict[str, Any]:
-    """
-    Обнаружить все активные оверлеи на странице:
-    модалки, тултипы, дропдауны, поповеры, уведомления, контекстные меню.
-    Возвращает dict: { has_overlay, overlays: [{type, text, buttons, inputs, close_selector}] }
-    Чат/виджеты поддержки (jivo, intercom, crisp и т.д.) исключаются — не часть приложения.
-    """
-    try:
-        ignore_patterns = list(OVERLAY_IGNORE_PATTERNS) if OVERLAY_IGNORE_PATTERNS else []
-        result = page.evaluate(
-            """
-            (ignorePatterns) => {
-                const overlays = [];
-                // UI агента в closed Shadow DOM — невидим. Фильтр только для host-элемента.
-                const isAgentUI = (el) => {
-                    if (!el) return false;
-                    let cur = el;
-                    while (cur && cur !== document.body) {
-                        if (cur.hasAttribute && cur.hasAttribute('data-agent-host')) return true;
-                        cur = cur.parentElement;
-                    }
-                    return false;
-                };
-                const isChatOrSupport = (el) => {
-                    if (!el || !ignorePatterns || !ignorePatterns.length) return false;
-                    // Сначала проверяем: это UI агента?
-                    if (isAgentUI(el)) return true;
-                    const check = (s) => {
-                        if (!s || typeof s !== 'string') return false;
-                        const low = s.toLowerCase();
-                        return ignorePatterns.some(p => low.indexOf(p) !== -1);
-                    };
-                    let cur = el;
-                    for (let i = 0; i < 10 && cur; i++) {
-                        if (check(cur.id) || check(cur.className && cur.className.toString()) || check(cur.getAttribute('aria-label') || '')) return true;
-                        cur = cur.parentElement;
-                    }
-                    const text = (el.textContent || '').trim().toLowerCase().slice(0, 500);
-                    return ignorePatterns.some(p => text.indexOf(p) !== -1);
-                };
-                const vis = (el) => {
-                    if (!el) return false;
-                    const r = el.getBoundingClientRect();
-                    if (r.width < 10 || r.height < 10) return false;
-                    const s = getComputedStyle(el);
-                    return s.display !== 'none' && s.visibility !== 'hidden' && parseFloat(s.opacity) > 0.1;
-                };
-                const zOf = (el) => {
-                    let z = 0;
-                    let cur = el;
-                    while (cur && cur !== document.body) {
-                        const zi = parseInt(getComputedStyle(cur).zIndex);
-                        if (!isNaN(zi) && zi > z) z = zi;
-                        cur = cur.parentElement;
-                    }
-                    return z;
-                };
-                const textOf = (el, max) => (el.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, max || 150);
+    """Return the authoritative blocking/transient overlay snapshot."""
+    from agent.browser.overlay_state import inspect_overlays
 
-                // --- Модалки / Диалоги ---
-                const modalSels = [
-                    '[role="dialog"]', '[role="alertdialog"]', 'dialog[open]',
-                    '.modal.show', '.modal.active', '.modal.open', '.modal.visible',
-                    '.modal-dialog', '.modal-content',
-                    '[class*="modal"][class*="open"]', '[class*="modal"][class*="show"]',
-                    '[class*="modal"][class*="active"]', '[class*="modal"][class*="visible"]',
-                    '[class*="popup"][class*="open"]', '[class*="popup"][class*="show"]',
-                    '[class*="popup"][class*="active"]', '[class*="popup"][class*="visible"]',
-                    '[class*="drawer"][class*="open"]', '[class*="drawer"][class*="show"]',
-                    '[class*="overlay"][class*="open"]', '[class*="overlay"][class*="show"]',
-                    '[class*="lightbox"]',
-                    '[aria-modal="true"]'
-                ];
-                const modalEls = new Set();
-                for (const sel of modalSels) {
-                    try {
-                        document.querySelectorAll(sel).forEach(el => {
-                            if (vis(el) && zOf(el) > 10) modalEls.add(el);
-                        });
-                    } catch(e) {}
-                }
-                // Ещё: элементы с position:fixed/absolute и высоким z-index
-                document.querySelectorAll('*').forEach(el => {
-                    if (modalEls.has(el)) return;
-                    const s = getComputedStyle(el);
-                    const pos = s.position;
-                    if ((pos === 'fixed' || pos === 'absolute') && vis(el)) {
-                        const z = parseInt(s.zIndex);
-                        const r = el.getBoundingClientRect();
-                        // Большой оверлей (не наш агентский UI)
-                        if (z > 100 && r.width > 200 && r.height > 100
-                            && !(el.hasAttribute && el.hasAttribute('data-agent-host'))) {
-                            modalEls.add(el);
-                        }
-                    }
-                });
-
-                modalEls.forEach(el => {
-                    if (isChatOrSupport(el)) return;
-                    const o = { type: 'modal', text: textOf(el, 200), buttons: [], inputs: [], links: [], close_selector: null };
-                    // Кнопки внутри модалки
-                    el.querySelectorAll('button, [role="button"], input[type="submit"]').forEach(btn => {
-                        if (vis(btn)) o.buttons.push(textOf(btn, 50) || btn.getAttribute('aria-label') || '(кнопка)');
-                    });
-                    // Инпуты внутри
-                    el.querySelectorAll('input:not([type="hidden"]), textarea, select').forEach(inp => {
-                        if (vis(inp)) o.inputs.push({ type: inp.type || 'text', placeholder: (inp.placeholder || '').slice(0, 40), name: inp.name || '' });
-                    });
-                    // Ссылки внутри
-                    el.querySelectorAll('a[href]').forEach(a => {
-                        if (vis(a)) o.links.push(textOf(a, 40));
-                    });
-                    // Крестик закрытия — назначаем ref для надёжного поиска
-                    const closeBtn = el.querySelector('[aria-label*="close" i], [aria-label*="закрыть" i], [class*="close"], [class*="dismiss"], button.close, .modal-close, [data-dismiss="modal"], [data-bs-dismiss="modal"]');
-                    if (closeBtn && vis(closeBtn)) {
-                        let closeRef = closeBtn.getAttribute('data-agent-ref');
-                        if (!closeRef && window.__agentRefs) {
-                            let maxR = 0;
-                            for (const k of Object.keys(window.__agentRefs)) { const n = parseInt(k); if (n > maxR) maxR = n; }
-                            closeRef = String(maxR + 1);
-                            closeBtn.setAttribute('data-agent-ref', closeRef);
-                            window.__agentRefs[parseInt(closeRef)] = closeBtn;
-                        }
-                        o.close_selector = closeRef ? 'ref:' + closeRef : null;
-                    }
-                    if (o.text.length > 5 || o.buttons.length || o.inputs.length) overlays.push(o);
-                });
-
-                // --- Тултипы ---
-                const tooltipSels = [
-                    '[role="tooltip"]', '.tooltip.show', '.tooltip.active',
-                    '[class*="tooltip"][class*="show"]', '[class*="tooltip"][class*="visible"]',
-                    '.tippy-box', '.tippy-content', '[data-tippy-root]'
-                ];
-                for (const sel of tooltipSels) {
-                    try {
-                        document.querySelectorAll(sel).forEach(el => {
-                            if (vis(el) && !isAgentUI(el) && !isChatOrSupport(el)) overlays.push({ type: 'tooltip', text: textOf(el, 120) });
-                        });
-                    } catch(e) {}
-                }
-
-                // --- Дропдауны ---
-                const ddSels = [
-                    '[role="listbox"]', '[role="menu"]:not(nav [role="menu"])',
-                    '.dropdown-menu.show', '.dropdown-menu.active', '.dropdown-menu.open',
-                    '[class*="dropdown"][class*="open"]', '[class*="dropdown"][class*="show"]',
-                    '[class*="select"][class*="open"]', '[class*="select"][class*="show"]',
-                    '[class*="listbox"]', '.autocomplete-results', '[class*="autocomplete"][class*="open"]',
-                    'ul[class*="menu"][class*="open"]', 'ul[class*="menu"][class*="show"]'
-                ];
-                for (const sel of ddSels) {
-                    try {
-                        document.querySelectorAll(sel).forEach(el => {
-                            if (vis(el) && zOf(el) > 5 && !isAgentUI(el) && !isChatOrSupport(el)) {
-                                const items = [];
-                                el.querySelectorAll('[role="option"], [role="menuitem"], li, a').forEach(li => {
-                                    if (vis(li)) items.push(textOf(li, 40));
-                                });
-                                overlays.push({ type: 'dropdown', text: textOf(el, 100), items: items.slice(0, 10) });
-                            }
-                        });
-                    } catch(e) {}
-                }
-
-                // --- Поповеры ---
-                const popSels = [
-                    '[role="dialog"][class*="popover"]', '.popover.show', '.popover.active',
-                    '[class*="popover"][class*="show"]', '[class*="popover"][class*="visible"]'
-                ];
-                for (const sel of popSels) {
-                    try {
-                        document.querySelectorAll(sel).forEach(el => {
-                            if (vis(el) && !isAgentUI(el) && !isChatOrSupport(el)) overlays.push({ type: 'popover', text: textOf(el, 150) });
-                        });
-                    } catch(e) {}
-                }
-
-                // --- Уведомления / Тосты ---
-                const toastSels = [
-                    '[role="alert"]', '[role="status"]', '.toast.show',
-                    '[class*="toast"][class*="show"]', '[class*="notification"][class*="show"]',
-                    '[class*="snackbar"][class*="show"]', '[class*="alert"][class*="show"]',
-                    '.Toastify__toast', '.notistack-SnackbarContainer'
-                ];
-                for (const sel of toastSels) {
-                    try {
-                        document.querySelectorAll(sel).forEach(el => {
-                            if (vis(el) && !isAgentUI(el) && !isChatOrSupport(el)) overlays.push({ type: 'notification', text: textOf(el, 120) });
-                        });
-                    } catch(e) {}
-                }
-
-                // Дедупликация
-                const seen = new Set();
-                const unique = [];
-                for (const o of overlays) {
-                    const k = o.type + '|' + (o.text || '').slice(0, 50);
-                    if (!seen.has(k)) { seen.add(k); unique.push(o); }
-                }
-
-                return { has_overlay: unique.length > 0, overlays: unique.slice(0, 8) };
-            }
-        """,
-            ignore_patterns,
-        )
-        return result or {"has_overlay": False, "overlays": []}
-    except Exception as e:
-        return {"has_overlay": False, "overlays": [], "error": str(e)}
+    return inspect_overlays(page)
 
 
 def format_overlays_context(overlay_info: Dict[str, Any]) -> str:

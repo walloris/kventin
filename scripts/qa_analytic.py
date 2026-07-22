@@ -23,7 +23,7 @@ except ImportError:
 from atlassian import Confluence
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Set, Union
 
 script_dir = Path(__file__).resolve().parent
 parent_dir = script_dir.parent
@@ -905,7 +905,7 @@ def weekly_total_series(unified_data, author):
     return [sum_author_week(unified_data[author], w) for w in weeks]
 
 
-def story_touches_weeks(story: dict[str, Any], weeks: list[str] | set[str]) -> bool:
+def story_touches_weeks(story: dict[str, Any], weeks: Union[list[str], Set[str]]) -> bool:
     """True, если по дате списания (worklog started) есть время в одной из недель отчёта."""
     target_weeks = set(weeks) if not isinstance(weeks, set) else weeks
     wk_field = str(story.get("worklog_weeks", "")).strip()

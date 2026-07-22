@@ -8,7 +8,6 @@ from __future__ import annotations
 import json
 import logging
 import re
-import time
 from typing import Any, Dict, List, Optional
 
 from agent.llm.local_openai_client import LocalOpenAIClient
@@ -34,11 +33,10 @@ def init_llm_connection() -> bool:
     """Compatibility name: initialize the local OpenAI-compatible LLM connection."""
     try:
         client = _get_client()
-        out = client.query("Ответь одним словом: ок", system="Ты отвечаешь только одним словом.")
-        if not out:
-            LOG.warning("Local LLM did not return a smoke-test response")
+        if not client.healthcheck(timeout=3.0):
+            LOG.warning("Local LLM startup healthcheck did not succeed")
             return False
-        LOG.info("Local LLM is ready")
+        LOG.info("Local LLM endpoint is reachable")
         return True
     except Exception as exc:  # noqa: BLE001
         LOG.exception("Local LLM init failed: %s", exc)
@@ -60,22 +58,18 @@ def consult_agent(context: str, question: str) -> Optional[str]:
 
 
 def _llm_call_with_retry(prompt: str, screenshot_b64: Optional[str] = None, system: Optional[str] = None) -> Optional[str]:
-    try:
-        from config import LLM_RETRY_COUNT, LLM_RETRY_BASE_DELAY
-    except ImportError:
-        LLM_RETRY_COUNT, LLM_RETRY_BASE_DELAY = 1, 1.0
+    """Call the client once; transport retries live in one authoritative layer.
 
-    last_result = None
-    for attempt in range(max(1, LLM_RETRY_COUNT)):
-        result = _get_client().chat_with_screenshot(prompt, screenshot_b64=screenshot_b64, system=system)
-        if result and result.strip():
-            return result
-        last_result = result
-        if attempt < LLM_RETRY_COUNT - 1:
-            delay = LLM_RETRY_BASE_DELAY * (2 ** attempt)
-            LOG.warning("LLM retry %d/%d: empty response, sleep %.1fs", attempt + 1, LLM_RETRY_COUNT, delay)
-            time.sleep(delay)
-    return last_result
+    The previous implementation retried here and inside ``LocalOpenAIClient``.
+    With three attempts in each layer one logical prompt could generate nine
+    upstream calls and make a 429 storm worse.
+    """
+    result = _get_client().chat_with_screenshot(
+        prompt,
+        screenshot_b64=screenshot_b64,
+        system=system,
+    )
+    return result if result and result.strip() else None
 
 
 VALID_ACTIONS = {"click", "type", "scroll", "hover", "close_modal", "select_option", "press_key", "check_defect", "explore", "fill_form", "upload_file"}

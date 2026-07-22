@@ -163,7 +163,7 @@ def collect_action_candidates(
         return []
 
     candidates: List[ActionCandidate] = []
-    if has_overlay and memory is not None and not getattr(memory, "ignore_overlay", False):
+    if has_overlay:
         close_selector = ""
         for ov in (overlay_info or {}).get("overlays", []) or []:
             close_selector = ov.get("close_selector") or close_selector
@@ -176,7 +176,7 @@ def collect_action_candidates(
                 selector=close_selector,
                 label="Закрыть активный оверлей",
                 kind="overlay",
-                priority=5,
+                priority=35,
                 reason="Закрыть или проверить активный оверлей",
                 test_goal="Завершить работу с активным оверлеем",
                 expected_outcome="Оверлей закрывается и основной экран снова доступен",
@@ -219,17 +219,6 @@ def collect_action_candidates(
                 const activeOverlayRoots = (() => {
                     if (!hasOverlay) return [];
                     const roots = [];
-                    const sels = [
-                        '[aria-modal="true"]', '[role="dialog"]', '[role="alertdialog"]', 'dialog[open]',
-                        '[popover]:popover-open',
-                        '[class*="modal"][class*="open"]', '[class*="modal"][class*="show"]',
-                        '[class*="drawer"][class*="open"]', '[class*="drawer"][class*="show"]',
-                        '[class*="sidebar"][class*="open"]', '[class*="sidebar"][class*="show"]',
-                        '[class*="side-bar"][class*="open"]', '[class*="side-bar"][class*="show"]',
-                        '[class*="offcanvas"][class*="show"]', '[class*="overlay"][class*="open"]',
-                        '[class*="overlay"][class*="show"]', '[role="menu"]', '[role="listbox"]',
-                        '.dropdown-menu.show'
-                    ];
                     const rootVisible = (node) => {
                         if (!node || isAgent(node) || hiddenByDomState(node)) return false;
                         const r = node.getBoundingClientRect();
@@ -237,23 +226,17 @@ def collect_action_candidates(
                         const s = getComputedStyle(node);
                         return s.display !== 'none'
                             && s.visibility !== 'hidden'
-                            && parseFloat(s.opacity || '1') > 0.1;
+                            && parseFloat(s.opacity || '1') > 0.01;
                     };
-                    for (const sel of sels) {
-                        try {
-                            document.querySelectorAll(sel).forEach(node => {
-                                if (!rootVisible(node)) return;
-                                if (zOf(node) >= 5 || node.getAttribute('aria-modal') === 'true' || node.open || node.matches('[popover]:popover-open')) {
-                                    roots.push(node);
-                                }
-                            });
-                        } catch(e) {}
-                    }
+                    Array.from(window.__agentActiveOverlayRoots || []).forEach(node => {
+                        if (rootVisible(node)) roots.push(node);
+                    });
                     roots.sort((a, b) => zOf(b) - zOf(a));
-                    return roots.filter((node, idx) => roots.indexOf(node) === idx).slice(0, 4);
+                    return roots.filter((node, idx) => roots.indexOf(node) === idx).slice(0, 1);
                 })();
                 const inActiveOverlayScope = (el) => {
-                    if (!hasOverlay || !activeOverlayRoots.length) return true;
+                    if (!hasOverlay) return true;
+                    if (!activeOverlayRoots.length) return false;
                     return activeOverlayRoots.some(root => root === el || root.contains(el));
                 };
                 const visible = (el) => {
@@ -283,31 +266,39 @@ def collect_action_candidates(
                         canonical_locator: locators[ref] || '',
                     });
                 };
-                document.querySelectorAll('button, [role="button"], input[type="submit"], input[type="button"]').forEach(el => add(el, 'button'));
-                document.querySelectorAll('a[href]').forEach(el => {
-                    const href = el.getAttribute('href') || '';
-                    if (href.startsWith('javascript:') || href === '#') return;
-                    if (href.startsWith('http')) {
-                        try {
-                            const url = new URL(href, window.location.href);
-                            if (url.hostname !== window.location.hostname && url.hostname !== '') return;
-                        } catch(e) { return; }
+                Object.values(window.__agentRefs || {}).forEach(el => {
+                    if (!el || !el.isConnected || !el.tagName) return;
+                    const tag = el.tagName.toLowerCase();
+                    const role = (el.getAttribute('role') || '').toLowerCase();
+                    const inputType = (el.type || '').toLowerCase();
+                    if (tag === 'button' || role === 'button' || (tag === 'input' && ['submit', 'button'].includes(inputType))) {
+                        add(el, 'button');
+                    } else if (tag === 'a' && el.hasAttribute('href')) {
+                        const href = el.getAttribute('href') || '';
+                        if (href.startsWith('javascript:') || href === '#') return;
+                        if (href.startsWith('http')) {
+                            try {
+                                const url = new URL(href, window.location.href);
+                                if (url.hostname !== window.location.hostname && url.hostname !== '') return;
+                            } catch(e) { return; }
+                        }
+                        add(el, 'link');
+                    } else if (tag === 'textarea') {
+                        add(el, 'textarea');
+                    } else if (tag === 'input' && !['hidden', 'submit', 'button'].includes(inputType)) {
+                        add(el, inputType === 'file' ? 'file' : 'input', inputType === 'file' ? 'file input' : '');
+                    } else if (tag === 'select') {
+                        const opts = Array.from(el.options || []).slice(0, 5).map(o => o.text.trim()).filter(Boolean).join(',');
+                        add(el, 'select', opts);
+                    } else if (role === 'tab') {
+                        add(el, 'tab');
+                    } else if (role === 'menuitem' || role === 'option') {
+                        add(el, role);
                     }
-                    add(el, 'link');
                 });
-                document.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([type="button"]), textarea').forEach(el => {
-                    if ((el.type || '').toLowerCase() === 'file') add(el, 'file', 'file input');
-                    else add(el, el.tagName && el.tagName.toLowerCase() === 'textarea' ? 'textarea' : 'input');
-                });
-                document.querySelectorAll('select').forEach(el => {
-                    const opts = Array.from(el.options || []).slice(0, 5).map(o => o.text.trim()).filter(Boolean).join(',');
-                    add(el, 'select', opts);
-                });
-                document.querySelectorAll('[role="tab"]').forEach(el => add(el, 'tab'));
-                document.querySelectorAll('[role="menuitem"]').forEach(el => add(el, 'menuitem'));
                 return out;
             }""",
-            bool(has_overlay and not getattr(memory, "ignore_overlay", False)),
+            bool(has_overlay),
         ) or []
     except Exception:
         raw_items = []

@@ -58,24 +58,48 @@ class _SingleInstanceLock:
         self.acquired = False
 
     def __enter__(self) -> "_SingleInstanceLock":
-        if self.path and os.path.exists(self.path):
+        if not self.path:
+            return self
+        parent = os.path.dirname(os.path.abspath(self.path))
+        os.makedirs(parent, exist_ok=True)
+
+        while True:
             try:
-                with open(self.path, "r", encoding="utf-8") as f:
-                    pid = (f.read() or "").strip()
-                if pid and pid.isdigit() and _pid_alive(int(pid)):
-                    raise SystemExit(f"[daemon] Уже запущен (pid={pid}, lock={self.path}).")
-            except SystemExit:
-                raise
-            except Exception:
-                pass
-        if self.path:
-            try:
-                with open(self.path, "w", encoding="utf-8") as f:
-                    f.write(str(os.getpid()))
-                self.acquired = True
+                fd = os.open(
+                    self.path,
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                    0o600,
+                )
+            except FileExistsError:
+                try:
+                    with open(self.path, "r", encoding="utf-8") as lock_file:
+                        pid = (lock_file.read() or "").strip()
+                except OSError:
+                    pid = ""
+                if pid.isdigit() and _pid_alive(int(pid)):
+                    raise SystemExit(
+                        f"[daemon] Уже запущен (pid={pid}, lock={self.path})."
+                    )
+                try:
+                    os.remove(self.path)
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    raise SystemExit(
+                        f"[daemon] Не удалось захватить lock {self.path}: {exc}"
+                    )
+                continue
             except OSError as exc:
-                LOG.warning("Не удалось создать lock %s: %s", self.path, exc)
-        return self
+                raise SystemExit(
+                    f"[daemon] Не удалось создать lock {self.path}: {exc}"
+                )
+
+            try:
+                os.write(fd, str(os.getpid()).encode("ascii"))
+                self.acquired = True
+            finally:
+                os.close(fd)
+            return self
 
     def __exit__(self, *_exc) -> None:
         if self.acquired and self.path and os.path.exists(self.path):
@@ -88,6 +112,10 @@ class _SingleInstanceLock:
 def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
     except OSError:
         return False
     return True
@@ -95,11 +123,21 @@ def _pid_alive(pid: int) -> bool:
 
 def _run_once() -> int:
     """Один прогон: ретест дефектов + тестирование задач. Возвращает число обработанных."""
-    from agent.defects.defect_retest import collect_retest_issue_keys, process_retest_issue
+    from agent.defects.defect_retest import (
+        collect_qa_retest_issue_keys,
+        collect_retest_issue_keys,
+        process_retest_issue,
+    )
 
     processed = 0
 
-    retest_keys = collect_retest_issue_keys()
+    try:
+        ready_keys = collect_retest_issue_keys()
+        qa_keys = collect_qa_retest_issue_keys()
+        retest_keys = list(dict.fromkeys(ready_keys + qa_keys))
+    except Exception as exc:  # noqa: BLE001
+        LOG.exception("Не удалось получить очередь ретестов: %s", exc)
+        retest_keys = []
     if retest_keys:
         LOG.info("Ретест дефектов: %d в статусе «%s»", len(retest_keys), JIRA_RETEST_STATUS_READY_FOR_QA)
         for key in retest_keys:
@@ -116,7 +154,14 @@ def _run_once() -> int:
     if JIRA_DAEMON_TASK_STATUS:
         from agent.tasks.task_testing import collect_task_issue_keys, process_task_issue
 
-        task_keys = collect_task_issue_keys(JIRA_DAEMON_TASK_STATUS, max_results=JIRA_DAEMON_TASK_MAX or 10)
+        try:
+            task_keys = collect_task_issue_keys(
+                JIRA_DAEMON_TASK_STATUS,
+                max_results=JIRA_DAEMON_TASK_MAX or 10,
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOG.exception("Не удалось получить очередь задач: %s", exc)
+            task_keys = []
         if task_keys:
             LOG.info("Тестирование задач: %d в статусе «%s»", len(task_keys), JIRA_DAEMON_TASK_STATUS)
             for key in task_keys:

@@ -31,3 +31,19 @@ def test_defect_signals_detect_action_failure() -> None:
     assert best is not None
     assert best.kind == "action_failure"
     assert "кликабельным" in best.title
+
+
+def test_defect_signals_detect_verified_overlay_close_failure() -> None:
+    signals = collect_rule_signals(
+        action={"action": "close_modal", "selector": ""},
+        result="modal_close_failed: overlay_still_open:dialog|checkout",
+        current_url="https://example.test/checkout",
+        new_console=[],
+        new_network=[],
+    )
+
+    best = pick_best_signal(signals)
+
+    assert best is not None
+    assert best.kind == "action_failure"
+    assert "невозможно закрыть" in best.title

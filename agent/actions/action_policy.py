@@ -42,7 +42,9 @@ def score_candidate(cand: ActionCandidate, memory: Any = None) -> float:
     elif cand.action == "hover":
         score += 8
     elif cand.action == "close_modal":
-        score += 70
+        # Modal content is testable state. Close only after its actionable
+        # controls have been covered (their repeat penalty then makes close win).
+        score += 5
 
     if any(word in label for word in CTA_WORDS):
         score += 28
@@ -54,7 +56,11 @@ def score_candidate(cand: ActionCandidate, memory: Any = None) -> float:
         score -= 30
 
     for flag in cand.risk_flags:
-        if flag in ("external", "destructive"):
+        if flag in ("outside_overlay", "inactive_layer"):
+            # A blocking overlay makes every element behind it ineligible, even
+            # when a stale DOM snapshot still describes that element as visible.
+            score -= 1000
+        elif flag in ("external", "destructive"):
             score -= 80
         elif flag in ("low_signal", "footer"):
             score -= 25
@@ -77,7 +83,7 @@ def choose_best_candidate(candidates: Iterable[ActionCandidate], memory: Any = N
     for cand in ranked:
         if cand.score > -500:
             return cand
-    return ranked[0] if ranked else None
+    return None
 
 
 def action_from_llm_candidate_choice(raw: str, candidates: Iterable[ActionCandidate]) -> Optional[Dict[str, Any]]:

@@ -1,29 +1,9 @@
 # AI-агент тестировщик (Playwright + Local OpenAI-compatible LLM + Jira)
 
-Автономный агент, который **бесконечно** тестирует одну переданную страницу:
-
----
-
-## Как запушить код на GitHub
-
-1. Открой **Терминал** (в Cursor: меню Terminal → New Terminal или `` Ctrl+` ``).
-2. Перейди в папку проекта и выполни одну команду:
-
-```bash
-cd /Users/walloris/Documents/kventin && git add -A && git status
-```
-
-Если видишь список файлов — потом выполни:
-
-```bash
-git commit -m "обновление" && git push -u origin main
-```
-
-Если при `git push` спросит **логин** — введи свой GitHub-логин. Если спросит **пароль** — в GitHub пароль больше не подходит: нужен **токен**. Как получить: зайди на [github.com → Settings → Developer settings → Personal access tokens](https://github.com/settings/tokens), нажми «Generate new token», отметь `repo`, скопируй токен и вставь его в терминал вместо пароля.
-
----
-
-Автономный агент, который **бесконечно** тестирует одну переданную страницу: анализирует консоль, сеть и DOM, советуется с локальной **OpenAI-compatible LLM** для принятия решений и при необходимости создаёт дефекты в **Jira** через API. Флаки и типичные проблемы тестовой среды (404 в консоли и т.п.) **игнорируются**. Все действия агента **видимы**: браузер в режиме с замедлением, визуальный курсор на странице и подсветка элементов перед кликом.
+Автономный агент, который непрерывно исследует приложение, анализирует консоль,
+сеть и DOM, выполняет проверки, создаёт дефекты в Jira и ретестирует их. Локальная
+OpenAI-compatible LLM улучшает выбор и oracle-анализ, но не является точкой отказа:
+при её недоступности агент продолжает работу по детерминированной политике.
 
 ## Требования
 
@@ -68,12 +48,18 @@ cp .env.example .env
 | `LOCAL_LLM_MODEL` | ID модели. Если пусто, агент берёт первую модель из `GET /v1/models`. |
 | `LOCAL_LLM_API_KEY` | Bearer token для совместимости; по умолчанию `local`. |
 | `LLM_REQUEST_TIMEOUT_SEC` | HTTP timeout локальной LLM. |
+| `LLM_RETRY_COUNT` | Число попыток для `429`, временных `5xx`, timeout и connection error. |
+| `LLM_RETRY_BASE_DELAY` / `LLM_RETRY_MAX_DELAY` | Границы exponential backoff; `Retry-After` имеет приоритет. |
+| `LLM_CIRCUIT_BREAKER_AFTER_N_TIMEOUTS` | После скольких ошибок временно перейти только на локальную политику. |
 | `JIRA_URL` | URL вашего Jira (например `https://your-company.atlassian.net`). |
 | `JIRA_USERNAME` | Логин (username) в Jira. |
 | `JIRA_EMAIL` | Email в Jira (если у вас логин по email, например Atlassian Cloud). |
 | `JIRA_API_TOKEN` | API-токен (или пароль) для Jira. |
 | `JIRA_PROJECT_KEY` | Ключ проекта для создания дефектов (например `PROJ`). |
 | `JIRA_VERIFY_SSL` | `0` — отключить проверку SSL для внутренней Jira; по умолчанию `1`. |
+| `JIRA_RETRY_COUNT` | Число попыток временно неуспешных Jira REST-запросов. |
+| `JIRA_TASK_EXPLORATORY_STEPS` | Бюджет реального exploratory-прогона задачи перед генерацией XML; `0` отключает прогон. |
+| `AGENT_CONTINUOUS_RESTART` | Перезапускать аварийно завершившуюся браузерную сессию в бесконечном режиме. |
 | `BROWSER_SLOW_MO` | Замедление операций браузера в мс (по умолчанию 300), чтобы было видно действия. |
 | `HIGHLIGHT_DURATION_MS` | Пауза после подсветки элемента в мс (по умолчанию 800). |
 | `HEADLESS` | `true` — без окна браузера; по умолчанию `false` (окно видно). |
@@ -125,7 +111,9 @@ python scripts/main.py https://example.com
 python scripts/main.py
 ```
 
-Агент работает **бесконечно**: в цикле анализирует страницу, спрашивает локальную LLM «что делать дальше», выполняет клики или создаёт дефекты в Jira, при переходе по ссылке проверяет открытие и возвращается на переданную страницу.
+По умолчанию агент работает бесконечно. Он исследует страницы того же приложения,
+ограничивает глубину и бюджет URL, а после закрытия браузера или страницы supervisor
+создаёт новую сессию с bounded backoff.
 
 Для CI можно ограничить прогон:
 
@@ -135,20 +123,26 @@ HEADLESS=true MAX_STEPS=20 python scripts/main.py https://example.com --json-sum
 
 ## Поведение агента
 
-1. **Одна страница**  
-   Агент тестирует только переданный URL. Если по клику происходит переход по ссылке (URL меняется), он лишь проверяет, что страница открылась, и возвращается назад на исходный URL.
+1. **Навигация по приложению**
+   Агент начинает с переданного URL, исследует внутренние переходы и новые вкладки,
+   не уходит на чужие домены и использует лимиты глубины/прогресса против циклов.
 
-2. **Анализ**  
+2. **Анализ**
    На каждой итерации собираются:
    - **Консоль** — сообщения (log, error, warning);
    - **Сеть** — неуспешные ответы (статус и URL);
    - **DOM** — кнопки и ссылки (тег, текст, id, класс, href).
 
-3. **Local LLM**
-   Контекст (консоль, сеть, DOM и скриншот) отправляется в локальный OpenAI-compatible endpoint. Агент задаёт вопрос: что кликнуть следующим или есть ли дефект для Jira. Действия выполняются по ответу.
+3. **Local LLM и деградация**
+   Контекст отправляется в локальный OpenAI-compatible endpoint. `429`, временные
+   `5xx` и transport errors получают мягкие ретраи с jitter и `Retry-After`.
+   Circuit breaker не даёт недоступной LLM остановить Playwright.
 
-4. **Jira**  
-   Дефекты создаются по API только когда LLM указывает на реальный баг. Игнорируются:
+4. **Jira**
+   Детерминированные сигналы (`pageerror`, action failure, значимые `4xx/5xx`)
+   не зависят от ответа LLM. Перед созданием применяются структурная, локальная,
+   Jira- и семантическая дедупликация. Потерянный ответ create восстанавливается
+   поиском тикета перед повтором. Игнорируются:
    - типичные флаки и проблемы тестовой среды;
    - 404 в консоли, `Failed to load resource`, запросы к аналитике, расширениям и т.п.  
    Список игнорируемых паттернов настраивается в `config.py` (`IGNORE_CONSOLE_PATTERNS`, `IGNORE_NETWORK_STATUSES`).
@@ -157,6 +151,23 @@ HEADLESS=true MAX_STEPS=20 python scripts/main.py https://example.com --json-sum
    - Браузер запускается в видимом режиме (`headless=false`) с замедлением (`slow_mo`).  
    - На страницу инжектируется визуальный курсор (красный круг), который перемещается перед кликами.  
    - Перед каждым кликом элемент подсвечивается (`locator.highlight()`), затем выполняется клик.
+
+6. **Модалки, sidebar и dropdown**
+   Верхний blocking overlay помечается в DOM как единственная интерактивная область.
+   `hidden`, `inert`, `aria-hidden`, disabled, stale и визуально перекрытые элементы
+   отклоняются повторным preflight непосредственно перед действием. Закрытие считается
+   успешным только после подтверждённого изменения overlay-состояния в DOM.
+
+## Непрерывный daemon
+
+```bash
+python scripts/daemon.py
+python scripts/daemon.py --once
+```
+
+Daemon атомарно блокирует второй экземпляр, независимо обрабатывает очередь Jira-задач
+и дефектов в `Ready for QA`/`QA`, повторяет инфраструктурно сорванные ретесты и не
+закрывает дефект, если сценарий пуст, неизвестен или выполнен не полностью.
 
 ## Структура проекта
 
@@ -168,20 +179,33 @@ kventin/
 ├── README.md
 ├── agent/                # Код браузерного агента
 │   ├── __init__.py
-│   ├── core/             # Основной цикл, память, наблюдения, oracle
-│   ├── actions/          # Выбор, preflight и выполнение действий
-│   ├── browser/          # Playwright, DOM/page-анализ, page objects
-│   ├── defects/          # Jira, дефекты, дедупликация, ретест
-│   ├── llm/              # LLM-клиент и парсинг ответов
-│   ├── checks/           # A11y/perf/visual/session checks
+│   ├── core/             # Supervisor, orchestration, memory, resilience, reports
+│   ├── actions/          # Candidates, policy, preflight и Playwright adapter
+│   ├── browser/          # Overlay state, DOM analysis, network, page objects
+│   ├── defects/          # Signals, delivery, Jira, deduplication и retest
+│   ├── llm/              # OpenAI-compatible transport и parsing
+│   ├── checks/           # Scheduler, a11y, perf, iframe, responsive, visual
 │   └── tasks/            # Тестирование Jira-задач
 ├── scripts/              # Точки входа и разовые утилиты
 │   ├── main.py           # python scripts/main.py [URL]
 │   ├── daemon.py
 │   └── release_checker.py
 ├── tests/
-└── trash/                # Временные файлы и мусор
+└── docs/                 # Архитектура и эксплуатационные контракты
 ```
+
+Подробная схема и инварианты: [`docs/agent_architecture.md`](docs/agent_architecture.md).
+
+## Проверка
+
+```bash
+python -m pytest -q
+KVENTIN_RUN_BROWSER_TESTS=1 python -m pytest -q tests/test_overlay_browser_integration.py
+python -m compileall -q agent scripts tests config.py
+```
+
+Browser integration suite проверяет реальный Chromium-сценарий с открытым sidebar,
+`aria-hidden/inert` фоном, подтверждаемым закрытием и визуальным перехватом клика.
 
 ## Остановка
 

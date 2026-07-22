@@ -6,17 +6,24 @@
     <style>
       body { font-family: sans-serif; margin: 0; }
       main[aria-hidden="true"] { opacity: .4; }
-      aside.sidebar.open { position: fixed; inset: 0 0 0 auto; width: 320px; background: white; z-index: 100; box-shadow: 0 0 20px #999; }
+      aside.panel-active { position: fixed; inset: 0 0 0 auto; width: 320px; background: white; z-index: 1; box-shadow: 0 0 20px #999; }
     </style>
   </head>
   <body>
     <main id="app" aria-hidden="true" inert>
       <button id="hidden-save">Hidden Save</button>
     </main>
-    <aside class="sidebar open" role="dialog" aria-modal="true">
+    <aside class="panel-active">
       <h1>Меню</h1>
       <button id="sidebar-action">Sidebar Action</button>
       <button aria-label="Закрыть">×</button>
     </aside>
+    <script>
+      document.querySelector('[aria-label="Закрыть"]').addEventListener('click', () => {
+        document.querySelector('aside').remove();
+        document.querySelector('main').removeAttribute('aria-hidden');
+        document.querySelector('main').removeAttribute('inert');
+      });
+    </script>
   </body>
 </html>

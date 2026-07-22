@@ -76,7 +76,7 @@ class AgentMemory:
         self.reported_perf_rules: set = set()
         self.responsive_done: set = set()
         self.screenshot_before_action: Optional[str] = None
-        self._pending_analysis: Optional[Dict[str, Any]] = None
+        self._pending_analyses: List[Dict[str, Any]] = []
         self._scenario_queue: List[Dict[str, Any]] = []
         self._consecutive_repeats: int = 0
         self._recent_action_keys: List[str] = []
@@ -113,10 +113,6 @@ class AgentMemory:
         self.touched_keys_on_url: Dict[str, set] = {}
         # Future-ы фоновой отправки дефектов в Jira: дожидаемся в финале сессии.
         self.pending_defect_futures: List[Future] = []
-        # «Упрямый оверлей»: серия подряд close_modal без полезного действия между ними.
-        # Если она достигнет порога — игнорируем оверлей, пока агент не сделает что-то ещё.
-        self._consecutive_close_modal: int = 0
-        self.ignore_overlay: bool = False
         # --- Anti-Loop Guard на уровне сессии ---
         # Сколько шагов прошло БЕЗ полезного прогресса (новый stable_key / новый URL /
         # новый дефект). Сбрасывается на каждом «полезном» шаге.
@@ -198,6 +194,11 @@ class AgentMemory:
 
     # ------------------------------------------------------------------ actions
 
+    def begin_step(self) -> int:
+        """Advance the orchestration step exactly once."""
+        self.iteration += 1
+        return self.iteration
+
     def add_action(self, action: Dict[str, Any], result: str = "") -> None:
         act = (action.get("action") or "").lower()
         sel = _norm_key(action.get("selector", ""))
@@ -207,10 +208,11 @@ class AgentMemory:
         loop_key = stable_key or sel
         self.record_action_key(act, loop_key)
 
-        self.iteration += 1
+        if self.iteration <= 0:
+            self.begin_step()
         step_ctx = action.get("_step_context") or {}
         entry = {
-            "step": self.iteration,
+            "step": int(action.get("_step_number") or self.iteration),
             "time": datetime.now().strftime("%H:%M:%S"),
             "action": act,
             "selector": action.get("selector", ""),
@@ -291,25 +293,6 @@ class AgentMemory:
             elif sel in ("up", "вверх"):
                 self.done_scroll_up += 1
 
-        # Учёт «упрямого оверлея»: серия close_modal (scroll между ними не сбрасывает,
-        # потому что anti-loop сам ставит scroll ровно для разрядки).
-        if act == "close_modal":
-            self._consecutive_close_modal += 1
-            if self._consecutive_close_modal >= 3 and not self.ignore_overlay:
-                self.ignore_overlay = True
-                LOG.info(
-                    "Оверлей не закрывается (close_modal x%d) — игнорирую и работаю под ним",
-                    self._consecutive_close_modal,
-                )
-        elif act != "scroll":
-            if self._consecutive_close_modal or self.ignore_overlay:
-                LOG.debug(
-                    "Полезное действие %r — сбрасываю флаг ignore_overlay (было close_modal x%d)",
-                    act, self._consecutive_close_modal,
-                )
-            self._consecutive_close_modal = 0
-            self.ignore_overlay = False
-
         self.last_actions_sequence.append(act)
         if len(self.last_actions_sequence) > 10:
             self.last_actions_sequence = self.last_actions_sequence[-10:]
@@ -352,8 +335,6 @@ class AgentMemory:
                 return True
             if sel and (sel,) in self.done_select_option:
                 return True
-        if act == "close_modal" and self.done_close_modal > 0:
-            pass
         return False
 
     def is_already_done_action(self, action: Dict[str, Any]) -> bool:

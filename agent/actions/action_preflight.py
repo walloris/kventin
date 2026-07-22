@@ -64,7 +64,7 @@ def _find_current_ref_by_stable_key(page: Any, stable_key: str) -> str:
                     return false;
                 };
                 const visible = (el) => {
-                    if (!el || !document.contains(el) || hiddenByDomState(el)) return false;
+                    if (!el || !el.isConnected || hiddenByDomState(el)) return false;
                     const r = el.getBoundingClientRect();
                     if (r.width <= 0 || r.height <= 0) return false;
                     const s = getComputedStyle(el);
@@ -100,11 +100,14 @@ def _inspect_ref_state(page: Any, selector: str) -> Dict[str, Any]:
                     disabled: false,
                     hidden_dom: false,
                     outside_overlay: false,
+                    overlay_root_count: 0,
+                    inside_active_overlay: false,
+                    occluded: false,
                     stable_key: '',
                     text: '',
                     tag: '',
                 };
-                if (!el || !document.contains(el)) return out;
+                if (!el || !el.isConnected) return out;
                 out.exists = true;
                 out.stable_key = (window.__agentRefMeta && window.__agentRefMeta[refStr]) || '';
                 out.tag = el.tagName ? el.tagName.toLowerCase() : '';
@@ -132,43 +135,18 @@ def _inspect_ref_state(page: Any, selector: str) -> Dict[str, Any]:
                     const r = node.getBoundingClientRect();
                     return r.top < window.innerHeight && r.bottom > 0 && r.left < window.innerWidth && r.right > 0;
                 };
-                const zOf = (node) => {
-                    let z = 0;
-                    let cur = node;
-                    while (cur && cur !== document.body) {
-                        const zi = parseInt(getComputedStyle(cur).zIndex, 10);
-                        if (!Number.isNaN(zi) && zi > z) z = zi;
-                        cur = cur.parentElement || (cur.getRootNode && cur.getRootNode().host) || null;
+                const deepestElementFromPoint = (x, y) => {
+                    let hit = document.elementFromPoint(x, y);
+                    while (hit && hit.shadowRoot && hit.shadowRoot.elementFromPoint) {
+                        const inner = hit.shadowRoot.elementFromPoint(x, y);
+                        if (!inner || inner === hit) break;
+                        hit = inner;
                     }
-                    return z;
+                    return hit;
                 };
-                const activeOverlayRoots = [];
-                const overlaySels = [
-                    '[aria-modal="true"]', '[role="dialog"]', '[role="alertdialog"]', 'dialog[open]',
-                    '[popover]:popover-open',
-                    '[class*="modal"][class*="open"]', '[class*="modal"][class*="show"]',
-                    '[class*="drawer"][class*="open"]', '[class*="drawer"][class*="show"]',
-                    '[class*="sidebar"][class*="open"]', '[class*="sidebar"][class*="show"]',
-                    '[class*="side-bar"][class*="open"]', '[class*="side-bar"][class*="show"]',
-                    '[class*="offcanvas"][class*="show"]',
-                    '[class*="overlay"][class*="open"]', '[class*="overlay"][class*="show"]',
-                    '[role="menu"]', '[role="listbox"]', '.dropdown-menu.show'
-                ];
-                for (const sel of overlaySels) {
-                    try {
-                        document.querySelectorAll(sel).forEach(node => {
-                            if (!node || hiddenByDomState(node)) return;
-                            const r = node.getBoundingClientRect();
-                            const s = getComputedStyle(node);
-                            const visible = r.width > 20 && r.height > 20
-                                && s.display !== 'none' && s.visibility !== 'hidden'
-                                && parseFloat(s.opacity || '1') > 0.1;
-                            if (visible && (zOf(node) >= 5 || node.getAttribute('aria-modal') === 'true' || node.open || node.matches('[popover]:popover-open'))) {
-                                activeOverlayRoots.push(node);
-                            }
-                        });
-                    } catch (e) {}
-                }
+                const activeOverlayRoots = Array.from(
+                    window.__agentActiveOverlayRoots || []
+                ).filter(node => node && node.isConnected && !hiddenByDomState(node));
 
                 out.hidden_dom = hiddenByDomState(el);
                 out.disabled = !!(el.disabled || (el.getAttribute && el.getAttribute('aria-disabled') === 'true'));
@@ -177,8 +155,14 @@ def _inspect_ref_state(page: Any, selector: str) -> Dict[str, Any]:
                     && rect.width > 0 && rect.height > 0
                     && inViewport(el)
                     && ancestorsVisible(el);
-                if (activeOverlayRoots.length) {
-                    out.outside_overlay = !activeOverlayRoots.some(root => root === el || root.contains(el));
+                out.overlay_root_count = activeOverlayRoots.length;
+                out.inside_active_overlay = activeOverlayRoots.some(root => root === el || root.contains(el));
+                out.outside_overlay = activeOverlayRoots.length > 0 && !out.inside_active_overlay;
+                if (out.visible) {
+                    const x = Math.max(0, Math.min(window.innerWidth - 1, rect.left + rect.width / 2));
+                    const y = Math.max(0, Math.min(window.innerHeight - 1, rect.top + rect.height / 2));
+                    const top = deepestElementFromPoint(x, y);
+                    out.occluded = !!top && top !== el && !el.contains(top);
                 }
                 return out;
             }""",
@@ -187,6 +171,90 @@ def _inspect_ref_state(page: Any, selector: str) -> Dict[str, Any]:
         return state or {"exists": False, "visible": False}
     except Exception as exc:
         return {"exists": False, "visible": False, "error": str(exc)}
+
+
+def _inspect_locator_state(page: Any, selector: str) -> Dict[str, Any]:
+    """Inspect a non-ref Playwright locator in the same live DOM contract."""
+    if not page or not selector:
+        return {"exists": False, "visible": False}
+    try:
+        locator = page.locator(selector).first
+        if locator.count() <= 0:
+            return {"exists": False, "visible": False}
+        state = locator.evaluate(
+            """(el) => {
+                const hiddenByDomState = (node) => {
+                    let cur = node;
+                    while (cur && cur.nodeType === 1) {
+                        if (cur.hidden || cur.inert) return true;
+                        if ((cur.getAttribute('aria-hidden') || '').toLowerCase() === 'true') return true;
+                        const s = getComputedStyle(cur);
+                        if (s.display === 'none' || s.visibility === 'hidden' || parseFloat(s.opacity || '1') <= 0.01) return true;
+                        cur = cur.parentElement || (cur.getRootNode && cur.getRootNode().host) || null;
+                    }
+                    return false;
+                };
+                const roots = Array.from(window.__agentActiveOverlayRoots || [])
+                    .filter(root => root && root.isConnected && !hiddenByDomState(root));
+                const deepestElementFromPoint = (x, y) => {
+                    let hit = document.elementFromPoint(x, y);
+                    while (hit && hit.shadowRoot && hit.shadowRoot.elementFromPoint) {
+                        const inner = hit.shadowRoot.elementFromPoint(x, y);
+                        if (!inner || inner === hit) break;
+                        hit = inner;
+                    }
+                    return hit;
+                };
+                const rect = el.getBoundingClientRect();
+                const inViewport = rect.top < window.innerHeight && rect.bottom > 0
+                    && rect.left < window.innerWidth && rect.right > 0;
+                const hidden = hiddenByDomState(el);
+                const visible = !hidden && rect.width > 0 && rect.height > 0 && inViewport;
+                let occluded = false;
+                if (visible) {
+                    const x = Math.max(0, Math.min(window.innerWidth - 1, rect.left + rect.width / 2));
+                    const y = Math.max(0, Math.min(window.innerHeight - 1, rect.top + rect.height / 2));
+                    const top = deepestElementFromPoint(x, y);
+                    occluded = !!top && top !== el && !el.contains(top);
+                }
+                const inside = roots.some(root => root === el || root.contains(el));
+                return {
+                    exists: true,
+                    visible,
+                    disabled: !!(el.disabled || (el.getAttribute('aria-disabled') || '').toLowerCase() === 'true'),
+                    hidden_dom: hidden,
+                    overlay_root_count: roots.length,
+                    inside_active_overlay: inside,
+                    outside_overlay: roots.length > 0 && !inside,
+                    occluded,
+                };
+            }"""
+        )
+        return state or {"exists": False, "visible": False}
+    except Exception as exc:
+        return {"exists": False, "visible": False, "error": str(exc)}
+
+
+def _state_rejection(state: Mapping[str, Any], *, has_overlay: bool) -> str:
+    if not state.get("exists"):
+        return "stale_ref"
+    if state.get("hidden_dom"):
+        return "hidden_dom"
+    if has_overlay and (
+        state.get("outside_overlay")
+        or (
+            "inside_active_overlay" in state
+            and not state.get("inside_active_overlay")
+        )
+    ):
+        return "outside_overlay"
+    if not state.get("visible"):
+        return "not_visible"
+    if state.get("disabled"):
+        return "disabled"
+    if state.get("occluded"):
+        return "occluded"
+    return ""
 
 
 def _is_repeat(memory: Any, action: Dict[str, Any]) -> bool:
@@ -217,6 +285,12 @@ def preflight_action(
     if act in SELECTOR_REQUIRED_ACTIONS and not selector:
         return ActionPreflightResult(action, False, "missing_selector")
 
+    if has_overlay and act in ("scroll", "explore", "fill_form"):
+        # These actions have no target that can be proven to belong to the
+        # active layer. Modal fields are exposed as individual type/select
+        # candidates and therefore remain fully testable.
+        return ActionPreflightResult(action, False, "outside_overlay")
+
     if act in REF_STATE_ACTIONS and ref_num(selector) is not None:
         expected_key = expected_stable_key(selector, expected_ref_meta)
         if expected_key:
@@ -233,23 +307,22 @@ def preflight_action(
                     repaired.pop("_canonical_locator", None)
                     repaired = enrich_action(page, memory, repaired)
                     state = _inspect_ref_state(page, new_selector)
-                    if state.get("exists") and state.get("visible") and not state.get("disabled") and not state.get("outside_overlay"):
+                    if not _state_rejection(state, has_overlay=has_overlay):
                         if not allow_repeat and _is_repeat(memory, repaired):
                             return ActionPreflightResult(repaired, False, "repeat")
                         return ActionPreflightResult(repaired, True, "ref_repaired", repaired=True)
                 return ActionPreflightResult(action, False, "stale_ref")
 
         state = _inspect_ref_state(page, selector)
-        if not state.get("exists"):
-            return ActionPreflightResult(action, False, "stale_ref")
-        if state.get("hidden_dom"):
-            return ActionPreflightResult(action, False, "hidden_dom")
-        if state.get("outside_overlay") and has_overlay:
-            return ActionPreflightResult(action, False, "outside_overlay")
-        if not state.get("visible"):
-            return ActionPreflightResult(action, False, "not_visible")
-        if state.get("disabled"):
-            return ActionPreflightResult(action, False, "disabled")
+        rejection = _state_rejection(state, has_overlay=has_overlay)
+        if rejection:
+            return ActionPreflightResult(action, False, rejection)
+
+    elif act in REF_STATE_ACTIONS:
+        state = _inspect_locator_state(page, selector)
+        rejection = _state_rejection(state, has_overlay=has_overlay)
+        if rejection:
+            return ActionPreflightResult(action, False, rejection)
 
     if (
         not allow_repeat

@@ -75,8 +75,8 @@ def execute_browser_action(
     if act == "check_defect":
         return "defect_found"
 
-    print(f"[Agent] Неизвестное действие: {act}, пробую клик")
-    return handlers.click(selector, reason) if selector else "no_action"
+    print(f"[Agent] Неизвестное действие: {act}, выполнение запрещено")
+    return f"unsupported_action: {act or 'empty'}"
 
 
 __all__ = ["ActionHandlers", "execute_browser_action"]

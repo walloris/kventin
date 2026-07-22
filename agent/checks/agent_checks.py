@@ -41,7 +41,7 @@ from agent.defects.defect_rules import rule_page_load_errors
 from agent.llm.llm_client import consult_agent_with_screenshot
 from agent.llm.llm_parser import parse_llm_action, validate_llm_action
 from agent.checks.performance import check_performance, format_performance_issues
-from agent.browser.page_analyzer import take_screenshot_b64
+from agent.browser.screenshot import take_screenshot_b64
 
 LOG = logging.getLogger("kventin.checks")
 
@@ -240,8 +240,8 @@ def run_iframe_check(
     try:
         iframes = page.evaluate("""() => {
             return Array.from(document.querySelectorAll('iframe'))
-                .filter(f => f.src && !f.agent.startsWith('about:') && f.width > 50 && f.height > 50)
-                .map(f => ({ src: f.agent.slice(0, 200), name: f.name || '', id: f.id || '' }))
+                .filter(f => f.src && !f.src.startsWith('about:') && f.width > 50 && f.height > 50)
+                .map(f => ({ src: f.src.slice(0, 200), name: f.name || '', id: f.id || '' }))
                 .slice(0, 3);
         }""")
         for iframe_info in (iframes or []):

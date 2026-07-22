@@ -6,11 +6,16 @@
 """
 import copy
 import os
+import random
 import re
 import logging
+import threading
+import time
 from typing import Optional, List, Union, Set
 
 import requests
+
+from agent.core.resilience import RetryPolicy, parse_retry_after
 
 try:
     import urllib3
@@ -29,6 +34,9 @@ from config import (
     JIRA_RETEST_STATUS_IN_PROGRESS,
     JIRA_RETEST_STATUS_QA,
     JIRA_RETEST_STATUS_RESOLVED,
+    JIRA_RETRY_BASE_DELAY,
+    JIRA_RETRY_COUNT,
+    JIRA_RETRY_MAX_DELAY,
     JIRA_VERIFY_SSL,
 )
 
@@ -36,6 +44,71 @@ LOG = logging.getLogger("Jira")
 
 # Лейбл всех дефектов, заведённых агентом
 JIRA_DEFECT_LABEL = "kventin"
+JIRA_RETRYABLE_HTTP_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
+
+
+def _jira_retry_policy() -> RetryPolicy:
+    return RetryPolicy(
+        max_attempts=max(1, int(JIRA_RETRY_COUNT)),
+        base_delay=max(0.0, float(JIRA_RETRY_BASE_DELAY)),
+        max_delay=max(0.0, float(JIRA_RETRY_MAX_DELAY)),
+        retryable_statuses=JIRA_RETRYABLE_HTTP_STATUSES,
+    )
+
+
+def _jira_http_request(
+    method: str,
+    url: str,
+    *,
+    retry_mutating: bool = False,
+    max_attempts: Optional[int] = None,
+    **kwargs: object,
+) -> Optional[requests.Response]:
+    """Execute a bounded Jira request with conservative mutation retries."""
+    policy = _jira_retry_policy()
+    method_upper = method.upper()
+    can_retry = method_upper in {"GET", "HEAD", "OPTIONS"} or retry_mutating
+    attempts = policy.attempts() if can_retry else 1
+    if max_attempts is not None:
+        attempts = min(attempts, max(1, int(max_attempts)))
+    for attempt in range(attempts):
+        try:
+            response = requests.request(method_upper, url, **kwargs)
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+            if attempt >= attempts - 1:
+                LOG.warning("Jira transport error %s %s: %s", method_upper, url, exc)
+                return None
+            delay = policy.delay_for(attempt, random_fn=random.uniform)
+            LOG.warning(
+                "Jira transport error, retry %d/%d in %.1fs: %s",
+                attempt + 1,
+                attempts,
+                delay,
+                exc,
+            )
+            time.sleep(delay)
+            continue
+        except requests.exceptions.RequestException as exc:
+            LOG.warning("Jira request failed %s %s: %s", method_upper, url, exc)
+            return None
+
+        if response.status_code not in policy.retryable_statuses or attempt >= attempts - 1:
+            return response
+        delay = policy.delay_for(
+            attempt,
+            retry_after=parse_retry_after(response.headers),
+            random_fn=random.uniform,
+        )
+        LOG.warning(
+            "Jira HTTP %s, retry %d/%d in %.1fs: %s",
+            response.status_code,
+            attempt + 1,
+            attempts,
+            delay,
+            (response.text or "")[:300],
+        )
+        time.sleep(delay)
+    return None
 
 # =============================================
 # Локальная дедупликация (в памяти процесса)
@@ -48,6 +121,9 @@ JIRA_DEFECT_LABEL = "kventin"
 #   Уровень B — нормализованный summary (как раньше): для случаев без сигнатуры.
 _session_defect_keys: Set[str] = set()        # уровень B: нормализованный summary
 _session_signatures: Set[str] = set()         # уровень A: компактная сигнатура
+_pending_defect_keys: Set[str] = set()
+_pending_signatures: Set[str] = set()
+_dedup_lock = threading.RLock()
 
 
 def _normalize_defect_key(text: str) -> str:
@@ -127,37 +203,68 @@ def is_local_duplicate(
     Сначала — структурная сигнатура (если задана). Совпадение ⇒ дубль.
     Затем — нормализованный summary (точное совпадение или Jaccard > 0.6).
     """
-    if signature and signature in _session_signatures:
-        LOG.info("Локальный дубль (сигнатура): %s", summary[:80])
-        return True
-
-    key = _normalize_defect_key(summary)
-    if not key:
-        return False
-    if key in _session_defect_keys:
-        LOG.info("Локальный дубль (точный): %s", summary[:60])
-        return True
-    for existing in _session_defect_keys:
-        sim = _similarity(key, existing)
-        if sim > 0.6:
-            LOG.info("Локальный дубль (sim=%.2f): '%s' ~ '%s'", sim, key[:40], existing[:40])
+    with _dedup_lock:
+        if signature and signature in (_session_signatures | _pending_signatures):
+            LOG.info("Локальный дубль (сигнатура): %s", summary[:80])
             return True
+
+        key = _normalize_defect_key(summary)
+        if not key:
+            return False
+        all_keys = _session_defect_keys | _pending_defect_keys
+        if key in all_keys:
+            LOG.info("Локальный дубль (точный): %s", summary[:60])
+            return True
+        for existing in all_keys:
+            sim = _similarity(key, existing)
+            if sim > 0.6:
+                LOG.info("Локальный дубль (sim=%.2f): '%s' ~ '%s'", sim, key[:40], existing[:40])
+                return True
     return False
 
 
 def register_local_defect(summary: str, *, signature: str = "") -> None:
     """Запомнить дефект в памяти сессии для дедупликации (summary + сигнатура)."""
     key = _normalize_defect_key(summary)
-    if key:
-        _session_defect_keys.add(key)
-    if signature:
-        _session_signatures.add(signature)
+    with _dedup_lock:
+        if key:
+            _pending_defect_keys.discard(key)
+            _session_defect_keys.add(key)
+        if signature:
+            _pending_signatures.discard(signature)
+            _session_signatures.add(signature)
+
+
+def reserve_local_defect(summary: str, *, signature: str = "") -> bool:
+    """Atomically reserve a defect while Jira delivery is in flight."""
+    with _dedup_lock:
+        if is_local_duplicate(summary, signature=signature):
+            return False
+        key = _normalize_defect_key(summary)
+        if key:
+            _pending_defect_keys.add(key)
+        if signature:
+            _pending_signatures.add(signature)
+        return True
+
+
+def release_local_defect(summary: str, *, signature: str = "") -> None:
+    """Release a failed delivery so a later observation can retry it."""
+    key = _normalize_defect_key(summary)
+    with _dedup_lock:
+        if key:
+            _pending_defect_keys.discard(key)
+        if signature:
+            _pending_signatures.discard(signature)
 
 
 def reset_session_defects() -> None:
     """Сбросить локальный кеш (при перезапуске агента)."""
-    _session_defect_keys.clear()
-    _session_signatures.clear()
+    with _dedup_lock:
+        _session_defect_keys.clear()
+        _session_signatures.clear()
+        _pending_defect_keys.clear()
+        _pending_signatures.clear()
 
 
 def _jira_request(
@@ -168,6 +275,7 @@ def _jira_request(
     headers: dict,
     auth: Optional[tuple],
     use_bearer: bool,
+    max_attempts: Optional[int] = None,
     **kwargs: object,
 ) -> Optional[dict]:
     """Выполнить запрос к Jira API. Возвращает JSON или None."""
@@ -180,7 +288,9 @@ def _jira_request(
         kwargs["auth"] = auth
     kwargs["headers"] = {**headers, **kwargs.get("headers", {})}
     try:
-        r = requests.request(method, url, **kwargs)
+        r = _jira_http_request(method, url, max_attempts=max_attempts, **kwargs)
+        if r is None:
+            return None
         if r.status_code in (200, 201):
             return r.json() if r.text else {}
         return None
@@ -218,6 +328,8 @@ def search_duplicates(
     email: Optional[str] = None,
     api_token: Optional[str] = None,
     project_key: Optional[str] = None,
+    broad: bool = True,
+    request_attempts: Optional[int] = None,
 ) -> Optional[str]:
     """
     Поиск дубля в Jira: открытые задачи с лейблом kventin и похожим summary.
@@ -253,6 +365,7 @@ def search_duplicates(
             "GET", jira_url, "search",
             params={"jql": jql, "fields": "key,summary", "maxResults": 5},
             headers=headers, auth=auth, use_bearer=use_bearer,
+            max_attempts=request_attempts,
         )
         if res and res.get("issues"):
             # Проверяем similarity с каждым результатом
@@ -267,6 +380,9 @@ def search_duplicates(
                     return key
 
     # --- Поиск 2: по ключевым словам (широкий) ---
+    if not broad:
+        return None
+
     keywords = _extract_search_keywords(summary_part)
     if keywords and len(keywords.split()) >= 2:
         kw_safe = keywords.replace('"', '').replace('\\', '')[:60]
@@ -278,6 +394,7 @@ def search_duplicates(
             "GET", jira_url, "search",
             params={"jql": jql2, "fields": "key,summary", "maxResults": 5},
             headers=headers, auth=auth, use_bearer=use_bearer,
+            max_attempts=request_attempts,
         )
         if res2 and res2.get("issues"):
             norm_input = _normalize_defect_key(summary_part)
@@ -367,14 +484,18 @@ def _assign_issue(
 
     for label, body in attempts:
         try:
-            r = requests.put(
+            r = _jira_http_request(
+                "PUT",
                 url,
+                retry_mutating=True,
                 json=body,
                 headers=h,
                 auth=auth if not use_bearer else None,
                 verify=JIRA_VERIFY_SSL,
                 timeout=15,
             )
+            if r is None:
+                continue
             if r.status_code in (200, 204):
                 LOG.info("Assignee %s: %s=%s", issue_key, label, assignee_value)
                 return True
@@ -386,6 +507,39 @@ def _assign_issue(
     return False
 
 
+def _jira_attachment_exists(
+    jira_url: str,
+    issue_key: str,
+    filename: str,
+    file_size: int,
+    *,
+    headers: dict,
+    auth: Optional[tuple],
+    use_bearer: bool,
+) -> bool:
+    response = _jira_http_request(
+        "GET",
+        f"{jira_url}/rest/api/2/issue/{issue_key}",
+        params={"fields": "attachment"},
+        headers=headers,
+        auth=auth if not use_bearer else None,
+        verify=JIRA_VERIFY_SSL,
+        timeout=30,
+    )
+    if response is None or response.status_code != 200:
+        return False
+    try:
+        attachments = ((response.json() or {}).get("fields") or {}).get("attachment") or []
+    except Exception:
+        return False
+    return any(
+        str(item.get("filename") or "") == filename
+        and int(item.get("size") or -1) == file_size
+        for item in attachments
+        if isinstance(item, dict)
+    )
+
+
 def _attach_files(
     jira_url: str,
     issue_key: str,
@@ -394,31 +548,81 @@ def _attach_files(
     headers_base: dict,
     auth: Optional[tuple],
     use_bearer: bool,
-    api_token: str,
-) -> None:
+) -> bool:
     """Приложить файлы к созданной задаче."""
     url = f"{jira_url}/rest/api/2/issue/{issue_key}/attachments"
     headers = {k: v for k, v in headers_base.items() if k.lower() != "content-type"}
+    all_attached = True
+    policy = _jira_retry_policy()
     for path in file_paths:
         if not path or not os.path.isfile(path):
+            all_attached = False
             continue
-        try:
-            with open(path, "rb") as f:
-                files = {"file": (os.path.basename(path), f)}
-                r = requests.post(
-                    url,
-                    files=files,
-                    headers=headers,
-                    auth=auth if not use_bearer else None,
-                    verify=JIRA_VERIFY_SSL,
-                    timeout=60,
-                )
-            if r.status_code in (200, 201):
-                print(f"[Jira] Вложение: {issue_key} <- {os.path.basename(path)}")
-            else:
-                print(f"[Jira] Ошибка вложения {r.status_code}: {os.path.basename(path)}")
-        except Exception as e:
-            print(f"[Jira] Ошибка вложения {path}: {e}")
+        filename = os.path.basename(path)
+        file_size = os.path.getsize(path)
+        attached = False
+        if _jira_attachment_exists(
+            jira_url,
+            issue_key,
+            filename,
+            file_size,
+            headers=headers,
+            auth=auth,
+            use_bearer=use_bearer,
+        ):
+            LOG.info("Attachment already exists: %s on %s", filename, issue_key)
+            continue
+        for attempt in range(policy.attempts()):
+            try:
+                with open(path, "rb") as file_handle:
+                    response = _jira_http_request(
+                        "POST",
+                        url,
+                        retry_mutating=False,
+                        files={"file": (filename, file_handle)},
+                        headers=headers,
+                        auth=auth if not use_bearer else None,
+                        verify=JIRA_VERIFY_SSL,
+                        timeout=60,
+                    )
+            except Exception as exc:
+                LOG.warning("Attachment %s failed: %s", filename, exc)
+                response = None
+
+            if response is not None and response.status_code in (200, 201):
+                attached = True
+                break
+            if _jira_attachment_exists(
+                jira_url,
+                issue_key,
+                filename,
+                file_size,
+                headers=headers,
+                auth=auth,
+                use_bearer=use_bearer,
+            ):
+                LOG.info("Attachment response was lost; found %s on %s", filename, issue_key)
+                attached = True
+                break
+            if (
+                response is not None
+                and response.status_code not in policy.retryable_statuses
+            ) or attempt >= policy.attempts() - 1:
+                break
+            delay = policy.delay_for(
+                attempt,
+                retry_after=parse_retry_after(response.headers) if response is not None else None,
+                random_fn=random.uniform,
+            )
+            time.sleep(delay)
+
+        if attached:
+            print(f"[Jira] Вложение: {issue_key} <- {filename}")
+        else:
+            all_attached = False
+            status = response.status_code if response is not None else "нет ответа"
+            print(f"[Jira] Ошибка вложения {status}: {filename}")
+    return all_attached
 
 
 def _jira_priority_name_for_severity(severity: Optional[str]) -> Optional[str]:
@@ -449,6 +653,7 @@ def create_jira_issue(
     project_key: Optional[str] = None,
     attachment_paths: Optional[List[Union[str, os.PathLike]]] = None,
     severity: Optional[str] = None,
+    skip_local_duplicate_check: bool = False,
 ) -> Optional[str]:
     """
     Создать дефект в Jira с описанием и вложениями (фактура).
@@ -488,7 +693,7 @@ def create_jira_issue(
         return None
 
     # Уровень 1: локальная дедупликация (в памяти сессии)
-    if is_local_duplicate(summary, description):
+    if not skip_local_duplicate_check and is_local_duplicate(summary, description):
         print(f"[Jira] Пропуск (локальный дубль): {summary[:80]}")
         LOG.info("Пропуск (локальный дубль): %s", summary[:80])
         return None
@@ -534,8 +739,66 @@ def create_jira_issue(
     else:
         LOG.debug("create issue: priority не передаётся (JIRA_PRIORITY_* пусто или нет severity)")
 
+    def _post_create(payload_to_send: dict) -> tuple:
+        policy = _jira_retry_policy()
+        last_response = None
+        for attempt in range(policy.attempts()):
+            last_response = _jira_http_request(
+                "POST",
+                url,
+                retry_mutating=False,
+                json=payload_to_send,
+                headers=headers,
+                auth=auth,
+                verify=JIRA_VERIFY_SSL,
+                timeout=30,
+            )
+            if last_response is not None and last_response.status_code not in policy.retryable_statuses:
+                return last_response, None
+
+            # Jira may have accepted the create before a proxy dropped the
+            # response. Search before every retry to keep create idempotent.
+            duplicate_key = search_duplicates(
+                summary,
+                jira_url=jira_url,
+                username=login,
+                api_token=api_token,
+                project_key=project_key,
+                broad=False,
+                request_attempts=1,
+            )
+            if duplicate_key:
+                return None, duplicate_key
+            if attempt >= policy.attempts() - 1:
+                break
+            retry_after = (
+                parse_retry_after(last_response.headers)
+                if last_response is not None
+                else None
+            )
+            delay = policy.delay_for(
+                attempt,
+                retry_after=retry_after,
+                random_fn=random.uniform,
+            )
+            LOG.warning(
+                "Jira create retry %d/%d in %.1fs",
+                attempt + 1,
+                policy.attempts(),
+                delay,
+            )
+            time.sleep(delay)
+        return last_response, None
+
     try:
-        r = requests.post(url, json=payload, headers=headers, auth=auth, verify=JIRA_VERIFY_SSL, timeout=30)
+        r, recovered_key = _post_create(payload)
+        if recovered_key:
+            LOG.info("Jira create response was lost; found issue by dedup: %s", recovered_key)
+            register_local_defect(summary)
+            return recovered_key
+        if r is None:
+            LOG.error("Jira create failed after retries: no response")
+            return None
         if r.status_code == 400 and "priority" in (payload.get("fields") or {}):
             err_json: dict = {}
             try:
@@ -550,9 +813,17 @@ def create_jira_issue(
                 LOG.warning("Jira 400: invalid priority, retrying without priority field")
                 payload2 = copy.deepcopy(payload)
                 payload2["fields"].pop("priority", None)
-                r = requests.post(url, json=payload2, headers=headers, auth=auth, verify=JIRA_VERIFY_SSL, timeout=30)
+                r, recovered_key = _post_create(payload2)
+                if recovered_key:
+                    register_local_defect(summary)
+                    return recovered_key
+                if r is None:
+                    return None
         r.raise_for_status()
         key = r.json().get("key")
+        if not key:
+            LOG.error("Jira create returned success without an issue key: %s", (r.text or "")[:300])
+            return None
         LOG.info("Создан дефект: %s", key)
         register_local_defect(summary)
 
@@ -567,7 +838,6 @@ def create_jira_issue(
                 headers_base=headers,
                 auth=auth,
                 use_bearer=use_bearer,
-                api_token=api_token,
             )
         return key
     except requests.exceptions.HTTPError as e:
@@ -633,9 +903,10 @@ def _jira_rest(
         return 0, None, "Jira: не заданы JIRA_URL / JIRA_API_TOKEN / JIRA_PROJECT_KEY"
     url = f"{conn['jira_url']}/rest/api/2/{path.lstrip('/')}"
     try:
-        r = requests.request(
+        r = _jira_http_request(
             method,
             url,
+            retry_mutating=method.upper() in {"PUT", "DELETE"},
             params=params,
             json=json_body,
             headers=conn["headers"],
@@ -643,6 +914,8 @@ def _jira_rest(
             verify=JIRA_VERIFY_SSL,
             timeout=45,
         )
+        if r is None:
+            return 0, None, "Jira transport failed after retries"
         text = (r.text or "")[:800]
         if r.status_code in (200, 201):
             try:
@@ -742,27 +1015,24 @@ def attach_file_to_issue(issue_key: str, file_path: str) -> bool:
     if not file_path or not os.path.isfile(file_path):
         LOG.warning("attach_file_to_issue: файл не найден: %s", file_path)
         return False
-    api_token = (os.getenv("JIRA_API_TOKEN", "") or "").strip()
-    _attach_files(
+    return _attach_files(
         conn["jira_url"],
         issue_key,
         [file_path],
         headers_base=conn["headers"],
         auth=conn["auth"],
         use_bearer=conn["use_bearer"],
-        api_token=api_token,
     )
-    return True
 
 
 def get_issue_with_changelog(issue_key: str) -> tuple[int, Optional[dict], str]:
-    """GET issue с expand=changelog, полями description, summary, status, assignee."""
+    """GET issue with fields needed by retest and task workflows."""
     return _jira_rest(
         "GET",
         f"issue/{issue_key}",
         params={
             "expand": "changelog",
-            "fields": "description,summary,status,assignee,reporter",
+            "fields": "description,summary,status,assignee,reporter,comment,attachment,updated",
         },
     )
 
@@ -991,3 +1261,23 @@ def extract_description_text(fields: Optional[dict]) -> str:
         except Exception:
             return str(d)[:20000]
     return ""
+
+
+def extract_issue_comment_text(fields: Optional[dict]) -> str:
+    """Flatten Jira wiki/ADF comments into searchable plain text."""
+    comments = (((fields or {}).get("comment") or {}).get("comments") or [])
+
+    def flatten(value: object) -> str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, dict):
+            return " ".join(flatten(item) for item in value.values())
+        if isinstance(value, list):
+            return " ".join(flatten(item) for item in value)
+        return ""
+
+    return "\n".join(
+        flatten(comment.get("body"))
+        for comment in comments
+        if isinstance(comment, dict)
+    )

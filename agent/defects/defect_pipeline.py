@@ -36,8 +36,9 @@ from agent.llm.llm_client import consult_agent
 from agent.defects.jira_client import (
     build_defect_signature,
     create_jira_issue,
-    is_local_duplicate,
     register_local_defect,
+    release_local_defect,
+    reserve_local_defect,
 )
 from agent.actions.locators import url_pattern as _url_pattern
 
@@ -46,7 +47,7 @@ LOG = logging.getLogger("kventin.defect")
 
 _SIG_HEADERS = (
     ("page_load", r"\[Загрузка страницы\]"),
-    ("action_failure", r"кнопка/элемент недоступна для клика|перекрыта другим элементом|не становится кликабельным"),
+    ("action_failure", r"кнопка/элемент недоступна для клика|перекрыта другим элементом|не становится кликабельным|оверлей невозможно закрыть|modal_close_failed"),
     ("pageerror", r"JS pageerror|JS error в консоли"),
     ("network_5xx", r"HTTP 5xx|http\s*5\d\d"),
     ("network_4xx", r"HTTP\s*4\d\d|http\s*4\d\d"),
@@ -54,6 +55,17 @@ _SIG_HEADERS = (
     ("perf", r"\[Perf\]|Performance"),
     ("responsive", r"\[Responsive"),
 )
+
+
+def _cleanup_evidence(attachment_paths: Optional[List[str]]) -> None:
+    if not attachment_paths:
+        return
+    try:
+        directory = os.path.dirname(os.fspath(attachment_paths[0]))
+        if directory and os.path.isdir(directory) and "kventin_defect_" in directory:
+            shutil.rmtree(directory, ignore_errors=True)
+    except Exception:
+        LOG.debug("Could not clean temporary defect evidence", exc_info=True)
 
 
 def _classify_kind(bug_text: str) -> str:
@@ -65,6 +77,7 @@ def _classify_kind(bug_text: str) -> str:
 
 
 _RULE_FRAGMENTS = (
+    ("overlay_close", r"оверлей невозможно закрыть|modal_close_failed"),
     ("intercept", r"intercepts? pointer events|перекрыта другим элементом"),
     ("timeout_ui", r"не становится кликабельным|exceeded while waiting"),
     ("rule_5xx", r"\b5\d\d\b"),
@@ -194,8 +207,8 @@ def is_semantic_duplicate(bug_description: str, memory: Any) -> bool:
     try:
         answer = consult_agent(
             f"Уже заведённые дефекты:\n{existing}\n\n"
-            f"Новый дефект: {bug_description[:300]}\n\n"
-            f"Это ДУБЛЬ одного из уже заведённых? Ответь ОДНИМ словом: ДА или НЕТ."
+            f"Новый дефект: {bug_description[:300]}",
+            "Это ДУБЛЬ одного из уже заведённых? Ответь ОДНИМ словом: ДА или НЕТ.",
         )
         if answer and "да" in answer.strip().lower()[:10]:
             LOG.info("Семантический дубль (LLM): %s", bug_description[:60])
@@ -231,6 +244,7 @@ def _create_defect_bg(
             description=description,
             attachment_paths=attachment_paths or None,
             severity=severity,
+            skip_local_duplicate_check=True,
         )
         if key:
             print(f"[Agent] Дефект создан: {key} [{severity}]")
@@ -244,17 +258,13 @@ def _create_defect_bg(
         else:
             print(f"[Agent] Jira вернула None (тикет не создан): {summary[:60]}")
             LOG.warning("_create_defect_bg: create_jira_issue=None — смотри логи Jira выше")
+            release_local_defect(summary, signature=signature)
     except Exception:
+        release_local_defect(summary, signature=signature)
         LOG.exception("_create_defect_bg: исключение при создании дефекта")
         print(f"[Agent] Ошибка фонового создания дефекта (см. логи)")
     finally:
-        if attachment_paths:
-            try:
-                d = os.path.dirname(attachment_paths[0])
-                if d and os.path.isdir(d) and "kventin_defect_" in d:
-                    shutil.rmtree(d, ignore_errors=True)
-            except Exception:
-                pass
+        _cleanup_evidence(attachment_paths)
 
 
 def create_defect(
@@ -306,15 +316,6 @@ def create_defect(
     )
     if signature:
         LOG.info("create_defect: signature=%r", signature[:160])
-
-    if is_local_duplicate(summary, bug_description, signature=signature):
-        print(f"[Agent] Пропуск дефекта (локальный дубль): {summary[:60]}")
-        LOG.info("create_defect: отбито is_local_duplicate")
-        return
-
-    # Регистрируем сигнатуру СРАЗУ (до отправки в фон) — иначе пока Jira отвечает,
-    # тот же баг может попасть на повторное заведение со следующего шага.
-    register_local_defect(summary, signature=signature)
 
     attachment_paths = collect_evidence(page, console_log, network_failures)
     steps_to_reproduce = (
@@ -379,12 +380,34 @@ def create_defect(
         network_failures=network_failures,
     )
 
+    # Reserve only after the fallible evidence/description preparation. A
+    # preparation exception must never poison deduplication for later signals.
+    if not reserve_local_defect(summary, signature=signature):
+        print(f"[Agent] Пропуск дефекта (локальный дубль): {summary[:60]}")
+        LOG.info("create_defect: отбито is_local_duplicate")
+        _cleanup_evidence(attachment_paths)
+        return
+
     print(f"[Agent] Отправка дефекта в Jira (фон): {summary[:60]} [{severity}]")
     LOG.info("create_defect: ставим в фон отправку в Jira (severity=%s)", severity)
-    fut = bg_submit(
-        _create_defect_bg,
-        summary, description, bug_description, attachment_paths, memory, severity, signature,
-    )
+    try:
+        fut = bg_submit(
+            _create_defect_bg,
+            summary, description, bug_description, attachment_paths, memory, severity, signature,
+            pool_name="jira",
+        )
+    except Exception:
+        LOG.exception("create_defect: фон недоступен — создаём дефект синхронно")
+        _create_defect_bg(
+            summary,
+            description,
+            bug_description,
+            attachment_paths,
+            memory,
+            severity,
+            signature,
+        )
+        return
     if fut is None:
         LOG.error("create_defect: bg_submit вернул None — создаём дефект синхронно")
         _create_defect_bg(summary, description, bug_description, attachment_paths, memory, severity, signature)
@@ -392,6 +415,12 @@ def create_defect(
     if memory is not None:
         try:
             memory.pending_defect_futures.append(fut)
+            def _forget_completed(done_future) -> None:
+                try:
+                    memory.pending_defect_futures.remove(done_future)
+                except (AttributeError, ValueError):
+                    pass
+            fut.add_done_callback(_forget_completed)
         except AttributeError:
             memory.pending_defect_futures = [fut]
 

@@ -29,7 +29,7 @@ def check_accessibility(page: Page) -> List[Dict[str, Any]]:
 def _check_images_without_alt(page: Page) -> List[Dict]:
     """Изображения без alt-текста."""
     try:
-        result = page.evaluate("""() => {
+        result = page.evaluate(r"""() => {
             const issues = [];
             document.querySelectorAll('img').forEach(img => {
                 if (img.width < 5 || img.height < 5) return;
@@ -234,7 +234,7 @@ def _check_focus_indicators(page: Page) -> List[Dict]:
 def _check_color_contrast(page: Page) -> List[Dict]:
     """Базовая проверка контраста текста (крупные проблемы: белый на белом и т.п.)."""
     try:
-        result = page.evaluate("""() => {
+        result = page.evaluate(r"""() => {
             const issues = [];
             const luminance = (r, g, b) => {
                 const [rs, gs, bs] = [r, g, b].map(c => {

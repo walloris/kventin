@@ -183,12 +183,22 @@ MAX_STEPS = int(os.getenv("MAX_STEPS", "0"))
 # Retry при сбое локальной LLM (пустой ответ / не JSON): экспоненциальный backoff.
 LLM_RETRY_COUNT = int(os.getenv("LLM_RETRY_COUNT", "3"))
 LLM_RETRY_BASE_DELAY = float(os.getenv("LLM_RETRY_BASE_DELAY", "1.0"))  # секунды
+LLM_RETRY_MAX_DELAY = float(os.getenv("LLM_RETRY_MAX_DELAY", "20.0"))
 # Если LLM не ответила за N секунд — берём fast action (не зависаем).
 LLM_RESPONSE_TIMEOUT_SEC = int(os.getenv("LLM_RESPONSE_TIMEOUT_SEC", "20"))
 # Circuit breaker: после N таймаутов подряд не вызывать LLM M секунд (0 = отключить).
 # Применяется и к выбору действия, и к фоновому анализу (любой chat()-вызов).
 LLM_CIRCUIT_BREAKER_AFTER_N_TIMEOUTS = int(os.getenv("LLM_CIRCUIT_BREAKER_AFTER_N_TIMEOUTS", "2"))
 LLM_CIRCUIT_BREAKER_COOLDOWN_SEC = int(os.getenv("LLM_CIRCUIT_BREAKER_COOLDOWN_SEC", "60"))
+
+# Jira uses the same soft-failure policy as the LLM, but with its own budget.
+# Mutating requests are retried only for transport failures and explicit
+# transient HTTP statuses. Duplicate search before create keeps the operation
+# idempotent when a response is lost after Jira accepted the request.
+JIRA_RETRY_COUNT = int(os.getenv("JIRA_RETRY_COUNT", "4"))
+JIRA_RETRY_BASE_DELAY = float(os.getenv("JIRA_RETRY_BASE_DELAY", "1.0"))
+JIRA_RETRY_MAX_DELAY = float(os.getenv("JIRA_RETRY_MAX_DELAY", "20.0"))
+JIRA_TASK_EXPLORATORY_STEPS = int(os.getenv("JIRA_TASK_EXPLORATORY_STEPS", "20"))
 # Таймаут на одно действие Playwright (клик, fill, wait), мс
 ACTION_TIMEOUT_MS = int(os.getenv("ACTION_TIMEOUT_MS", "10000"))
 # Путь к файлу итогового отчёта сессии (пусто = только в консоль)
@@ -235,9 +245,19 @@ LOOP_GUARD_HARD_STOP_AFTER = int(os.getenv("LOOP_GUARD_HARD_STOP_AFTER", "80"))
 AGENT_MEMORY_PATH = os.getenv("AGENT_MEMORY_PATH", "./.kventin_agent_memory.json").strip()
 AGENT_MEMORY_SAVE_EVERY_N = int(os.getenv("AGENT_MEMORY_SAVE_EVERY_N", "1"))
 
+# Browser/process supervisor. In the default endless mode an unexpected page or
+# browser shutdown starts a fresh session instead of terminating the agent.
+AGENT_CONTINUOUS_RESTART = os.getenv("AGENT_CONTINUOUS_RESTART", "true").lower() in (
+    "1", "true", "yes",
+)
+AGENT_RESTART_BASE_DELAY_SEC = float(os.getenv("AGENT_RESTART_BASE_DELAY_SEC", "2.0"))
+AGENT_RESTART_MAX_DELAY_SEC = float(os.getenv("AGENT_RESTART_MAX_DELAY_SEC", "60.0"))
+
 # --- Продвинутые проверки ---
 A11Y_CHECK_EVERY_N = int(os.getenv("A11Y_CHECK_EVERY_N", "10"))
 PERF_CHECK_EVERY_N = int(os.getenv("PERF_CHECK_EVERY_N", "15"))
+IFRAME_CHECK_EVERY_N = int(os.getenv("IFRAME_CHECK_EVERY_N", "20"))
+RESPONSIVE_CHECK_EVERY_N = int(os.getenv("RESPONSIVE_CHECK_EVERY_N", "30"))
 # Responsive тестирование: после основного прохода переключить на мобильный viewport
 ENABLE_RESPONSIVE_TEST = os.getenv("ENABLE_RESPONSIVE_TEST", "true").lower() in ("1", "true", "yes")
 RESPONSIVE_VIEWPORTS = [

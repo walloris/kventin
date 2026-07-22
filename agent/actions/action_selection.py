@@ -61,7 +61,7 @@ def apply_preflight_or_fallback(
         else:
             action = (
                 {"action": "close_modal", "selector": "", "reason": f"Preflight fallback: {preflight.reason}"}
-                if has_overlay and not getattr(memory, "ignore_overlay", False)
+                if has_overlay
                 else {"action": "scroll", "selector": "down", "reason": f"Preflight fallback: {preflight.reason}"}
             )
             enrich_action(page, memory, action)
