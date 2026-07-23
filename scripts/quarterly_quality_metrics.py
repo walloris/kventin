@@ -75,12 +75,6 @@ DEFAULT_RELEASE_LINK_KEYWORDS = ("consist", "part")
 DEFAULT_HOTFIX_VALUES = ("Hotfix",)
 DEFAULT_INSTALLED_RELEASE_STATUSES = (
     "Установлен на ПРОМ",
-    "Установлено на ПРОМ",
-    "Установлен в ПРОМ",
-    "Установлено в ПРОМ",
-    "Installed on PROM",
-    "Installed on PROD",
-    "Installed to PROD",
 )
 RELEASE_KE_IDS = tuple(
     dict.fromkeys(
