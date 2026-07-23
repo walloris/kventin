@@ -376,9 +376,9 @@ def calculate_metric(spec: TeamSpec, counts: TeamCounts) -> TeamMetric:
         actual_ratio = None
 
     if stories == 0 and bugs == 0:
-        attainment = None
+        attainment = Decimal(100)
         infinite_attainment = False
-        state = "Нет релизов"
+        state = "Цель выполнена"
     elif bugs == 0 or actual_ratio == 0:
         attainment = Decimal(100)
         infinite_attainment = False
@@ -1693,20 +1693,11 @@ def render_confluence_html(
         '<div style="color:#79F2C0;font-size:12px;font-weight:bold;'
         'letter-spacing:.08em;text-transform:uppercase;">Quality Radar</div>',
         '<div style="font-size:25px;font-weight:bold;margin-top:5px;">'
-        "Качество релизов команд · 90 дней и квартал</div>",
+        "Качество релизов команд · квартал и 90 дней</div>",
         '<div style="color:#B3D4FF;font-size:13px;margin-top:7px;">'
         "Два независимых среза Story и критичных PSI/ПРОМ-багов из "
         "установленных на ПРОМ плановых релизов и Hotfix</div>",
         "</div>",
-        render_metric_section_html(
-            rolling_metrics,
-            title="Последние 90 дней",
-            start=rolling_start,
-            end=rolling_end,
-            release_count=rolling_release_count,
-            hotfix_count=rolling_hotfix_count,
-            accent="#0052CC",
-        ),
         render_metric_section_html(
             quarter_metrics,
             title=f"Текущий квартал · {quarter_start.year} Q{quarter}",
@@ -1715,6 +1706,15 @@ def render_confluence_html(
             release_count=quarter_release_count,
             hotfix_count=quarter_hotfix_count,
             accent="#6554C0",
+        ),
+        render_metric_section_html(
+            rolling_metrics,
+            title="Последние 90 дней",
+            start=rolling_start,
+            end=rolling_end,
+            release_count=rolling_release_count,
+            hotfix_count=rolling_hotfix_count,
+            accent="#0052CC",
         ),
         '<div style="background-color:#F4F5F7;border-radius:7px;color:#5E6C84;'
         'font-size:12px;margin-top:14px;padding:11px 13px;">',
