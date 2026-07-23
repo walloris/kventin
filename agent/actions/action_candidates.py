@@ -80,6 +80,13 @@ def _candidate_from_raw(raw: Dict[str, Any], idx: int, url_pat: str) -> ActionCa
     label = str(raw.get("text") or "").strip()
     stable_key = str(raw.get("stable_key") or "").strip()
     canonical = str(raw.get("canonical_locator") or "").strip()
+    risk_flags = [str(flag) for flag in (raw.get("risk_flags") or []) if flag]
+    form_state = str(raw.get("form_state") or "").strip()
+    if form_state and stable_key:
+        # A submit control is a different meaningful action after the form has
+        # changed. Keeping the DOM key alone would permanently suppress the
+        # second click after an early HTML-validation attempt.
+        stable_key = f"{stable_key}::form={form_state}"
 
     if kind in ("input", "textarea"):
         value = _test_value_for_input(label)
@@ -96,6 +103,7 @@ def _candidate_from_raw(raw: Dict[str, Any], idx: int, url_pat: str) -> ActionCa
             reason=f"Заполнить поле {label[:40] or ref}",
             test_goal=f"Проверить ввод в поле {label[:60] or ref}",
             expected_outcome="Поле принимает значение и не показывает неожиданную ошибку",
+            risk_flags=risk_flags,
         )
     if kind == "select":
         first_opt = (label.split(",")[0] if label else "").strip()
@@ -112,6 +120,7 @@ def _candidate_from_raw(raw: Dict[str, Any], idx: int, url_pat: str) -> ActionCa
             reason=f"Выбрать опцию {first_opt[:40] or label[:40]}",
             test_goal="Проверить выбор значения в списке",
             expected_outcome="Выбранная опция применяется",
+            risk_flags=risk_flags,
         )
     if kind == "file":
         return ActionCandidate(
@@ -126,6 +135,7 @@ def _candidate_from_raw(raw: Dict[str, Any], idx: int, url_pat: str) -> ActionCa
             reason="Проверить загрузку файла",
             test_goal="Загрузить тестовый файл",
             expected_outcome="Файл принят или показана понятная валидация",
+            risk_flags=risk_flags,
         )
 
     action = "click"
@@ -143,6 +153,7 @@ def _candidate_from_raw(raw: Dict[str, Any], idx: int, url_pat: str) -> ActionCa
         reason=f"Проверить элемент {label[:50] or ref}",
         test_goal=f"Проверить реакцию элемента {label[:60] or ref}",
         expected_outcome="Элемент реагирует без ошибок, зависаний и неожиданной навигации",
+        risk_flags=risk_flags,
     )
 
 
@@ -258,12 +269,47 @@ def collect_action_candidates(
                     if (el.disabled || (el.getAttribute && el.getAttribute('aria-disabled') === 'true')) return;
                     const ref = el.getAttribute('data-agent-ref');
                     if (!ref) return;
+                    const tag = (el.tagName || '').toLowerCase();
+                    const inputType = (el.type || '').toLowerCase();
+                    const isSubmit = (
+                        (tag === 'button' && (!inputType || inputType === 'submit'))
+                        || (tag === 'input' && inputType === 'submit')
+                    );
+                    const riskFlags = [];
+                    let formState = '';
+                    if (isSubmit && el.form) {
+                        const fields = Array.from(el.form.elements || []).filter(field => {
+                            if (!field || field === el || field.disabled || field.readOnly) return false;
+                            const fieldTag = (field.tagName || '').toLowerCase();
+                            const fieldType = (field.type || '').toLowerCase();
+                            if (!['input', 'textarea', 'select'].includes(fieldTag)) return false;
+                            if (['hidden', 'submit', 'button', 'reset', 'image', 'file'].includes(fieldType)) return false;
+                            return !hiddenByDomState(field);
+                        });
+                        const filled = (field) => {
+                            const fieldType = (field.type || '').toLowerCase();
+                            if (fieldType === 'checkbox' || fieldType === 'radio') return Boolean(field.checked);
+                            return String(field.value || '').trim().length > 0;
+                        };
+                        const bits = fields.map(field => filled(field) ? '1' : '0');
+                        const gatingFields = fields.filter(field => {
+                            const fieldType = (field.type || '').toLowerCase();
+                            return field.required || !['checkbox', 'radio'].includes(fieldType);
+                        });
+                        formState = bits.join('');
+                        if (gatingFields.some(field => !filled(field))) riskFlags.push('form_incomplete');
+                    }
+                    const associatedLabel = el.labels && el.labels.length
+                        ? (el.labels[0].innerText || el.labels[0].textContent || '')
+                        : '';
                     out.push({
                         ref: 'ref:' + ref,
                         type,
-                        text: (text || el.innerText || el.textContent || el.value || el.placeholder || el.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim().slice(0, 100),
+                        text: (text || associatedLabel || el.innerText || el.textContent || el.placeholder || el.getAttribute('aria-label') || el.value || '').replace(/\\s+/g, ' ').trim().slice(0, 100),
                         stable_key: meta[ref] || '',
                         canonical_locator: locators[ref] || '',
+                        risk_flags: riskFlags,
+                        form_state: formState,
                     });
                 };
                 Object.values(window.__agentRefs || {}).forEach(el => {
@@ -286,7 +332,10 @@ def collect_action_candidates(
                     } else if (tag === 'textarea') {
                         add(el, 'textarea');
                     } else if (tag === 'input' && !['hidden', 'submit', 'button'].includes(inputType)) {
-                        add(el, inputType === 'file' ? 'file' : 'input', inputType === 'file' ? 'file input' : '');
+                        const kind = inputType === 'file'
+                            ? 'file'
+                            : (['checkbox', 'radio'].includes(inputType) ? inputType : 'input');
+                        add(el, kind, inputType === 'file' ? 'file input' : '');
                     } else if (tag === 'select') {
                         const opts = Array.from(el.options || []).slice(0, 5).map(o => o.text.trim()).filter(Boolean).join(',');
                         add(el, 'select', opts);

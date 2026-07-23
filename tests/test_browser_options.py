@@ -22,6 +22,8 @@ def test_build_browser_launch_options_adds_chromium_cert_flags(monkeypatch) -> N
     monkeypatch.setattr(browser_options, "BROWSER_SUPPRESS_CERT_PROMPT", True)
     monkeypatch.setattr(browser_options, "HEADLESS", True)
     monkeypatch.setattr(browser_options, "BROWSER_SLOW_MO", 0)
+    monkeypatch.setattr(browser_options, "BROWSER_CHANNEL", "")
+    monkeypatch.setattr(browser_options, "BROWSER_EXECUTABLE_PATH", "")
 
     options = browser_options.build_browser_launch_options(engine_name="chromium", platform="darwin")
 
@@ -30,3 +32,26 @@ def test_build_browser_launch_options_adds_chromium_cert_flags(monkeypatch) -> N
         "slow_mo": 0,
         "args": ["--one", "--ignore-certificate-errors", "--use-mock-keychain"],
     }
+
+
+def test_build_browser_launch_options_uses_configured_channel(monkeypatch) -> None:
+    monkeypatch.setattr(browser_options, "BROWSER_CHROMIUM_ARGS", [])
+    monkeypatch.setattr(browser_options, "BROWSER_SUPPRESS_CERT_PROMPT", False)
+    monkeypatch.setattr(browser_options, "BROWSER_CHANNEL", "chrome")
+    monkeypatch.setattr(browser_options, "BROWSER_EXECUTABLE_PATH", "")
+
+    options = browser_options.build_browser_launch_options(engine_name="chromium")
+
+    assert options["channel"] == "chrome"
+
+
+def test_browser_executable_path_takes_precedence_over_channel(monkeypatch) -> None:
+    monkeypatch.setattr(browser_options, "BROWSER_CHROMIUM_ARGS", [])
+    monkeypatch.setattr(browser_options, "BROWSER_SUPPRESS_CERT_PROMPT", False)
+    monkeypatch.setattr(browser_options, "BROWSER_CHANNEL", "chrome")
+    monkeypatch.setattr(browser_options, "BROWSER_EXECUTABLE_PATH", "/opt/browser")
+
+    options = browser_options.build_browser_launch_options(engine_name="chromium")
+
+    assert options["executable_path"] == "/opt/browser"
+    assert "channel" not in options

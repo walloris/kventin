@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 
 from config import (
     BROWSER_AUTO_SELECT_CERT_PATTERNS,
+    BROWSER_CHANNEL,
     BROWSER_CHROMIUM_ARGS,
     BROWSER_CLIENT_CERT_CERT_PATH,
     BROWSER_CLIENT_CERT_KEY_PATH,
@@ -14,6 +15,7 @@ from config import (
     BROWSER_CLIENT_CERT_ORIGINS,
     BROWSER_CLIENT_CERT_PASSPHRASE,
     BROWSER_CLIENT_CERT_PFX_PATH,
+    BROWSER_EXECUTABLE_PATH,
     BROWSER_SLOW_MO,
     BROWSER_SUPPRESS_CERT_PROMPT,
     BROWSER_USER_DATA_DIR,
@@ -71,6 +73,11 @@ def build_browser_launch_options(
     launch_options: Dict[str, Any] = {"headless": HEADLESS, "slow_mo": BROWSER_SLOW_MO}
     if use_chromium and chromium_args:
         launch_options["args"] = chromium_args
+    if use_chromium:
+        if BROWSER_EXECUTABLE_PATH:
+            launch_options["executable_path"] = BROWSER_EXECUTABLE_PATH
+        elif BROWSER_CHANNEL:
+            launch_options["channel"] = BROWSER_CHANNEL
     return launch_options
 
 

@@ -10,6 +10,8 @@ from typing import Any, List, Dict, Optional, Tuple
 
 from playwright.sync_api import Page
 
+from agent.defects.defect_rules import is_noise_console_text, is_noise_url
+
 
 DEFECT_SUMMARY_PREFIX = "[Kventin]"
 
@@ -165,20 +167,24 @@ def build_retest_oracle(
     steps and then check exact signals from the original failure: action errors,
     console errors, and HTTP failures.
     """
+    action_failure_needles = [
+        "click_error",
+        "type_error",
+        "hover_error",
+        "not_found",
+        "timeout",
+    ]
+    bug_low = (bug_description or "").casefold()
+    if "possible_dead_click" in bug_low or "мёртв" in bug_low or "мертв" in bug_low:
+        action_failure_needles.append("possible_dead_click")
+
     oracle: Dict[str, Any] = {
         "bug_summary": _short_text_signature(bug_description, max_len=600),
         "pass_condition": (
             "Все шаги ретеста выполняются без action_error/not_found, "
             "и после воспроизведения не появляются перечисленные console/network сигналы."
         ),
-        "fail_on_action_result_contains": [
-            "click_error",
-            "type_error",
-            "hover_error",
-            "not_found",
-            "timeout",
-            "possible_dead_click",
-        ],
+        "fail_on_action_result_contains": action_failure_needles,
         "fail_on_console_contains": [],
         "fail_on_network": [],
     }
@@ -188,7 +194,10 @@ def build_retest_oracle(
             for action in reversed(getattr(memory, "actions", []) or []):
                 result = _short_text_signature(action.get("result") or "")
                 low = result.lower()
-                if result and any(x in low for x in ("error", "not_found", "timeout", "dead_click")):
+                failure_markers = ["error", "not_found", "timeout"]
+                if "possible_dead_click" in action_failure_needles:
+                    failure_markers.append("dead_click")
+                if result and any(x in low for x in failure_markers):
                     oracle["original_action_failure"] = {
                         "action": (action.get("action") or "")[:40],
                         "selector": (action.get("canonical_locator") or action.get("selector") or "")[:500],
@@ -203,7 +212,14 @@ def build_retest_oracle(
         etype = (entry.get("type") or "").lower()
         if etype not in ("pageerror", "error"):
             continue
+        source_url = entry.get("source_url") or entry.get("url") or ""
         text = _short_text_signature(entry.get("text") or "")
+        if (source_url and is_noise_url(source_url)) or is_noise_console_text(text):
+            continue
+        # Browser resource messages duplicate network evidence but lose the
+        # exact method/path that the retest needs for matching.
+        if "failed to load resource" in text.casefold():
+            continue
         if text and text not in console_signals:
             console_signals.append(text)
         if len(console_signals) >= RETEST_SIGNAL_MAX_ITEMS:
@@ -215,6 +231,8 @@ def build_retest_oracle(
     for entry in (network_failures or [])[-80:]:
         status = int(entry.get("status") or 0)
         if status < 400:
+            continue
+        if is_noise_url(entry.get("url") or ""):
             continue
         sig = _network_signature(entry)
         key = (sig["status"], sig["method"], sig["url_path"])

@@ -1779,10 +1779,39 @@ def _step_handle_defect(page, action, possible_bug, current_url, checklist_resul
     time.sleep(1)
 
 
+def _capture_click_target_state(page, selector: str) -> Optional[Dict[str, Any]]:
+    """Capture properties that can change without changing serialized HTML."""
+    if not selector:
+        return None
+    try:
+        locator = _find_element(page, selector)
+        if not locator:
+            return None
+        return locator.evaluate(
+            """(el) => ({
+                checked: ('checked' in el) ? Boolean(el.checked) : null,
+                value: ('value' in el) ? String(el.value || '').slice(0, 200) : null,
+                selectedIndex: ('selectedIndex' in el) ? el.selectedIndex : null,
+                open: ('open' in el) ? Boolean(el.open) : null,
+                ariaExpanded: el.getAttribute && el.getAttribute('aria-expanded'),
+                ariaPressed: el.getAttribute && el.getAttribute('aria-pressed'),
+                ariaSelected: el.getAttribute && el.getAttribute('aria-selected'),
+                disabled: ('disabled' in el) ? Boolean(el.disabled) : null
+            })"""
+        )
+    except Exception:
+        return None
+
+
 def _step_execute(page, action, step, memory, context):
     """STEP 3: Выполнение действия с retry."""
     act_type = (action.get("action") or "").lower()
     sel = (action.get("selector") or "").strip()
+    click_target_state_before = (
+        _capture_click_target_state(page, sel)
+        if act_type == "click" and not page.is_closed()
+        else None
+    )
     page_state_before = {}
     if not page.is_closed():
         try:
@@ -1875,7 +1904,16 @@ def _step_execute(page, action, step, memory, context):
     if ENABLE_DOM_DIFF_AFTER_ACTION and act_type == "click" and not page.is_closed():
         try:
             h = page.evaluate("() => document.body ? document.body.innerHTML.length : 0")
-            if getattr(memory, "_dom_hash_before", None) is not None and h == memory._dom_hash_before:
+            target_after = _capture_click_target_state(page, sel)
+            target_unchanged = (
+                click_target_state_before is None
+                or click_target_state_before == target_after
+            )
+            if (
+                getattr(memory, "_dom_hash_before", None) is not None
+                and h == memory._dom_hash_before
+                and target_unchanged
+            ):
                 result = (result or "") + " possible_dead_click"
         except Exception:
             pass

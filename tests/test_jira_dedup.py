@@ -111,6 +111,38 @@ def test_jira_success_without_key_is_not_registered(monkeypatch) -> None:
     assert is_local_duplicate(summary) is False
 
 
+def test_jira_create_keeps_severity_as_label_without_priority(monkeypatch) -> None:
+    payloads = []
+    monkeypatch.setattr(jira_client, "is_ignorable_issue", lambda *_args: False)
+    monkeypatch.setattr(jira_client, "search_duplicates", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(jira_client, "JIRA_PRIORITY_CRITICAL", "")
+    monkeypatch.setattr(jira_client, "JIRA_ASSIGNEE", "")
+
+    def fake_request(method, _url, **kwargs):
+        if method == "POST":
+            payloads.append(kwargs["json"])
+            return Response(201, data={"key": "QA-43"})
+        raise AssertionError("Unexpected Jira request: %s" % method)
+
+    monkeypatch.setattr(jira_client, "_jira_http_request", fake_request)
+
+    key = create_jira_issue(
+        "Checkout HTTP 500",
+        "Detailed description with reproduction steps",
+        jira_url="https://jira.example.test",
+        api_token="x" * 30,
+        project_key="QA",
+        severity="critical",
+    )
+
+    assert key == "QA-43"
+    fields = payloads[0]["fields"]
+    assert fields["description"] == "Detailed description with reproduction steps"
+    assert fields["issuetype"]["name"]
+    assert "severity-critical" in fields["labels"]
+    assert "priority" not in fields
+
+
 def test_attachment_lost_response_is_recovered_without_duplicate(tmp_path, monkeypatch) -> None:
     path = tmp_path / "evidence.log"
     path.write_bytes(b"full evidence")

@@ -18,7 +18,6 @@ import json
 import logging
 import os
 import re
-import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -30,13 +29,9 @@ from config import (
     AUTH_SUBMIT_SELECTOR,
     AUTH_URL,
     AUTH_USERNAME,
-    BROWSER_CHROMIUM_ARGS,
     BROWSER_ENGINE,
-    BROWSER_SLOW_MO,
-    BROWSER_SUPPRESS_CERT_PROMPT,
     BROWSER_USER_DATA_DIR,
     ENABLE_SHADOW_DOM,
-    HEADLESS,
     JIRA_RETEST_FALLBACK_ASSIGNEE,
     JIRA_RETEST_MAX_ISSUES,
     JIRA_RETEST_STATUS_QA,
@@ -68,6 +63,7 @@ from agent.defects.defect_builder import (
     playwright_canonical_to_exec_selector,
 )
 from agent.browser.page_analyzer import get_dom_summary
+from agent.browser.browser_options import build_browser_launch_options
 
 LOG = logging.getLogger("kventin.retest")
 _INCONCLUSIVE_MARKER_PREFIX = "KVENTIN_RETEST_INCONCLUSIVE_V1"
@@ -384,15 +380,7 @@ def _interpret_step_to_action(step: str, default_selector: str) -> Optional[Dict
 
 def _retest_launch_browser(p: Playwright) -> Tuple[BrowserContext, Page, Optional[Browser]]:
     engine = getattr(p, BROWSER_ENGINE, p.chromium)
-    use_chromium = BROWSER_ENGINE == "chromium" or bool(BROWSER_USER_DATA_DIR)
-    chromium_args = list(BROWSER_CHROMIUM_ARGS)
-    if use_chromium and BROWSER_SUPPRESS_CERT_PROMPT:
-        chromium_args.append("--ignore-certificate-errors")
-        if sys.platform == "darwin":
-            chromium_args.append("--use-mock-keychain")
-    launch_kw: Dict[str, Any] = {"headless": HEADLESS, "slow_mo": BROWSER_SLOW_MO}
-    if use_chromium and chromium_args:
-        launch_kw["args"] = chromium_args
+    launch_kw = build_browser_launch_options(engine_name=BROWSER_ENGINE)
     ctx_common = {
         "viewport": {"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
         "ignore_https_errors": True,

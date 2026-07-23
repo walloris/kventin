@@ -334,6 +334,10 @@ TEST_UPLOAD_FILE_PATH = os.getenv("TEST_UPLOAD_FILE_PATH", "").strip()
 BROWSER_ENGINE = os.getenv("BROWSER_ENGINE", "chromium").strip().lower() or "chromium"
 if BROWSER_ENGINE not in ("chromium", "firefox", "webkit"):
     BROWSER_ENGINE = "chromium"
+# Опционально использовать установленный Chrome/Edge вместо bundled Chromium.
+# BROWSER_EXECUTABLE_PATH имеет приоритет над BROWSER_CHANNEL.
+BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "").strip()
+BROWSER_EXECUTABLE_PATH = os.getenv("BROWSER_EXECUTABLE_PATH", "").strip()
 
 # --- Visual regression baseline ---
 # Папка для эталонных скриншотов (URL -> hash). Пусто = не сравнивать с baseline.

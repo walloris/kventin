@@ -109,3 +109,28 @@ def test_policy_tests_modal_content_before_closing_it() -> None:
     ]
 
     assert choose_best_candidate(candidates).id == "c1"
+
+
+def test_policy_fills_form_before_submit() -> None:
+    candidates = [
+        ActionCandidate(
+            id="c1",
+            action="click",
+            selector="ref:1",
+            label="Зарегистрироваться",
+            kind="button",
+            priority=10,
+            risk_flags=["form_incomplete"],
+        ),
+        ActionCandidate(
+            id="c2",
+            action="type",
+            selector="ref:2",
+            value="test@example.com",
+            label="Email",
+            kind="input",
+            priority=20,
+        ),
+    ]
+
+    assert choose_best_candidate(candidates).id == "c2"

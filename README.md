@@ -63,6 +63,8 @@ cp .env.example .env
 | `BROWSER_SLOW_MO` | Замедление операций браузера в мс (по умолчанию 300), чтобы было видно действия. |
 | `HIGHLIGHT_DURATION_MS` | Пауза после подсветки элемента в мс (по умолчанию 800). |
 | `HEADLESS` | `true` — без окна браузера; по умолчанию `false` (окно видно). |
+| `BROWSER_CHANNEL` | Канал установленного Chromium-браузера, например `chrome` или `msedge`. |
+| `BROWSER_EXECUTABLE_PATH` | Явный путь к браузеру; имеет приоритет над `BROWSER_CHANNEL`. |
 
 ### Локальная LLM
 
@@ -206,6 +208,20 @@ python -m compileall -q agent scripts tests config.py
 
 Browser integration suite проверяет реальный Chromium-сценарий с открытым sidebar,
 `aria-hidden/inert` фоном, подтверждаемым закрытием и визуальным перехватом клика.
+
+## Сквозная проверка: дефект и ретест
+
+Локальный acceptance-стенд с формой регистрации проходит весь рабочий цикл без
+внешней Jira: агент находит известный `HTTP 500`, создаёт тикет в debug Jira,
+после развёртывания исправления повторяет сохранённый сценарий и закрывает тикет
+как `Closed / Fixed`.
+
+```bash
+.venv/bin/python scripts/run_registration_demo.py
+```
+
+Артефакты прогона находятся в `artifacts/registration-demo/`. Устройство стенда
+и ручной запуск описаны в [`examples/registration_demo/README.md`](examples/registration_demo/README.md).
 
 ## Остановка
 

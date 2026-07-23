@@ -83,6 +83,30 @@ def test_retest_oracle_fails_on_repeated_signals() -> None:
     assert "network-сигнал" in msg
 
 
+def test_retest_oracle_excludes_resource_noise_and_unrelated_dead_clicks() -> None:
+    oracle = build_retest_oracle(
+        "HTTP 500 POST /api/register",
+        console_log=[
+            {
+                "type": "error",
+                "text": "Failed to load resource: the server responded with a status of 404",
+                "source_url": "https://example.test/favicon.ico",
+            },
+            {"type": "pageerror", "text": "TypeError: profile is undefined"},
+        ],
+        network_failures=[
+            {"status": 404, "method": "GET", "url": "https://example.test/favicon.ico"},
+            {"status": 500, "method": "POST", "url": "https://example.test/api/register"},
+        ],
+    )
+
+    assert oracle["fail_on_console_contains"] == ["TypeError: profile is undefined"]
+    assert oracle["fail_on_network"] == [
+        {"status": 500, "method": "POST", "url_path": "/api/register"}
+    ]
+    assert "possible_dead_click" not in oracle["fail_on_action_result_contains"]
+
+
 def test_retest_fails_closed_for_empty_or_unknown_steps() -> None:
     memory = AgentMemory()
 

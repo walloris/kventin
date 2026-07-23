@@ -60,6 +60,10 @@ def score_candidate(cand: ActionCandidate, memory: Any = None) -> float:
             # A blocking overlay makes every element behind it ineligible, even
             # when a stale DOM snapshot still describes that element as visible.
             score -= 1000
+        elif flag == "form_incomplete":
+            # Explore/fill the form before submitting it. HTML validation can
+            # make an early click look successful while no request is sent.
+            score -= 120
         elif flag in ("external", "destructive"):
             score -= 80
         elif flag in ("low_signal", "footer"):

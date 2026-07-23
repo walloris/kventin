@@ -723,6 +723,12 @@ def create_jira_issue(
     # Assignee: если задан JIRA_ASSIGNEE — используем его, иначе — текущего пользователя (login)
     assignee_value = JIRA_ASSIGNEE if JIRA_ASSIGNEE else login
 
+    normalized_severity = (severity or "").lower().strip()
+    labels = [JIRA_DEFECT_LABEL]
+    if normalized_severity in ("critical", "major", "minor"):
+        labels.append("severity-%s" % normalized_severity)
+    labels = list(dict.fromkeys(label for label in labels if label))
+
     priority_name = _jira_priority_name_for_severity(severity)
     payload = {
         "fields": {
@@ -730,7 +736,7 @@ def create_jira_issue(
             "summary": summary[:255],
             "description": description,
             "issuetype": {"name": JIRA_ISSUE_TYPE},
-            "labels": [JIRA_DEFECT_LABEL],
+            "labels": labels,
         }
     }
     if priority_name:
