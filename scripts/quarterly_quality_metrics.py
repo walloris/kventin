@@ -23,7 +23,7 @@ import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Optional, Sequence
 
@@ -64,6 +64,12 @@ DEFAULT_PSI_STANDS = ("PSI", "ПСИ")
 DEFAULT_PROM_STANDS = ("PROM", "ПРОМ")
 DEFAULT_RELEASE_LINK_KEYWORDS = ("consist", "part")
 DEFAULT_HOTFIX_VALUES = ("Hotfix",)
+DEFAULT_INSTALLED_RELEASE_STATUSES = (
+    "Установлен на ПРОМ",
+    "Установлено на ПРОМ",
+    "Installed on PROM",
+    "Installed to PROD",
+)
 RELEASE_KE_IDS = tuple(
     dict.fromkeys(
         (
@@ -341,7 +347,11 @@ def calculate_metric(spec: TeamSpec, counts: TeamCounts) -> TeamMetric:
     bugs = counts.bugs
 
     if stories > 0:
-        actual_ratio: Optional[Decimal] = Decimal(bugs) / Decimal(stories)
+        # В эталонной таблице сначала округляется факт до сотых, а уже затем
+        # считается выполнение цели: target / rounded_fact * 100.
+        actual_ratio: Optional[Decimal] = (
+            Decimal(bugs) / Decimal(stories)
+        ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     else:
         actual_ratio = None
 
@@ -349,9 +359,9 @@ def calculate_metric(spec: TeamSpec, counts: TeamCounts) -> TeamMetric:
         attainment = None
         infinite_attainment = False
         state = "Нет релизов"
-    elif bugs == 0:
-        attainment = None
-        infinite_attainment = True
+    elif bugs == 0 or actual_ratio == 0:
+        attainment = Decimal(100)
+        infinite_attainment = False
         state = "Цель выполнена"
     elif stories == 0:
         attainment = Decimal(0)
@@ -751,6 +761,22 @@ def is_hotfix_release(
     return any(value and value in summary for value in expected)
 
 
+def release_is_installed_on_prom(
+    release: Mapping[str, Any],
+    allowed_statuses: Sequence[str] = DEFAULT_INSTALLED_RELEASE_STATUSES,
+) -> bool:
+    status = normalized(named_value(issue_field(release, "status")))
+    if status in normalized_set(allowed_statuses):
+        return True
+    return (
+        (
+            "установлен" in status
+            and ("пром" in status or "prom" in status or "prod" in status)
+        )
+        or ("installed" in status and ("prom" in status or "prod" in status))
+    )
+
+
 def collect_released_issues(
     jira: JiraClient,
     *,
@@ -784,7 +810,7 @@ def collect_released_issues(
         print(f"JQL релизов (как в dpm2.py): {release_jql}")
     release_candidates = jira.search(release_jql, release_fields)
 
-    releases = [
+    quarter_releases = [
         release
         for release in release_candidates
         if (
@@ -792,6 +818,11 @@ def collect_released_issues(
             is not None
             and start <= installed < end
         )
+    ]
+    releases = [
+        release
+        for release in quarter_releases
+        if release_is_installed_on_prom(release)
     ]
     if verbose:
         with_install_date = sum(
@@ -801,8 +832,17 @@ def collect_released_issues(
         print(
             f"Jira вернула релизов: {len(release_candidates)}; "
             f"с датой установки: {with_install_date}; "
-            f"в выбранном квартале: {len(releases)}"
+            f"в выбранном квартале: {len(quarter_releases)}; "
+            f"в статусе «Установлен на ПРОМ»: {len(releases)}"
         )
+        status_counts = Counter(
+            named_value(issue_field(release, "status")) or "Без статуса"
+            for release in quarter_releases
+        )
+        if status_counts:
+            print("Статусы релизов выбранного квартала:")
+            for status_name, count in status_counts.most_common():
+                print(f"  {status_name}: {count}")
 
     issue_fields = (
         "summary",
@@ -929,6 +969,108 @@ def print_issue_inventory(issues: Sequence[Mapping[str, Any]]) -> None:
         print(f"  {project_key}: всего={total}; {details}")
 
 
+def print_filter_audit(
+    team_specs: Sequence[TeamSpec],
+    issues: Sequence[Mapping[str, Any]],
+    rules: MetricRules,
+    detection_stand_field_id: str,
+) -> None:
+    """Explain how Story/Bug candidates pass through metric filters."""
+
+    project_to_team = {
+        project_key: spec.team for spec in team_specs for project_key in spec.project_keys
+    }
+    audit: dict[str, Counter[str]] = {
+        spec.team: Counter() for spec in team_specs
+    }
+    rejected_values: dict[str, dict[str, Counter[str]]] = {
+        spec.team: {
+            "story_status": Counter(),
+            "bug_status": Counter(),
+            "bug_priority": Counter(),
+            "bug_stand": Counter(),
+        }
+        for spec in team_specs
+    }
+    outside_projects: Counter[str] = Counter()
+
+    for issue in issues:
+        project_key = issue_project_key(issue) or "БЕЗ ПРОЕКТА"
+        team = project_to_team.get(project_key)
+        if team is None:
+            outside_projects[project_key] += 1
+            continue
+
+        issue_type = normalized(named_value(issue_field(issue, "issuetype")))
+        raw_status = issue_field(issue, "status")
+        status_name = named_value(raw_status) or "Без статуса"
+        status = normalized(status_name)
+
+        if issue_type in rules.story_types:
+            audit[team]["story_total"] += 1
+            if story_has_done_status(raw_status, rules):
+                audit[team]["story_done"] += 1
+            else:
+                rejected_values[team]["story_status"][status_name] += 1
+            continue
+
+        if issue_type not in rules.bug_types:
+            continue
+        audit[team]["bug_total"] += 1
+        if status not in rules.bug_statuses:
+            rejected_values[team]["bug_status"][status_name] += 1
+            continue
+        audit[team]["bug_closed"] += 1
+
+        priority_name = named_value(issue_field(issue, "priority")) or "Без приоритета"
+        if normalized(priority_name) not in rules.bug_priorities:
+            rejected_values[team]["bug_priority"][priority_name] += 1
+            continue
+        audit[team]["bug_high_plus"] += 1
+
+        stand_values = named_values(issue_field(issue, detection_stand_field_id))
+        stand_name = ", ".join(stand_values) or "Без стенда"
+        if classify_eligible_stand(
+            issue_field(issue, detection_stand_field_id),
+            rules,
+        ) is None:
+            rejected_values[team]["bug_stand"][stand_name] += 1
+            continue
+        audit[team]["bug_eligible"] += 1
+
+    print("Аудит фильтров метрики:")
+    for spec in team_specs:
+        values = audit[spec.team]
+        print(
+            f"  {spec.team}: "
+            f"Story всего={values['story_total']}, Done={values['story_done']}; "
+            f"Bug всего={values['bug_total']}, Closed={values['bug_closed']}, "
+            f"High+={values['bug_high_plus']}, PSI/ПРОМ={values['bug_eligible']}"
+        )
+        details: list[str] = []
+        for field_name, label in (
+            ("story_status", "Story-статусы"),
+            ("bug_status", "Bug-статусы"),
+            ("bug_priority", "приоритеты"),
+            ("bug_stand", "стенды"),
+        ):
+            counter = rejected_values[spec.team][field_name]
+            if counter:
+                rendered = ", ".join(
+                    f"{value}={count}" for value, count in counter.most_common()
+                )
+                details.append(f"{label}: {rendered}")
+        if details:
+            print("    Отсев — " + "; ".join(details))
+
+    if outside_projects:
+        rendered = ", ".join(
+            f"{project_key}={count}"
+            for project_key, count in outside_projects.most_common()
+        )
+        print("  Вне настроенных команд: " + rendered)
+
+
 def decimal_text(value: Decimal, places: int = 3) -> str:
     quantizer = Decimal(1).scaleb(-places)
     return format(value.quantize(quantizer), "f").replace(".", ",")
@@ -937,7 +1079,7 @@ def decimal_text(value: Decimal, places: int = 3) -> str:
 def ratio_text(value: Optional[Decimal], bugs: int, stories: int) -> str:
     if value is None:
         return "∞" if bugs > 0 and stories == 0 else "—"
-    return f"{decimal_text(value)} ({decimal_text(value * 100, 1)}%)"
+    return f"{decimal_text(value, 2)} ({decimal_text(value * 100, 1)}%)"
 
 
 def target_text(value: Decimal) -> str:
@@ -1091,7 +1233,8 @@ def render_confluence_html(
         '<div style="background-color:#EAE6FF;border-left:5px solid #6554C0;'
         'border-radius:6px;color:#403294;margin-bottom:15px;padding:10px 13px;">',
         f'<strong>Цель выполняют {teams_on_target} из {len(metrics)} команд.</strong> '
-        "Факт = баги / Story, выполнение = целевой коэффициент / факт × 100%. "
+        "Факт = баги / Story и округляется до сотых; выполнение = целевой "
+        "коэффициент / факт × 100%. При нуле багов выполнение равно 100%. "
         "Чем выше процент выполнения, тем лучше.",
         "</div>",
         '<table class="confluenceTable" style="border-collapse:collapse;'
@@ -1478,6 +1621,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         if args.verbose:
             print_issue_inventory(issues)
+            print_filter_audit(
+                team_specs,
+                issues,
+                rules,
+                detection_stand_field_id,
+            )
         counts = aggregate_issues(
             team_specs,
             issues,
@@ -1503,7 +1652,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(
             f"Релизов: {len(releases)} "
             f"(плановых: {len(releases) - hotfix_count}, Hotfix: {hotfix_count}); "
-            f"задач состава релизов: {len(issues)}"
+            f"уникальных Story/Bug-кандидатов: {len(issues)}"
         )
         print(render_console(metrics))
 
