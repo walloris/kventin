@@ -126,7 +126,7 @@ TEAM_SETTINGS_JSON = r"""
   },
   {
     "team": "Продуктовая аналитика",
-    "project_keys": ["SEARCHCS"],
+    "project_keys": ["HRPPA"],
     "target_ratio": 0.10
   },
   {"team": "Люди Сбера", "project_keys": ["SBRPPL"], "target_ratio": 0.10},
