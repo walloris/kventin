@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Quarterly released Story/Bug quality metrics for Jira and Confluence.
+"""90-day and quarterly released Story/Bug quality metrics for Jira/Confluence.
 
-The script finds Release 2.0 issues installed to production during a quarter,
-collects Story/Bug issues included in those releases, calculates the eligible
-bug-to-story ratio for each team, and publishes a Confluence table.
+The script finds Release 2.0 issues installed to production, collects Story/Bug
+issues included in those releases, calculates independent rolling-90-day and
+quarter-to-date ratios for each team, and publishes both Confluence tables.
 
 Run locally without publishing:
     python scripts/quarterly_quality_metrics.py --no-publish
@@ -794,7 +794,12 @@ def collect_released_issues(
     detection_stand_field_id: str,
     link_keywords: Sequence[str],
     verbose: bool = False,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    str,
+    dict[str, set[str]],
+]:
     release_fields = (
         "summary",
         "status",
@@ -812,7 +817,7 @@ def collect_released_issues(
         print(f"JQL релизов (как в dpm2.py): {release_jql}")
     release_candidates = jira.search(release_jql, release_fields)
 
-    quarter_releases = [
+    range_releases = [
         release
         for release in release_candidates
         if (
@@ -823,7 +828,7 @@ def collect_released_issues(
     ]
     releases = [
         release
-        for release in quarter_releases
+        for release in range_releases
         if release_is_installed_on_prom(release)
     ]
     if verbose:
@@ -834,15 +839,15 @@ def collect_released_issues(
         print(
             f"Jira вернула релизов: {len(release_candidates)}; "
             f"с датой установки: {with_install_date}; "
-            f"в выбранном квартале: {len(quarter_releases)}; "
+            f"в объединённом диапазоне: {len(range_releases)}; "
             f"в статусе «Установлен на ПРОМ»: {len(releases)}"
         )
         status_counts = Counter(
             named_value(issue_field(release, "status")) or "Без статуса"
-            for release in quarter_releases
+            for release in range_releases
         )
         if status_counts:
-            print("Статусы релизов выбранного квартала:")
+            print("Статусы релизов объединённого диапазона:")
             for status_name, count in status_counts.most_common():
                 print(f"  {status_name}: {count}")
 
@@ -861,11 +866,13 @@ def collect_released_issues(
     bug_result_keys: set[str] = set()
     failed_releases: list[str] = []
     link_types: Counter[str] = Counter()
+    issue_keys_by_release: dict[str, set[str]] = {}
 
     for index, release in enumerate(releases, start=1):
         release_key = str(release.get("key") or "").strip().upper()
         if not release_key:
             continue
+        release_issue_keys = issue_keys_by_release.setdefault(release_key, set())
         try:
             # release_checker.py получает полный issuelinks отдельным запросом
             # для каждого релиза: jira.issue(release_key, fields='issuelinks').
@@ -891,6 +898,7 @@ def collect_released_issues(
                     if key:
                         issues_by_key[key] = issue
                         story_result_keys.add(key)
+                        release_issue_keys.add(key)
                         release_story_count += 1
 
             if linked_keys:
@@ -910,6 +918,7 @@ def collect_released_issues(
                 if key:
                     issues_by_key[key] = issue
                     bug_result_keys.add(key)
+                    release_issue_keys.add(key)
                     release_bug_count += 1
 
             if verbose and (index % 10 == 0 or index == len(releases)):
@@ -945,7 +954,37 @@ def collect_released_issues(
                 file=sys.stderr,
             )
 
-    return releases, list(issues_by_key.values()), release_jql
+    return releases, list(issues_by_key.values()), release_jql, issue_keys_by_release
+
+
+def select_period_data(
+    releases: Sequence[Mapping[str, Any]],
+    issues: Sequence[Mapping[str, Any]],
+    issue_keys_by_release: Mapping[str, set[str]],
+    *,
+    start: date,
+    end: date,
+    release_date_field_id: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    period_releases: list[dict[str, Any]] = []
+    period_issue_keys: set[str] = set()
+
+    for release in releases:
+        installed = parse_jira_date(issue_field(release, release_date_field_id))
+        if installed is None or not (start <= installed < end):
+            continue
+        if not isinstance(release, dict):
+            continue
+        period_releases.append(release)
+        release_key = str(release.get("key") or "").strip().upper()
+        period_issue_keys.update(issue_keys_by_release.get(release_key, set()))
+
+    period_issues = [
+        issue
+        for issue in issues
+        if str(issue.get("key") or "").strip().upper() in period_issue_keys
+    ]
+    return period_releases, period_issues
 
 
 def print_issue_inventory(issues: Sequence[Mapping[str, Any]]) -> None:
@@ -1192,15 +1231,15 @@ def kpi_cell(label: str, value: str, background: str, color: str = "#FFFFFF") ->
     )
 
 
-def render_confluence_html(
+def render_metric_section_html(
     metrics: Sequence[TeamMetric],
     *,
+    title: str,
     start: date,
     end: date,
-    quarter: int,
     release_count: int,
     hotfix_count: int,
-    generated_at: datetime,
+    accent: str,
 ) -> str:
     planned_release_count = max(0, release_count - hotfix_count)
     story_count = sum(metric.stories for metric in metrics)
@@ -1214,15 +1253,11 @@ def render_confluence_html(
     )
 
     parts = [
-        '<div style="background-color:#172B4D;border-radius:12px;'
-        'color:#FFFFFF;margin-bottom:14px;padding:20px 22px;">',
-        '<div style="color:#79F2C0;font-size:12px;font-weight:bold;'
-        'letter-spacing:.08em;text-transform:uppercase;">Quality Radar</div>',
-        f'<div style="font-size:25px;font-weight:bold;margin-top:5px;">'
-        f"Качество релизов команд · {start.year} Q{quarter}</div>",
-        '<div style="color:#B3D4FF;font-size:13px;margin-top:7px;">'
-        "Story и критичные PSI/ПРОМ-баги из установленных на ПРОМ "
-        "плановых релизов и Hotfix</div>",
+        f'<div style="background-color:{accent};border-radius:9px;color:#FFFFFF;'
+        'font-size:20px;font-weight:bold;margin:18px 0 10px;padding:13px 16px;">',
+        html.escape(title),
+        f'<div style="color:#DEEBFF;font-size:12px;font-weight:normal;margin-top:4px;">'
+        f"{html.escape(period)}</div>",
         "</div>",
         '<table style="border-collapse:separate;border-spacing:0;margin:0 0 14px 0;'
         'table-layout:fixed;width:100%;"><tbody><tr>',
@@ -1325,20 +1360,65 @@ def render_confluence_html(
         )
         parts.append("</tr>")
 
-    parts.extend(
-        [
-            "</tbody></table>",
-            '<div style="background-color:#F4F5F7;border-radius:7px;color:#5E6C84;'
-            'font-size:12px;margin-top:14px;padding:11px 13px;">',
-            "В баги входят только Closed/Закрыт с приоритетом "
-            "Critical/Crytical, Blocker, Высокий или Блокирующий "
-            "и стендом обнаружения PSI/ПСИ или PROM/ПРОМ. "
-            "«Ещё ПРОМ-багов» — целый запас до коэффициента; «Story до цели» — "
-            "минимальное число дополнительных Story для возвращения к 100%.",
-            f"<br/>Обновлено автоматически: {html.escape(generated_at.isoformat(timespec='seconds'))}.",
-            "</div>",
-        ]
-    )
+    parts.append("</tbody></table>")
+    return "".join(parts)
+
+
+def render_confluence_html(
+    *,
+    rolling_metrics: Sequence[TeamMetric],
+    quarter_metrics: Sequence[TeamMetric],
+    rolling_start: date,
+    rolling_end: date,
+    quarter_start: date,
+    quarter_end: date,
+    quarter: int,
+    rolling_release_count: int,
+    rolling_hotfix_count: int,
+    quarter_release_count: int,
+    quarter_hotfix_count: int,
+    generated_at: datetime,
+) -> str:
+    parts = [
+        '<div style="background-color:#172B4D;border-radius:12px;'
+        'color:#FFFFFF;margin-bottom:14px;padding:20px 22px;">',
+        '<div style="color:#79F2C0;font-size:12px;font-weight:bold;'
+        'letter-spacing:.08em;text-transform:uppercase;">Quality Radar</div>',
+        '<div style="font-size:25px;font-weight:bold;margin-top:5px;">'
+        "Качество релизов команд · 90 дней и квартал</div>",
+        '<div style="color:#B3D4FF;font-size:13px;margin-top:7px;">'
+        "Два независимых среза Story и критичных PSI/ПРОМ-багов из "
+        "установленных на ПРОМ плановых релизов и Hotfix</div>",
+        "</div>",
+        render_metric_section_html(
+            rolling_metrics,
+            title="Последние 90 дней",
+            start=rolling_start,
+            end=rolling_end,
+            release_count=rolling_release_count,
+            hotfix_count=rolling_hotfix_count,
+            accent="#0052CC",
+        ),
+        render_metric_section_html(
+            quarter_metrics,
+            title=f"Текущий квартал · {quarter_start.year} Q{quarter}",
+            start=quarter_start,
+            end=quarter_end,
+            release_count=quarter_release_count,
+            hotfix_count=quarter_hotfix_count,
+            accent="#6554C0",
+        ),
+        '<div style="background-color:#F4F5F7;border-radius:7px;color:#5E6C84;'
+        'font-size:12px;margin-top:14px;padding:11px 13px;">',
+        "В баги входят только Closed/Закрыт с приоритетом "
+        "Critical/Crytical, Blocker, Высокий или Блокирующий "
+        "и стендом обнаружения PSI/ПСИ или PROM/ПРОМ. "
+        "«Ещё ПРОМ-багов» — целый запас до коэффициента; «Story до цели» — "
+        "минимальное число дополнительных Story для возвращения к 100%.",
+        f"<br/>Обновлено автоматически: "
+        f"{html.escape(generated_at.isoformat(timespec='seconds'))}.",
+        "</div>",
+    ]
     return "".join(parts)
 
 
@@ -1550,9 +1630,9 @@ def load_confluence_settings() -> ConnectionSettings:
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Собирает за квартал отношение закрытых Critical/Blocker/Высокий/"
-            "Блокирующий PSI/ПРОМ-багов к зарелизенным Story и публикует "
-            "таблицу в Confluence."
+            "Собирает за последние 90 дней и отдельно за квартал отношение "
+            "закрытых Critical/Blocker/Высокий/Блокирующий PSI/ПРОМ-багов "
+            "к зарелизенным Story и публикует таблицы в Confluence."
         )
     )
     parser.add_argument(
@@ -1577,10 +1657,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         team_specs = load_team_specs()
         rules = MetricRules.defaults()
+        today = datetime.now().astimezone().date()
         if args.quarter:
-            start, end, quarter = parse_quarter(args.quarter)
+            quarter_start, quarter_calendar_end, quarter = parse_quarter(args.quarter)
         else:
-            start, end, quarter = quarter_bounds(datetime.now().astimezone().date())
+            quarter_start, quarter_calendar_end, quarter = quarter_bounds(today)
+
+        if quarter_start <= today < quarter_calendar_end:
+            quarter_end = today + timedelta(days=1)
+        else:
+            quarter_end = quarter_calendar_end
+        rolling_end = today + timedelta(days=1)
+        rolling_start = rolling_end - timedelta(days=90)
+        collection_start = min(rolling_start, quarter_start)
+        collection_end = max(rolling_end, quarter_end)
 
         jira = JiraClient(load_jira_settings())
         release_date_name = DEFAULT_RELEASE_DATE_FIELD_NAME
@@ -1602,10 +1692,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         detection_stand_field_id = DEFAULT_DETECTION_STAND_FIELD_ID
         release_type_field_id = DEFAULT_RELEASE_TYPE_FIELD_ID
 
-        releases, issues, release_jql = collect_released_issues(
+        releases, issues, release_jql, issue_keys_by_release = collect_released_issues(
             jira,
-            start=start,
-            end=end,
+            start=collection_start,
+            end=collection_end,
             release_project=DEFAULT_RELEASE_PROJECT,
             release_issue_type=DEFAULT_RELEASE_ISSUE_TYPE,
             release_ke_field_name=DEFAULT_RELEASE_KE_FIELD_NAME,
@@ -1617,50 +1707,118 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             link_keywords=DEFAULT_RELEASE_LINK_KEYWORDS,
             verbose=args.verbose,
         )
-        hotfix_count = sum(
+
+        rolling_releases, rolling_issues = select_period_data(
+            releases,
+            issues,
+            issue_keys_by_release,
+            start=rolling_start,
+            end=rolling_end,
+            release_date_field_id=release_date_field_id,
+        )
+        quarter_releases, quarter_issues = select_period_data(
+            releases,
+            issues,
+            issue_keys_by_release,
+            start=quarter_start,
+            end=quarter_end,
+            release_date_field_id=release_date_field_id,
+        )
+
+        rolling_hotfix_count = sum(
             is_hotfix_release(release, release_type_field_id, DEFAULT_HOTFIX_VALUES)
-            for release in releases
+            for release in rolling_releases
+        )
+        quarter_hotfix_count = sum(
+            is_hotfix_release(release, release_type_field_id, DEFAULT_HOTFIX_VALUES)
+            for release in quarter_releases
         )
         if args.verbose:
-            print_issue_inventory(issues)
+            print("\n=== Последние 90 дней: аудит ===")
+            print_issue_inventory(rolling_issues)
             print_filter_audit(
                 team_specs,
-                issues,
+                rolling_issues,
                 rules,
                 detection_stand_field_id,
             )
-        counts = aggregate_issues(
+            print(f"\n=== {quarter_start.year} Q{quarter}: аудит ===")
+            print_issue_inventory(quarter_issues)
+            print_filter_audit(
+                team_specs,
+                quarter_issues,
+                rules,
+                detection_stand_field_id,
+            )
+
+        rolling_counts = aggregate_issues(
             team_specs,
-            issues,
+            rolling_issues,
             rules,
             detection_stand_field_id,
         )
-        metrics = [calculate_metric(spec, counts[spec.team]) for spec in team_specs]
+        quarter_counts = aggregate_issues(
+            team_specs,
+            quarter_issues,
+            rules,
+            detection_stand_field_id,
+        )
+        rolling_metrics = [
+            calculate_metric(spec, rolling_counts[spec.team]) for spec in team_specs
+        ]
+        quarter_metrics = [
+            calculate_metric(spec, quarter_counts[spec.team]) for spec in team_specs
+        ]
         generated_at = datetime.now().astimezone()
         report_html = render_confluence_html(
-            metrics,
-            start=start,
-            end=end,
+            rolling_metrics=rolling_metrics,
+            quarter_metrics=quarter_metrics,
+            rolling_start=rolling_start,
+            rolling_end=rolling_end,
+            quarter_start=quarter_start,
+            quarter_end=quarter_end,
             quarter=quarter,
-            release_count=len(releases),
-            hotfix_count=hotfix_count,
+            rolling_release_count=len(rolling_releases),
+            rolling_hotfix_count=rolling_hotfix_count,
+            quarter_release_count=len(quarter_releases),
+            quarter_hotfix_count=quarter_hotfix_count,
             generated_at=generated_at,
         )
 
         print(
-            f"\n{start.year} Q{quarter}: {start.isoformat()} — "
-            f"{(end - timedelta(days=1)).isoformat()}"
+            f"\nПоследние 90 дней: {rolling_start.isoformat()} — "
+            f"{(rolling_end - timedelta(days=1)).isoformat()}"
         )
         print(
-            f"Релизов: {len(releases)} "
-            f"(плановых: {len(releases) - hotfix_count}, Hotfix: {hotfix_count}); "
-            f"уникальных Story/Bug-кандидатов: {len(issues)}"
+            f"Релизов: {len(rolling_releases)} "
+            f"(плановых: {len(rolling_releases) - rolling_hotfix_count}, "
+            f"Hotfix: {rolling_hotfix_count}); "
+            f"уникальных Story/Bug-кандидатов: {len(rolling_issues)}"
         )
-        print(render_console(metrics))
+        print(render_console(rolling_metrics))
+
+        print(
+            f"\n{quarter_start.year} Q{quarter}: {quarter_start.isoformat()} — "
+            f"{(quarter_end - timedelta(days=1)).isoformat()}"
+        )
+        print(
+            f"Релизов: {len(quarter_releases)} "
+            f"(плановых: {len(quarter_releases) - quarter_hotfix_count}, "
+            f"Hotfix: {quarter_hotfix_count}); "
+            f"уникальных Story/Bug-кандидатов: {len(quarter_issues)}"
+        )
+        print(render_console(quarter_metrics))
 
         if args.verbose:
             print(f"\nФактический JQL релизов: {release_jql}")
-            for metric in metrics:
+            print("Последние 90 дней:")
+            for metric in rolling_metrics:
+                print(
+                    f"{metric.team}: Story={','.join(metric.story_keys) or '—'}; "
+                    f"Bug={','.join(metric.bug_keys) or '—'}"
+                )
+            print(f"{quarter_start.year} Q{quarter}:")
+            for metric in quarter_metrics:
                 print(
                     f"{metric.team}: Story={','.join(metric.story_keys) or '—'}; "
                     f"Bug={','.join(metric.bug_keys) or '—'}"
