@@ -162,7 +162,10 @@ def jql_value(value: str) -> str:
 
 def issue_keys_jql(keys: Iterable[str]) -> str:
     cleaned = sorted({str(key).strip().upper() for key in keys if str(key).strip()})
-    return ", ".join(jql_value(key) for key in cleaned)
+    return ",".join(
+        key if re.fullmatch(r"[A-Z][A-Z0-9_]*-\d+", key) else jql_value(key)
+        for key in cleaned
+    )
 
 
 def batches(values: Sequence[str], size: int = 100) -> Iterator[Sequence[str]]:
@@ -623,6 +626,16 @@ class JiraClient:
             raise RuntimeError("Jira /field вернул неожиданный ответ.")
         return [item for item in data if isinstance(item, dict)]
 
+    def issue(self, issue_key: str, fields: Sequence[str]) -> dict[str, Any]:
+        data = self.rest.request_json(
+            "GET",
+            f"/rest/api/2/issue/{issue_key}",
+            params={"fields": ",".join(dict.fromkeys(fields))},
+        )
+        if not isinstance(data, dict):
+            raise RuntimeError(f"Jira issue {issue_key} вернул неожиданный ответ.")
+        return data
+
 
 def find_jira_field_id(
     jira: JiraClient,
@@ -677,11 +690,7 @@ def build_release_jql(
 def issue_link_type_text(link: Mapping[str, Any]) -> str:
     link_type = link.get("type")
     if isinstance(link_type, Mapping):
-        return " / ".join(
-            value
-            for field_name in ("name", "inward", "outward")
-            for value in named_values(link_type.get(field_name))
-        )
+        return " / ".join(named_values(link_type.get("name")))
     return " / ".join(named_values(link_type))
 
 
@@ -753,7 +762,6 @@ def collect_released_issues(
     release_fields = (
         "summary",
         "status",
-        "issuelinks",
         release_date_field_id,
         release_type_field_id,
     )
@@ -788,34 +796,6 @@ def collect_released_issues(
             f"в выбранном квартале: {len(releases)}"
         )
 
-    release_keys = sorted(
-        str(release.get("key") or "").strip().upper()
-        for release in releases
-        if str(release.get("key") or "").strip()
-    )
-    linked_keys = sorted(
-        {
-            key
-            for release in releases
-            for key in release_linked_keys(release, link_keywords)
-        }
-    )
-    if verbose:
-        link_types: Counter[str] = Counter()
-        for release in releases:
-            links = issue_field(release, "issuelinks") or []
-            if not isinstance(links, list):
-                continue
-            for link in links:
-                if isinstance(link, Mapping):
-                    label = issue_link_type_text(link) or "без названия"
-                    link_types[label] += 1
-        print(f"Ключей задач из связей состава: {len(linked_keys)}")
-        if link_types:
-            print("Типы связей релизов:")
-            for label, count in link_types.most_common():
-                print(f"  {label}: {count}")
-
     issue_fields = (
         "summary",
         "project",
@@ -825,44 +805,95 @@ def collect_released_issues(
         detection_stand_field_id,
     )
     issues_by_key: dict[str, dict[str, Any]] = {}
-    linked_issue_keys: set[str] = set()
-    for key_batch in batches(linked_keys):
-        jql = f"key in ({issue_keys_jql(key_batch)})"
-        for issue in jira.search(jql, issue_fields):
-            key = str(issue.get("key") or "").strip().upper()
-            if key:
-                issues_by_key[key] = issue
-                linked_issue_keys.add(key)
+    bug_types = normalized_set(DEFAULT_BUG_TYPES)
+    all_linked_keys: set[str] = set()
+    story_result_keys: set[str] = set()
+    bug_result_keys: set[str] = set()
+    failed_releases: list[str] = []
+    link_types: Counter[str] = Counter()
 
-    child_issue_keys: set[str] = set()
-    for release_batch in batches(release_keys, size=50):
-        if not release_batch:
+    for index, release in enumerate(releases, start=1):
+        release_key = str(release.get("key") or "").strip().upper()
+        if not release_key:
             continue
-        parent_jql = f"parent in ({issue_keys_jql(release_batch)})"
         try:
-            child_issues = jira.search(parent_jql, issue_fields)
-        except HttpRequestError as exc:
-            if exc.status_code != 400:
-                raise
-            child_issues = []
+            # release_checker.py получает полный issuelinks отдельным запросом
+            # для каждого релиза: jira.issue(release_key, fields='issuelinks').
+            full_release = jira.issue(release_key, ("issuelinks",))
+            linked_keys = sorted(release_linked_keys(full_release, link_keywords))
+            all_linked_keys.update(linked_keys)
+
+            if verbose:
+                links = issue_field(full_release, "issuelinks") or []
+                if isinstance(links, list):
+                    for link in links:
+                        if isinstance(link, Mapping):
+                            link_types[issue_link_type_text(link) or "без названия"] += 1
+
+            release_story_count = 0
+            if linked_keys:
+                story_jql = (
+                    f"key in ({issue_keys_jql(linked_keys)}) "
+                    "AND issuetype = Story"
+                )
+                for issue in jira.search(story_jql, issue_fields):
+                    key = str(issue.get("key") or "").strip().upper()
+                    if key:
+                        issues_by_key[key] = issue
+                        story_result_keys.add(key)
+                        release_story_count += 1
+
+            if linked_keys:
+                bug_jql = (
+                    f"parent = {release_key} "
+                    f"OR key in ({issue_keys_jql(linked_keys)})"
+                )
+            else:
+                bug_jql = f"parent = {release_key}"
+
+            release_bug_count = 0
+            for issue in jira.search(bug_jql, issue_fields):
+                issue_type = normalized(named_value(issue_field(issue, "issuetype")))
+                if issue_type not in bug_types:
+                    continue
+                key = str(issue.get("key") or "").strip().upper()
+                if key:
+                    issues_by_key[key] = issue
+                    bug_result_keys.add(key)
+                    release_bug_count += 1
+
+            if verbose and (index % 10 == 0 or index == len(releases)):
+                print(
+                    f"Обработано релизов: {index}/{len(releases)}; "
+                    f"последний {release_key}: связей={len(linked_keys)}, "
+                    f"Story={release_story_count}, Bug={release_bug_count}"
+                )
+        except Exception as exc:
+            failed_releases.append(release_key)
             if verbose:
                 print(
-                    "Jira не поддержала parent in (...) для релизов; "
-                    "учтены задачи из связей consist of / is part of.",
+                    f"Предупреждение: {release_key} пропущен из-за ошибки: {exc}",
                     file=sys.stderr,
                 )
-        for issue in child_issues:
-            key = str(issue.get("key") or "").strip().upper()
-            if key:
-                issues_by_key[key] = issue
-                child_issue_keys.add(key)
 
     if verbose:
         print(
-            f"Загружено задач: по связям={len(linked_issue_keys)}, "
-            f"по parent={len(child_issue_keys)}, "
-            f"уникальных={len(issues_by_key)}"
+            f"Сбор как в release_checker.py: релизов={len(releases)}, "
+            f"ошибок={len(failed_releases)}, "
+            f"ключей в составе={len(all_linked_keys)}, "
+            f"Story={len(story_result_keys)}, "
+            f"Bug={len(bug_result_keys)}, "
+            f"уникальных задач={len(issues_by_key)}"
         )
+        if link_types:
+            print("Типы связей релизов:")
+            for label, count in link_types.most_common():
+                print(f"  {label}: {count}")
+        if failed_releases:
+            print(
+                "Не удалось обработать релизы: " + ", ".join(failed_releases),
+                file=sys.stderr,
+            )
 
     return releases, list(issues_by_key.values()), release_jql
 
