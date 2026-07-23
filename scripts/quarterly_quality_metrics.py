@@ -401,6 +401,15 @@ def issue_field(issue: Mapping[str, Any], key: str) -> Any:
     return fields.get(key)
 
 
+def issue_project_key(issue: Mapping[str, Any]) -> str:
+    project = issue_field(issue, "project")
+    if isinstance(project, Mapping):
+        key = str(project.get("key") or "").strip()
+        if key:
+            return key.upper()
+    return named_value(project).upper()
+
+
 def story_has_done_status(raw_status: Any, rules: MetricRules) -> bool:
     if normalized(named_value(raw_status)) in rules.story_statuses:
         return True
@@ -447,8 +456,7 @@ def aggregate_issues(
             continue
         seen_keys.add(key)
 
-        project = issue_field(issue, "project")
-        project_key = named_value(project).upper()
+        project_key = issue_project_key(issue)
         team = project_to_team.get(project_key)
         if team is None:
             continue
@@ -903,7 +911,7 @@ def print_issue_inventory(issues: Sequence[Mapping[str, Any]]) -> None:
 
     inventory: dict[str, Counter[tuple[str, str]]] = defaultdict(Counter)
     for issue in issues:
-        project_key = named_value(issue_field(issue, "project")).upper() or "БЕЗ ПРОЕКТА"
+        project_key = issue_project_key(issue) or "БЕЗ ПРОЕКТА"
         issue_type = named_value(issue_field(issue, "issuetype")) or "Без типа"
         status = named_value(issue_field(issue, "status")) or "Без статуса"
         inventory[project_key][(issue_type, status)] += 1
