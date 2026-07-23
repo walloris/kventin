@@ -40,7 +40,8 @@ HTTP_TIMEOUT_SECONDS = 60
 VERIFY_SSL = False
 DEFAULT_RELEASE_PROJECT = "HRPRELEASE"
 DEFAULT_RELEASE_ISSUE_TYPE = "Release 2.0"
-DEFAULT_RELEASE_STATUS = "Установлен на ПРОМ"
+DEFAULT_RELEASE_CREATED_SINCE = "2025-09-01"
+DEFAULT_RELEASE_KE_FIELD_NAME = "КЭ"
 DEFAULT_RELEASE_DATE_FIELD_NAME = "Дата установки на ПРОМ"
 DEFAULT_RELEASE_DATE_FIELD_ID = ""
 DEFAULT_RELEASE_TYPE_FIELD_ID = "customfield_23500"
@@ -62,6 +63,49 @@ DEFAULT_PSI_STANDS = ("PSI", "ПСИ")
 DEFAULT_PROM_STANDS = ("PROM", "ПРОМ")
 DEFAULT_RELEASE_LINK_KEYWORDS = ("consist", "part")
 DEFAULT_HOTFIX_VALUES = ("Hotfix",)
+RELEASE_KE_IDS = tuple(
+    dict.fromkeys(
+        (
+            2298599,
+            8553253,
+            3589425,
+            3304476,
+            3303802,
+            3191860,
+            2288712,
+            2257858,
+            2935717,
+            3521872,
+            6355438,
+            5452084,
+            5452083,
+            5452082,
+            5452085,
+            3303802,
+            3304476,
+            7993288,
+            2257817,
+            2644268,
+            2298078,
+            5366436,
+            2503797,
+            3930742,
+            2836020,
+            3173847,
+            2295205,
+            2288712,
+            9643400,
+            9643401,
+            9644023,
+            9644025,
+            9362600,
+            9535069,
+            8553253,
+            9644020,
+            10743713,
+        )
+    )
+)
 
 RETRYABLE_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504}
 
@@ -113,15 +157,6 @@ def jql_value(value: str) -> str:
     if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", value):
         return value
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
-
-
-def jql_field_ref(field_id: str, field_name: str) -> str:
-    match = re.fullmatch(r"customfield_(\d+)", field_id.strip(), flags=re.IGNORECASE)
-    if match:
-        return f"cf[{match.group(1)}]"
-    if field_id.strip():
-        return jql_value(field_id.strip())
-    return jql_value(field_name.strip())
 
 
 def issue_keys_jql(keys: Iterable[str]) -> str:
@@ -602,23 +637,19 @@ def find_jira_field_id(
 
 
 def build_release_jql(
-    start: date,
-    end: date,
     *,
     project: str,
     issue_type: str,
-    status: str,
-    release_date_field_id: str,
-    release_date_field_name: str,
+    ke_field_name: str,
+    ke_ids: Sequence[int],
+    created_since: str,
 ) -> str:
-    date_field = jql_field_ref(release_date_field_id, release_date_field_name)
+    ke_ids_jql = ", ".join(str(value) for value in dict.fromkeys(ke_ids))
     return (
-        f"project = {jql_value(project)} "
-        f"AND issuetype = {jql_value(issue_type)} "
-        f"AND status = {jql_value(status)} "
-        f'AND {date_field} >= "{start.isoformat()}" '
-        f'AND {date_field} < "{end.isoformat()}" '
-        f"ORDER BY {date_field} ASC"
+        f"project={jql_value(project)} "
+        f"AND {ke_field_name} in ({ke_ids_jql}) "
+        f"AND type = {jql_value(issue_type)} "
+        f'AND created >= "{created_since}"'
     )
 
 
@@ -679,9 +710,10 @@ def collect_released_issues(
     end: date,
     release_project: str,
     release_issue_type: str,
-    release_status: str,
+    release_ke_field_name: str,
+    release_ke_ids: Sequence[int],
+    release_created_since: str,
     release_date_field_id: str,
-    release_date_field_name: str,
     release_type_field_id: str,
     detection_stand_field_id: str,
     link_keywords: Sequence[str],
@@ -694,37 +726,16 @@ def collect_released_issues(
         release_date_field_id,
         release_type_field_id,
     )
-    precise_jql = build_release_jql(
-        start,
-        end,
+    release_jql = build_release_jql(
         project=release_project,
         issue_type=release_issue_type,
-        status=release_status,
-        release_date_field_id=release_date_field_id,
-        release_date_field_name=release_date_field_name,
+        ke_field_name=release_ke_field_name,
+        ke_ids=release_ke_ids,
+        created_since=release_created_since,
     )
     if verbose:
-        print(f"JQL релизов: {precise_jql}")
-    try:
-        release_candidates = jira.search(precise_jql, release_fields)
-        used_jql = precise_jql
-    except HttpRequestError as exc:
-        if exc.status_code != 400:
-            raise
-        fallback_jql = (
-            f"project = {jql_value(release_project)} "
-            f"AND issuetype = {jql_value(release_issue_type)} "
-            f"AND status = {jql_value(release_status)} "
-            f'AND updated >= "{start.isoformat()}" '
-            "ORDER BY updated ASC"
-        )
-        print(
-            "Предупреждение: Jira не приняла фильтр по дате установки; "
-            "использую updated и фильтрую дату локально.",
-            file=sys.stderr,
-        )
-        release_candidates = jira.search(fallback_jql, release_fields)
-        used_jql = fallback_jql
+        print(f"JQL релизов (как в dpm2.py): {release_jql}")
+    release_candidates = jira.search(release_jql, release_fields)
 
     releases = [
         release
@@ -733,10 +744,18 @@ def collect_released_issues(
             (installed := parse_jira_date(issue_field(release, release_date_field_id)))
             is not None
             and start <= installed < end
-            and normalized(named_value(issue_field(release, "status")))
-            == normalized(release_status)
         )
     ]
+    if verbose:
+        with_install_date = sum(
+            parse_jira_date(issue_field(release, release_date_field_id)) is not None
+            for release in release_candidates
+        )
+        print(
+            f"Jira вернула релизов: {len(release_candidates)}; "
+            f"с датой установки: {with_install_date}; "
+            f"в выбранном квартале: {len(releases)}"
+        )
 
     release_keys = sorted(
         str(release.get("key") or "").strip().upper()
@@ -788,7 +807,7 @@ def collect_released_issues(
             if key:
                 issues_by_key[key] = issue
 
-    return releases, list(issues_by_key.values()), used_jql
+    return releases, list(issues_by_key.values()), release_jql
 
 
 def decimal_text(value: Decimal, places: int = 3) -> str:
@@ -1144,6 +1163,19 @@ def load_repository_config() -> tuple[Any, Mapping[str, Any]]:
     return config_module, nested if isinstance(nested, Mapping) else {}
 
 
+def configured_jira_field_id(field_name: str, default: str = "") -> str:
+    """Read config['jira']['fields'][field_name] exactly like dpm2.py."""
+
+    _, nested = load_repository_config()
+    jira_config = nested.get("jira") if isinstance(nested.get("jira"), Mapping) else {}
+    fields = (
+        jira_config.get("fields")
+        if isinstance(jira_config.get("fields"), Mapping)
+        else {}
+    )
+    return first_text(fields.get(field_name), default=default)
+
+
 def first_text(*values: Any, default: str = "") -> str:
     for value in values:
         text = str(value or "").strip()
@@ -1290,7 +1322,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         release_date_name = DEFAULT_RELEASE_DATE_FIELD_NAME
         release_date_field_id = find_jira_field_id(
             jira,
-            DEFAULT_RELEASE_DATE_FIELD_ID,
+            configured_jira_field_id(
+                "prod_installed_date_id",
+                DEFAULT_RELEASE_DATE_FIELD_ID,
+            ),
             release_date_name,
             (
                 "Дата установки на пром",
@@ -1309,9 +1344,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             end=end,
             release_project=DEFAULT_RELEASE_PROJECT,
             release_issue_type=DEFAULT_RELEASE_ISSUE_TYPE,
-            release_status=DEFAULT_RELEASE_STATUS,
+            release_ke_field_name=DEFAULT_RELEASE_KE_FIELD_NAME,
+            release_ke_ids=RELEASE_KE_IDS,
+            release_created_since=DEFAULT_RELEASE_CREATED_SINCE,
             release_date_field_id=release_date_field_id,
-            release_date_field_name=release_date_name,
             release_type_field_id=release_type_field_id,
             detection_stand_field_id=detection_stand_field_id,
             link_keywords=DEFAULT_RELEASE_LINK_KEYWORDS,
