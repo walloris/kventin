@@ -160,6 +160,18 @@ TEAM_SETTINGS_JSON = r"""
 TEAM_SETTINGS: tuple[dict[str, Any], ...] = tuple(json.loads(TEAM_SETTINGS_JSON))
 
 
+def execution_log(message: str, *, error: bool = False) -> None:
+    """Print a timestamped job log line immediately."""
+
+    timestamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    stream = sys.stderr if error else sys.stdout
+    print(f"[{timestamp}] {message}", file=stream, flush=True)
+
+
+def elapsed_seconds(started_at: float) -> str:
+    return f"{time.perf_counter() - started_at:.1f} с"
+
+
 def normalized(value: Any) -> str:
     text = str(value or "").strip().casefold().replace("ё", "е")
     return re.sub(r"\s+", " ", text)
@@ -585,7 +597,13 @@ class RestClient:
             except Exception as exc:
                 if attempt >= attempts:
                     raise RuntimeError(f"{self.service}: ошибка запроса {url}: {exc}") from exc
-                time.sleep(min(2 ** (attempt - 1), 8))
+                delay = min(2 ** (attempt - 1), 8)
+                execution_log(
+                    f"{self.service}: ошибка сети, повтор "
+                    f"{attempt + 1}/{attempts} через {delay} с: {exc}",
+                    error=True,
+                )
+                time.sleep(delay)
                 continue
 
             if 200 <= response.status_code < 300:
@@ -607,7 +625,13 @@ class RestClient:
                     delay = float(retry_after)
                 except ValueError:
                     delay = min(2 ** (attempt - 1), 8)
-                time.sleep(max(0, min(delay, 30)))
+                delay = max(0, min(delay, 30))
+                execution_log(
+                    f"{self.service}: HTTP {response.status_code}, повтор "
+                    f"{attempt + 1}/{attempts} через {delay:g} с",
+                    error=True,
+                )
+                time.sleep(delay)
                 continue
             raise HttpRequestError(self.service, response.status_code, response.text)
         raise AssertionError("unreachable")
@@ -673,6 +697,7 @@ class JiraClient:
         fields: Sequence[str],
         *,
         max_workers: int = JIRA_LINK_WORKERS,
+        progress_label: str = "",
     ) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
         keys = sorted(
             {
@@ -687,11 +712,16 @@ class JiraClient:
         if max_workers <= 1:
             result: dict[str, dict[str, Any]] = {}
             errors: dict[str, str] = {}
-            for key in keys:
+            for index, key in enumerate(keys, start=1):
                 try:
                     result[key] = self.issue(key, fields)
                 except Exception as exc:
                     errors[key] = str(exc)
+                if progress_label and (index % 10 == 0 or index == len(keys)):
+                    execution_log(
+                        f"{progress_label}: {index}/{len(keys)}, "
+                        f"ошибок={len(errors)}"
+                    )
             return result, errors
 
         worker_state = local()
@@ -714,14 +744,23 @@ class JiraClient:
                 executor.submit(load_issue, key): key
                 for key in keys
             }
+            completed = 0
             for future in as_completed(futures):
                 key = futures[future]
                 try:
                     loaded_key, issue = future.result()
                 except Exception as exc:
                     errors[key] = str(exc)
-                    continue
-                result[loaded_key] = issue
+                else:
+                    result[loaded_key] = issue
+                completed += 1
+                if progress_label and (
+                    completed % 10 == 0 or completed == len(keys)
+                ):
+                    execution_log(
+                        f"{progress_label}: {completed}/{len(keys)}, "
+                        f"ошибок={len(errors)}"
+                    )
         return result, errors
 
     def issues_by_keys(
@@ -730,6 +769,7 @@ class JiraClient:
         fields: Sequence[str],
         *,
         batch_size: int = JIRA_KEY_BATCH_SIZE,
+        progress_label: str = "",
     ) -> dict[str, dict[str, Any]]:
         if batch_size <= 0:
             raise ValueError("Jira batch_size должен быть больше нуля.")
@@ -741,16 +781,28 @@ class JiraClient:
             }
         )
         result: dict[str, dict[str, Any]] = {}
-        for key_batch in batches(keys, size=batch_size):
+        batch_count = (len(keys) + batch_size - 1) // batch_size
+        for batch_index, key_batch in enumerate(
+            batches(keys, size=batch_size),
+            start=1,
+        ):
+            batch_started = time.perf_counter()
             jql = f"key in ({issue_keys_jql(key_batch)})"
-            for issue in self.search(
+            batch_issues = self.search(
                 jql,
                 fields,
                 page_size=min(max(len(key_batch), 100), 1000),
-            ):
+            )
+            for issue in batch_issues:
                 key = str(issue.get("key") or "").strip().upper()
                 if key:
                     result[key] = issue
+            if progress_label:
+                execution_log(
+                    f"{progress_label}: пакет {batch_index}/{batch_count}, "
+                    f"ключей={len(key_batch)}, Jira вернула={len(batch_issues)}, "
+                    f"всего загружено={len(result)} ({elapsed_seconds(batch_started)})"
+                )
         return result
 
 
@@ -896,6 +948,7 @@ def collect_released_issues(
     str,
     dict[str, set[str]],
 ]:
+    collection_started = time.perf_counter()
     release_fields = (
         "summary",
         "status",
@@ -911,10 +964,20 @@ def collect_released_issues(
     )
     if verbose:
         print(f"JQL релизов (как в dpm2.py): {release_jql}")
+    release_search_started = time.perf_counter()
+    execution_log(
+        "Jira: поиск Release 2.0 по КЭ "
+        f"для диапазона {start.isoformat()} — "
+        f"{(end - timedelta(days=1)).isoformat()}"
+    )
     release_candidates = jira.search(
         release_jql,
         release_fields,
         page_size=1000,
+    )
+    execution_log(
+        f"Jira: найдено кандидатов релизов={len(release_candidates)} "
+        f"({elapsed_seconds(release_search_started)})"
     )
 
     range_releases = [
@@ -931,6 +994,10 @@ def collect_released_issues(
         for release in range_releases
         if release_is_installed_on_prom(release)
     ]
+    execution_log(
+        f"Jira: в диапазоне={len(range_releases)}, "
+        f"в статусе «Установлен на ПРОМ»={len(releases)}"
+    )
     if verbose:
         with_install_date = sum(
             parse_jira_date(issue_field(release, release_date_field_id)) is not None
@@ -974,10 +1041,16 @@ def collect_released_issues(
     # явном fields=issuelinks. Как и release_checker.py, источником истины
     # оставляем GET /issue/{key}; независимые Session позволяют безопасно
     # выполнять эти запросы с небольшим ограниченным параллелизмом.
+    release_links_started = time.perf_counter()
+    execution_log(
+        f"Jira: загружаю точный consist-of для {len(release_keys)} релизов, "
+        f"параллельность={JIRA_LINK_WORKERS}"
+    )
     release_details_by_key, release_errors = jira.issues_individually(
         release_keys,
         ("issuelinks",),
         max_workers=JIRA_LINK_WORKERS,
+        progress_label="Jira: связи релизов",
     )
     incomplete_release_keys = [
         key
@@ -1041,16 +1114,36 @@ def collect_released_issues(
             "публикация остановлена. "
             f"{details}{suffix}"
         )
+    execution_log(
+        f"Jira: связи релизов загружены, "
+        f"уникальных consist-of ключей={len(all_linked_keys)} "
+        f"({elapsed_seconds(release_links_started)})"
+    )
 
     # Сначала загружаем абсолютно весь состав consist of без фильтра типа,
     # проекта, статуса, приоритета или стенда. Все бизнес-фильтры применяются
     # только позже в aggregate_issues().
-    issues_by_key = jira.issues_by_keys(all_linked_keys, issue_fields)
+    issue_load_started = time.perf_counter()
+    execution_log(
+        f"Jira: загружаю {len(all_linked_keys)} уникальных задач состава "
+        f"пакетами по {JIRA_KEY_BATCH_SIZE}"
+    )
+    issues_by_key = jira.issues_by_keys(
+        all_linked_keys,
+        issue_fields,
+        progress_label="Jira: задачи состава",
+    )
     initially_missing_keys = sorted(all_linked_keys - set(issues_by_key))
+    if initially_missing_keys:
+        execution_log(
+            f"Jira: пакетный поиск не вернул {len(initially_missing_keys)} задач; "
+            "запускаю точный GET fallback"
+        )
     fallback_issues, issue_errors = jira.issues_individually(
         initially_missing_keys,
         issue_fields,
         max_workers=JIRA_LINK_WORKERS,
+        progress_label="Jira: fallback задач",
     )
     issues_by_key.update(fallback_issues)
     inaccessible_keys = sorted(
@@ -1072,6 +1165,11 @@ def collect_released_issues(
             "публикация остановлена. "
             f"{details}{suffix}"
         )
+    execution_log(
+        f"Jira: задачи состава загружены={len(issues_by_key)} "
+        f"({elapsed_seconds(issue_load_started)}); "
+        f"весь сбор={elapsed_seconds(collection_started)}"
+    )
 
     if verbose:
         issue_batch_requests = (
@@ -1800,6 +1898,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
+    job_started = time.perf_counter()
+    execution_log(
+        "Старт quarterly_quality_metrics "
+        f"(публикация={'выключена' if args.no_publish else 'включена'}, "
+        f"verbose={'да' if args.verbose else 'нет'})"
+    )
     try:
         team_specs = load_team_specs()
         rules = MetricRules.defaults()
@@ -1814,9 +1918,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         rolling_start = rolling_end - timedelta(days=90)
         collection_start = min(rolling_start, quarter_start)
         collection_end = max(rolling_end, quarter_end)
+        execution_log(
+            f"Периоды: 90 дней {rolling_start.isoformat()} — "
+            f"{(rolling_end - timedelta(days=1)).isoformat()}; "
+            f"{quarter_start.year} Q{quarter} {quarter_start.isoformat()} — "
+            f"{(quarter_end - timedelta(days=1)).isoformat()}; "
+            f"команд={len(team_specs)}"
+        )
 
+        execution_log("Загружаю настройки Jira из config.py")
         jira = JiraClient(load_jira_settings())
         release_date_name = DEFAULT_RELEASE_DATE_FIELD_NAME
+        field_lookup_started = time.perf_counter()
+        execution_log(
+            f"Jira: определяю поле «{release_date_name}»"
+        )
         release_date_field_id = find_jira_field_id(
             jira,
             configured_jira_field_id(
@@ -1831,6 +1947,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "Дата установки (ПРОМ)",
                 "Дата установки PROD",
             ),
+        )
+        execution_log(
+            f"Jira: поле даты релиза={release_date_field_id} "
+            f"({elapsed_seconds(field_lookup_started)})"
         )
         detection_stand_field_id = DEFAULT_DETECTION_STAND_FIELD_ID
         release_type_field_id = DEFAULT_RELEASE_TYPE_FIELD_ID
@@ -1867,6 +1987,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             end=quarter_end,
             release_date_field_id=release_date_field_id,
         )
+        execution_log(
+            "Разбиение по периодам завершено: "
+            f"90 дней — релизов={len(rolling_releases)}, задач={len(rolling_issues)}; "
+            f"квартал — релизов={len(quarter_releases)}, задач={len(quarter_issues)}"
+        )
 
         rolling_hotfix_count = sum(
             is_hotfix_release(release, release_type_field_id, DEFAULT_HOTFIX_VALUES)
@@ -1894,6 +2019,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 detection_stand_field_id,
             )
 
+        metrics_started = time.perf_counter()
+        execution_log("Рассчитываю метрики команд и формирую таблицы")
         rolling_counts = aggregate_issues(
             team_specs,
             rolling_issues,
@@ -1926,6 +2053,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             quarter_release_count=len(quarter_releases),
             quarter_hotfix_count=quarter_hotfix_count,
             generated_at=generated_at,
+        )
+        execution_log(
+            f"Метрики и таблицы сформированы ({elapsed_seconds(metrics_started)})"
         )
 
         print(
@@ -1968,21 +2098,38 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 )
 
         if args.no_publish:
-            print("Confluence не изменён (--no-publish).")
+            execution_log(
+                f"Готово за {elapsed_seconds(job_started)}; "
+                "Confluence не изменён (--no-publish)"
+            )
             return 0
 
+        publish_started = time.perf_counter()
+        execution_log(
+            f"Confluence: публикую отчёт на страницу {DEFAULT_CONFLUENCE_PAGE_ID}"
+        )
         publisher = ConfluencePublisher(load_confluence_settings())
         page_url = publisher.publish(
             body=report_html,
             page_id=DEFAULT_CONFLUENCE_PAGE_ID,
         )
         print(f"CONFLUENCE_PAGE_URL={page_url}")
+        execution_log(
+            f"Confluence: публикация завершена ({elapsed_seconds(publish_started)}); "
+            f"весь запуск={elapsed_seconds(job_started)}"
+        )
         return 0
     except KeyboardInterrupt:
-        print("Остановлено пользователем.", file=sys.stderr)
+        execution_log(
+            f"Остановлено пользователем через {elapsed_seconds(job_started)}",
+            error=True,
+        )
         return 130
     except Exception as exc:
-        print(f"Ошибка: {exc}", file=sys.stderr)
+        execution_log(
+            f"Ошибка через {elapsed_seconds(job_started)}: {exc}",
+            error=True,
+        )
         return 1
 
 
