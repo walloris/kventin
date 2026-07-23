@@ -35,6 +35,9 @@ if str(PROJECT_ROOT) not in sys.path:
 DEFAULT_JIRA_URL = "https://jira.sberbank.ru"
 DEFAULT_CONFLUENCE_URL = "https://confluence.sberbank.ru"
 HTTP_TIMEOUT_SECONDS = 60
+# Корпоративные Jira/Confluence используют self-signed CA. release_checker.py
+# также принудительно отключает verify для этих подключений.
+VERIFY_SSL = False
 DEFAULT_RELEASE_PROJECT = "HRPRELEASE"
 DEFAULT_RELEASE_ISSUE_TYPE = "Release 2.0"
 DEFAULT_RELEASE_STATUS = "Установлен на ПРОМ"
@@ -1149,16 +1152,6 @@ def first_text(*values: Any, default: str = "") -> str:
     return default
 
 
-def config_bool(*values: Any, default: bool) -> bool:
-    for value in values:
-        if value is None or value == "":
-            continue
-        if isinstance(value, bool):
-            return value
-        return normalized(value) in {"1", "true", "yes", "y", "on"}
-    return default
-
-
 def load_jira_settings() -> ConnectionSettings:
     config_module, nested = load_repository_config()
     jira_config = nested.get("jira") if isinstance(nested.get("jira"), Mapping) else {}
@@ -1202,12 +1195,7 @@ def load_jira_settings() -> ConnectionSettings:
         token=token,
         username=username,
         auth_mode=auth_mode,
-        verify_ssl=config_bool(
-            jira_config.get("verify_ssl"),
-            options.get("verify"),
-            getattr(config_module, "JIRA_VERIFY_SSL", None),
-            default=True,
-        ),
+        verify_ssl=VERIFY_SSL,
         timeout_seconds=HTTP_TIMEOUT_SECONDS,
     )
 
@@ -1258,11 +1246,7 @@ def load_confluence_settings() -> ConnectionSettings:
         token=token,
         username=username,
         auth_mode=auth_mode,
-        verify_ssl=config_bool(
-            confluence_config.get("verify_ssl"),
-            getattr(config_module, "CONFLUENCE_VERIFY_SSL", None),
-            default=True,
-        ),
+        verify_ssl=VERIFY_SSL,
         timeout_seconds=HTTP_TIMEOUT_SECONDS,
     )
 
