@@ -20,6 +20,7 @@ import json
 import re
 import sys
 import time
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
@@ -130,7 +131,7 @@ TEAM_SETTINGS_JSON = r"""
   },
   {"team": "Люди Сбера", "project_keys": ["SBRPPL"], "target_ratio": 0.10},
   {
-    "team": "Управление эффективностью",
+    "team": "Задачи и уведомления",
     "project_keys": ["PERFREVIEW"],
     "target_ratio": 0.33
   },
@@ -397,6 +398,25 @@ def issue_field(issue: Mapping[str, Any], key: str) -> Any:
     return fields.get(key)
 
 
+def story_has_done_status(raw_status: Any, rules: MetricRules) -> bool:
+    if normalized(named_value(raw_status)) in rules.story_statuses:
+        return True
+    if not isinstance(raw_status, Mapping):
+        return False
+    status_category = raw_status.get("statusCategory")
+    category_values = {
+        normalized(value)
+        for value in named_values(status_category)
+    }
+    if isinstance(status_category, Mapping):
+        category_values.update(
+            normalized(status_category.get(key))
+            for key in ("key", "name")
+            if status_category.get(key)
+        )
+    return "done" in category_values
+
+
 def classify_eligible_stand(raw_value: Any, rules: MetricRules) -> Optional[str]:
     stands = {normalized(value) for value in named_values(raw_value)}
     if stands & rules.prom_stands:
@@ -431,9 +451,10 @@ def aggregate_issues(
             continue
 
         issue_type = normalized(named_value(issue_field(issue, "issuetype")))
-        status = normalized(named_value(issue_field(issue, "status")))
+        raw_status = issue_field(issue, "status")
+        status = normalized(named_value(raw_status))
 
-        if issue_type in rules.story_types and status in rules.story_statuses:
+        if issue_type in rules.story_types and story_has_done_status(raw_status, rules):
             counts[team].stories += 1
             counts[team].story_keys.append(key)
             continue
@@ -653,6 +674,17 @@ def build_release_jql(
     )
 
 
+def issue_link_type_text(link: Mapping[str, Any]) -> str:
+    link_type = link.get("type")
+    if isinstance(link_type, Mapping):
+        return " / ".join(
+            value
+            for field_name in ("name", "inward", "outward")
+            for value in named_values(link_type.get(field_name))
+        )
+    return " / ".join(named_values(link_type))
+
+
 def release_linked_keys(
     release: Mapping[str, Any],
     link_keywords: Sequence[str],
@@ -668,8 +700,7 @@ def release_linked_keys(
     for link in links:
         if not isinstance(link, Mapping):
             continue
-        link_type = link.get("type")
-        link_type_text = " ".join(named_values(link_type))
+        link_type_text = issue_link_type_text(link)
         normalized_type = normalized(link_type_text)
         if not any(keyword in normalized_type for keyword in keywords):
             continue
@@ -769,6 +800,21 @@ def collect_released_issues(
             for key in release_linked_keys(release, link_keywords)
         }
     )
+    if verbose:
+        link_types: Counter[str] = Counter()
+        for release in releases:
+            links = issue_field(release, "issuelinks") or []
+            if not isinstance(links, list):
+                continue
+            for link in links:
+                if isinstance(link, Mapping):
+                    label = issue_link_type_text(link) or "без названия"
+                    link_types[label] += 1
+        print(f"Ключей задач из связей состава: {len(linked_keys)}")
+        if link_types:
+            print("Типы связей релизов:")
+            for label, count in link_types.most_common():
+                print(f"  {label}: {count}")
 
     issue_fields = (
         "summary",
@@ -779,13 +825,16 @@ def collect_released_issues(
         detection_stand_field_id,
     )
     issues_by_key: dict[str, dict[str, Any]] = {}
+    linked_issue_keys: set[str] = set()
     for key_batch in batches(linked_keys):
         jql = f"key in ({issue_keys_jql(key_batch)})"
         for issue in jira.search(jql, issue_fields):
             key = str(issue.get("key") or "").strip().upper()
             if key:
                 issues_by_key[key] = issue
+                linked_issue_keys.add(key)
 
+    child_issue_keys: set[str] = set()
     for release_batch in batches(release_keys, size=50):
         if not release_batch:
             continue
@@ -806,8 +855,39 @@ def collect_released_issues(
             key = str(issue.get("key") or "").strip().upper()
             if key:
                 issues_by_key[key] = issue
+                child_issue_keys.add(key)
+
+    if verbose:
+        print(
+            f"Загружено задач: по связям={len(linked_issue_keys)}, "
+            f"по parent={len(child_issue_keys)}, "
+            f"уникальных={len(issues_by_key)}"
+        )
 
     return releases, list(issues_by_key.values()), release_jql
+
+
+def print_issue_inventory(issues: Sequence[Mapping[str, Any]]) -> None:
+    """Print raw released-issue distribution before metric filters."""
+
+    inventory: dict[str, Counter[tuple[str, str]]] = defaultdict(Counter)
+    for issue in issues:
+        project_key = named_value(issue_field(issue, "project")).upper() or "БЕЗ ПРОЕКТА"
+        issue_type = named_value(issue_field(issue, "issuetype")) or "Без типа"
+        status = named_value(issue_field(issue, "status")) or "Без статуса"
+        inventory[project_key][(issue_type, status)] += 1
+
+    print("Состав релизов до фильтров метрики:")
+    if not inventory:
+        print("  задач не загружено")
+        return
+    for project_key in sorted(inventory):
+        total = sum(inventory[project_key].values())
+        details = "; ".join(
+            f"{issue_type}/{status}={count}"
+            for (issue_type, status), count in inventory[project_key].most_common()
+        )
+        print(f"  {project_key}: всего={total}; {details}")
 
 
 def decimal_text(value: Decimal, places: int = 3) -> str:
@@ -1357,6 +1437,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             is_hotfix_release(release, release_type_field_id, DEFAULT_HOTFIX_VALUES)
             for release in releases
         )
+        if args.verbose:
+            print_issue_inventory(issues)
         counts = aggregate_issues(
             team_specs,
             issues,
