@@ -39,7 +39,12 @@ DEFAULT_JIRA_URL = "https://jira.sberbank.ru"
 DEFAULT_CONFLUENCE_URL = "https://confluence.sberbank.ru"
 HTTP_TIMEOUT_SECONDS = 60
 JIRA_KEY_BATCH_SIZE = 200
-JIRA_LINK_WORKERS = 4
+# Jira ограничивает частоту одиночных GET /issue. Одна переиспользуемая
+# Session работает стабильнее нескольких параллельных сессий и соответствует
+# способу загрузки issuelinks в release_checker.py.
+JIRA_LINK_WORKERS = 1
+JIRA_ISSUE_REQUEST_INTERVAL_SECONDS = 0.35
+JIRA_RATE_LIMIT_RECOVERY_SECONDS = 30
 # Корпоративные Jira/Confluence используют self-signed CA. release_checker.py
 # также принудительно отключает verify для этих подключений.
 VERIFY_SSL = False
@@ -625,6 +630,10 @@ class RestClient:
                     delay = float(retry_after)
                 except ValueError:
                     delay = min(2 ** (attempt - 1), 8)
+                if response.status_code == 429:
+                    # SynGX/Jira иногда присылает Retry-After: 0. Немедленный
+                    # повтор только добивает лимит и расходует все попытки.
+                    delay = max(delay, min(2 ** (attempt - 1), 8))
                 delay = max(0, min(delay, 30))
                 execution_log(
                     f"{self.service}: HTTP {response.status_code}, повтор "
@@ -712,7 +721,20 @@ class JiraClient:
         if max_workers <= 1:
             result: dict[str, dict[str, Any]] = {}
             errors: dict[str, str] = {}
+            previous_request_started = 0.0
             for index, key in enumerate(keys, start=1):
+                since_previous_start = (
+                    time.perf_counter() - previous_request_started
+                    if previous_request_started
+                    else JIRA_ISSUE_REQUEST_INTERVAL_SECONDS
+                )
+                pacing_delay = max(
+                    0.0,
+                    JIRA_ISSUE_REQUEST_INTERVAL_SECONDS - since_previous_start,
+                )
+                if pacing_delay:
+                    time.sleep(pacing_delay)
+                previous_request_started = time.perf_counter()
                 try:
                     result[key] = self.issue(key, fields)
                 except Exception as exc:
@@ -1039,12 +1061,12 @@ def collect_released_issues(
     )
     # Jira Search на практике может вернуть урезанный issuelinks даже при
     # явном fields=issuelinks. Как и release_checker.py, источником истины
-    # оставляем GET /issue/{key}; независимые Session позволяют безопасно
-    # выполнять эти запросы с небольшим ограниченным параллелизмом.
+    # оставляем последовательный GET /issue/{key} через одну Session.
     release_links_started = time.perf_counter()
     execution_log(
         f"Jira: загружаю точный consist-of для {len(release_keys)} релизов, "
-        f"параллельность={JIRA_LINK_WORKERS}"
+        f"параллельность={JIRA_LINK_WORKERS}, "
+        f"интервал GET≥{JIRA_ISSUE_REQUEST_INTERVAL_SECONDS:.2f} с"
     )
     release_details_by_key, release_errors = jira.issues_individually(
         release_keys,
@@ -1063,6 +1085,51 @@ def collect_released_issues(
     for key in incomplete_release_keys:
         release_details_by_key.pop(key, None)
         release_errors[key] = "в ответе отсутствует fields.issuelinks"
+
+    retry_release_keys = sorted(
+        set(release_keys) - set(release_details_by_key)
+    )
+    if retry_release_keys:
+        rate_limited = any(
+            "429" in release_errors.get(key, "")
+            for key in retry_release_keys
+        )
+        if rate_limited:
+            execution_log(
+                f"Jira: rate limit затронул {len(retry_release_keys)} релизов; "
+                f"жду {JIRA_RATE_LIMIT_RECOVERY_SECONDS} с перед recovery",
+                error=True,
+            )
+            time.sleep(JIRA_RATE_LIMIT_RECOVERY_SECONDS)
+        else:
+            execution_log(
+                f"Jira: повторно загружаю связи {len(retry_release_keys)} релизов "
+                "через последовательный recovery"
+            )
+
+        recovered_releases, recovery_errors = jira.issues_individually(
+            retry_release_keys,
+            ("issuelinks",),
+            max_workers=1,
+            progress_label="Jira: recovery связей",
+        )
+        incomplete_recovery_keys = [
+            key
+            for key, release in recovered_releases.items()
+            if (
+                not isinstance(release.get("fields"), Mapping)
+                or "issuelinks" not in release["fields"]
+            )
+        ]
+        for key in incomplete_recovery_keys:
+            recovered_releases.pop(key, None)
+            recovery_errors[key] = "в ответе отсутствует fields.issuelinks"
+        release_details_by_key.update(recovered_releases)
+        for key in recovered_releases:
+            release_errors.pop(key, None)
+        for key, error in recovery_errors.items():
+            release_errors[key] = error
+
     failed_releases.extend(
         sorted(set(release_keys) - set(release_details_by_key))
     )
