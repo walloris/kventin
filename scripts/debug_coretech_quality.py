@@ -139,13 +139,13 @@ def issue_status_category(issue: Mapping[str, Any]) -> str:
 
 def issue_snapshot(
     issue: Mapping[str, Any],
-    detection_stand_field_id: str,
+    detection_stage_field_id: str,
     ke_field_id: str,
 ) -> dict[str, Any]:
     fields = issue.get("fields")
     raw_fields = dict(fields) if isinstance(fields, Mapping) else {}
-    stand_values = metrics.named_values(
-        metrics.issue_field(issue, detection_stand_field_id)
+    detection_stage_values = metrics.named_values(
+        metrics.issue_field(issue, detection_stage_field_id)
     )
     snapshot = {
         "key": str(issue.get("key") or "").strip().upper(),
@@ -155,7 +155,7 @@ def issue_snapshot(
         "status": metrics.named_value(metrics.issue_field(issue, "status")),
         "status_category": issue_status_category(issue),
         "priority": metrics.named_value(metrics.issue_field(issue, "priority")),
-        "detection_stand": stand_values,
+        "detection_stage": detection_stage_values,
         "resolution": metrics.named_value(metrics.issue_field(issue, "resolution")),
         "resolution_date": metrics.issue_field(issue, "resolutiondate"),
         "created": metrics.issue_field(issue, "created"),
@@ -176,7 +176,7 @@ def classify_for_period(
     issue: Optional[Mapping[str, Any]],
     period_release_keys: Sequence[str],
     rules: metrics.MetricRules,
-    detection_stand_field_id: str,
+    detection_stage_field_id: str,
 ) -> dict[str, Any]:
     if issue is None:
         return {
@@ -264,27 +264,27 @@ def classify_for_period(
             ),
         }
 
-    stand = metrics.classify_eligible_stand(
-        metrics.issue_field(issue, detection_stand_field_id),
+    detection_stage = metrics.classify_eligible_detection_stage(
+        metrics.issue_field(issue, detection_stage_field_id),
         rules,
     )
-    if stand is None:
+    if detection_stage is None:
         return {
             "counted": False,
             "bucket": None,
-            "reason_code": "BUG_STAND_NOT_ELIGIBLE",
+            "reason_code": "BUG_DETECTION_STAGE_NOT_ELIGIBLE",
             "reason": (
-                "Стенд обнаружения Bug не PSI/ПСИ/PROM/ПРОМ: "
-                f"{metrics.named_values(metrics.issue_field(issue, detection_stand_field_id)) or ['пусто']}."
+                "Этап обнаружения Bug не PSI/ПСИ/PROM/ПРОМ: "
+                f"{metrics.named_values(metrics.issue_field(issue, detection_stage_field_id)) or ['пусто']}."
             ),
         }
     return {
         "counted": True,
-        "bucket": "Bug PROM" if stand == "prom" else "Bug PSI",
+        "bucket": "Bug PROM" if detection_stage == "prom" else "Bug PSI",
         "reason_code": "COUNTED_BUG",
         "reason": (
-            "Bug проекта HRC, Closed, с допустимым приоритетом и стендом "
-            f"{stand.upper()}."
+            "Bug проекта HRC, Closed, с допустимым приоритетом и этапом "
+            f"обнаружения {detection_stage.upper()}."
         ),
     }
 
@@ -411,7 +411,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "Дата установки PROD",
             ),
         )
-        detection_stand_field_id = metrics.DEFAULT_DETECTION_STAND_FIELD_ID
+        detection_stage_field_id = metrics.DEFAULT_DETECTION_STAGE_FIELD_ID
         release_type_field_id = metrics.DEFAULT_RELEASE_TYPE_FIELD_ID
 
         releases, basic_issues, release_jql, issue_keys_by_release = (
@@ -426,7 +426,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 release_created_since=metrics.DEFAULT_RELEASE_CREATED_SINCE,
                 release_date_field_id=release_date_field_id,
                 release_type_field_id=release_type_field_id,
-                detection_stand_field_id=detection_stand_field_id,
+                detection_stage_field_id=detection_stage_field_id,
                 link_keywords=metrics.DEFAULT_RELEASE_LINK_KEYWORDS,
                 verbose=False,
             )
@@ -450,7 +450,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "issuetype",
             "status",
             "priority",
-            detection_stand_field_id,
+            detection_stage_field_id,
             "resolution",
             "resolutiondate",
             "created",
@@ -507,13 +507,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             (team_spec,),
             rolling_issues,
             rules,
-            detection_stand_field_id,
+            detection_stage_field_id,
         )[CORETECH_TEAM]
         quarter_counts = metrics.aggregate_issues(
             (team_spec,),
             quarter_issues,
             rules,
-            detection_stand_field_id,
+            detection_stage_field_id,
         )[CORETECH_TEAM]
 
         issue_records: dict[str, dict[str, Any]] = {}
@@ -529,7 +529,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "jira": (
                     issue_snapshot(
                         issue,
-                        detection_stand_field_id,
+                        detection_stage_field_id,
                         ke_field_id,
                     )
                     if issue is not None
@@ -542,7 +542,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         issue,
                         rolling_links,
                         rules,
-                        detection_stand_field_id,
+                        detection_stage_field_id,
                     ),
                 },
                 "quarter": {
@@ -551,7 +551,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         issue,
                         quarter_links,
                         rules,
-                        detection_stand_field_id,
+                        detection_stage_field_id,
                     ),
                 },
                 "detail_error": detail_errors.get(key),
@@ -641,7 +641,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     quarter_end - timedelta(days=1)
                 ).isoformat(),
                 "release_date_field_id": release_date_field_id,
-                "detection_stand_field_id": detection_stand_field_id,
+                "detection_stage_field_id": detection_stage_field_id,
                 "ke_field_id": ke_field_id or None,
                 "release_jql": release_jql,
             },

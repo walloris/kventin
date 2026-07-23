@@ -55,7 +55,7 @@ DEFAULT_RELEASE_KE_FIELD_NAME = "КЭ"
 DEFAULT_RELEASE_DATE_FIELD_NAME = "Дата установки на ПРОМ"
 DEFAULT_RELEASE_DATE_FIELD_ID = ""
 DEFAULT_RELEASE_TYPE_FIELD_ID = "customfield_23500"
-DEFAULT_DETECTION_STAND_FIELD_ID = "customfield_17500"
+DEFAULT_DETECTION_STAGE_FIELD_ID = "customfield_11507"
 DEFAULT_CONFLUENCE_PAGE_ID = "24517214638"
 
 DEFAULT_STORY_TYPES = ("Story",)
@@ -69,8 +69,8 @@ DEFAULT_BUG_PRIORITIES = (
     "Высокий",
     "Блокирующий",
 )
-DEFAULT_PSI_STANDS = ("PSI", "ПСИ")
-DEFAULT_PROM_STANDS = ("PROM", "ПРОМ")
+DEFAULT_PSI_DETECTION_STAGES = ("PSI", "ПСИ")
+DEFAULT_PROM_DETECTION_STAGES = ("PROM", "ПРОМ")
 DEFAULT_RELEASE_LINK_KEYWORDS = ("consist", "part")
 DEFAULT_HOTFIX_VALUES = ("Hotfix",)
 DEFAULT_INSTALLED_RELEASE_STATUSES = (
@@ -317,8 +317,8 @@ class MetricRules:
     bug_types: frozenset[str]
     bug_statuses: frozenset[str]
     bug_priorities: frozenset[str]
-    psi_stands: frozenset[str]
-    prom_stands: frozenset[str]
+    psi_detection_stages: frozenset[str]
+    prom_detection_stages: frozenset[str]
 
     @classmethod
     def defaults(cls) -> "MetricRules":
@@ -328,8 +328,8 @@ class MetricRules:
             bug_types=normalized_set(DEFAULT_BUG_TYPES),
             bug_statuses=normalized_set(DEFAULT_BUG_STATUSES),
             bug_priorities=normalized_set(DEFAULT_BUG_PRIORITIES),
-            psi_stands=normalized_set(DEFAULT_PSI_STANDS),
-            prom_stands=normalized_set(DEFAULT_PROM_STANDS),
+            psi_detection_stages=normalized_set(DEFAULT_PSI_DETECTION_STAGES),
+            prom_detection_stages=normalized_set(DEFAULT_PROM_DETECTION_STAGES),
         )
 
 
@@ -462,11 +462,14 @@ def story_has_done_status(raw_status: Any, rules: MetricRules) -> bool:
     return "done" in category_values
 
 
-def classify_eligible_stand(raw_value: Any, rules: MetricRules) -> Optional[str]:
-    stands = {normalized(value) for value in named_values(raw_value)}
-    if stands & rules.prom_stands:
+def classify_eligible_detection_stage(
+    raw_value: Any,
+    rules: MetricRules,
+) -> Optional[str]:
+    stages = {normalized(value) for value in named_values(raw_value)}
+    if stages & rules.prom_detection_stages:
         return "prom"
-    if stands & rules.psi_stands:
+    if stages & rules.psi_detection_stages:
         return "psi"
     return None
 
@@ -475,7 +478,7 @@ def aggregate_issues(
     team_specs: Sequence[TeamSpec],
     issues: Iterable[Mapping[str, Any]],
     rules: MetricRules,
-    detection_stand_field_id: str,
+    detection_stage_field_id: str,
 ) -> dict[str, TeamCounts]:
     counts = {spec.team: TeamCounts() for spec in team_specs}
     project_to_team = {
@@ -510,16 +513,16 @@ def aggregate_issues(
         if priority not in rules.bug_priorities:
             continue
 
-        stand = classify_eligible_stand(
-            issue_field(issue, detection_stand_field_id),
+        detection_stage = classify_eligible_detection_stage(
+            issue_field(issue, detection_stage_field_id),
             rules,
         )
-        if stand is None:
+        if detection_stage is None:
             continue
 
         counts[team].bugs += 1
         counts[team].bug_keys.append(key)
-        if stand == "prom":
+        if detection_stage == "prom":
             counts[team].prom_bugs += 1
         else:
             counts[team].psi_bugs += 1
@@ -955,7 +958,7 @@ def collect_released_issues(
     release_created_since: str,
     release_date_field_id: str,
     release_type_field_id: str,
-    detection_stand_field_id: str,
+    detection_stage_field_id: str,
     link_keywords: Sequence[str],
     verbose: bool = False,
 ) -> tuple[
@@ -1039,7 +1042,7 @@ def collect_released_issues(
         "issuetype",
         "status",
         "priority",
-        detection_stand_field_id,
+        detection_stage_field_id,
     )
     issues_by_key: dict[str, dict[str, Any]] = {}
     all_linked_keys: set[str] = set()
@@ -1182,8 +1185,8 @@ def collect_released_issues(
     )
 
     # Сначала загружаем абсолютно весь состав consist of без фильтра типа,
-    # проекта, статуса, приоритета или стенда. Все бизнес-фильтры применяются
-    # только позже в aggregate_issues().
+    # проекта, статуса, приоритета или этапа обнаружения. Все
+    # бизнес-фильтры применяются только позже в aggregate_issues().
     issue_load_started = time.perf_counter()
     execution_log(
         f"Jira: загружаю {len(all_linked_keys)} уникальных задач состава "
@@ -1318,7 +1321,7 @@ def print_filter_audit(
     team_specs: Sequence[TeamSpec],
     issues: Sequence[Mapping[str, Any]],
     rules: MetricRules,
-    detection_stand_field_id: str,
+    detection_stage_field_id: str,
 ) -> None:
     """Explain how Story/Bug candidates pass through metric filters."""
 
@@ -1333,7 +1336,7 @@ def print_filter_audit(
             "story_status": Counter(),
             "bug_status": Counter(),
             "bug_priority": Counter(),
-            "bug_stand": Counter(),
+            "bug_detection_stage": Counter(),
         }
         for spec in team_specs
     }
@@ -1373,13 +1376,13 @@ def print_filter_audit(
             continue
         audit[team]["bug_high_plus"] += 1
 
-        stand_values = named_values(issue_field(issue, detection_stand_field_id))
-        stand_name = ", ".join(stand_values) or "Без стенда"
-        if classify_eligible_stand(
-            issue_field(issue, detection_stand_field_id),
+        stage_values = named_values(issue_field(issue, detection_stage_field_id))
+        stage_name = ", ".join(stage_values) or "Без этапа обнаружения"
+        if classify_eligible_detection_stage(
+            issue_field(issue, detection_stage_field_id),
             rules,
         ) is None:
-            rejected_values[team]["bug_stand"][stand_name] += 1
+            rejected_values[team]["bug_detection_stage"][stage_name] += 1
             continue
         audit[team]["bug_eligible"] += 1
 
@@ -1397,7 +1400,7 @@ def print_filter_audit(
             ("story_status", "Story-статусы"),
             ("bug_status", "Bug-статусы"),
             ("bug_priority", "приоритеты"),
-            ("bug_stand", "стенды"),
+            ("bug_detection_stage", "этапы обнаружения"),
         ):
             counter = rejected_values[spec.team][field_name]
             if counter:
@@ -1717,7 +1720,7 @@ def render_confluence_html(
         'font-size:12px;margin-top:14px;padding:11px 13px;">',
         "В баги входят только Closed/Закрыт с приоритетом "
         "Critical/Crytical, Blocker, Высокий или Блокирующий "
-        "и стендом обнаружения PSI/ПСИ или PROM/ПРОМ. "
+        "и этапом обнаружения PSI/ПСИ или PROM/ПРОМ. "
         "«Ещё ПРОМ-багов» — целый запас до коэффициента; «Story до цели» — "
         "минимальное число дополнительных Story для возвращения к 100%.",
         f"<br/>Обновлено автоматически: "
@@ -2013,7 +2016,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"Jira: поле даты релиза={release_date_field_id} "
             f"({elapsed_seconds(field_lookup_started)})"
         )
-        detection_stand_field_id = DEFAULT_DETECTION_STAND_FIELD_ID
+        detection_stage_field_id = DEFAULT_DETECTION_STAGE_FIELD_ID
         release_type_field_id = DEFAULT_RELEASE_TYPE_FIELD_ID
 
         releases, issues, release_jql, issue_keys_by_release = collect_released_issues(
@@ -2027,7 +2030,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             release_created_since=DEFAULT_RELEASE_CREATED_SINCE,
             release_date_field_id=release_date_field_id,
             release_type_field_id=release_type_field_id,
-            detection_stand_field_id=detection_stand_field_id,
+            detection_stage_field_id=detection_stage_field_id,
             link_keywords=DEFAULT_RELEASE_LINK_KEYWORDS,
             verbose=args.verbose,
         )
@@ -2069,7 +2072,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 team_specs,
                 rolling_issues,
                 rules,
-                detection_stand_field_id,
+                detection_stage_field_id,
             )
             print(f"\n=== {quarter_start.year} Q{quarter}: аудит ===")
             print_issue_inventory(quarter_issues)
@@ -2077,7 +2080,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 team_specs,
                 quarter_issues,
                 rules,
-                detection_stand_field_id,
+                detection_stage_field_id,
             )
 
         metrics_started = time.perf_counter()
@@ -2086,13 +2089,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             team_specs,
             rolling_issues,
             rules,
-            detection_stand_field_id,
+            detection_stage_field_id,
         )
         quarter_counts = aggregate_issues(
             team_specs,
             quarter_issues,
             rules,
-            detection_stand_field_id,
+            detection_stage_field_id,
         )
         rolling_metrics = [
             calculate_metric(spec, rolling_counts[spec.team]) for spec in team_specs
