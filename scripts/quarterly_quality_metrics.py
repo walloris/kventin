@@ -21,10 +21,12 @@ import re
 import sys
 import time
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 from pathlib import Path
+from threading import local
 from typing import Any, Iterable, Iterator, Mapping, Optional, Sequence
 
 
@@ -36,6 +38,8 @@ if str(PROJECT_ROOT) not in sys.path:
 DEFAULT_JIRA_URL = "https://jira.sberbank.ru"
 DEFAULT_CONFLUENCE_URL = "https://confluence.sberbank.ru"
 HTTP_TIMEOUT_SECONDS = 60
+JIRA_KEY_BATCH_SIZE = 200
+JIRA_LINK_WORKERS = 4
 # Корпоративные Jira/Confluence используют self-signed CA. release_checker.py
 # также принудительно отключает verify для этих подключений.
 VERIFY_SSL = False
@@ -67,7 +71,10 @@ DEFAULT_HOTFIX_VALUES = ("Hotfix",)
 DEFAULT_INSTALLED_RELEASE_STATUSES = (
     "Установлен на ПРОМ",
     "Установлено на ПРОМ",
+    "Установлен в ПРОМ",
+    "Установлено в ПРОМ",
     "Installed on PROM",
+    "Installed on PROD",
     "Installed to PROD",
 )
 RELEASE_KE_IDS = tuple(
@@ -374,6 +381,9 @@ def calculate_metric(spec: TeamSpec, counts: TeamCounts) -> TeamMetric:
         infinite_attainment = False
         state = "Цель выполнена" if actual_ratio <= target else "Ниже цели"
 
+    # Запас багов и Story до цели считаются по точному неравенству
+    # bugs / stories <= target. Округление выше нужно только для отображения
+    # и процента выполнения по правилам эталонной таблицы.
     bug_budget = int(
         (Decimal(stories) * target).to_integral_value(rounding=ROUND_FLOOR)
     )
@@ -605,6 +615,7 @@ class RestClient:
 
 class JiraClient:
     def __init__(self, settings: ConnectionSettings):
+        self.settings = settings
         self.rest = RestClient("Jira", settings)
 
     def search(
@@ -655,6 +666,92 @@ class JiraClient:
         if not isinstance(data, dict):
             raise RuntimeError(f"Jira issue {issue_key} вернул неожиданный ответ.")
         return data
+
+    def issues_individually(
+        self,
+        issue_keys: Iterable[str],
+        fields: Sequence[str],
+        *,
+        max_workers: int = JIRA_LINK_WORKERS,
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+        keys = sorted(
+            {
+                str(issue_key).strip().upper()
+                for issue_key in issue_keys
+                if str(issue_key).strip()
+            }
+        )
+        if not keys:
+            return {}, {}
+
+        if max_workers <= 1:
+            result: dict[str, dict[str, Any]] = {}
+            errors: dict[str, str] = {}
+            for key in keys:
+                try:
+                    result[key] = self.issue(key, fields)
+                except Exception as exc:
+                    errors[key] = str(exc)
+            return result, errors
+
+        worker_state = local()
+
+        def load_issue(key: str) -> tuple[str, dict[str, Any]]:
+            worker_client = getattr(worker_state, "jira_client", None)
+            if worker_client is None:
+                worker_client = JiraClient(self.settings)
+                worker_state.jira_client = worker_client
+            return key, worker_client.issue(key, fields)
+
+        result = {}
+        errors = {}
+        worker_count = min(max_workers, len(keys))
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="jira-links",
+        ) as executor:
+            futures = {
+                executor.submit(load_issue, key): key
+                for key in keys
+            }
+            for future in as_completed(futures):
+                key = futures[future]
+                try:
+                    loaded_key, issue = future.result()
+                except Exception as exc:
+                    errors[key] = str(exc)
+                    continue
+                result[loaded_key] = issue
+        return result, errors
+
+    def issues_by_keys(
+        self,
+        issue_keys: Iterable[str],
+        fields: Sequence[str],
+        *,
+        batch_size: int = JIRA_KEY_BATCH_SIZE,
+    ) -> dict[str, dict[str, Any]]:
+        if batch_size <= 0:
+            raise ValueError("Jira batch_size должен быть больше нуля.")
+        keys = sorted(
+            {
+                str(issue_key).strip().upper()
+                for issue_key in issue_keys
+                if str(issue_key).strip()
+            }
+        )
+        result: dict[str, dict[str, Any]] = {}
+        for key_batch in batches(keys, size=batch_size):
+            jql = f"key in ({issue_keys_jql(key_batch)})"
+            for issue in self.search(
+                jql,
+                fields,
+                page_size=min(max(len(key_batch), 100), 1000),
+            ):
+                key = str(issue.get("key") or "").strip().upper()
+                if key:
+                    result[key] = issue
+        return result
 
 
 def find_jira_field_id(
@@ -710,7 +807,12 @@ def build_release_jql(
 def issue_link_type_text(link: Mapping[str, Any]) -> str:
     link_type = link.get("type")
     if isinstance(link_type, Mapping):
-        return " / ".join(named_values(link_type.get("name")))
+        # У разных Jira название связи встречается в name либо только в
+        # направлении inward/outward. Для consist-of учитываем все варианты.
+        values: list[str] = []
+        for key in ("name", "inward", "outward"):
+            values.extend(named_values(link_type.get(key)))
+        return " / ".join(dict.fromkeys(values))
     return " / ".join(named_values(link_type))
 
 
@@ -768,15 +870,9 @@ def release_is_installed_on_prom(
     allowed_statuses: Sequence[str] = DEFAULT_INSTALLED_RELEASE_STATUSES,
 ) -> bool:
     status = normalized(named_value(issue_field(release, "status")))
-    if status in normalized_set(allowed_statuses):
-        return True
-    return (
-        (
-            "установлен" in status
-            and ("пром" in status or "prom" in status or "prod" in status)
-        )
-        or ("installed" in status and ("prom" in status or "prod" in status))
-    )
+    # Только точный allowlist: substring-проверка ошибочно принимала статусы
+    # вроде «Не установлен на ПРОМ» и «Будет установлен на ПРОМ».
+    return status in normalized_set(allowed_statuses)
 
 
 def collect_released_issues(
@@ -815,7 +911,11 @@ def collect_released_issues(
     )
     if verbose:
         print(f"JQL релизов (как в dpm2.py): {release_jql}")
-    release_candidates = jira.search(release_jql, release_fields)
+    release_candidates = jira.search(
+        release_jql,
+        release_fields,
+        page_size=1000,
+    )
 
     range_releases = [
         release
@@ -852,7 +952,6 @@ def collect_released_issues(
                 print(f"  {status_name}: {count}")
 
     issue_fields = (
-        "summary",
         "project",
         "issuetype",
         "status",
@@ -864,76 +963,141 @@ def collect_released_issues(
     failed_releases: list[str] = []
     link_types: Counter[str] = Counter()
     issue_keys_by_release: dict[str, set[str]] = {}
+    release_keys = sorted(
+        {
+            str(release.get("key") or "").strip().upper()
+            for release in releases
+            if str(release.get("key") or "").strip()
+        }
+    )
+    # Jira Search на практике может вернуть урезанный issuelinks даже при
+    # явном fields=issuelinks. Как и release_checker.py, источником истины
+    # оставляем GET /issue/{key}; независимые Session позволяют безопасно
+    # выполнять эти запросы с небольшим ограниченным параллелизмом.
+    release_details_by_key, release_errors = jira.issues_individually(
+        release_keys,
+        ("issuelinks",),
+        max_workers=JIRA_LINK_WORKERS,
+    )
+    incomplete_release_keys = [
+        key
+        for key, release in release_details_by_key.items()
+        if (
+            not isinstance(release.get("fields"), Mapping)
+            or "issuelinks" not in release["fields"]
+        )
+    ]
+    for key in incomplete_release_keys:
+        release_details_by_key.pop(key, None)
+        release_errors[key] = "в ответе отсутствует fields.issuelinks"
+    failed_releases.extend(
+        sorted(set(release_keys) - set(release_details_by_key))
+    )
 
     for index, release in enumerate(releases, start=1):
         release_key = str(release.get("key") or "").strip().upper()
         if not release_key:
             continue
-        try:
-            # release_checker.py получает полный issuelinks отдельным запросом
-            # для каждого релиза: jira.issue(release_key, fields='issuelinks').
-            full_release = jira.issue(release_key, ("issuelinks",))
-            linked_keys = release_linked_keys(full_release, link_keywords)
-            issue_keys_by_release[release_key] = set(linked_keys)
-            all_linked_keys.update(linked_keys)
-
-            if verbose:
-                links = issue_field(full_release, "issuelinks") or []
-                if isinstance(links, list):
-                    for link in links:
-                        if isinstance(link, Mapping):
-                            link_types[issue_link_type_text(link) or "без названия"] += 1
-
-            if verbose and (index % 10 == 0 or index == len(releases)):
-                print(
-                    f"Обработано релизов: {index}/{len(releases)}; "
-                    f"последний {release_key}: consist-of задач={len(linked_keys)}"
-                )
-        except Exception as exc:
+        full_release = release_details_by_key.get(release_key)
+        if full_release is None:
             issue_keys_by_release[release_key] = set()
-            failed_releases.append(release_key)
             if verbose:
                 print(
-                    f"Предупреждение: {release_key} пропущен из-за ошибки: {exc}",
+                    f"Не удалось получить связи {release_key}: "
+                    f"{release_errors.get(release_key, 'пустой ответ Jira')}",
                     file=sys.stderr,
                 )
+            continue
+
+        linked_keys = release_linked_keys(full_release, link_keywords)
+        issue_keys_by_release[release_key] = set(linked_keys)
+        all_linked_keys.update(linked_keys)
+
+        if verbose:
+            links = issue_field(full_release, "issuelinks") or []
+            if isinstance(links, list):
+                for link in links:
+                    if isinstance(link, Mapping):
+                        link_types[issue_link_type_text(link) or "без названия"] += 1
+
+        if verbose and (index % 10 == 0 or index == len(releases)):
+            print(
+                f"Обработано релизов: {index}/{len(releases)}; "
+                f"последний {release_key}: consist-of задач={len(linked_keys)}"
+            )
+
+    if failed_releases:
+        details = "; ".join(
+            f"{key}: {release_errors.get(key, 'пустой ответ Jira')}"
+            for key in failed_releases[:5]
+        )
+        suffix = (
+            f"; ещё {len(failed_releases) - 5}"
+            if len(failed_releases) > 5
+            else ""
+        )
+        raise RuntimeError(
+            "Jira не вернула полный состав установленных релизов; "
+            "публикация остановлена. "
+            f"{details}{suffix}"
+        )
 
     # Сначала загружаем абсолютно весь состав consist of без фильтра типа,
     # проекта, статуса, приоритета или стенда. Все бизнес-фильтры применяются
     # только позже в aggregate_issues().
-    all_linked_keys_sorted = sorted(all_linked_keys)
-    for key_batch in batches(all_linked_keys_sorted, size=100):
-        linked_jql = f"key in ({issue_keys_jql(key_batch)})"
-        for issue in jira.search(linked_jql, issue_fields):
-            key = str(issue.get("key") or "").strip().upper()
-            if key:
-                issues_by_key[key] = issue
+    issues_by_key = jira.issues_by_keys(all_linked_keys, issue_fields)
+    initially_missing_keys = sorted(all_linked_keys - set(issues_by_key))
+    fallback_issues, issue_errors = jira.issues_individually(
+        initially_missing_keys,
+        issue_fields,
+        max_workers=JIRA_LINK_WORKERS,
+    )
+    issues_by_key.update(fallback_issues)
+    inaccessible_keys = sorted(
+        set(initially_missing_keys) - set(fallback_issues)
+    )
 
-    loaded_keys = set(issues_by_key)
-    missing_keys = sorted(all_linked_keys - loaded_keys)
+    if inaccessible_keys:
+        details = "; ".join(
+            f"{key}: {issue_errors.get(key, 'пустой ответ Jira')}"
+            for key in inaccessible_keys[:5]
+        )
+        suffix = (
+            f"; ещё {len(inaccessible_keys) - 5}"
+            if len(inaccessible_keys) > 5
+            else ""
+        )
+        raise RuntimeError(
+            "Jira не вернула все задачи из consist of; "
+            "публикация остановлена. "
+            f"{details}{suffix}"
+        )
 
     if verbose:
+        issue_batch_requests = (
+            (len(all_linked_keys) + JIRA_KEY_BATCH_SIZE - 1)
+            // JIRA_KEY_BATCH_SIZE
+            if all_linked_keys
+            else 0
+        )
         print(
             f"Полный состав consist of: релизов={len(releases)}, "
             f"ошибок={len(failed_releases)}, "
             f"уникальных ключей={len(all_linked_keys)}, "
             f"загружено задач без фильтров={len(issues_by_key)}, "
-            f"не вернулось из Jira={len(missing_keys)}"
+            f"недоступно в Jira={len(inaccessible_keys)}"
+        )
+        print(
+            "Jira-запросы состава: "
+            f"точные GET релизов={len(release_keys)} "
+            f"(параллельность≤{JIRA_LINK_WORKERS}), "
+            f"пакеты задач≈{issue_batch_requests}, "
+            f"GET fallback задач={len(initially_missing_keys)}"
         )
         if link_types:
             print("Типы связей релизов:")
             for label, count in link_types.most_common():
                 print(f"  {label}: {count}")
-        if failed_releases:
-            print(
-                "Не удалось обработать релизы: " + ", ".join(failed_releases),
-                file=sys.stderr,
-            )
-        if missing_keys:
-            print(
-                "Jira не вернула связанные задачи: " + ", ".join(missing_keys),
-                file=sys.stderr,
-            )
 
     return releases, list(issues_by_key.values()), release_jql, issue_keys_by_release
 
@@ -966,22 +1130,6 @@ def select_period_data(
         if str(issue.get("key") or "").strip().upper() in period_issue_keys
     ]
     return period_releases, period_issues
-
-
-def merge_period_items(
-    primary: Sequence[Mapping[str, Any]],
-    required: Sequence[Mapping[str, Any]],
-) -> list[dict[str, Any]]:
-    """Return primary plus required items, deduplicated by Jira key."""
-
-    result: dict[str, dict[str, Any]] = {}
-    for item in (*primary, *required):
-        if not isinstance(item, dict):
-            continue
-        key = str(item.get("key") or "").strip().upper()
-        if key:
-            result[key] = item
-    return list(result.values())
 
 
 def print_issue_inventory(issues: Sequence[Mapping[str, Any]]) -> None:
@@ -1719,37 +1867,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             end=quarter_end,
             release_date_field_id=release_date_field_id,
         )
-
-        # На границе периодов один и тот же установленный релиз обязан входить
-        # в оба среза. Повторный выбор пересечения служит защитой от потери
-        # связей при последующем изменении логики периодов.
-        overlap_start = max(rolling_start, quarter_start)
-        overlap_end = min(rolling_end, quarter_end)
-        if overlap_start < overlap_end:
-            overlap_releases, overlap_issues = select_period_data(
-                releases,
-                issues,
-                issue_keys_by_release,
-                start=overlap_start,
-                end=overlap_end,
-                release_date_field_id=release_date_field_id,
-            )
-            rolling_releases = merge_period_items(
-                rolling_releases,
-                overlap_releases,
-            )
-            rolling_issues = merge_period_items(
-                rolling_issues,
-                overlap_issues,
-            )
-            quarter_releases = merge_period_items(
-                quarter_releases,
-                overlap_releases,
-            )
-            quarter_issues = merge_period_items(
-                quarter_issues,
-                overlap_issues,
-            )
 
         rolling_hotfix_count = sum(
             is_hotfix_release(release, release_type_field_id, DEFAULT_HOTFIX_VALUES)
