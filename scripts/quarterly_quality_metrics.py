@@ -987,6 +987,22 @@ def select_period_data(
     return period_releases, period_issues
 
 
+def merge_period_items(
+    primary: Sequence[Mapping[str, Any]],
+    required: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return primary plus required items, deduplicated by Jira key."""
+
+    result: dict[str, dict[str, Any]] = {}
+    for item in (*primary, *required):
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or "").strip().upper()
+        if key:
+            result[key] = item
+    return list(result.values())
+
+
 def print_issue_inventory(issues: Sequence[Mapping[str, Any]]) -> None:
     """Print raw released-issue distribution before metric filters."""
 
@@ -1293,10 +1309,11 @@ def render_metric_section_html(
     )
     for header in headers:
         parts.append(
-            '<th style="background-color:#253858;border:1px solid #42526E;'
-            'color:#FFFFFF;font-size:12px;font-weight:bold;padding:9px 7px;'
+            '<th style="background-color:#F4F5F7;border:1px solid #C1C7D0;'
+            'color:#172B4D;font-size:12px;font-weight:bold;padding:9px 7px;'
             'text-align:center;vertical-align:middle;">'
-            f"{html.escape(header)}</th>"
+            f'<span style="color:#172B4D;font-weight:bold;">'
+            f"{html.escape(header)}</span></th>"
         )
     parts.append("</tr></thead><tbody>")
 
@@ -1663,10 +1680,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         else:
             quarter_start, quarter_calendar_end, quarter = quarter_bounds(today)
 
-        if quarter_start <= today < quarter_calendar_end:
-            quarter_end = today + timedelta(days=1)
-        else:
-            quarter_end = quarter_calendar_end
+        quarter_end = quarter_calendar_end
         rolling_end = today + timedelta(days=1)
         rolling_start = rolling_end - timedelta(days=90)
         collection_start = min(rolling_start, quarter_start)
@@ -1724,6 +1738,37 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             end=quarter_end,
             release_date_field_id=release_date_field_id,
         )
+
+        # На границе периодов один и тот же установленный релиз обязан входить
+        # в оба среза. Повторный выбор пересечения служит защитой от потери
+        # связей при последующем изменении логики периодов.
+        overlap_start = max(rolling_start, quarter_start)
+        overlap_end = min(rolling_end, quarter_end)
+        if overlap_start < overlap_end:
+            overlap_releases, overlap_issues = select_period_data(
+                releases,
+                issues,
+                issue_keys_by_release,
+                start=overlap_start,
+                end=overlap_end,
+                release_date_field_id=release_date_field_id,
+            )
+            rolling_releases = merge_period_items(
+                rolling_releases,
+                overlap_releases,
+            )
+            rolling_issues = merge_period_items(
+                rolling_issues,
+                overlap_issues,
+            )
+            quarter_releases = merge_period_items(
+                quarter_releases,
+                overlap_releases,
+            )
+            quarter_issues = merge_period_items(
+                quarter_issues,
+                overlap_issues,
+            )
 
         rolling_hotfix_count = sum(
             is_hotfix_release(release, release_type_field_id, DEFAULT_HOTFIX_VALUES)
