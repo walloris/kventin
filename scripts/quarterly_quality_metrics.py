@@ -860,10 +860,7 @@ def collect_released_issues(
         detection_stand_field_id,
     )
     issues_by_key: dict[str, dict[str, Any]] = {}
-    bug_types = normalized_set(DEFAULT_BUG_TYPES)
     all_linked_keys: set[str] = set()
-    story_result_keys: set[str] = set()
-    bug_result_keys: set[str] = set()
     failed_releases: list[str] = []
     link_types: Counter[str] = Counter()
     issue_keys_by_release: dict[str, set[str]] = {}
@@ -872,12 +869,12 @@ def collect_released_issues(
         release_key = str(release.get("key") or "").strip().upper()
         if not release_key:
             continue
-        release_issue_keys = issue_keys_by_release.setdefault(release_key, set())
         try:
             # release_checker.py получает полный issuelinks отдельным запросом
             # для каждого релиза: jira.issue(release_key, fields='issuelinks').
             full_release = jira.issue(release_key, ("issuelinks",))
-            linked_keys = sorted(release_linked_keys(full_release, link_keywords))
+            linked_keys = release_linked_keys(full_release, link_keywords)
+            issue_keys_by_release[release_key] = set(linked_keys)
             all_linked_keys.update(linked_keys)
 
             if verbose:
@@ -887,47 +884,13 @@ def collect_released_issues(
                         if isinstance(link, Mapping):
                             link_types[issue_link_type_text(link) or "без названия"] += 1
 
-            release_story_count = 0
-            if linked_keys:
-                story_jql = (
-                    f"key in ({issue_keys_jql(linked_keys)}) "
-                    "AND issuetype = Story"
-                )
-                for issue in jira.search(story_jql, issue_fields):
-                    key = str(issue.get("key") or "").strip().upper()
-                    if key:
-                        issues_by_key[key] = issue
-                        story_result_keys.add(key)
-                        release_issue_keys.add(key)
-                        release_story_count += 1
-
-            if linked_keys:
-                bug_jql = (
-                    f"parent = {release_key} "
-                    f"OR key in ({issue_keys_jql(linked_keys)})"
-                )
-            else:
-                bug_jql = f"parent = {release_key}"
-
-            release_bug_count = 0
-            for issue in jira.search(bug_jql, issue_fields):
-                issue_type = normalized(named_value(issue_field(issue, "issuetype")))
-                if issue_type not in bug_types:
-                    continue
-                key = str(issue.get("key") or "").strip().upper()
-                if key:
-                    issues_by_key[key] = issue
-                    bug_result_keys.add(key)
-                    release_issue_keys.add(key)
-                    release_bug_count += 1
-
             if verbose and (index % 10 == 0 or index == len(releases)):
                 print(
                     f"Обработано релизов: {index}/{len(releases)}; "
-                    f"последний {release_key}: связей={len(linked_keys)}, "
-                    f"Story={release_story_count}, Bug={release_bug_count}"
+                    f"последний {release_key}: consist-of задач={len(linked_keys)}"
                 )
         except Exception as exc:
+            issue_keys_by_release[release_key] = set()
             failed_releases.append(release_key)
             if verbose:
                 print(
@@ -935,14 +898,27 @@ def collect_released_issues(
                     file=sys.stderr,
                 )
 
+    # Сначала загружаем абсолютно весь состав consist of без фильтра типа,
+    # проекта, статуса, приоритета или стенда. Все бизнес-фильтры применяются
+    # только позже в aggregate_issues().
+    all_linked_keys_sorted = sorted(all_linked_keys)
+    for key_batch in batches(all_linked_keys_sorted, size=100):
+        linked_jql = f"key in ({issue_keys_jql(key_batch)})"
+        for issue in jira.search(linked_jql, issue_fields):
+            key = str(issue.get("key") or "").strip().upper()
+            if key:
+                issues_by_key[key] = issue
+
+    loaded_keys = set(issues_by_key)
+    missing_keys = sorted(all_linked_keys - loaded_keys)
+
     if verbose:
         print(
-            f"Сбор как в release_checker.py: релизов={len(releases)}, "
+            f"Полный состав consist of: релизов={len(releases)}, "
             f"ошибок={len(failed_releases)}, "
-            f"ключей в составе={len(all_linked_keys)}, "
-            f"Story={len(story_result_keys)}, "
-            f"Bug={len(bug_result_keys)}, "
-            f"уникальных задач={len(issues_by_key)}"
+            f"уникальных ключей={len(all_linked_keys)}, "
+            f"загружено задач без фильтров={len(issues_by_key)}, "
+            f"не вернулось из Jira={len(missing_keys)}"
         )
         if link_types:
             print("Типы связей релизов:")
@@ -951,6 +927,11 @@ def collect_released_issues(
         if failed_releases:
             print(
                 "Не удалось обработать релизы: " + ", ".join(failed_releases),
+                file=sys.stderr,
+            )
+        if missing_keys:
+            print(
+                "Jira не вернула связанные задачи: " + ", ".join(missing_keys),
                 file=sys.stderr,
             )
 
@@ -1838,7 +1819,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"Релизов: {len(rolling_releases)} "
             f"(плановых: {len(rolling_releases) - rolling_hotfix_count}, "
             f"Hotfix: {rolling_hotfix_count}); "
-            f"уникальных Story/Bug-кандидатов: {len(rolling_issues)}"
+            f"задач consist of до фильтров: {len(rolling_issues)}"
         )
         print(render_console(rolling_metrics))
 
@@ -1850,7 +1831,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"Релизов: {len(quarter_releases)} "
             f"(плановых: {len(quarter_releases) - quarter_hotfix_count}, "
             f"Hotfix: {quarter_hotfix_count}); "
-            f"уникальных Story/Bug-кандидатов: {len(quarter_issues)}"
+            f"задач consist of до фильтров: {len(quarter_issues)}"
         )
         print(render_console(quarter_metrics))
 
