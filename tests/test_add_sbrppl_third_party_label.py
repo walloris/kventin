@@ -6,8 +6,18 @@ from scripts.add_sbrppl_third_party_label import (
 )
 
 
-def test_build_jql_selects_all_sbrppl_stories() -> None:
-    assert build_jql() == "project = SBRPPL AND issuetype = Story ORDER BY key ASC"
+def test_build_jql_selects_sbrppl_stories_tasks_and_bugs() -> None:
+    assert build_jql() == (
+        "project = SBRPPL "
+        "AND issuetype in (Story, Task, Bug) "
+        "ORDER BY key ASC"
+    )
+
+
+def test_build_jql_escapes_custom_issue_types() -> None:
+    assert build_jql("ABC", ("Story", "Service Task")) == (
+        'project = ABC AND issuetype in (Story, "Service Task") ORDER BY key ASC'
+    )
 
 
 def test_normalize_label_accepts_jira_and_ui_notation() -> None:

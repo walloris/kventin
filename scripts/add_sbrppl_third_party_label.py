@@ -1,4 +1,4 @@
-"""Add the #Пульс_3лица label to every Story in the SBRPPL Jira project.
+"""Add the #Пульс_3лица label to Story, Task, and Bug issues in SBRPPL.
 
 Jira stores this label as ``Пульс_3лица``; the leading ``#`` is only the
 human-readable notation used in the project.
@@ -18,7 +18,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 
 script_dir = Path(__file__).resolve().parent
 parent_dir = script_dir.parent
@@ -35,7 +35,7 @@ from export_jira_stories_without_description import (  # noqa: E402
 )
 
 PROJECT_KEY = "SBRPPL"
-ISSUE_TYPE = "Story"
+ISSUE_TYPES = ("Story", "Task", "Bug")
 LABEL = "Пульс_3лица"
 PAGE_SIZE = 100
 
@@ -43,7 +43,7 @@ PAGE_SIZE = 100
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Добавляет лейбл #Пульс_3лица всем Story проекта SBRPPL, "
+            "Добавляет лейбл #Пульс_3лица всем Story, Task и Bug проекта SBRPPL, "
             "у которых его ещё нет."
         )
     )
@@ -56,7 +56,7 @@ def parse_args() -> argparse.Namespace:
         "--max-issues",
         type=int,
         default=0,
-        help="Ограничить число найденных Story; 0 означает без ограничения.",
+        help="Ограничить число найденных задач; 0 означает без ограничения.",
     )
     parser.add_argument(
         "--auth-mode",
@@ -67,12 +67,18 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_jql(project_key: str = PROJECT_KEY, issue_type: str = ISSUE_TYPE) -> str:
-    """Build JQL for every Story in the target project."""
+def build_jql(
+    project_key: str = PROJECT_KEY,
+    issue_types: Sequence[str] = ISSUE_TYPES,
+) -> str:
+    """Build JQL for all selected issue types in the target project."""
 
+    if not issue_types:
+        raise ValueError("Список типов задач пустой.")
+    issue_types_jql = ", ".join(jql_value(issue_type) for issue_type in issue_types)
     return (
         f"project = {jql_value(project_key)} "
-        f"AND issuetype = {jql_value(issue_type)} "
+        f"AND issuetype in ({issue_types_jql}) "
         "ORDER BY key ASC"
     )
 
@@ -137,13 +143,13 @@ def request_search_page(
     return data
 
 
-def iter_stories(
+def iter_issues(
     settings: JiraSettings,
     *,
     max_issues: int = 0,
     page_size: int = PAGE_SIZE,
 ) -> Iterator[dict[str, Any]]:
-    """Yield every Story in SBRPPL, following Jira pagination."""
+    """Yield every selected SBRPPL issue, following Jira pagination."""
 
     if max_issues < 0:
         raise ValueError("--max-issues не может быть отрицательным.")
@@ -217,11 +223,11 @@ def main() -> int:
     args = parse_args()
     try:
         settings = load_jira_settings(auth_mode_arg=args.auth_mode)
-        stories = list(iter_stories(settings, max_issues=args.max_issues))
-        missing = [issue for issue in stories if not issue_has_label(issue)]
+        issues = list(iter_issues(settings, max_issues=args.max_issues))
+        missing = [issue for issue in issues if not issue_has_label(issue)]
 
-        print(f"Найдено Story в {PROJECT_KEY}: {len(stories)}")
-        print(f"Уже с лейблом #{LABEL}: {len(stories) - len(missing)}")
+        print(f"Найдено Story/Task/Bug в {PROJECT_KEY}: {len(issues)}")
+        print(f"Уже с лейблом #{LABEL}: {len(issues) - len(missing)}")
         print(f"Нужно обновить: {len(missing)}")
 
         if not args.apply:
@@ -242,7 +248,7 @@ def main() -> int:
         print(f"Ошибка: {exc}", file=sys.stderr)
         return 1
 
-    print(f"Готово. Обновлено Story: {updated}")
+    print(f"Готово. Обновлено задач: {updated}")
     return 0
 
 
