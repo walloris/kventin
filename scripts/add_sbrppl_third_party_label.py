@@ -5,9 +5,7 @@ human-readable notation used in the project.
 
 Usage:
     python scripts/add_sbrppl_third_party_label.py
-    python scripts/add_sbrppl_third_party_label.py --apply
 
-The first command is a dry run. Pass ``--apply`` to update Jira.
 Connection settings are loaded exactly like in
 ``export_jira_stories_without_description.py``: first from environment/.env,
 then from the repository's legacy ``config.py``.
@@ -46,11 +44,6 @@ def parse_args() -> argparse.Namespace:
             "Добавляет лейбл #Пульс_3лица всем Story, Task и Bug проекта SBRPPL, "
             "у которых его ещё нет."
         )
-    )
-    parser.add_argument(
-        "--apply",
-        action="store_true",
-        help="Внести изменения в Jira. Без флага выполняется только dry-run.",
     )
     parser.add_argument(
         "--max-issues",
@@ -129,7 +122,7 @@ def request_search_page(
             "jql": jql,
             "startAt": start_at,
             "maxResults": max_results,
-            "fields": ["summary", "labels"],
+            "fields": ["labels"],
         },
     )
     if response.status_code != 200:
@@ -212,13 +205,6 @@ def add_label(settings: JiraSettings, issue_key: str, label: str = LABEL) -> Non
         )
 
 
-def issue_summary(issue: dict[str, Any]) -> str:
-    fields = issue.get("fields")
-    if not isinstance(fields, dict):
-        return ""
-    return str(fields.get("summary") or "").strip()
-
-
 def main() -> int:
     args = parse_args()
     try:
@@ -229,12 +215,6 @@ def main() -> int:
         print(f"Найдено Story/Task/Bug в {PROJECT_KEY}: {len(issues)}")
         print(f"Уже с лейблом #{LABEL}: {len(issues) - len(missing)}")
         print(f"Нужно обновить: {len(missing)}")
-
-        if not args.apply:
-            for issue in missing:
-                print(f"[dry-run] {issue.get('key', '?')}: {issue_summary(issue)}")
-            print("Изменения не внесены. Для применения запустите с флагом --apply.")
-            return 0
 
         updated = 0
         for issue in missing:
