@@ -76,6 +76,7 @@ DEFAULT_HOTFIX_VALUES = ("Hotfix",)
 DEFAULT_INSTALLED_RELEASE_STATUSES = (
     "Установлен на ПРОМ",
 )
+EXCLUDED_METRIC_KE_IDS = frozenset((9362600, 9535069))
 RELEASE_KE_IDS = tuple(
     dict.fromkeys(
         (
@@ -113,8 +114,6 @@ RELEASE_KE_IDS = tuple(
             9643401,
             9644023,
             9644025,
-            9362600,
-            9535069,
             8553253,
             9644020,
             10743713,
@@ -133,48 +132,59 @@ TEAM_SETTINGS_JSON = r"""
   {
     "team": "HRP Core UI",
     "project_keys": ["HRM"],
+    "ke_ids": [
+      2298599, 3589425, 3304476, 3303802, 3191860, 2288712, 2257858,
+      2935717, 3521872, 6355438, 5452084, 5452083, 5452082, 5452085
+    ],
     "as_is_ratio": 0.11,
     "target_ratio": 0.12
   },
   {
     "team": "HRP Core Tech",
     "project_keys": ["HRC"],
+    "ke_ids": [7993288, 2435236, 5374387, 2257817, 2644268, 2298078],
     "as_is_ratio": 0.13,
     "target_ratio": 0.13
   },
   {
     "team": "Core UI 2.0 / Neuro UI",
     "project_keys": ["NEUROUI"],
+    "ke_ids": [9643400, 9643401, 9644023, 9644025, 9644020],
     "as_is_ratio": 0.29,
     "target_ratio": 0.24
   },
   {
     "team": "Профиль сотрудника",
     "project_keys": ["SFILE"],
+    "ke_ids": [2295205, 8553253],
     "as_is_ratio": 0.21,
     "target_ratio": 0.24
   },
   {
     "team": "Продуктовая аналитика",
     "project_keys": ["HRPPA"],
+    "ke_ids": [],
     "as_is_ratio": 0.80,
     "target_ratio": 0.10
   },
   {
     "team": "Люди Сбера",
     "project_keys": ["SBRPPL"],
+    "ke_ids": [],
     "as_is_ratio": null,
     "target_ratio": 0.10
   },
   {
     "team": "Задачи и уведомления",
     "project_keys": ["PERFREVIEW"],
+    "ke_ids": [],
     "as_is_ratio": 0.34,
     "target_ratio": 0.33
   },
   {
     "team": "Ассистент HR",
     "project_keys": ["HRPASSIST"],
+    "ke_ids": [5366436, 2503797, 3930742, 2836020, 3173847, 10743713],
     "as_is_ratio": 0.09,
     "target_ratio": 0.09
   }
@@ -291,6 +301,7 @@ def named_value(value: Any) -> str:
 class TeamSpec:
     team: str
     project_keys: tuple[str, ...]
+    ke_ids: tuple[int, ...]
     as_is_ratio: Optional[Decimal]
     target_ratio: Decimal
 
@@ -303,6 +314,13 @@ class TeamSpec:
         project_keys = tuple(
             dict.fromkeys(str(key).strip().upper() for key in projects_raw if str(key).strip())
         )
+        ke_ids_raw = raw.get("ke_ids")
+        if not isinstance(ke_ids_raw, list):
+            raise ValueError(f"{team or 'Команда'}: ke_ids должен быть массивом.")
+        try:
+            ke_ids = tuple(dict.fromkeys(int(value) for value in ke_ids_raw))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{team or 'Команда'}: неверный ke_ids.") from exc
         try:
             target_ratio = Decimal(str(raw.get("target_ratio")))
         except Exception as exc:
@@ -325,6 +343,7 @@ class TeamSpec:
         return cls(
             team=team,
             project_keys=project_keys,
+            ke_ids=ke_ids,
             as_is_ratio=as_is_ratio,
             target_ratio=target_ratio,
         )
@@ -337,6 +356,7 @@ def load_team_specs() -> list[TeamSpec]:
         raise ValueError("Каждый элемент TEAM_SETTINGS должен быть словарём.")
 
     seen_projects: dict[str, str] = {}
+    seen_ke_ids: dict[int, str] = {}
     for spec in specs:
         for project_key in spec.project_keys:
             previous = seen_projects.get(project_key)
@@ -346,6 +366,28 @@ def load_team_specs() -> list[TeamSpec]:
                     f"'{previous}' и '{spec.team}'."
                 )
             seen_projects[project_key] = spec.team
+        for ke_id in spec.ke_ids:
+            if ke_id <= 0:
+                raise ValueError(f"{spec.team}: КЭ должен быть положительным числом.")
+            if ke_id in EXCLUDED_METRIC_KE_IDS:
+                raise ValueError(f"{spec.team}: КЭ {ke_id} исключён из метрики.")
+            previous = seen_ke_ids.get(ke_id)
+            if previous:
+                raise ValueError(
+                    f"КЭ {ke_id} одновременно назначен командам "
+                    f"'{previous}' и '{spec.team}'."
+                )
+            seen_ke_ids[ke_id] = spec.team
+    configured_ke_ids = set(seen_ke_ids)
+    release_ke_ids = set(RELEASE_KE_IDS)
+    if configured_ke_ids != release_ke_ids:
+        missing = sorted(configured_ke_ids - release_ke_ids)
+        unassigned = sorted(release_ke_ids - configured_ke_ids)
+        raise ValueError(
+            "Список КЭ релизов не совпадает с распределением по командам: "
+            f"нет в RELEASE_KE_IDS={missing or '—'}; "
+            f"не назначены команде={unassigned or '—'}."
+        )
     return specs
 
 
