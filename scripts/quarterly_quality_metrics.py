@@ -123,35 +123,59 @@ RELEASE_KE_IDS = tuple(
 )
 
 RETRYABLE_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504}
+AS_IS_FLOOR_MULTIPLIER = Decimal("0.8")
 
+# target_ratio — уже рассчитанный коэффициент A × AS IS + B из целевой
+# таблицы. Итоговый коэффициент дополнительно ограничивается снизу значением
+# as_is_ratio × AS_IS_FLOOR_MULTIPLIER.
 TEAM_SETTINGS_JSON = r"""
 [
-  {"team": "HRP Core UI", "project_keys": ["HRM"], "target_ratio": 0.12},
-  {"team": "HRP Core Tech", "project_keys": ["HRC"], "target_ratio": 0.13},
+  {
+    "team": "HRP Core UI",
+    "project_keys": ["HRM"],
+    "as_is_ratio": 0.11,
+    "target_ratio": 0.12
+  },
+  {
+    "team": "HRP Core Tech",
+    "project_keys": ["HRC"],
+    "as_is_ratio": 0.13,
+    "target_ratio": 0.13
+  },
   {
     "team": "Core UI 2.0 / Neuro UI",
     "project_keys": ["NEUROUI"],
+    "as_is_ratio": 0.29,
     "target_ratio": 0.24
   },
   {
     "team": "Профиль сотрудника",
     "project_keys": ["SFILE"],
+    "as_is_ratio": 0.21,
     "target_ratio": 0.24
   },
   {
     "team": "Продуктовая аналитика",
     "project_keys": ["HRPPA"],
+    "as_is_ratio": 0.80,
     "target_ratio": 0.10
   },
-  {"team": "Люди Сбера", "project_keys": ["SBRPPL"], "target_ratio": 0.10},
+  {
+    "team": "Люди Сбера",
+    "project_keys": ["SBRPPL"],
+    "as_is_ratio": null,
+    "target_ratio": 0.10
+  },
   {
     "team": "Задачи и уведомления",
     "project_keys": ["PERFREVIEW"],
+    "as_is_ratio": 0.34,
     "target_ratio": 0.33
   },
   {
     "team": "Ассистент HR",
     "project_keys": ["HRPASSIST"],
+    "as_is_ratio": 0.09,
     "target_ratio": 0.09
   }
 ]
@@ -267,6 +291,7 @@ def named_value(value: Any) -> str:
 class TeamSpec:
     team: str
     project_keys: tuple[str, ...]
+    as_is_ratio: Optional[Decimal]
     target_ratio: Decimal
 
     @classmethod
@@ -282,13 +307,27 @@ class TeamSpec:
             target_ratio = Decimal(str(raw.get("target_ratio")))
         except Exception as exc:
             raise ValueError(f"{team or 'Команда'}: неверный target_ratio.") from exc
+        as_is_raw = raw.get("as_is_ratio")
+        try:
+            as_is_ratio = (
+                None if as_is_raw in (None, "") else Decimal(str(as_is_raw))
+            )
+        except Exception as exc:
+            raise ValueError(f"{team or 'Команда'}: неверный as_is_ratio.") from exc
         if not team:
             raise ValueError("У команды не задано имя.")
         if not project_keys:
             raise ValueError(f"{team}: не задан ни один Jira project key.")
         if target_ratio <= 0 or target_ratio >= 1:
             raise ValueError(f"{team}: target_ratio должен быть больше 0 и меньше 1.")
-        return cls(team=team, project_keys=project_keys, target_ratio=target_ratio)
+        if as_is_ratio is not None and as_is_ratio < 0:
+            raise ValueError(f"{team}: as_is_ratio не может быть отрицательным.")
+        return cls(
+            team=team,
+            project_keys=project_keys,
+            as_is_ratio=as_is_ratio,
+            target_ratio=target_ratio,
+        )
 
 
 def load_team_specs() -> list[TeamSpec]:
@@ -347,6 +386,9 @@ class TeamCounts:
 class TeamMetric:
     team: str
     project_keys: tuple[str, ...]
+    as_is_ratio: Optional[Decimal]
+    calculated_target_ratio: Decimal
+    minimum_target_ratio: Optional[Decimal]
     target_ratio: Decimal
     stories: int
     bugs: int
@@ -361,8 +403,19 @@ class TeamMetric:
     story_keys: tuple[str, ...]
     bug_keys: tuple[str, ...]
 
+
 def calculate_metric(spec: TeamSpec, counts: TeamCounts) -> TeamMetric:
-    target = spec.target_ratio
+    calculated_target = spec.target_ratio
+    minimum_target = (
+        spec.as_is_ratio * AS_IS_FLOOR_MULTIPLIER
+        if spec.as_is_ratio is not None
+        else None
+    )
+    target = (
+        max(calculated_target, minimum_target)
+        if minimum_target is not None
+        else calculated_target
+    )
     stories = counts.stories
     bugs = counts.bugs
 
@@ -411,6 +464,9 @@ def calculate_metric(spec: TeamSpec, counts: TeamCounts) -> TeamMetric:
     return TeamMetric(
         team=spec.team,
         project_keys=spec.project_keys,
+        as_is_ratio=spec.as_is_ratio,
+        calculated_target_ratio=calculated_target,
+        minimum_target_ratio=minimum_target,
         target_ratio=target,
         stories=stories,
         bugs=bugs,
@@ -1434,6 +1490,25 @@ def target_text(value: Decimal) -> str:
     return f"{decimal_text(value, 2)} ({decimal_text(value * 100, 0)}%)"
 
 
+def target_formula_text(metric: TeamMetric) -> str:
+    if metric.as_is_ratio is None or metric.minimum_target_ratio is None:
+        return (
+            f"AS IS — · расчёт {decimal_text(metric.calculated_target_ratio, 3)}"
+        )
+    return (
+        f"AS IS {decimal_text(metric.as_is_ratio, 3)} · "
+        f"расчёт {decimal_text(metric.calculated_target_ratio, 3)} · "
+        f"80% AS IS {decimal_text(metric.minimum_target_ratio, 3)}"
+    )
+
+
+def as_is_floor_applied(metric: TeamMetric) -> bool:
+    return (
+        metric.minimum_target_ratio is not None
+        and metric.calculated_target_ratio < metric.minimum_target_ratio
+    )
+
+
 def attainment_text(metric: TeamMetric) -> str:
     if metric.infinite_attainment:
         return "∞"
@@ -1446,6 +1521,8 @@ def render_console(metrics: Sequence[TeamMetric]) -> str:
     headers = (
         "Команда",
         "Jira",
+        "AS IS",
+        "A×AS IS+B",
         "Цель",
         "Story",
         "Баги",
@@ -1460,6 +1537,12 @@ def render_console(metrics: Sequence[TeamMetric]) -> str:
         (
             metric.team,
             ",".join(metric.project_keys),
+            (
+                decimal_text(metric.as_is_ratio, 2)
+                if metric.as_is_ratio is not None
+                else "—"
+            ),
+            decimal_text(metric.calculated_target_ratio, 2),
             decimal_text(metric.target_ratio, 2),
             str(metric.stories),
             str(metric.bugs),
@@ -1578,7 +1661,8 @@ def render_metric_section_html(
         'border-radius:6px;color:#403294;margin-bottom:15px;padding:10px 13px;">',
         f'<strong>Цель выполняют {teams_on_target} из {len(metrics)} команд.</strong> '
         "Факт = баги / Story и округляется до сотых; выполнение = целевой "
-        "коэффициент / факт × 100%. При нуле багов выполнение равно 100%. "
+        "коэффициент / факт × 100%. Эффективная цель = максимум из "
+        "расчёта A × AS IS + B и 80% от AS IS. При нуле багов выполнение равно 100%. "
         "Чем выше процент выполнения, тем лучше.",
         "</div>",
         '<table class="confluenceTable" style="border-collapse:collapse;'
@@ -1623,9 +1707,15 @@ def render_metric_section_html(
             'border-radius:10px;color:#0747A6;font-weight:bold;padding:3px 7px;">'
             f'{html.escape(", ".join(metric.project_keys))}</span></td>'
         )
+        target_background = "#FFF0B3" if as_is_floor_applied(metric) else "#EAE6FF"
+        target_color = "#974F0C" if as_is_floor_applied(metric) else "#403294"
+        floor_note = " · применён минимум" if as_is_floor_applied(metric) else ""
         parts.append(
-            f'<td style="{base_cell}background-color:#EAE6FF;color:#403294;'
-            f'font-weight:bold;">{html.escape(target_text(metric.target_ratio))}</td>'
+            f'<td style="{base_cell}background-color:{target_background};'
+            f'color:{target_color};font-weight:bold;">'
+            f'<div>{html.escape(target_text(metric.target_ratio))}</div>'
+            f'<div style="font-size:10px;font-weight:normal;margin-top:3px;">'
+            f'{html.escape(target_formula_text(metric) + floor_note)}</div></td>'
         )
         parts.append(
             f'<td style="{base_cell}color:#006644;font-size:16px;'
@@ -1721,7 +1811,9 @@ def render_confluence_html(
         "В баги входят только Closed/Закрыт с приоритетом "
         "Critical/Crytical, Blocker, Высокий или Блокирующий "
         "и этапом обнаружения PSI/ПСИ или PROM/ПРОМ. "
-        "«Ещё ПРОМ-багов» — целый запас до коэффициента; «Story до цели» — "
+        "Эффективная цель = max(A × AS IS + B; AS IS × 0,8). "
+        "Лимит дефектов = floor(эффективная цель × Story). "
+        "«Ещё ПРОМ-багов» — целый запас до этого лимита; «Story до цели» — "
         "минимальное число дополнительных Story для возвращения к 100%.",
         f"<br/>Обновлено автоматически: "
         f"{html.escape(generated_at.isoformat(timespec='seconds'))}.",
