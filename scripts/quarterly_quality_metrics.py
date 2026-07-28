@@ -53,7 +53,7 @@ DEFAULT_RELEASE_ISSUE_TYPE = "Release 2.0"
 DEFAULT_RELEASE_CREATED_SINCE = "2025-09-01"
 DEFAULT_RELEASE_KE_FIELD_NAME = "КЭ"
 DEFAULT_RELEASE_DATE_FIELD_NAME = "Дата установки на ПРОМ"
-DEFAULT_RELEASE_DATE_FIELD_ID = ""
+DEFAULT_RELEASE_DATE_FIELD_ID = "customfield_19400"
 DEFAULT_RELEASE_TYPE_FIELD_ID = "customfield_23500"
 DEFAULT_DETECTION_STAGE_FIELD_ID = "customfield_11507"
 DEFAULT_CONFLUENCE_PAGE_ID = "24517214638"
@@ -887,29 +887,107 @@ def find_jira_field_id(
     requested_name: str,
     candidates: Sequence[str],
 ) -> str:
-    if explicit_id.strip():
-        return explicit_id.strip()
+    explicit_id = explicit_id.strip()
     wanted = normalized_set((requested_name, *candidates))
     fields = jira.fields()
-    for item in fields:
-        if normalized(item.get("name")) in wanted:
-            field_id = str(item.get("id") or "").strip()
-            if field_id:
-                return field_id
+
+    explicit_field = next(
+        (
+            item
+            for item in fields
+            if str(item.get("id") or "").strip() == explicit_id
+        ),
+        None,
+    )
+
+    default_field = next(
+        (
+            item
+            for item in fields
+            if str(item.get("id") or "").strip() == DEFAULT_RELEASE_DATE_FIELD_ID
+            and normalized(item.get("name")) in wanted
+        ),
+        None,
+    )
+    if default_field is not None:
+        if explicit_id and explicit_id != DEFAULT_RELEASE_DATE_FIELD_ID:
+            configured_name = (
+                str(explicit_field.get("name") or "").strip()
+                if explicit_field is not None
+                else "поле с таким ID не найдено"
+            )
+            execution_log(
+                f"Jira: настроенный ID даты {explicit_id} указывает на "
+                f"«{configured_name}»; использую проверенный "
+                f"{DEFAULT_RELEASE_DATE_FIELD_ID} "
+                f"«{default_field.get('name')}»",
+                error=True,
+            )
+        return DEFAULT_RELEASE_DATE_FIELD_ID
+
+    if explicit_field is not None:
+        explicit_name = str(explicit_field.get("name") or "").strip()
+        if normalized(explicit_name) in wanted:
+            return explicit_id
+
+    exact = [
+        item
+        for item in fields
+        if normalized(item.get("name")) in wanted
+        and str(item.get("id") or "").strip()
+    ]
+    if len(exact) == 1:
+        resolved_id = str(exact[0].get("id") or "").strip()
+        if explicit_id and resolved_id != explicit_id:
+            configured_name = (
+                str(explicit_field.get("name") or "").strip()
+                if explicit_field is not None
+                else "поле с таким ID не найдено"
+            )
+            execution_log(
+                f"Jira: настроенный ID даты {explicit_id} указывает на "
+                f"«{configured_name}»; использую {resolved_id} "
+                f"«{exact[0].get('name')}»",
+                error=True,
+            )
+        return resolved_id
+    if len(exact) > 1:
+        available = ", ".join(
+            f"{item.get('name')} ({item.get('id')})" for item in exact
+        )
+        raise RuntimeError(
+            f"Для Jira-поля '{requested_name}' найдено несколько точных "
+            f"совпадений: {available}. Укажите правильный id в "
+            "config['jira']['fields']['prod_installed_date_id']."
+        )
+
     partial = [
         item
         for item in fields
         if any(candidate in normalized(item.get("name")) for candidate in wanted)
     ]
     if len(partial) == 1:
-        return str(partial[0].get("id") or "").strip()
+        resolved_id = str(partial[0].get("id") or "").strip()
+        if resolved_id:
+            return resolved_id
     available = ", ".join(
-        sorted(str(item.get("name")) for item in partial if item.get("name"))
+        sorted(
+            f"{item.get('name')} ({item.get('id')})"
+            for item in partial
+            if item.get("name")
+        )
     )
     suffix = f" Похожие поля: {available}." if available else ""
+    explicit_suffix = (
+        f" Настроенный ID {explicit_id} не соответствует этому имени."
+        if explicit_id
+        else ""
+    )
     raise RuntimeError(
         f"Не найдено Jira-поле '{requested_name}'. "
-        "Укажите его id в константе DEFAULT_RELEASE_DATE_FIELD_ID внутри скрипта."
+        "Укажите его id в config['jira']['fields']['prod_installed_date_id'] "
+        "или DEFAULT_RELEASE_DATE_FIELD_ID внутри скрипта."
+        + explicit_suffix
         + suffix
     )
 
@@ -1055,9 +1133,22 @@ def collect_released_issues(
         f"({elapsed_seconds(release_search_started)})"
     )
 
-    range_releases = [
+    releases_with_install_date = [
         release
         for release in release_candidates
+        if parse_jira_date(issue_field(release, release_date_field_id)) is not None
+    ]
+    if release_candidates and not releases_with_install_date:
+        raise RuntimeError(
+            f"Jira вернула {len(release_candidates)} кандидатов релизов, "
+            f"но поле даты {release_date_field_id} пусто у всех. "
+            "Проверьте config['jira']['fields']['prod_installed_date_id']; "
+            f"для текущей Jira ожидается {DEFAULT_RELEASE_DATE_FIELD_ID}."
+        )
+
+    range_releases = [
+        release
+        for release in releases_with_install_date
         if (
             (installed := parse_jira_date(issue_field(release, release_date_field_id)))
             is not None
@@ -1074,13 +1165,9 @@ def collect_released_issues(
         f"в статусе «Установлен на ПРОМ»={len(releases)}"
     )
     if verbose:
-        with_install_date = sum(
-            parse_jira_date(issue_field(release, release_date_field_id)) is not None
-            for release in release_candidates
-        )
         print(
             f"Jira вернула релизов: {len(release_candidates)}; "
-            f"с датой установки: {with_install_date}; "
+            f"с датой установки: {len(releases_with_install_date)}; "
             f"в объединённом диапазоне: {len(range_releases)}; "
             f"в статусе «Установлен на ПРОМ»: {len(releases)}"
         )
