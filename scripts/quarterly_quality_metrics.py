@@ -1174,10 +1174,9 @@ def build_created_bugs_jql(
         )
     )
     project_values = ", ".join(jql_value(value) for value in projects)
-    bug_type_values = ", ".join(jql_value(value) for value in DEFAULT_BUG_TYPES)
     return (
         f"project in ({project_values}) "
-        f"AND issuetype in ({bug_type_values}) "
+        "AND issuetype = Bug "
         f'AND created >= "{start.isoformat()}" '
         f'AND created < "{end.isoformat()}"'
     )
