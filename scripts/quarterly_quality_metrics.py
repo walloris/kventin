@@ -52,7 +52,10 @@ DEFAULT_RELEASE_PROJECT = "HRPRELEASE"
 DEFAULT_RELEASE_ISSUE_TYPE = "Release 2.0"
 DEFAULT_RELEASE_CREATED_SINCE = "2025-09-01"
 DEFAULT_RELEASE_KE_FIELD_NAME = "КЭ"
-DEFAULT_RELEASE_DATE_FIELD_NAME = "Дата установки на ПРОМ"
+# Фактическое имя customfield_19400 в Jira. Несмотря на суффикс «(план)»,
+# именно это поле отображается в карточке Release 2.0 и содержит дату,
+# по которой dpm2 относит установленный релиз к отчётному периоду.
+DEFAULT_RELEASE_DATE_FIELD_NAME = "Дата завершения установки в ПРОМ (план)"
 DEFAULT_RELEASE_DATE_FIELD_ID = "customfield_19400"
 DEFAULT_RELEASE_TYPE_FIELD_ID = "customfield_23500"
 DEFAULT_DETECTION_STAGE_FIELD_ID = "customfield_11507"
