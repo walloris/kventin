@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""90-day and quarterly released Story/Bug quality metrics for Jira/Confluence.
+"""90-day and quarterly Story/Bug quality metrics for Jira/Confluence.
 
-The script finds Release 2.0 issues installed to production, collects Story/Bug
-issues included in those releases, calculates independent rolling-90-day and
-quarter-to-date ratios for each team, and publishes both Confluence tables.
+The script finds Story issues from Release 2.0 tickets installed to production,
+collects bugs created in each team's Jira projects, restores their original
+detection stage from changelog, calculates independent rolling-90-day and
+quarter ratios, and publishes both Confluence tables.
 
 Run locally without publishing:
     python scripts/quarterly_quality_metrics.py --no-publish
@@ -59,6 +60,7 @@ DEFAULT_RELEASE_DATE_FIELD_NAME = "Дата завершения установ�
 DEFAULT_RELEASE_DATE_FIELD_ID = "customfield_19400"
 DEFAULT_RELEASE_TYPE_FIELD_ID = "customfield_23500"
 DEFAULT_DETECTION_STAGE_FIELD_ID = "customfield_11507"
+METRIC_CURRENT_DETECTION_STAGE_FIELD = "_metric_current_detection_stage"
 DEFAULT_CONFLUENCE_PAGE_ID = "24517214638"
 
 DEFAULT_STORY_TYPES = ("Story",)
@@ -473,7 +475,9 @@ def calculate_metric(spec: TeamSpec, counts: TeamCounts) -> TeamMetric:
     else:
         actual_ratio = None
 
-    if stories == 0 and bugs == 0:
+    if stories == 0:
+        # Business rule: absence of released Story means the metric is met,
+        # even if bugs were created in the team's Jira space in the period.
         attainment = Decimal(100)
         infinite_attainment = False
         state = "Цель выполнена"
@@ -481,10 +485,6 @@ def calculate_metric(spec: TeamSpec, counts: TeamCounts) -> TeamMetric:
         attainment = Decimal(100)
         infinite_attainment = False
         state = "Цель выполнена"
-    elif stories == 0:
-        attainment = Decimal(0)
-        infinite_attainment = False
-        state = "Ниже цели"
     else:
         attainment = (target / actual_ratio) * Decimal(100) if actual_ratio else None
         infinite_attainment = False
@@ -498,7 +498,9 @@ def calculate_metric(spec: TeamSpec, counts: TeamCounts) -> TeamMetric:
     )
     additional_bugs_allowed = max(0, bug_budget - bugs)
 
-    if bugs > 0:
+    if stories == 0:
+        stories_needed_total = 0
+    elif bugs > 0:
         stories_needed_total = int(
             (Decimal(bugs) / target).to_integral_value(rounding=ROUND_CEILING)
         )
@@ -573,6 +575,62 @@ def classify_eligible_detection_stage(
     if stages & rules.psi_detection_stages:
         return "psi"
     return None
+
+
+def initial_detection_stage_value(
+    issue: Mapping[str, Any],
+    detection_stage_field_id: str,
+) -> Any:
+    """Restore the detection stage that was set when the bug was created."""
+
+    changelog = issue.get("changelog")
+    histories = changelog.get("histories") if isinstance(changelog, Mapping) else None
+    if not isinstance(histories, list):
+        return issue_field(issue, detection_stage_field_id)
+
+    ordered_histories = sorted(
+        (history for history in histories if isinstance(history, Mapping)),
+        key=lambda history: str(history.get("created") or ""),
+    )
+    for history in ordered_histories:
+        items = history.get("items")
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, Mapping):
+                continue
+            field_id = str(item.get("fieldId") or "").strip()
+            field_name = normalized(item.get("field"))
+            if (
+                field_id != detection_stage_field_id
+                and field_name not in {"этап обнаружения", "detection stage"}
+            ):
+                continue
+            # fromString is the value before the very first edit, i.e. the
+            # value with which the bug was originally created.
+            return item.get("fromString") or ""
+
+    return issue_field(issue, detection_stage_field_id)
+
+
+def with_initial_detection_stage(
+    issue: Mapping[str, Any],
+    detection_stage_field_id: str,
+) -> dict[str, Any]:
+    """Copy an issue and replace its metric stage with the original value."""
+
+    result = dict(issue)
+    raw_fields = issue.get("fields")
+    fields = dict(raw_fields) if isinstance(raw_fields, Mapping) else {}
+    fields[METRIC_CURRENT_DETECTION_STAGE_FIELD] = fields.get(
+        detection_stage_field_id
+    )
+    fields[detection_stage_field_id] = initial_detection_stage_value(
+        issue,
+        detection_stage_field_id,
+    )
+    result["fields"] = fields
+    return result
 
 
 def aggregate_issues(
@@ -788,11 +846,20 @@ class JiraClient:
             raise RuntimeError("Jira /field вернул неожиданный ответ.")
         return [item for item in data if isinstance(item, dict)]
 
-    def issue(self, issue_key: str, fields: Sequence[str]) -> dict[str, Any]:
+    def issue(
+        self,
+        issue_key: str,
+        fields: Sequence[str],
+        *,
+        expand: str = "",
+    ) -> dict[str, Any]:
+        params = {"fields": ",".join(dict.fromkeys(fields))}
+        if expand:
+            params["expand"] = expand
         data = self.rest.request_json(
             "GET",
             f"/rest/api/2/issue/{issue_key}",
-            params={"fields": ",".join(dict.fromkeys(fields))},
+            params=params,
         )
         if not isinstance(data, dict):
             raise RuntimeError(f"Jira issue {issue_key} вернул неожиданный ответ.")
@@ -805,6 +872,7 @@ class JiraClient:
         *,
         max_workers: int = JIRA_LINK_WORKERS,
         progress_label: str = "",
+        expand: str = "",
     ) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
         keys = sorted(
             {
@@ -834,7 +902,7 @@ class JiraClient:
                     time.sleep(pacing_delay)
                 previous_request_started = time.perf_counter()
                 try:
-                    result[key] = self.issue(key, fields)
+                    result[key] = self.issue(key, fields, expand=expand)
                 except Exception as exc:
                     errors[key] = str(exc)
                 if progress_label and (index % 10 == 0 or index == len(keys)):
@@ -851,7 +919,7 @@ class JiraClient:
             if worker_client is None:
                 worker_client = JiraClient(self.settings)
                 worker_state.jira_client = worker_client
-            return key, worker_client.issue(key, fields)
+            return key, worker_client.issue(key, fields, expand=expand)
 
         result = {}
         errors = {}
@@ -924,6 +992,44 @@ class JiraClient:
                     f"всего загружено={len(result)} ({elapsed_seconds(batch_started)})"
                 )
         return result
+
+    def changelog(
+        self,
+        issue_key: str,
+        *,
+        page_size: int = 100,
+    ) -> dict[str, Any]:
+        """Load a complete Jira changelog, including histories past expand limits."""
+
+        start_at = 0
+        histories: list[dict[str, Any]] = []
+        while True:
+            data = self.rest.request_json(
+                "GET",
+                f"/rest/api/2/issue/{issue_key}/changelog",
+                params={"startAt": start_at, "maxResults": page_size},
+            )
+            if not isinstance(data, Mapping):
+                raise RuntimeError(
+                    f"Jira changelog {issue_key} вернул неожиданный ответ."
+                )
+            page = data.get("values")
+            if not isinstance(page, list):
+                page = data.get("histories")
+            if not isinstance(page, list):
+                raise RuntimeError(
+                    f"Jira changelog {issue_key}: нет массива histories/values."
+                )
+            histories.extend(item for item in page if isinstance(item, dict))
+            start_at += len(page)
+            total = int(data.get("total") or len(histories))
+            if not page or start_at >= total:
+                return {
+                    "startAt": 0,
+                    "maxResults": len(histories),
+                    "total": total,
+                    "histories": histories,
+                }
 
 
 def find_jira_field_id(
@@ -1052,6 +1158,129 @@ def build_release_jql(
         f"AND type = {jql_value(issue_type)} "
         f'AND created >= "{created_since}"'
     )
+
+
+def build_created_bugs_jql(
+    team_specs: Sequence[TeamSpec],
+    *,
+    start: date,
+    end: date,
+) -> str:
+    projects = tuple(
+        dict.fromkeys(
+            project_key
+            for spec in team_specs
+            for project_key in spec.project_keys
+        )
+    )
+    project_values = ", ".join(jql_value(value) for value in projects)
+    bug_type_values = ", ".join(jql_value(value) for value in DEFAULT_BUG_TYPES)
+    return (
+        f"project in ({project_values}) "
+        f"AND issuetype in ({bug_type_values}) "
+        f'AND created >= "{start.isoformat()}" '
+        f'AND created < "{end.isoformat()}"'
+    )
+
+
+def collect_created_bugs(
+    jira: JiraClient,
+    team_specs: Sequence[TeamSpec],
+    rules: MetricRules,
+    *,
+    start: date,
+    end: date,
+    detection_stage_field_id: str,
+    verbose: bool = False,
+) -> tuple[list[dict[str, Any]], str]:
+    """Collect bugs created in team projects and restore their original stage."""
+
+    started = time.perf_counter()
+    jql = build_created_bugs_jql(team_specs, start=start, end=end)
+    fields = (
+        "project",
+        "issuetype",
+        "status",
+        "priority",
+        "created",
+        detection_stage_field_id,
+    )
+    execution_log(
+        "Jira: ищу заведённые баги в пространствах команд "
+        f"за {start.isoformat()} — {(end - timedelta(days=1)).isoformat()}"
+    )
+    if verbose:
+        print(f"JQL заведённых багов: {jql}")
+    candidates = jira.search(jql, fields, page_size=1000)
+
+    # Changelog is only needed for bugs that pass the inexpensive current
+    # status/priority checks. This keeps the number of individual Jira calls low.
+    history_keys: list[str] = []
+    for issue in candidates:
+        issue_type = normalized(named_value(issue_field(issue, "issuetype")))
+        status = normalized(named_value(issue_field(issue, "status")))
+        priority = normalized(named_value(issue_field(issue, "priority")))
+        key = str(issue.get("key") or "").strip().upper()
+        if (
+            key
+            and issue_type in rules.bug_types
+            and status in rules.bug_statuses
+            and priority in rules.bug_priorities
+        ):
+            history_keys.append(key)
+
+    execution_log(
+        f"Jira: заведённых Bug/Defect найдено={len(candidates)}; "
+        f"Closed High+ для проверки истории этапа={len(history_keys)}"
+    )
+    detailed, errors = jira.issues_individually(
+        history_keys,
+        fields,
+        max_workers=JIRA_LINK_WORKERS,
+        progress_label="Jira: changelog багов",
+        expand="changelog",
+    )
+    if errors or len(detailed) != len(set(history_keys)):
+        missing = sorted(set(history_keys) - set(detailed))
+        details = "; ".join(
+            f"{key}: {errors.get(key, 'пустой ответ Jira')}"
+            for key in missing[:5]
+        )
+        raise RuntimeError(
+            "Jira не вернула changelog всех Closed High+ багов; "
+            f"публикация остановлена. {details}"
+        )
+
+    for key, issue in detailed.items():
+        changelog = issue.get("changelog")
+        if not isinstance(changelog, Mapping):
+            raise RuntimeError(
+                f"Jira issue {key}: expand=changelog не вернул changelog."
+            )
+        histories = changelog.get("histories")
+        if not isinstance(histories, list):
+            raise RuntimeError(
+                f"Jira issue {key}: changelog.histories не является массивом."
+            )
+        total = int(changelog.get("total") or len(histories))
+        if total > len(histories):
+            issue["changelog"] = jira.changelog(key)
+
+    detailed_with_initial_stage = {
+        key: with_initial_detection_stage(issue, detection_stage_field_id)
+        for key, issue in detailed.items()
+    }
+    result: list[dict[str, Any]] = []
+    for issue in candidates:
+        key = str(issue.get("key") or "").strip().upper()
+        result.append(detailed_with_initial_stage.get(key, issue))
+
+    execution_log(
+        f"Jira: баги команд загружены={len(result)}, "
+        f"исходный этап восстановлен для={len(detailed_with_initial_stage)} "
+        f"({elapsed_seconds(started)})"
+    )
+    return result, jql
 
 
 def issue_link_type_text(link: Mapping[str, Any]) -> str:
@@ -1482,8 +1711,41 @@ def select_period_data(
     return period_releases, period_issues
 
 
+def released_story_candidates(
+    issues: Sequence[Mapping[str, Any]],
+    rules: MetricRules,
+) -> list[dict[str, Any]]:
+    """Keep only Story candidates from installed-release consist-of contents."""
+
+    return [
+        issue
+        for issue in issues
+        if isinstance(issue, dict)
+        and normalized(named_value(issue_field(issue, "issuetype")))
+        in rules.story_types
+    ]
+
+
+def select_created_issues(
+    issues: Sequence[Mapping[str, Any]],
+    *,
+    start: date,
+    end: date,
+) -> list[dict[str, Any]]:
+    return [
+        issue
+        for issue in issues
+        if isinstance(issue, dict)
+        and (
+            (created := parse_jira_date(issue_field(issue, "created")))
+            is not None
+            and start <= created < end
+        )
+    ]
+
+
 def print_issue_inventory(issues: Sequence[Mapping[str, Any]]) -> None:
-    """Print raw released-issue distribution before metric filters."""
+    """Print raw Story/Bug distribution before metric filters."""
 
     inventory: dict[str, Counter[tuple[str, str]]] = defaultdict(Counter)
     for issue in issues:
@@ -1566,6 +1828,14 @@ def print_filter_audit(
 
         stage_values = named_values(issue_field(issue, detection_stage_field_id))
         stage_name = ", ".join(stage_values) or "Без этапа обнаружения"
+        current_stage_values = named_values(
+            issue_field(issue, METRIC_CURRENT_DETECTION_STAGE_FIELD)
+        )
+        if current_stage_values:
+            current_stage_name = ", ".join(current_stage_values)
+            if normalized(current_stage_name) != normalized(stage_name):
+                audit[team]["bug_stage_changed"] += 1
+                stage_name = f"{stage_name} → сейчас {current_stage_name}"
         if classify_eligible_detection_stage(
             issue_field(issue, detection_stage_field_id),
             rules,
@@ -1581,7 +1851,8 @@ def print_filter_audit(
             f"  {spec.team}: "
             f"Story всего={values['story_total']}, Done={values['story_done']}; "
             f"Bug всего={values['bug_total']}, Closed={values['bug_closed']}, "
-            f"High+={values['bug_high_plus']}, PSI/ПРОМ={values['bug_eligible']}"
+            f"High+={values['bug_high_plus']}, PSI/ПРОМ={values['bug_eligible']}; "
+            f"этап изменён после заведения={values['bug_stage_changed']}"
         )
         details: list[str] = []
         for field_name, label in (
@@ -1614,7 +1885,7 @@ def decimal_text(value: Decimal, places: int = 3) -> str:
 
 def ratio_text(value: Optional[Decimal], bugs: int, stories: int) -> str:
     if value is None:
-        return "∞" if bugs > 0 and stories == 0 else "—"
+        return "—"
     return f"{decimal_text(value, 2)} ({decimal_text(value * 100, 1)}%)"
 
 
@@ -1917,8 +2188,8 @@ def render_confluence_html(
         '<div style="font-size:25px;font-weight:bold;margin-top:5px;">'
         "Качество релизов команд · квартал и 90 дней</div>",
         '<div style="color:#B3D4FF;font-size:13px;margin-top:7px;">'
-        "Два независимых среза Story и критичных PSI/ПРОМ-багов из "
-        "установленных на ПРОМ плановых релизов и Hotfix</div>",
+        "Story из установленных на ПРОМ релизов · критичные PSI/ПРОМ-баги, "
+        "заведённые в Jira-пространствах команд</div>",
         "</div>",
         render_metric_section_html(
             quarter_metrics,
@@ -1940,9 +2211,12 @@ def render_confluence_html(
         ),
         '<div style="background-color:#F4F5F7;border-radius:7px;color:#5E6C84;'
         'font-size:12px;margin-top:14px;padding:11px 13px;">',
-        "В баги входят только Closed/Закрыт с приоритетом "
+        "В баги входят заведённые за отчётный период в Jira-проектах команд "
+        "задачи типа Bug/Defect/Ошибка: только Closed/Закрыт с приоритетом "
         "Critical/Crytical, Blocker, Высокий или Блокирующий "
-        "и этапом обнаружения PSI/ПСИ или PROM/ПРОМ. "
+        "и первоначальным этапом обнаружения PSI/ПСИ или PROM/ПРОМ. "
+        "Первоначальный этап восстанавливается из changelog, поэтому последующее "
+        "изменение ПРОМ на другое значение не исключает баг из метрики. "
         "Эффективная цель = max(A × AS IS + B; AS IS × 0,8). "
         "Лимит дефектов = floor(эффективная цель × Story). "
         "«Ещё ПРОМ-багов» — целый запас до этого лимита; «Story до цели» — "
@@ -2163,7 +2437,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Собирает за последние 90 дней и отдельно за квартал отношение "
-            "закрытых Critical/Blocker/Высокий/Блокирующий PSI/ПРОМ-багов "
+            "заведённых в Jira-проектах команд закрытых High+ PSI/ПРОМ-багов "
             "к зарелизенным Story и публикует таблицы в Confluence."
         )
     )
@@ -2243,7 +2517,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         detection_stage_field_id = DEFAULT_DETECTION_STAGE_FIELD_ID
         release_type_field_id = DEFAULT_RELEASE_TYPE_FIELD_ID
 
-        releases, issues, release_jql, issue_keys_by_release = collect_released_issues(
+        (
+            releases,
+            released_issues,
+            release_jql,
+            issue_keys_by_release,
+        ) = collect_released_issues(
             jira,
             start=collection_start,
             end=collection_end,
@@ -2258,27 +2537,54 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             link_keywords=DEFAULT_RELEASE_LINK_KEYWORDS,
             verbose=args.verbose,
         )
+        created_bugs, bugs_jql = collect_created_bugs(
+            jira,
+            team_specs,
+            rules,
+            start=collection_start,
+            end=collection_end,
+            detection_stage_field_id=detection_stage_field_id,
+            verbose=args.verbose,
+        )
 
-        rolling_releases, rolling_issues = select_period_data(
+        rolling_releases, rolling_release_issues = select_period_data(
             releases,
-            issues,
+            released_issues,
             issue_keys_by_release,
             start=rolling_start,
             end=rolling_end,
             release_date_field_id=release_date_field_id,
         )
-        quarter_releases, quarter_issues = select_period_data(
+        quarter_releases, quarter_release_issues = select_period_data(
             releases,
-            issues,
+            released_issues,
             issue_keys_by_release,
             start=quarter_start,
             end=quarter_end,
             release_date_field_id=release_date_field_id,
         )
+        rolling_stories = released_story_candidates(rolling_release_issues, rules)
+        quarter_stories = released_story_candidates(quarter_release_issues, rules)
+        rolling_bugs = select_created_issues(
+            created_bugs,
+            start=rolling_start,
+            end=rolling_end,
+        )
+        quarter_bugs = select_created_issues(
+            created_bugs,
+            start=quarter_start,
+            end=quarter_end,
+        )
+        rolling_metric_issues = [*rolling_stories, *rolling_bugs]
+        quarter_metric_issues = [*quarter_stories, *quarter_bugs]
         execution_log(
             "Разбиение по периодам завершено: "
-            f"90 дней — релизов={len(rolling_releases)}, задач={len(rolling_issues)}; "
-            f"квартал — релизов={len(quarter_releases)}, задач={len(quarter_issues)}"
+            f"90 дней — релизов={len(rolling_releases)}, "
+            f"Story-кандидатов={len(rolling_stories)}, "
+            f"заведённых багов={len(rolling_bugs)}; "
+            f"квартал — релизов={len(quarter_releases)}, "
+            f"Story-кандидатов={len(quarter_stories)}, "
+            f"заведённых багов={len(quarter_bugs)}"
         )
 
         rolling_hotfix_count = sum(
@@ -2291,18 +2597,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         if args.verbose:
             print("\n=== Последние 90 дней: аудит ===")
-            print_issue_inventory(rolling_issues)
+            print(
+                "Источник: Story из consist of установленных релизов; "
+                "Bug по дате создания в Jira-проектах команд."
+            )
+            print_issue_inventory(rolling_metric_issues)
             print_filter_audit(
                 team_specs,
-                rolling_issues,
+                rolling_metric_issues,
                 rules,
                 detection_stage_field_id,
             )
             print(f"\n=== {quarter_start.year} Q{quarter}: аудит ===")
-            print_issue_inventory(quarter_issues)
+            print(
+                "Источник: Story из consist of установленных релизов; "
+                "Bug по дате создания в Jira-проектах команд."
+            )
+            print_issue_inventory(quarter_metric_issues)
             print_filter_audit(
                 team_specs,
-                quarter_issues,
+                quarter_metric_issues,
                 rules,
                 detection_stage_field_id,
             )
@@ -2311,13 +2625,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         execution_log("Рассчитываю метрики команд и формирую таблицы")
         rolling_counts = aggregate_issues(
             team_specs,
-            rolling_issues,
+            rolling_metric_issues,
             rules,
             detection_stage_field_id,
         )
         quarter_counts = aggregate_issues(
             team_specs,
-            quarter_issues,
+            quarter_metric_issues,
             rules,
             detection_stage_field_id,
         )
@@ -2354,7 +2668,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"Релизов: {len(rolling_releases)} "
             f"(плановых: {len(rolling_releases) - rolling_hotfix_count}, "
             f"Hotfix: {rolling_hotfix_count}); "
-            f"задач consist of до фильтров: {len(rolling_issues)}"
+            f"Story из consist of до фильтра Done: {len(rolling_stories)}; "
+            f"заведённых багов до фильтров: {len(rolling_bugs)}"
         )
         print(render_console(rolling_metrics))
 
@@ -2366,12 +2681,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"Релизов: {len(quarter_releases)} "
             f"(плановых: {len(quarter_releases) - quarter_hotfix_count}, "
             f"Hotfix: {quarter_hotfix_count}); "
-            f"задач consist of до фильтров: {len(quarter_issues)}"
+            f"Story из consist of до фильтра Done: {len(quarter_stories)}; "
+            f"заведённых багов до фильтров: {len(quarter_bugs)}"
         )
         print(render_console(quarter_metrics))
 
         if args.verbose:
             print(f"\nФактический JQL релизов: {release_jql}")
+            print(f"Фактический JQL заведённых багов: {bugs_jql}")
             print("Последние 90 дней:")
             for metric in rolling_metrics:
                 print(
