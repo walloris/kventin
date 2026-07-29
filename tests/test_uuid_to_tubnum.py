@@ -1,5 +1,6 @@
 import csv
 from pathlib import Path
+from urllib.parse import urlencode
 
 import pytest
 
@@ -10,10 +11,14 @@ UUID = "12345678-1234-1234-1234-123456789abc"
 
 
 class FakeResponse:
-    def __init__(self, status_code, payload=None, headers=None):
+    def __init__(
+        self, status_code, payload=None, headers=None, text="", url=""
+    ):
         self.status_code = status_code
         self._payload = payload
         self.headers = headers or {}
+        self.text = text
+        self.url = url
 
     def json(self):
         if isinstance(self._payload, Exception):
@@ -25,14 +30,70 @@ class FakeSession:
     def __init__(self, responses):
         self.responses = list(responses)
         self.calls = []
+        self.closed = False
 
     def get(self, url, **kwargs):
         self.calls.append((url, kwargs))
         return self.responses.pop(0)
 
+    def close(self):
+        self.closed = True
+
+
+class FlowSession(FakeSession):
+    def request(self, method, url, **kwargs):
+        self.calls.append((method, url, kwargs))
+        return self.responses.pop(0)
+
 
 def endpoint() -> exporter.Endpoint:
     return exporter.Endpoint("https://example.test/api", [], "empId")
+
+
+def oidc_url(state="state-1") -> str:
+    query = urlencode(
+        {
+            "client_id": "addressbook",
+            "redirect_uri": (
+                "https://addressbook.sigma.sbrf.ru"
+                "/openid-connect-auth/redirect_uri"
+            ),
+            "response_type": "code",
+            "scope": "openid",
+            "state": state,
+            "nonce": "nonce-1",
+        }
+    )
+    return (
+        "https://idp02.auth.sigma.sbrf.ru"
+        "/auth/realms/sigma/protocol/openid-connect/auth?"
+        f"{query}"
+    )
+
+
+def action_url() -> str:
+    return (
+        "https://idp02.auth.sigma.sbrf.ru"
+        "/auth/realms/sigma/login-actions/authenticate?"
+        "session_code=one&execution=two&client_id=addressbook"
+        "&tab_id=three&client_data=four"
+    )
+
+
+def alt_action_url() -> str:
+    return (
+        "https://alt.idp02.auth.sigma.sbrf.ru"
+        "/auth/realms/sigma/login-actions/authenticate?"
+        "client_id=addressbook&tab_id=three&client_data=four"
+    )
+
+
+def callback_url(state="state-1") -> str:
+    return (
+        "https://addressbook.sigma.sbrf.ru"
+        "/openid-connect-auth/redirect_uri?"
+        f"code=temporary&state={state}&session_state=session"
+    )
 
 
 def test_custom_ca_bundle(tmp_path: Path) -> None:
@@ -63,6 +124,125 @@ def test_ssl_reason_is_safely_classified(monkeypatch) -> None:
         exporter.safe_transport_error(error)
         == "SSLError[CERTIFICATE_VERIFY_FAILED]"
     )
+
+
+def test_reauth_follows_observed_spnego_oidc_flow() -> None:
+    login_form = (
+        "<html><form method='post' "
+        f"action='{action_url().replace('&', '&amp;')}'></form></html>"
+    )
+    session = FlowSession(
+        [
+            FakeResponse(302, headers={"Location": oidc_url()}),
+            FakeResponse(200, text=login_form),
+            FakeResponse(302, headers={"Location": alt_action_url()}),
+            FakeResponse(302, headers={"Location": callback_url()}),
+            FakeResponse(302, headers={"Location": "/"}),
+            FakeResponse(200, text="<html></html>"),
+            FakeResponse(200, {"user": {"authenticated": True}}),
+        ]
+    )
+    negotiate_auth = object()
+
+    exporter.drive_addressbook_reauth(
+        session,
+        negotiate_auth,
+        exporter.DEFAULT_EXPECTED_HOST,
+        timeout=1,
+    )
+
+    assert [call[0] for call in session.calls] == [
+        "GET",
+        "GET",
+        "POST",
+        "GET",
+        "GET",
+        "GET",
+        "GET",
+    ]
+    assert session.calls[1][2]["auth"] is negotiate_auth
+    assert session.calls[2][2]["auth"] is negotiate_auth
+    assert session.calls[3][2]["auth"] is negotiate_auth
+    assert "auth" not in session.calls[4][2]
+    assert "auth" not in session.calls[5][2]
+    assert session.calls[2][2]["data"] == b""
+    assert session.calls[2][2]["headers"] == {
+        "Accept": exporter.NAVIGATION_ACCEPT,
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    assert all(
+        call[2]["headers"]["Accept"] == exporter.NAVIGATION_ACCEPT
+        for call in session.calls[:-1]
+    )
+    assert session.calls[-1][2]["headers"] == {
+        "Accept": exporter.JSON_ACCEPT
+    }
+    assert all(
+        call[2]["allow_redirects"] is False for call in session.calls
+    )
+
+
+def test_reauth_rejects_oidc_state_mismatch() -> None:
+    session = FlowSession(
+        [
+            FakeResponse(302, headers={"Location": oidc_url()}),
+            FakeResponse(
+                302, headers={"Location": callback_url("different-state")}
+            ),
+        ]
+    )
+
+    with pytest.raises(exporter.AuthExpired, match="state"):
+        exporter.drive_addressbook_reauth(
+            session,
+            object(),
+            exporter.DEFAULT_EXPECTED_HOST,
+            timeout=1,
+        )
+    assert len(session.calls) == 2
+
+
+def test_reauth_does_not_convert_307_redirect_to_get() -> None:
+    session = FlowSession(
+        [
+            FakeResponse(302, headers={"Location": oidc_url()}),
+            FakeResponse(307, headers={"Location": callback_url()}),
+        ]
+    )
+
+    with pytest.raises(exporter.AuthExpired, match="HTTP 307"):
+        exporter.drive_addressbook_reauth(
+            session,
+            object(),
+            exporter.DEFAULT_EXPECTED_HOST,
+            timeout=1,
+        )
+    assert len(session.calls) == 2
+
+
+def test_reauth_rejects_redirect_to_untrusted_host() -> None:
+    session = FlowSession(
+        [
+            FakeResponse(
+                302,
+                headers={
+                    "Location": (
+                        "https://untrusted.example/"
+                        "auth/realms/sigma/protocol/openid-connect/auth"
+                    )
+                },
+            )
+        ]
+    )
+
+    with pytest.raises(exporter.AuthExpired, match="разрешённого маршрута"):
+        exporter.drive_addressbook_reauth(
+            session,
+            object(),
+            exporter.DEFAULT_EXPECTED_HOST,
+            timeout=1,
+        )
+    assert len(session.calls) == 1
 
 
 def test_parse_curl_and_protect_cookie_host() -> None:
@@ -183,3 +363,82 @@ def test_resume_rejects_incomplete_main_csv(tmp_path: Path) -> None:
 
     with pytest.raises(exporter.ConfigError):
         exporter.load_processed(output)
+
+
+def test_run_keeps_renewed_session_after_missing_tubnum(
+    tmp_path: Path, monkeypatch
+) -> None:
+    second_uuid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    input_path = tmp_path / "addr.csv"
+    with input_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["name", "uuid"])
+        writer.writerow(["first", UUID])
+        writer.writerow(["second", second_uuid])
+
+    request_path = tmp_path / "request.txt"
+    request_path.write_text(
+        "curl 'https://addressbook.sigma.sbrf.ru/api/home/empInfoFull"
+        "?empId=00000000-0000-0000-0000-000000000000' "
+        "-H 'Accept: application/json' -b 'SESSION=stale'",
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "result.csv"
+    args = exporter.parse_args(
+        [
+            "--input",
+            str(input_path),
+            "--request-rtf",
+            str(request_path),
+            "--output",
+            str(output_path),
+            "--rate",
+            "0",
+            "--retries",
+            "0",
+            "--auto-reauth",
+        ]
+    )
+
+    expired_session = FakeSession([])
+    renewed_session = FakeSession([])
+    fetch_calls = []
+    reauth_calls = []
+
+    monkeypatch.setattr(
+        exporter,
+        "create_session",
+        lambda *args, **kwargs: expired_session,
+    )
+
+    def fake_reauth(*args, **kwargs):
+        reauth_calls.append(True)
+        return renewed_session
+
+    def fake_fetch(session, endpoint, user_uuid, **kwargs):
+        fetch_calls.append((session, user_uuid))
+        if session is expired_session:
+            raise exporter.AuthExpired("expired")
+        if user_uuid == UUID:
+            raise exporter.MissingTubNum("missing")
+        return "77"
+
+    monkeypatch.setattr(
+        exporter, "reauthenticate_addressbook", fake_reauth
+    )
+    monkeypatch.setattr(exporter, "fetch_tubnum", fake_fetch)
+
+    assert exporter.run(args) == 1
+    assert reauth_calls == [True]
+    assert fetch_calls == [
+        (expired_session, UUID),
+        (renewed_session, UUID),
+        (renewed_session, second_uuid),
+    ]
+    assert expired_session.closed
+    assert renewed_session.closed
+
+    with output_path.open("r", encoding="utf-8-sig", newline="") as handle:
+        assert list(csv.DictReader(handle)) == [
+            {"uuid": second_uuid, "tubNum": "77"}
+        ]

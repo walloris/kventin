@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import logging
 import random
 import shlex
 import subprocess
@@ -23,10 +24,11 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from html.parser import HTMLParser
 from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
-from urllib.parse import parse_qsl, urlsplit, urlunsplit
+from urllib.parse import parse_qs, parse_qsl, urljoin, urlsplit, urlunsplit
 from uuid import UUID
 
 try:
@@ -46,8 +48,20 @@ except ImportError:
 
 
 DEFAULT_EXPECTED_HOST = "addressbook.sigma.sbrf.ru"
+DEFAULT_PRIMARY_IDP_HOST = "idp02.auth.sigma.sbrf.ru"
+DEFAULT_ALT_IDP_HOST = "alt.idp02.auth.sigma.sbrf.ru"
+OIDC_AUTH_PATH = "/auth/realms/sigma/protocol/openid-connect/auth"
+OIDC_ACTION_PATH = "/auth/realms/sigma/login-actions/authenticate"
+OIDC_CALLBACK_PATH = "/openid-connect-auth/redirect_uri"
+ADDRESSBOOK_PROBE_PATH = "/api/home/user/getUserData"
+NAVIGATION_ACCEPT = (
+    "text/html,application/xhtml+xml,application/xml;q=0.9,"
+    "image/avif,image/webp,*/*;q=0.8"
+)
+JSON_ACCEPT = "application/json"
 RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+OIDC_REDIRECT_STATUSES = {302, 303}
 AUTH_STATUSES = {401, 403}
 
 
@@ -69,6 +83,26 @@ class MissingTubNum(FetchError):
 
 class AmbiguousTubNum(FetchError):
     pass
+
+
+class _PostFormParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.forms: List[Tuple[str, str]] = []
+
+    def handle_starttag(
+        self, tag: str, attrs: List[Tuple[str, Optional[str]]]
+    ) -> None:
+        if tag.casefold() != "form":
+            return
+        values = {
+            name.casefold(): value or ""
+            for name, value in attrs
+            if name
+        }
+        self.forms.append(
+            (values.get("method", "get").casefold(), values.get("action", ""))
+        )
 
 
 @dataclass(frozen=True)
@@ -132,6 +166,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--ca-bundle",
         type=Path,
         help="PEM-файл с доверенными CA для внутреннего TLS.",
+    )
+    parser.add_argument(
+        "--auto-reauth",
+        action="store_true",
+        help=(
+            "При потере cookie-сессии один раз пройти OIDC через текущий "
+            "Kerberos/SPNEGO-билет и повторить UUID."
+        ),
     )
     parser.add_argument(
         "--rate",
@@ -380,6 +422,325 @@ def create_session(
     for name, value in curl_request.cookies.items():
         session.cookies.set(name, value, domain=expected_host, path="/")
     return session
+
+
+def _https_url(host: str, path: str = "/") -> str:
+    return urlunsplit(("https", host, path, "", ""))
+
+
+def _secure_url_parts(url: str) -> Any:
+    split = urlsplit(url)
+    try:
+        port = split.port
+    except ValueError as exc:
+        raise AuthExpired("повторный вход: некорректный redirect") from exc
+    if (
+        split.scheme.casefold() != "https"
+        or not split.hostname
+        or port not in {None, 443}
+        or split.username is not None
+        or split.password is not None
+        or split.fragment
+    ):
+        raise AuthExpired("повторный вход: небезопасный redirect")
+    return split
+
+
+def _classify_reauth_url(url: str, expected_host: str) -> str:
+    split = _secure_url_parts(url)
+    host = split.hostname.casefold()
+    path = split.path or "/"
+    expected_host = expected_host.casefold()
+
+    if host == expected_host and path == "/" and not split.query:
+        return "root"
+    if host == expected_host and path == OIDC_CALLBACK_PATH:
+        return "callback"
+    if host == DEFAULT_PRIMARY_IDP_HOST and path == OIDC_AUTH_PATH:
+        return "primary_auth"
+    if host == DEFAULT_PRIMARY_IDP_HOST and path == OIDC_ACTION_PATH:
+        return "primary_action"
+    if host == DEFAULT_ALT_IDP_HOST and path == OIDC_ACTION_PATH:
+        return "alt_action"
+    raise AuthExpired("повторный вход: redirect вне разрешённого маршрута")
+
+
+def _single_query_value(url: str, name: str) -> str:
+    values = parse_qs(
+        urlsplit(url).query, keep_blank_values=True, strict_parsing=False
+    ).get(name, [])
+    if len(values) != 1 or not values[0]:
+        raise AuthExpired(
+            f"повторный вход: отсутствует однозначный параметр {name}"
+        )
+    return values[0]
+
+
+def _validate_oidc_start(url: str, expected_host: str) -> str:
+    if _classify_reauth_url(url, expected_host) != "primary_auth":
+        raise AuthExpired("повторный вход: неожиданный старт OIDC")
+    state = _single_query_value(url, "state")
+    if _single_query_value(url, "response_type") != "code":
+        raise AuthExpired("повторный вход: ожидался OIDC code flow")
+    redirect_uri = _single_query_value(url, "redirect_uri")
+    if redirect_uri != _https_url(expected_host, OIDC_CALLBACK_PATH):
+        raise AuthExpired("повторный вход: изменён OIDC callback")
+    _single_query_value(url, "client_id")
+    return state
+
+
+def _validate_callback(url: str, expected_host: str, expected_state: str) -> None:
+    if _classify_reauth_url(url, expected_host) != "callback":
+        raise AuthExpired("повторный вход: неожиданный OIDC callback")
+    if _single_query_value(url, "state") != expected_state:
+        raise AuthExpired("повторный вход: OIDC state не совпал")
+    _single_query_value(url, "code")
+
+
+def _redirect_target(response: Response, request_url: str) -> str:
+    location = response.headers.get("Location")
+    if not location:
+        raise AuthExpired("повторный вход: redirect без Location")
+    return urljoin(request_url, location)
+
+
+def _post_form_action(
+    html: str, base_url: str, expected_host: str
+) -> str:
+    parser = _PostFormParser()
+    try:
+        parser.feed(html)
+        parser.close()
+    except Exception as exc:
+        raise AuthExpired(
+            "повторный вход: не удалось разобрать форму IdP"
+        ) from exc
+
+    candidates: List[str] = []
+    for method, action in parser.forms:
+        if method != "post" or not action:
+            continue
+        candidate = urljoin(base_url, action)
+        try:
+            kind = _classify_reauth_url(candidate, expected_host)
+        except AuthExpired:
+            continue
+        if kind == "primary_action":
+            candidates.append(candidate)
+    if len(candidates) != 1:
+        raise AuthExpired(
+            "повторный вход: ожидаемая POST-форма IdP не найдена"
+        )
+    return candidates[0]
+
+
+def _reauth_request(
+    session: Session,
+    method: str,
+    url: str,
+    timeout: float,
+    **kwargs: Any,
+) -> Response:
+    try:
+        return session.request(
+            method,
+            url,
+            timeout=(10.0, timeout),
+            allow_redirects=False,
+            **kwargs,
+        )
+    except RequestException as exc:
+        raise AuthExpired(
+            f"повторный вход: {safe_transport_error(exc)}"
+        ) from exc
+    except Exception as exc:
+        raise AuthExpired(
+            f"повторный вход SPNEGO: {exc.__class__.__name__}"
+        ) from exc
+
+
+def _probe_reauthenticated_session(
+    session: Session, expected_host: str, timeout: float
+) -> None:
+    response = _reauth_request(
+        session,
+        "GET",
+        _https_url(expected_host, ADDRESSBOOK_PROBE_PATH),
+        timeout,
+        headers={"Accept": JSON_ACCEPT},
+    )
+    if response.status_code in AUTH_STATUSES | REDIRECT_STATUSES:
+        raise AuthExpired("повторный вход: API всё ещё требует авторизацию")
+    if response.status_code != 200:
+        raise AuthExpired(
+            f"повторный вход: проверка API вернула HTTP {response.status_code}"
+        )
+    try:
+        response.json()
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise AuthExpired(
+            "повторный вход: проверка API не вернула JSON"
+        ) from exc
+
+
+def drive_addressbook_reauth(
+    session: Session,
+    negotiate_auth: Any,
+    expected_host: str,
+    timeout: float,
+) -> None:
+    """Пройти наблюдавшийся OIDC/SPNEGO flow, не раскрывая его параметры."""
+
+    root_url = _https_url(expected_host)
+    response = _reauth_request(
+        session,
+        "GET",
+        root_url,
+        timeout,
+        headers={"Accept": NAVIGATION_ACCEPT},
+    )
+    if response.status_code == 200:
+        _probe_reauthenticated_session(session, expected_host, timeout)
+        return
+    if response.status_code not in OIDC_REDIRECT_STATUSES:
+        raise AuthExpired(
+            f"повторный вход: Addressbook вернул HTTP {response.status_code}"
+        )
+
+    idp_url = _redirect_target(response, root_url)
+    oidc_state = _validate_oidc_start(idp_url, expected_host)
+    response = _reauth_request(
+        session,
+        "GET",
+        idp_url,
+        timeout,
+        auth=negotiate_auth,
+        headers={"Accept": NAVIGATION_ACCEPT},
+    )
+    current_url = idp_url
+    current_kind = "primary_auth"
+
+    if response.status_code in AUTH_STATUSES:
+        raise AuthExpired(
+            "повторный вход: Kerberos/SPNEGO-билет отклонён или отсутствует"
+        )
+    if response.status_code == 200:
+        action_url = _post_form_action(response.text, idp_url, expected_host)
+        response = _reauth_request(
+            session,
+            "POST",
+            action_url,
+            timeout,
+            data=b"",
+            headers={
+                "Accept": NAVIGATION_ACCEPT,
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            auth=negotiate_auth,
+        )
+        current_url = action_url
+        current_kind = "primary_action"
+    elif response.status_code not in OIDC_REDIRECT_STATUSES:
+        raise AuthExpired(
+            f"повторный вход: IdP вернул HTTP {response.status_code}"
+        )
+
+    allowed_transitions = {
+        "primary_auth": {"alt_action", "callback"},
+        "primary_action": {"alt_action", "callback"},
+        "alt_action": {"callback"},
+        "callback": {"root"},
+    }
+    for _ in range(6):
+        if response.status_code in AUTH_STATUSES:
+            raise AuthExpired("повторный вход: IdP отклонил авторизацию")
+        if current_kind == "root" and response.status_code == 200:
+            break
+        if response.status_code not in OIDC_REDIRECT_STATUSES:
+            raise AuthExpired(
+                "повторный вход: цепочка OIDC завершилась неожиданно"
+            )
+
+        target_url = _redirect_target(response, current_url)
+        target_kind = _classify_reauth_url(target_url, expected_host)
+        if target_kind not in allowed_transitions.get(current_kind, set()):
+            raise AuthExpired(
+                "повторный вход: неожиданная последовательность redirect"
+            )
+        if target_kind == "callback":
+            _validate_callback(target_url, expected_host, oidc_state)
+
+        request_kwargs: Dict[str, Any] = {}
+        if target_kind == "alt_action":
+            request_kwargs["auth"] = negotiate_auth
+        response = _reauth_request(
+            session,
+            "GET",
+            target_url,
+            timeout,
+            headers={"Accept": NAVIGATION_ACCEPT},
+            **request_kwargs,
+        )
+        current_url = target_url
+        current_kind = target_kind
+    else:
+        raise AuthExpired("повторный вход: слишком длинная цепочка redirect")
+
+    if current_kind != "root" or response.status_code != 200:
+        raise AuthExpired("повторный вход: Addressbook не открылся")
+    _probe_reauthenticated_session(session, expected_host, timeout)
+
+
+def _negotiate_auth() -> Any:
+    try:
+        from requests_gssapi import HTTPSPNEGOAuth
+    except (ImportError, OSError) as exc:
+        raise ConfigError(
+            "Для --auto-reauth нужен requests-gssapi. Выполните: "
+            "python3 -m pip install -r requirements-addressbook.txt"
+        ) from exc
+    # Библиотека пишет готовый Authorization: Negotiate в DEBUG, а детали
+    # GSS-ошибок — в ERROR. CLI выдаёт только свою безопасную классификацию.
+    logging.getLogger("requests_gssapi").setLevel(logging.CRITICAL + 1)
+    return HTTPSPNEGOAuth(delegate=False, opportunistic_auth=False)
+
+
+def reauthenticate_addressbook(
+    curl_request: CurlRequest,
+    expected_host: str,
+    tls_verify: Union[bool, str],
+    timeout: float,
+) -> Session:
+    if requests is None:
+        raise ConfigError(
+            "Не установлен пакет requests. Выполните: "
+            "python3 -m pip install -r requirements.txt"
+        )
+    auth_session = requests.Session()
+    auth_session.verify = tls_verify
+    safe_reauth_headers = {"accept-language", "user-agent"}
+    auth_session.headers.update(
+        {
+            name: value
+            for name, value in curl_request.headers.items()
+            if name.casefold() in safe_reauth_headers
+        }
+    )
+    try:
+        drive_addressbook_reauth(
+            auth_session,
+            _negotiate_auth(),
+            expected_host,
+            timeout,
+        )
+    except Exception:
+        auth_session.close()
+        raise
+
+    # Дальше сессия ходит только в API с allow_redirects=False, поэтому можно
+    # вернуть исходные браузерные заголовки после завершения cross-host flow.
+    auth_session.headers.update(curl_request.headers)
+    return auth_session
 
 
 def canonical_uuid(value: str) -> Optional[str]:
@@ -712,6 +1073,7 @@ def run(args: argparse.Namespace) -> int:
     skipped = 0
     consecutive_errors = 0
     stopped_for_auth = False
+    reauthentications = 0
 
     try:
         for source_row, user_uuid, input_error in input_rows(
@@ -731,20 +1093,56 @@ def run(args: argparse.Namespace) -> int:
 
             attempted += 1
             try:
-                tub_num = fetch_tubnum(
-                    session=session,
-                    endpoint=endpoint,
-                    user_uuid=user_uuid,
-                    timeout=args.timeout,
-                    retries=args.retries,
-                    max_backoff=args.max_backoff,
-                    rate_limiter=rate_limiter,
-                )
+                try:
+                    tub_num = fetch_tubnum(
+                        session=session,
+                        endpoint=endpoint,
+                        user_uuid=user_uuid,
+                        timeout=args.timeout,
+                        retries=args.retries,
+                        max_backoff=args.max_backoff,
+                        rate_limiter=rate_limiter,
+                    )
+                except AuthExpired:
+                    if not args.auto_reauth:
+                        raise
+                    renewed_session = reauthenticate_addressbook(
+                        curl_request,
+                        args.expected_host,
+                        tls_verify,
+                        args.timeout,
+                    )
+                    expired_session = session
+                    session = renewed_session
+                    expired_session.close()
+                    reauthentications += 1
+                    print(
+                        "Cookie-сессия Addressbook обновлена через "
+                        "Kerberos/SPNEGO.",
+                        file=sys.stderr,
+                    )
+                    tub_num = fetch_tubnum(
+                        session=session,
+                        endpoint=endpoint,
+                        user_uuid=user_uuid,
+                        timeout=args.timeout,
+                        retries=args.retries,
+                        max_backoff=args.max_backoff,
+                        rate_limiter=rate_limiter,
+                    )
             except AuthExpired as exc:
                 stopped_for_auth = True
+                reauth_hint = (
+                    "Автоматический повторный вход не завершён. Проверьте "
+                    "доступность корпоративной сети и Kerberos-билета "
+                    "командой klist. "
+                    if args.auto_reauth
+                    else ""
+                )
                 print(
                     "Сессия addressbook истекла или ведет на страницу входа "
-                    f"({exc}). Обновите RTF с curl и запустите ту же команду: "
+                    f"({exc}). {reauth_hint}"
+                    "Обновите RTF с curl и запустите ту же команду: "
                     "существующий CSV будет продолжен.",
                     file=sys.stderr,
                 )
@@ -808,7 +1206,8 @@ def run(args: argparse.Namespace) -> int:
     print(
         f"Итог: новых попыток={attempted}, записано={written}, "
         f"без tubNum={no_tubnum}, ошибок={failed}, "
-        f"некорректных строк={invalid}, ранее готовых={skipped}. "
+        f"некорректных строк={invalid}, ранее готовых={skipped}, "
+        f"повторных входов={reauthentications}. "
         f"Результат: {args.output}. Ошибки: {errors_path}."
     )
     return 3 if stopped_for_auth else (1 if failed or no_tubnum else 0)
