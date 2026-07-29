@@ -71,7 +71,7 @@ DEFAULT_CONFLUENCE_PAGE_ID = "24517214638"
 DEFAULT_STORY_TYPES = ("Story",)
 DEFAULT_STORY_STATUSES = ("Done", "Сделано", "Готово")
 DEFAULT_BUG_TYPES = ("Bug", "Defect", "Ошибка")
-DEFAULT_BUG_STATUSES = ("Closed", "Закрыт", "Закрыто")
+DEFAULT_EXCLUDED_BUG_STATUSES = ("Отклонен исполнителем",)
 DEFAULT_BUG_PRIORITIES = (
     "Critical",
     "Crytical",
@@ -422,7 +422,7 @@ class MetricRules:
     story_types: frozenset[str]
     story_statuses: frozenset[str]
     bug_types: frozenset[str]
-    bug_statuses: frozenset[str]
+    excluded_bug_statuses: frozenset[str]
     bug_priorities: frozenset[str]
     psi_detection_stages: frozenset[str]
     prom_detection_stages: frozenset[str]
@@ -433,7 +433,7 @@ class MetricRules:
             story_types=normalized_set(DEFAULT_STORY_TYPES),
             story_statuses=normalized_set(DEFAULT_STORY_STATUSES),
             bug_types=normalized_set(DEFAULT_BUG_TYPES),
-            bug_statuses=normalized_set(DEFAULT_BUG_STATUSES),
+            excluded_bug_statuses=normalized_set(DEFAULT_EXCLUDED_BUG_STATUSES),
             bug_priorities=normalized_set(DEFAULT_BUG_PRIORITIES),
             psi_detection_stages=normalized_set(DEFAULT_PSI_DETECTION_STAGES),
             prom_detection_stages=normalized_set(DEFAULT_PROM_DETECTION_STAGES),
@@ -584,6 +584,15 @@ def story_has_done_status(raw_status: Any, rules: MetricRules) -> bool:
             if status_category.get(key)
         )
     return "done" in category_values
+
+
+def bug_has_eligible_status(raw_status: Any, rules: MetricRules) -> bool:
+    """All Bug statuses are eligible except the explicit rejection status."""
+
+    return (
+        normalized(named_value(raw_status))
+        not in rules.excluded_bug_statuses
+    )
 
 
 def classify_eligible_detection_stage(
@@ -800,14 +809,16 @@ def aggregate_issues(
 
         issue_type = normalized(named_value(issue_field(issue, "issuetype")))
         raw_status = issue_field(issue, "status")
-        status = normalized(named_value(raw_status))
 
         if issue_type in rules.story_types and story_has_done_status(raw_status, rules):
             counts[team].stories += 1
             counts[team].story_keys.append(key)
             continue
 
-        if issue_type not in rules.bug_types or status not in rules.bug_statuses:
+        if (
+            issue_type not in rules.bug_types
+            or not bug_has_eligible_status(raw_status, rules)
+        ):
             continue
 
         priority = normalized(named_value(issue_field(issue, "priority")))
@@ -1378,20 +1389,21 @@ def collect_created_bugs(
     history_keys: list[str] = []
     for issue in candidates:
         issue_type = normalized(named_value(issue_field(issue, "issuetype")))
-        status = normalized(named_value(issue_field(issue, "status")))
+        raw_status = issue_field(issue, "status")
         priority = normalized(named_value(issue_field(issue, "priority")))
         key = str(issue.get("key") or "").strip().upper()
         if (
             key
             and issue_type in rules.bug_types
-            and status in rules.bug_statuses
+            and bug_has_eligible_status(raw_status, rules)
             and priority in rules.bug_priorities
         ):
             history_keys.append(key)
 
     execution_log(
         f"Jira: заведённых Bug/Defect найдено={len(candidates)}; "
-        f"Closed High+ для проверки всей истории этапа={len(history_keys)}"
+        "High+ без статуса «Отклонен исполнителем» для проверки "
+        f"истории этапа={len(history_keys)}"
     )
     detailed, errors = jira.issues_individually(
         history_keys,
@@ -1407,7 +1419,7 @@ def collect_created_bugs(
             for key in missing[:5]
         )
         raise RuntimeError(
-            "Jira не вернула changelog всех Closed High+ багов; "
+            "Jira не вернула changelog всех допустимых High+ багов; "
             f"публикация остановлена. {details}"
         )
 
@@ -2030,8 +2042,6 @@ def print_filter_audit(
         issue_type = normalized(named_value(issue_field(issue, "issuetype")))
         raw_status = issue_field(issue, "status")
         status_name = named_value(raw_status) or "Без статуса"
-        status = normalized(status_name)
-
         if issue_type in rules.story_types:
             audit[team]["story_total"] += 1
             if story_has_done_status(raw_status, rules):
@@ -2043,10 +2053,10 @@ def print_filter_audit(
         if issue_type not in rules.bug_types:
             continue
         audit[team]["bug_total"] += 1
-        if status not in rules.bug_statuses:
+        if not bug_has_eligible_status(raw_status, rules):
             rejected_values[team]["bug_status"][status_name] += 1
             continue
-        audit[team]["bug_closed"] += 1
+        audit[team]["bug_status_eligible"] += 1
 
         priority_name = named_value(issue_field(issue, "priority")) or "Без приоритета"
         if normalized(priority_name) not in rules.bug_priorities:
@@ -2085,14 +2095,15 @@ def print_filter_audit(
         print(
             f"  {spec.team}: "
             f"Story всего={values['story_total']}, Done={values['story_done']}; "
-            f"Bug всего={values['bug_total']}, Closed={values['bug_closed']}, "
+            f"Bug всего={values['bug_total']}, "
+            f"статус допустим={values['bug_status_eligible']}, "
             f"High+={values['bug_high_plus']}, PSI/ПРОМ={values['bug_eligible']}; "
             f"этап менялся={values['bug_stage_changed']}"
         )
         details: list[str] = []
         for field_name, label in (
             ("story_status", "Story-статусы"),
-            ("bug_status", "Bug-статусы"),
+            ("bug_status", "исключённые Bug-статусы"),
             ("bug_priority", "приоритеты"),
             ("bug_detection_stage", "этапы обнаружения"),
         ):
@@ -2311,7 +2322,7 @@ def render_metric_section_html(
         "Jira",
         "Цель",
         "Story Done",
-        "Баги Closed PSI/ПРОМ",
+        "Баги High+ PSI/ПРОМ",
         "PSI",
         "ПРОМ",
         "Факт",
@@ -2447,11 +2458,12 @@ def render_confluence_html(
         '<div style="background-color:#F4F5F7;border-radius:7px;color:#5E6C84;'
         'font-size:12px;margin-top:14px;padding:11px 13px;">',
         "В баги входят заведённые за отчётный период в Jira-проектах команд "
-        "задачи типа Bug: только Closed/Закрыт с приоритетом "
+        "задачи типа Bug в любом статусе, кроме «Отклонен исполнителем», "
+        "с приоритетом "
         "Critical/Crytical, Blocker, Высокий или Блокирующий "
-        "и первоначальным этапом обнаружения PSI/ПСИ или PROM/ПРОМ. "
-        "Первоначальный этап восстанавливается из changelog, поэтому последующее "
-        "изменение ПРОМ на другое значение не исключает баг из метрики. "
+        "и этапом обнаружения PSI/ПСИ или PROM/ПРОМ в истории задачи. "
+        "Поэтому последующее изменение ПРОМ на другое значение не исключает "
+        "баг из метрики. "
         "Для совпадения с корпоративной квартальной выгрузкой Story ночного "
         "batch последнего дня предыдущего квартала относятся к новому кварталу. "
         "Эффективная цель = max(A × AS IS + B; AS IS × 0,8). "
@@ -2530,7 +2542,25 @@ class ConfluencePublisher:
             raise RuntimeError(
                 f"Confluence: у страницы {page_id} не удалось прочитать текущее название."
             )
-        result = self.update_page(page, actual_title, body)
+        try:
+            result = self.update_page(page, actual_title, body)
+        except HttpRequestError as exc:
+            if exc.status_code != 403:
+                raise
+            space = page.get("space")
+            space_key = (
+                str(space.get("key") or "").strip()
+                if isinstance(space, Mapping)
+                else ""
+            )
+            space_suffix = f", space={space_key}" if space_key else ""
+            raise RuntimeError(
+                "Confluence: токен успешно читает страницу, но не имеет права "
+                f"редактировать pageId={page_id}{space_suffix}. "
+                "Выдайте пользователю токена право Add/Edit Page и снимите "
+                "ограничение редактирования именно с этой страницы или её "
+                "родителя. Доступ к соседней странице dpm2 этого права не даёт."
+            ) from exc
         result_id = str(result.get("id") or page_id).strip()
         if not result_id:
             raise RuntimeError("Confluence не вернул id опубликованной страницы.")
@@ -3076,7 +3106,6 @@ def write_reference_debug_report(
                 snapshot["reason"] = "должна учитываться"
         else:
             created = parse_jira_date(issue_field(issue, "created")) if issue else None
-            status = normalized(named_value(issue_field(issue, "status"))) if issue else ""
             priority = normalized(named_value(issue_field(issue, "priority"))) if issue else ""
             stage = (
                 classify_eligible_detection_stage(
@@ -3090,8 +3119,8 @@ def write_reference_debug_report(
                 snapshot["reason"] = "нет в JQL заведённых Bug объединённого периода"
             elif created is None or not (quarter_start <= created < quarter_end):
                 snapshot["reason"] = "created вне квартала"
-            elif status not in rules.bug_statuses:
-                snapshot["reason"] = "статус не Closed/Закрыт"
+            elif not bug_has_eligible_status(issue_field(issue, "status"), rules):
+                snapshot["reason"] = "статус «Отклонен исполнителем»"
             elif priority not in rules.bug_priorities:
                 snapshot["reason"] = "приоритет не High+"
             elif stage is None:
@@ -3170,7 +3199,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Собирает за последние 90 дней и отдельно за квартал отношение "
-            "заведённых в Jira-проектах команд закрытых High+ PSI/ПРОМ-багов "
+            "заведённых в Jira-проектах команд High+ PSI/ПРОМ-багов "
+            "в любом статусе, кроме «Отклонен исполнителем», "
             "к зарелизенным Story и публикует таблицы в Confluence."
         )
     )
