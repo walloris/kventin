@@ -16,11 +16,13 @@ Publish to the page embedded in DEFAULT_CONFLUENCE_PAGE_ID, using config.py:
 from __future__ import annotations
 
 import argparse
+import glob
 import html
 import json
 import re
 import sys
 import time
+import zipfile
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -29,6 +31,7 @@ from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 from pathlib import Path
 from threading import local
 from typing import Any, Iterable, Iterator, Mapping, Optional, Sequence
+from xml.etree import ElementTree
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -81,6 +84,11 @@ DEFAULT_HOTFIX_VALUES = ("Hotfix",)
 DEFAULT_INSTALLED_RELEASE_STATUSES = (
     "Установлен на ПРОМ",
 )
+# Корпоративная Q3-выгрузка относит к кварталу ночной batch Story,
+# закрытый в последний календарный день предыдущего квартала (например,
+# 30.06 22:05 для Q3). Сдвиг применяется только к квартальному срезу;
+# последние 90 дней остаются строго календарными.
+QUARTER_STORY_LOOKBACK_DAYS = 1
 EXCLUDED_METRIC_KE_IDS = frozenset((9362600, 9535069))
 RELEASE_KE_IDS = tuple(
     dict.fromkeys(
@@ -1457,6 +1465,7 @@ def collect_released_issues(
         "project",
         "issuetype",
         "status",
+        "resolutiondate",
         "priority",
         detection_stage_field_id,
     )
@@ -1710,11 +1719,14 @@ def select_period_data(
     return period_releases, period_issues
 
 
-def released_story_candidates(
+def select_released_stories(
     issues: Sequence[Mapping[str, Any]],
     rules: MetricRules,
+    *,
+    start: date,
+    end: date,
 ) -> list[dict[str, Any]]:
-    """Keep only Story candidates from installed-release consist-of contents."""
+    """Select released Story by its own resolution date, as the metric does."""
 
     return [
         issue
@@ -1722,6 +1734,11 @@ def released_story_candidates(
         if isinstance(issue, dict)
         and normalized(named_value(issue_field(issue, "issuetype")))
         in rules.story_types
+        and (
+            (resolved := parse_jira_date(issue_field(issue, "resolutiondate")))
+            is not None
+            and start <= resolved < end
+        )
     ]
 
 
@@ -2211,11 +2228,13 @@ def render_confluence_html(
         '<div style="background-color:#F4F5F7;border-radius:7px;color:#5E6C84;'
         'font-size:12px;margin-top:14px;padding:11px 13px;">',
         "В баги входят заведённые за отчётный период в Jira-проектах команд "
-        "задачи типа Bug/Defect/Ошибка: только Closed/Закрыт с приоритетом "
+        "задачи типа Bug: только Closed/Закрыт с приоритетом "
         "Critical/Crytical, Blocker, Высокий или Блокирующий "
         "и первоначальным этапом обнаружения PSI/ПСИ или PROM/ПРОМ. "
         "Первоначальный этап восстанавливается из changelog, поэтому последующее "
         "изменение ПРОМ на другое значение не исключает баг из метрики. "
+        "Для совпадения с корпоративной квартальной выгрузкой Story ночного "
+        "batch последнего дня предыдущего квартала относятся к новому кварталу. "
         "Эффективная цель = max(A × AS IS + B; AS IS × 0,8). "
         "Лимит дефектов = floor(эффективная цель × Story). "
         "«Ещё ПРОМ-багов» — целый запас до этого лимита; «Story до цели» — "
@@ -2432,6 +2451,323 @@ def load_confluence_settings() -> ConnectionSettings:
     )
 
 
+def excel_column_index(reference: str) -> int:
+    match = re.match(r"[A-Za-z]+", reference)
+    if not match:
+        return 0
+    result = 0
+    for char in match.group(0).upper():
+        result = result * 26 + ord(char) - ord("A") + 1
+    return result - 1
+
+
+def xml_node_text(node: Optional[ElementTree.Element]) -> str:
+    return "".join(node.itertext()) if node is not None else ""
+
+
+def read_jira_metric_xlsx(path: Path) -> list[list[Any]]:
+    """Read Jira's minimal XLSX export, including its case-mismatched sheet path."""
+
+    namespace = {
+        "x": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    }
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = archive.namelist()
+            names_by_lower = {name.lower(): name for name in names}
+            shared_strings: list[str] = []
+            shared_name = names_by_lower.get("xl/sharedstrings.xml")
+            if shared_name:
+                shared_root = ElementTree.fromstring(archive.read(shared_name))
+                shared_strings = [
+                    xml_node_text(node)
+                    for node in shared_root.findall("x:si", namespace)
+                ]
+            sheet_names = sorted(
+                name
+                for name in names
+                if name.lower().startswith("xl/worksheets/")
+                and name.lower().endswith(".xml")
+            )
+            if not sheet_names:
+                raise RuntimeError("в XLSX нет worksheet XML")
+            root = ElementTree.fromstring(archive.read(sheet_names[0]))
+    except Exception as exc:
+        raise RuntimeError(f"Не удалось прочитать debug XLSX {path}: {exc}") from exc
+
+    rows: list[list[Any]] = []
+    for row_node in root.findall(".//x:sheetData/x:row", namespace):
+        values_by_column: dict[int, Any] = {}
+        for cell in row_node.findall("x:c", namespace):
+            column = excel_column_index(str(cell.get("r") or "A1"))
+            cell_type = str(cell.get("t") or "")
+            value_node = cell.find("x:v", namespace)
+            if cell_type == "inlineStr":
+                value: Any = xml_node_text(cell.find("x:is", namespace))
+            elif value_node is None:
+                value = ""
+            elif cell_type == "s":
+                index = int(value_node.text or "0")
+                value = (
+                    shared_strings[index]
+                    if 0 <= index < len(shared_strings)
+                    else ""
+                )
+            else:
+                value = value_node.text or ""
+            values_by_column[column] = value
+        width = max(values_by_column, default=-1) + 1
+        rows.append([values_by_column.get(index, "") for index in range(width)])
+    return rows
+
+
+def expand_debug_reference_paths(values: Sequence[str]) -> list[Path]:
+    result: list[Path] = []
+    for raw_value in values:
+        expanded_value = str(Path(raw_value).expanduser())
+        candidate = Path(expanded_value)
+        if candidate.is_dir():
+            matches = sorted(candidate.glob("*.xlsx"))
+        else:
+            matches = [Path(value) for value in glob.glob(expanded_value)]
+            if not matches and candidate.is_file():
+                matches = [candidate]
+        result.extend(matches)
+    unique = {
+        str(path.resolve()): path.resolve()
+        for path in result
+        if path.suffix.casefold() == ".xlsx"
+    }
+    return list(unique.values())
+
+
+def reference_team_name(raw_name: str, team_specs: Sequence[TeamSpec]) -> str:
+    without_code = re.sub(r"\s*\([^)]*\)\s*$", "", raw_name).strip()
+    aliases = {
+        normalized("CoreUI 2.0"): "Core UI 2.0 / Neuro UI",
+    }
+    alias = aliases.get(normalized(without_code))
+    if alias:
+        return alias
+    by_normalized = {normalized(spec.team): spec.team for spec in team_specs}
+    return by_normalized.get(normalized(without_code), without_code)
+
+
+def load_reference_tasks(
+    paths: Sequence[Path],
+    team_specs: Sequence[TeamSpec],
+) -> dict[str, dict[str, set[str]]]:
+    result: dict[str, dict[str, set[str]]] = defaultdict(
+        lambda: {"Story": set(), "Bug": set()}
+    )
+    configured_teams = {spec.team for spec in team_specs}
+    for path in paths:
+        rows = read_jira_metric_xlsx(path)
+        for row in rows[2:]:
+            if len(row) < 4:
+                continue
+            issue_key = str(row[0] or "").strip().upper()
+            issue_type = str(row[2] or "").strip()
+            team = reference_team_name(str(row[3] or ""), team_specs)
+            if issue_key.startswith("S-"):
+                issue_key = issue_key[2:]
+            if team not in configured_teams or issue_type not in {"Story", "Bug"}:
+                continue
+            if issue_key:
+                result[team][issue_type].add(issue_key)
+    return dict(result)
+
+
+def issue_debug_snapshot(
+    issue: Optional[Mapping[str, Any]],
+    *,
+    detection_stage_field_id: str,
+) -> dict[str, Any]:
+    if issue is None:
+        return {"loaded": False}
+    return {
+        "loaded": True,
+        "project": issue_project_key(issue),
+        "type": named_value(issue_field(issue, "issuetype")),
+        "status": named_value(issue_field(issue, "status")),
+        "priority": named_value(issue_field(issue, "priority")),
+        "created": str(issue_field(issue, "created") or ""),
+        "resolutiondate": str(issue_field(issue, "resolutiondate") or ""),
+        "initial_detection_stage": named_values(
+            issue_field(issue, detection_stage_field_id)
+        ),
+        "current_detection_stage": named_values(
+            issue_field(issue, METRIC_CURRENT_DETECTION_STAGE_FIELD)
+        ),
+    }
+
+
+def write_reference_debug_report(
+    *,
+    reference_paths: Sequence[Path],
+    output_path: Path,
+    team_specs: Sequence[TeamSpec],
+    rules: MetricRules,
+    quarter_metrics: Sequence[TeamMetric],
+    quarter_start: date,
+    quarter_end: date,
+    quarter_story_start: date,
+    released_issues: Sequence[Mapping[str, Any]],
+    created_bugs: Sequence[Mapping[str, Any]],
+    releases: Sequence[Mapping[str, Any]],
+    issue_keys_by_release: Mapping[str, set[str]],
+    release_date_field_id: str,
+    detection_stage_field_id: str,
+) -> None:
+    reference = load_reference_tasks(reference_paths, team_specs)
+    metrics_by_team = {metric.team: metric for metric in quarter_metrics}
+    released_by_key = {
+        str(issue.get("key") or "").strip().upper(): issue
+        for issue in released_issues
+        if str(issue.get("key") or "").strip()
+    }
+    bugs_by_key = {
+        str(issue.get("key") or "").strip().upper(): issue
+        for issue in created_bugs
+        if str(issue.get("key") or "").strip()
+    }
+    release_dates = {
+        str(release.get("key") or "").strip().upper(): (
+            parse_jira_date(issue_field(release, release_date_field_id))
+        )
+        for release in releases
+        if str(release.get("key") or "").strip()
+    }
+    releases_by_issue: dict[str, list[str]] = defaultdict(list)
+    for release_key, issue_keys in issue_keys_by_release.items():
+        for issue_key in issue_keys:
+            releases_by_issue[issue_key].append(release_key)
+
+    def task_details(issue_key: str, issue_type: str) -> dict[str, Any]:
+        source = released_by_key if issue_type == "Story" else bugs_by_key
+        issue = source.get(issue_key)
+        snapshot = issue_debug_snapshot(
+            issue,
+            detection_stage_field_id=detection_stage_field_id,
+        )
+        if issue_type == "Story":
+            linked_releases = sorted(releases_by_issue.get(issue_key, []))
+            snapshot["installed_releases"] = [
+                {
+                    "key": release_key,
+                    "date": (
+                        release_dates[release_key].isoformat()
+                        if release_dates.get(release_key)
+                        else ""
+                    ),
+                }
+                for release_key in linked_releases
+            ]
+            resolved = parse_jira_date(
+                issue_field(issue, "resolutiondate")
+            ) if issue else None
+            if issue is None:
+                snapshot["reason"] = (
+                    "нет в consist of установленных релизов объединённой выборки"
+                )
+            elif not story_has_done_status(issue_field(issue, "status"), rules):
+                snapshot["reason"] = "Story не в Done"
+            elif resolved is None:
+                snapshot["reason"] = "не заполнена resolutiondate"
+            elif not (quarter_story_start <= resolved < quarter_end):
+                snapshot["reason"] = "resolutiondate вне границы Story квартала"
+            else:
+                snapshot["reason"] = "должна учитываться"
+        else:
+            created = parse_jira_date(issue_field(issue, "created")) if issue else None
+            status = normalized(named_value(issue_field(issue, "status"))) if issue else ""
+            priority = normalized(named_value(issue_field(issue, "priority"))) if issue else ""
+            stage = (
+                classify_eligible_detection_stage(
+                    issue_field(issue, detection_stage_field_id),
+                    rules,
+                )
+                if issue
+                else None
+            )
+            if issue is None:
+                snapshot["reason"] = "нет в JQL заведённых Bug объединённого периода"
+            elif created is None or not (quarter_start <= created < quarter_end):
+                snapshot["reason"] = "created вне квартала"
+            elif status not in rules.bug_statuses:
+                snapshot["reason"] = "статус не Closed/Закрыт"
+            elif priority not in rules.bug_priorities:
+                snapshot["reason"] = "приоритет не High+"
+            elif stage is None:
+                snapshot["reason"] = "исходный этап не PSI/ПРОМ"
+            else:
+                snapshot["reason"] = f"должен учитываться как {stage.upper()}"
+        return snapshot
+
+    comparisons: dict[str, Any] = {}
+    for spec in team_specs:
+        if spec.team not in reference:
+            continue
+        metric = metrics_by_team[spec.team]
+        team_result: dict[str, Any] = {}
+        for issue_type, actual_keys in (
+            ("Story", set(metric.story_keys)),
+            ("Bug", set(metric.bug_keys)),
+        ):
+            expected_keys = reference[spec.team][issue_type]
+            missing = sorted(expected_keys - actual_keys)
+            extra = sorted(actual_keys - expected_keys)
+            team_result[issue_type] = {
+                "reference_count": len(expected_keys),
+                "script_count": len(actual_keys),
+                "missing_count": len(missing),
+                "extra_count": len(extra),
+                "missing": [
+                    {
+                        "key": key,
+                        **task_details(key, issue_type),
+                    }
+                    for key in missing
+                ],
+                "extra": [
+                    {
+                        "key": key,
+                        **task_details(key, issue_type),
+                    }
+                    for key in extra
+                ],
+            }
+        comparisons[spec.team] = team_result
+        print(
+            f"DEBUG XLSX {spec.team}: "
+            f"Story {team_result['Story']['script_count']}/"
+            f"{team_result['Story']['reference_count']} "
+            f"(нет={team_result['Story']['missing_count']}, "
+            f"лишних={team_result['Story']['extra_count']}); "
+            f"Bug {team_result['Bug']['script_count']}/"
+            f"{team_result['Bug']['reference_count']} "
+            f"(нет={team_result['Bug']['missing_count']}, "
+            f"лишних={team_result['Bug']['extra_count']})"
+        )
+
+    payload = {
+        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "read_only": True,
+        "reference_files": [str(path) for path in reference_paths],
+        "quarter": {
+            "display_start": quarter_start.isoformat(),
+            "story_start": quarter_story_start.isoformat(),
+            "end_exclusive": quarter_end.isoformat(),
+        },
+        "comparisons": comparisons,
+    }
+    output_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(f"DEBUG_REFERENCE_JSON={output_path.resolve()}")
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -2454,11 +2790,30 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Показать JQL и ключи учтённых задач.",
     )
+    parser.add_argument(
+        "--debug-reference",
+        nargs="+",
+        metavar="XLSX",
+        help=(
+            "Сверить квартальные ключи с одной или несколькими XLSX-выгрузками "
+            "метрики. Поддерживаются путь, каталог и shell glob; публикация "
+            "Confluence автоматически отключается."
+        ),
+    )
+    parser.add_argument(
+        "--debug-output",
+        help=(
+            "Путь для JSON-аудита --debug-reference. По умолчанию файл "
+            "quarterly_reference_debug_<timestamp>.json в текущем каталоге."
+        ),
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
+    if args.debug_reference:
+        args.no_publish = True
     job_started = time.perf_counter()
     execution_log(
         "Старт quarterly_quality_metrics "
@@ -2468,6 +2823,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         team_specs = load_team_specs()
         rules = MetricRules.defaults()
+        debug_reference_paths = (
+            expand_debug_reference_paths(args.debug_reference)
+            if args.debug_reference
+            else []
+        )
+        if args.debug_reference and not debug_reference_paths:
+            raise RuntimeError(
+                "--debug-reference не нашёл ни одного существующего XLSX-файла."
+            )
+        if debug_reference_paths:
+            execution_log(
+                f"Debug XLSX: файлов эталона={len(debug_reference_paths)}; "
+                "публикация Confluence отключена"
+            )
         today = datetime.now().astimezone().date()
         if args.quarter:
             quarter_start, quarter_calendar_end, quarter = parse_quarter(args.quarter)
@@ -2546,7 +2915,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             verbose=args.verbose,
         )
 
-        rolling_releases, rolling_release_issues = select_period_data(
+        rolling_releases, _ = select_period_data(
             releases,
             released_issues,
             issue_keys_by_release,
@@ -2554,7 +2923,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             end=rolling_end,
             release_date_field_id=release_date_field_id,
         )
-        quarter_releases, quarter_release_issues = select_period_data(
+        quarter_releases, _ = select_period_data(
             releases,
             released_issues,
             issue_keys_by_release,
@@ -2562,8 +2931,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             end=quarter_end,
             release_date_field_id=release_date_field_id,
         )
-        rolling_stories = released_story_candidates(rolling_release_issues, rules)
-        quarter_stories = released_story_candidates(quarter_release_issues, rules)
+        rolling_stories = select_released_stories(
+            released_issues,
+            rules,
+            start=rolling_start,
+            end=rolling_end,
+        )
+        quarter_story_start = quarter_start - timedelta(
+            days=QUARTER_STORY_LOOKBACK_DAYS
+        )
+        quarter_stories = select_released_stories(
+            released_issues,
+            rules,
+            start=quarter_story_start,
+            end=quarter_end,
+        )
         rolling_bugs = select_created_issues(
             created_bugs,
             start=rolling_start,
@@ -2583,7 +2965,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"заведённых багов={len(rolling_bugs)}; "
             f"квартал — релизов={len(quarter_releases)}, "
             f"Story-кандидатов={len(quarter_stories)}, "
-            f"заведённых багов={len(quarter_bugs)}"
+            f"заведённых багов={len(quarter_bugs)}; "
+            f"граница Story квартала={quarter_story_start.isoformat()}"
         )
 
         rolling_hotfix_count = sum(
@@ -2640,6 +3023,34 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         quarter_metrics = [
             calculate_metric(spec, quarter_counts[spec.team]) for spec in team_specs
         ]
+        if debug_reference_paths:
+            debug_output = (
+                Path(args.debug_output).expanduser()
+                if args.debug_output
+                else Path.cwd()
+                / (
+                    "quarterly_reference_debug_"
+                    + datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
+                    + ".json"
+                )
+            )
+            debug_output.parent.mkdir(parents=True, exist_ok=True)
+            write_reference_debug_report(
+                reference_paths=debug_reference_paths,
+                output_path=debug_output,
+                team_specs=team_specs,
+                rules=rules,
+                quarter_metrics=quarter_metrics,
+                quarter_start=quarter_start,
+                quarter_end=quarter_end,
+                quarter_story_start=quarter_story_start,
+                released_issues=released_issues,
+                created_bugs=created_bugs,
+                releases=releases,
+                issue_keys_by_release=issue_keys_by_release,
+                release_date_field_id=release_date_field_id,
+                detection_stage_field_id=detection_stage_field_id,
+            )
         generated_at = datetime.now().astimezone()
         report_html = render_confluence_html(
             rolling_metrics=rolling_metrics,
