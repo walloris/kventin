@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from http.cookies import SimpleCookie
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 from uuid import UUID
 
@@ -34,12 +34,14 @@ try:
     from requests import Response, Session
     from requests.exceptions import ConnectionError as RequestsConnectionError
     from requests.exceptions import RequestException, Timeout
+    from requests.exceptions import SSLError as RequestsSSLError
 except ImportError:
     requests = None  # type: ignore[assignment]
     Response = Any  # type: ignore[misc,assignment]
     Session = Any  # type: ignore[misc,assignment]
     RequestsConnectionError = OSError  # type: ignore[assignment]
     RequestException = OSError  # type: ignore[assignment]
+    RequestsSSLError = OSError  # type: ignore[assignment]
     Timeout = TimeoutError  # type: ignore[assignment]
 
 
@@ -125,6 +127,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--expected-host",
         default=DEFAULT_EXPECTED_HOST,
         help="Разрешенный API-хост; защищает cookies от отправки не туда.",
+    )
+    parser.add_argument(
+        "--ca-bundle",
+        type=Path,
+        help="PEM-файл с доверенными CA для внутреннего TLS.",
     )
     parser.add_argument(
         "--rate",
@@ -346,13 +353,29 @@ def endpoint_from_request(
     )
 
 
-def create_session(curl_request: CurlRequest, expected_host: str) -> Session:
+def resolve_tls_verify(
+    ca_bundle: Optional[Path],
+) -> Union[bool, str]:
+    if ca_bundle is not None:
+        resolved = ca_bundle.expanduser().resolve()
+        if not resolved.is_file():
+            raise ConfigError(f"CA bundle не найден: {resolved}")
+        return str(resolved)
+    return True
+
+
+def create_session(
+    curl_request: CurlRequest,
+    expected_host: str,
+    tls_verify: Union[bool, str] = True,
+) -> Session:
     if requests is None:
         raise ConfigError(
             "Не установлен пакет requests. Выполните: "
             "python3 -m pip install -r requirements.txt"
         )
     session = requests.Session()
+    session.verify = tls_verify
     session.headers.update(curl_request.headers)
     for name, value in curl_request.cookies.items():
         session.cookies.set(name, value, domain=expected_host, path="/")
@@ -475,6 +498,31 @@ def backoff_seconds(attempt: int, max_backoff: float) -> float:
     return min(base + random.uniform(0.0, min(1.0, base / 4)), max_backoff)
 
 
+def safe_transport_error(exc: BaseException) -> str:
+    if requests is not None and isinstance(exc, RequestsSSLError):
+        message = str(exc).casefold()
+        if "certificate_verify_failed" in message:
+            reason = "CERTIFICATE_VERIFY_FAILED"
+        elif "self signed certificate" in message:
+            reason = "SELF_SIGNED_CERTIFICATE"
+        elif "hostname" in message and (
+            "mismatch" in message or "doesn" in message
+        ):
+            reason = "HOSTNAME_MISMATCH"
+        elif "certificate required" in message:
+            reason = "CLIENT_CERTIFICATE_REQUIRED"
+        elif "pem lib" in message:
+            reason = "PEM_ERROR"
+        elif "tlsv1 alert" in message or "ssl alert" in message:
+            reason = "TLS_ALERT"
+        elif "eof" in message:
+            reason = "UNEXPECTED_EOF"
+        else:
+            reason = "TLS_ERROR"
+        return f"SSLError[{reason}]"
+    return exc.__class__.__name__
+
+
 def fetch_tubnum(
     session: Session,
     endpoint: Endpoint,
@@ -497,7 +545,7 @@ def fetch_tubnum(
                 allow_redirects=False,
             )
         except (Timeout, RequestsConnectionError) as exc:
-            last_error = exc.__class__.__name__
+            last_error = safe_transport_error(exc)
             if attempt >= retries:
                 break
             time.sleep(backoff_seconds(attempt, max_backoff))
@@ -636,7 +684,10 @@ def run(args: argparse.Namespace) -> int:
 
     processed = load_processed(args.output)
     errors_path = default_errors_path(args.output)
-    session = create_session(curl_request, args.expected_host)
+    tls_verify = resolve_tls_verify(args.ca_bundle)
+    session = create_session(
+        curl_request, args.expected_host, tls_verify=tls_verify
+    )
     try:
         output_handle, output_writer = open_csv_append(
             args.output, ["uuid", "tubNum"]

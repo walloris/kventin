@@ -35,6 +35,36 @@ def endpoint() -> exporter.Endpoint:
     return exporter.Endpoint("https://example.test/api", [], "empId")
 
 
+def test_custom_ca_bundle(tmp_path: Path) -> None:
+    ca_bundle = tmp_path / "corp.pem"
+    ca_bundle.write_text(
+        "-----BEGIN CERTIFICATE-----\nplaceholder\n"
+        "-----END CERTIFICATE-----\n",
+        encoding="ascii",
+    )
+
+    verify = exporter.resolve_tls_verify(ca_bundle)
+    assert verify == str(ca_bundle.resolve())
+
+    with pytest.raises(exporter.ConfigError):
+        exporter.resolve_tls_verify(tmp_path / "missing.pem")
+
+
+def test_ssl_reason_is_safely_classified(monkeypatch) -> None:
+    class FakeSSLError(Exception):
+        pass
+
+    monkeypatch.setattr(exporter, "RequestsSSLError", FakeSSLError)
+    error = FakeSSLError(
+        "HTTPSConnectionPool UUID TOKEN: [SSL: CERTIFICATE_VERIFY_FAILED]"
+    )
+
+    assert (
+        exporter.safe_transport_error(error)
+        == "SSLError[CERTIFICATE_VERIFY_FAILED]"
+    )
+
+
 def test_parse_curl_and_protect_cookie_host() -> None:
     parsed = exporter.parse_curl(
         "curl 'https://addressbook.sigma.sbrf.ru/api/home/empInfoFull"
