@@ -886,15 +886,46 @@ def fetch_release_details(
             )
             result[key] = {"key": key, "fields": merged_fields}
 
-        if verbose and (
+        progress_step = 5 if verbose else 10
+        if (
             index == 1
-            or index % 10 == 0
+            or index % progress_step == 0
             or index == len(release_key_list)
         ):
-            logging.info(
-                "Точно загружен состав релизов: %s/%s",
-                index,
-                len(release_key_list),
+            if request_guard is not None:
+                remaining_seconds = (
+                    (len(release_key_list) - index)
+                    * request_guard.min_interval_seconds
+                )
+                requests_text = (
+                    f"{request_guard.requests_made}/"
+                    f"{request_guard.max_requests}"
+                )
+                rate_limit_text = str(request_guard.rate_limit_events)
+                interval_text = (
+                    f"{request_guard.min_interval_seconds:g}"
+                )
+            else:
+                remaining_seconds = 0.0
+                requests_text = "—"
+                rate_limit_text = "—"
+                interval_text = "—"
+            if remaining_seconds >= 3600:
+                eta_text = f"≈{remaining_seconds / 3600:.1f} ч"
+            elif remaining_seconds >= 60:
+                eta_text = (
+                    f"≈{int((remaining_seconds + 59) // 60)} мин"
+                )
+            else:
+                eta_text = f"≈{remaining_seconds:g} с"
+            print(
+                "Jira: состав релизов "
+                f"{index}/{len(release_key_list)} "
+                f"({index / len(release_key_list):.1%}); "
+                f"осталось минимум {eta_text}; "
+                f"запросы {requests_text}; HTTP 429: {rate_limit_text}; "
+                f"интервал ≥{interval_text} с.",
+                flush=True,
             )
     return result
 
@@ -952,9 +983,27 @@ def fetch_linked_issues(
                 f"{', '.join(without_issue_type[:20])}; нельзя достоверно "
                 "посчитать Story/Bug."
             )
-        if verbose:
-            logging.info(
-                "Загружен пакет задач состава %s/%s", index, len(batch_list)
+        progress_step = 5 if verbose else 10
+        if (
+            index == 1
+            or index % progress_step == 0
+            or index == len(batch_list)
+        ):
+            if request_guard is not None:
+                requests_text = (
+                    f"{request_guard.requests_made}/"
+                    f"{request_guard.max_requests}"
+                )
+                rate_limit_text = str(request_guard.rate_limit_events)
+            else:
+                requests_text = "—"
+                rate_limit_text = "—"
+            print(
+                "Jira: задачи состава, пакет "
+                f"{index}/{len(batch_list)}; "
+                f"загружено {len(result)}/{len(unique_keys)}; "
+                f"запросы {requests_text}; HTTP 429: {rate_limit_text}.",
+                flush=True,
             )
     return result
 
