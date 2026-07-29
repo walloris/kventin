@@ -5,6 +5,7 @@
 Скрипт:
 * берет UUID из второго столбца входного CSV;
 * извлекает URL, заголовки и cookies из сохраненного curl в RTF;
+* поддерживает клиентский PKCS#12 из CLIENT_CERT/CLIENT_CERT_PASSPHRASE;
 * пишет CSV строго с колонками uuid,tubNum;
 * безопасно возобновляет работу, пропуская уже записанные UUID;
 * не печатает cookies, заголовки авторизации или тела ответов.
@@ -16,18 +17,30 @@ import argparse
 import csv
 import json
 import logging
+import os
 import random
 import shlex
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from http.cookies import SimpleCookie
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
+from typing import (
+    Any,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+)
 from urllib.parse import parse_qs, parse_qsl, urljoin, urlsplit, urlunsplit
 from uuid import UUID
 
@@ -50,6 +63,8 @@ except ImportError:
 DEFAULT_EXPECTED_HOST = "addressbook.sigma.sbrf.ru"
 DEFAULT_PRIMARY_IDP_HOST = "idp02.auth.sigma.sbrf.ru"
 DEFAULT_ALT_IDP_HOST = "alt.idp02.auth.sigma.sbrf.ru"
+CLIENT_CERT_ENV = "CLIENT_CERT"
+CLIENT_CERT_PASSPHRASE_ENV = "CLIENT_CERT_PASSPHRASE"
 OIDC_AUTH_PATH = "/auth/realms/sigma/protocol/openid-connect/auth"
 OIDC_ACTION_PATH = "/auth/realms/sigma/login-actions/authenticate"
 OIDC_CALLBACK_PATH = "/openid-connect-auth/redirect_uri"
@@ -120,6 +135,12 @@ class Endpoint:
     uuid_parameter: str
 
 
+@dataclass(frozen=True)
+class ClientCertificate:
+    path: Path
+    password: str = field(repr=False)
+
+
 class RateLimiter:
     def __init__(self, requests_per_second: float) -> None:
         self.interval = 0.0 if requests_per_second <= 0 else 1.0 / requests_per_second
@@ -136,7 +157,11 @@ class RateLimiter:
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Выгрузить CSV uuid,tubNum из addressbook API."
+        description="Выгрузить CSV uuid,tubNum из addressbook API.",
+        epilog=(
+            "Клиентский .p12 задаётся парой переменных CLIENT_CERT и "
+            "CLIENT_CERT_PASSPHRASE."
+        ),
     )
     parser.add_argument("--input", required=True, type=Path, help="Исходный CSV.")
     parser.add_argument(
@@ -252,12 +277,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 def rtf_to_text(path: Path) -> str:
     if not path.is_file():
         raise ConfigError(f"RTF-файл не найден: {path}")
+    child_env = os.environ.copy()
+    child_env.pop(CLIENT_CERT_ENV, None)
+    child_env.pop(CLIENT_CERT_PASSPHRASE_ENV, None)
     try:
         result = subprocess.run(
             ["textutil", "-convert", "txt", "-stdout", str(path)],
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=child_env,
         )
     except FileNotFoundError as exc:
         raise ConfigError(
@@ -364,6 +393,14 @@ def validate_request(curl_request: CurlRequest, expected_host: str) -> Endpoint:
     split = urlsplit(curl_request.url)
     if split.scheme.lower() != "https":
         raise ConfigError("URL запроса должен использовать HTTPS.")
+    try:
+        port = split.port
+    except ValueError as exc:
+        raise ConfigError("В URL запроса указан некорректный порт.") from exc
+    if port not in {None, 443}:
+        raise ConfigError(
+            "URL запроса должен использовать стандартный HTTPS-порт."
+        )
     if split.hostname != expected_host:
         raise ConfigError(
             f"Хост запроса {split.hostname!r} не совпадает с разрешенным "
@@ -406,10 +443,100 @@ def resolve_tls_verify(
     return True
 
 
+def resolve_client_certificate(
+    environ: Optional[Mapping[str, str]] = None,
+) -> Optional[ClientCertificate]:
+    source = os.environ if environ is None else environ
+    raw_path = source.get(CLIENT_CERT_ENV, "").strip()
+    password = source.get(CLIENT_CERT_PASSPHRASE_ENV, "")
+
+    if not raw_path and not password:
+        return None
+    if not raw_path:
+        raise ConfigError(
+            f"Задана {CLIENT_CERT_PASSPHRASE_ENV}, но не задана "
+            f"{CLIENT_CERT_ENV}."
+        )
+    if not password:
+        raise ConfigError(
+            f"Задана {CLIENT_CERT_ENV}, но не задана "
+            f"{CLIENT_CERT_PASSPHRASE_ENV}."
+        )
+
+    try:
+        resolved = Path(raw_path).expanduser().resolve()
+    except (OSError, ValueError) as exc:
+        raise ConfigError(
+            f"В {CLIENT_CERT_ENV} указан некорректный путь."
+        ) from exc
+    if not resolved.is_file():
+        raise ConfigError(
+            f"PKCS#12-файл из {CLIENT_CERT_ENV} не найден: {resolved}"
+        )
+    if resolved.suffix.casefold() not in {".p12", ".pfx"}:
+        raise ConfigError(
+            f"{CLIENT_CERT_ENV} должен указывать на файл .p12 или .pfx."
+        )
+    return ClientCertificate(resolved, password)
+
+
+def _pkcs12_adapter(client_certificate: ClientCertificate) -> Any:
+    try:
+        from requests_pkcs12 import Pkcs12Adapter
+    except (ImportError, OSError) as exc:
+        raise ConfigError(
+            "Для CLIENT_CERT нужен requests-pkcs12. Выполните: "
+            "python3 -m pip install -r requirements-addressbook.txt"
+        ) from exc
+    try:
+        return Pkcs12Adapter(
+            pkcs12_filename=str(client_certificate.path),
+            pkcs12_password=client_certificate.password,
+        )
+    except Exception as exc:
+        raise ConfigError(
+            "Не удалось открыть CLIENT_CERT. Проверьте формат .p12/.pfx "
+            "и CLIENT_CERT_PASSPHRASE."
+        ) from exc
+
+
+def validate_client_certificate(
+    client_certificate: Optional[ClientCertificate],
+) -> None:
+    if client_certificate is None:
+        return
+    adapter = _pkcs12_adapter(client_certificate)
+    adapter.close()
+
+
+def mount_client_certificate(
+    session: Session,
+    client_certificate: Optional[ClientCertificate],
+    hosts: Iterable[str],
+) -> None:
+    if client_certificate is None:
+        return
+    normalized_hosts = {host.casefold() for host in hosts}
+    allowed_hosts = {
+        DEFAULT_EXPECTED_HOST,
+        DEFAULT_PRIMARY_IDP_HOST,
+        DEFAULT_ALT_IDP_HOST,
+    }
+    if not normalized_hosts.issubset(allowed_hosts):
+        raise ConfigError(
+            "CLIENT_CERT не отправлен: хост отсутствует в mTLS allowlist."
+        )
+    for host in sorted(normalized_hosts):
+        adapter = _pkcs12_adapter(client_certificate)
+        session.mount(_https_url(host), adapter)
+        session.mount(f"https://{host}:443/", adapter)
+
+
 def create_session(
     curl_request: CurlRequest,
     expected_host: str,
     tls_verify: Union[bool, str] = True,
+    client_certificate: Optional[ClientCertificate] = None,
 ) -> Session:
     if requests is None:
         raise ConfigError(
@@ -417,10 +544,17 @@ def create_session(
             "python3 -m pip install -r requirements.txt"
         )
     session = requests.Session()
-    session.verify = tls_verify
-    session.headers.update(curl_request.headers)
-    for name, value in curl_request.cookies.items():
-        session.cookies.set(name, value, domain=expected_host, path="/")
+    try:
+        session.verify = tls_verify
+        mount_client_certificate(
+            session, client_certificate, [expected_host]
+        )
+        session.headers.update(curl_request.headers)
+        for name, value in curl_request.cookies.items():
+            session.cookies.set(name, value, domain=expected_host, path="/")
+    except Exception:
+        session.close()
+        raise
     return session
 
 
@@ -710,6 +844,7 @@ def reauthenticate_addressbook(
     expected_host: str,
     tls_verify: Union[bool, str],
     timeout: float,
+    client_certificate: Optional[ClientCertificate] = None,
 ) -> Session:
     if requests is None:
         raise ConfigError(
@@ -717,16 +852,25 @@ def reauthenticate_addressbook(
             "python3 -m pip install -r requirements.txt"
         )
     auth_session = requests.Session()
-    auth_session.verify = tls_verify
-    safe_reauth_headers = {"accept-language", "user-agent"}
-    auth_session.headers.update(
-        {
-            name: value
-            for name, value in curl_request.headers.items()
-            if name.casefold() in safe_reauth_headers
-        }
-    )
     try:
+        auth_session.verify = tls_verify
+        mount_client_certificate(
+            auth_session,
+            client_certificate,
+            [
+                expected_host,
+                DEFAULT_PRIMARY_IDP_HOST,
+                DEFAULT_ALT_IDP_HOST,
+            ],
+        )
+        safe_reauth_headers = {"accept-language", "user-agent"}
+        auth_session.headers.update(
+            {
+                name: value
+                for name, value in curl_request.headers.items()
+                if name.casefold() in safe_reauth_headers
+            }
+        )
         drive_addressbook_reauth(
             auth_session,
             _negotiate_auth(),
@@ -1032,12 +1176,15 @@ def run(args: argparse.Namespace) -> int:
     endpoint = endpoint_from_request(
         curl_request, args.expected_host, args.uuid_parameter
     )
+    client_certificate = resolve_client_certificate()
 
     if args.dry_run:
+        validate_client_certificate(client_certificate)
         valid, invalid = scan_input(args.input, args.id_column)
         print(
             "Проверка завершена: "
             f"host={args.expected_host}, cookies={len(curl_request.cookies)}, "
+            f"client_cert={'да' if client_certificate else 'нет'}, "
             f"валидных UUID={valid}, некорректных/пустых={invalid}. "
             "HTTP-запросы не выполнялись."
         )
@@ -1047,7 +1194,10 @@ def run(args: argparse.Namespace) -> int:
     errors_path = default_errors_path(args.output)
     tls_verify = resolve_tls_verify(args.ca_bundle)
     session = create_session(
-        curl_request, args.expected_host, tls_verify=tls_verify
+        curl_request,
+        args.expected_host,
+        tls_verify=tls_verify,
+        client_certificate=client_certificate,
     )
     try:
         output_handle, output_writer = open_csv_append(
@@ -1111,6 +1261,7 @@ def run(args: argparse.Namespace) -> int:
                         args.expected_host,
                         tls_verify,
                         args.timeout,
+                        client_certificate=client_certificate,
                     )
                     expired_session = session
                     session = renewed_session

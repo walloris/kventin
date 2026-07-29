@@ -18,7 +18,7 @@
 cd /path/to/kventin
 python3 -m venv .venv
 source .venv/bin/activate
-python3 -m pip install -r requirements.txt
+python3 -m pip install -r requirements-addressbook.txt
 ```
 
 ## Проверка без HTTP-запросов
@@ -54,6 +54,27 @@ python3 scripts/uuid_to_tubnum.py \
   --rate 5
 ```
 
+## Клиентский сертификат `.p12`
+
+Для mTLS используются те же две переменные, что и в предоставленном
+`got.mjs`:
+
+```bash
+export CLIENT_CERT='/path/to/client-cert.p12'
+read -s 'CLIENT_CERT_PASSPHRASE?PKCS#12 password: '
+export CLIENT_CERT_PASSPHRASE
+echo
+```
+
+Обе переменные обязательны как пара. Пароль не передаётся в аргументах
+командной строки, не печатается и не попадает в error CSV. Зашифрованный
+PKCS#12 подключается напрямую через TLS adapter без создания временного
+незашифрованного PEM с приватным ключом.
+
+Сертификат разрешено предъявлять только трём хостам наблюдавшегося маршрута:
+Addressbook, основному IdP и альтернативному IdP. `--dry-run` проверяет
+наличие файла и корректность пароля без HTTP-запросов.
+
 ## Автоматический повторный вход
 
 Новый HAR показывает не refresh-token flow, а полный OIDC-вход через
@@ -62,7 +83,6 @@ Kerberos/SPNEGO. Если в текущем терминале доступен 
 тот же UUID:
 
 ```bash
-python3 -m pip install -r requirements-addressbook.txt
 klist -t
 
 python3 scripts/uuid_to_tubnum.py \
@@ -106,6 +126,9 @@ python3 scripts/uuid_to_tubnum.py \
 сертификаты Keychain: это может превратить недоверенные пользовательские
 сертификаты в доверенные корни.
 
+`--ca-bundle` и `CLIENT_CERT` решают разные задачи: первый доверяет
+сертификату сервера, второй предъявляет клиентский сертификат `.p12`.
+
 Основной результат содержит только подтверждённые непустые пары
 `uuid,tubNum`. Рядом создаётся `uuid_tubnum.errors.csv`. При повторном запуске
 готовые UUID пропускаются; отсутствующие или ошибочные ответы можно запросить
@@ -120,7 +143,8 @@ python3 scripts/uuid_to_tubnum.py \
 
 Предоставленные ранее `got.mjs` и `cli.mjs` используют другой сервис и
 Bearer/refresh-token flow, поэтому их нельзя применять для обновления
-cookie-сессии Addressbook.
+cookie-сессии Addressbook. Из `got.mjs` повторно используются только имена
+переменных `CLIENT_CERT` и `CLIENT_CERT_PASSPHRASE`.
 
 Последний HAR содержит всю front-channel цепочку: начальный redirect
 Addressbook, ответ IdP `WWW-Authenticate: Negotiate`, динамический пустой
@@ -132,5 +156,5 @@ POST `login-actions/authenticate`, альтернативный IdP и callback
 auth-ответов. Поэтому автоматический вход реализован строго по наблюдавшейся
 схеме, включая безопасный разбор auto-submit POST-формы, но окончательно
 проверить его можно только в корпоративной сети с доступным Kerberos TGT.
-Признаков обязательного клиентского PFX в HAR нет; `--ca-bundle` отвечает
-только за доверие серверным сертификатам.
+Sanitized HAR не показывал клиентский сертификат TLS, поэтому поддержку
+подтверждённого пользователем `.p12` добавили отдельно.
