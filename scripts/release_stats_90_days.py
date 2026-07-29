@@ -56,6 +56,11 @@ DEFAULT_MAX_RELEASE_DETAIL_REQUESTS = 90
 DEFAULT_MIN_REQUEST_RESERVE = 50
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 10
 DEFAULT_READ_TIMEOUT_SECONDS = 60
+DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 10.0
+DEFAULT_MAX_RATE_LIMIT_COOLDOWN_SECONDS = 60.0
+DEFAULT_MAX_CONSECUTIVE_429_RETRIES = 10
+DEFAULT_RATE_LIMIT_INTERVAL_STEP_SECONDS = 0.25
+DEFAULT_MAX_ADAPTIVE_REQUEST_INTERVAL_SECONDS = 3.0
 
 HEADERS = (
     "Дата релиза",
@@ -99,6 +104,7 @@ class JiraRequestGuard:
     min_interval_seconds: float = DEFAULT_MIN_REQUEST_INTERVAL_SECONDS
     max_requests: int = DEFAULT_MAX_JIRA_REQUESTS
     requests_made: int = 0
+    rate_limit_events: int = 0
     _last_request_started_at: float | None = None
 
     def __post_init__(self) -> None:
@@ -154,6 +160,106 @@ def automatic_jira_request_budget(max_release_detail_requests: int) -> int:
         DEFAULT_MAX_JIRA_REQUESTS,
         max_release_detail_requests + reserve,
     )
+
+
+def jira_error_status_code(error: Exception) -> int | None:
+    raw_status = getattr(error, "status_code", None)
+    if raw_status is None:
+        response = getattr(error, "response", None)
+        raw_status = getattr(response, "status_code", None)
+    try:
+        return int(raw_status) if raw_status is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def jira_retry_after_seconds(error: Exception) -> float:
+    response = getattr(error, "response", None)
+    header_sources = (
+        getattr(response, "headers", None),
+        getattr(error, "headers", None),
+    )
+    for headers in header_sources:
+        if not isinstance(headers, Mapping):
+            continue
+        raw_value = headers.get("Retry-After")
+        if raw_value is None:
+            continue
+        try:
+            return max(0.0, float(raw_value))
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
+def jira_call_with_429_recovery(
+    operation: Any,
+    *,
+    request_guard: JiraRequestGuard | None,
+    request_label: str,
+) -> Any:
+    consecutive_429 = 0
+    while True:
+        if request_guard is not None:
+            request_guard.before_request(request_label)
+        try:
+            return operation()
+        except Exception as exc:
+            if jira_error_status_code(exc) != 429:
+                raise
+
+            consecutive_429 += 1
+            if request_guard is not None:
+                request_guard.rate_limit_events += 1
+                total_rate_limit_events = request_guard.rate_limit_events
+            else:
+                total_rate_limit_events = consecutive_429
+            if consecutive_429 > DEFAULT_MAX_CONSECUTIVE_429_RETRIES:
+                raise RuntimeError(
+                    "Jira продолжает отвечать HTTP 429 для операции "
+                    f"«{request_label}» после "
+                    f"{DEFAULT_MAX_CONSECUTIVE_429_RETRIES} управляемых повторов."
+                ) from exc
+
+            exponential_cooldown = min(
+                DEFAULT_MAX_RATE_LIMIT_COOLDOWN_SECONDS,
+                DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
+                * (2 ** (consecutive_429 - 1)),
+            )
+            cooldown_seconds = max(
+                exponential_cooldown,
+                jira_retry_after_seconds(exc),
+            )
+            if request_guard is not None:
+                current_interval = request_guard.min_interval_seconds
+                adaptive_interval = min(
+                    DEFAULT_MAX_ADAPTIVE_REQUEST_INTERVAL_SECONDS,
+                    max(
+                        DEFAULT_MIN_REQUEST_INTERVAL_SECONDS,
+                        current_interval,
+                    )
+                    + DEFAULT_RATE_LIMIT_INTERVAL_STEP_SECONDS,
+                )
+                request_guard.min_interval_seconds = max(
+                    current_interval,
+                    adaptive_interval,
+                )
+                interval_text = (
+                    f"{request_guard.min_interval_seconds:g} с"
+                )
+            else:
+                interval_text = "без общего guard"
+            logging.warning(
+                "Jira HTTP 429: операция «%s»; пауза %.0f с, затем повтор "
+                "%s/%s; интервал запросов теперь ≥%s; всего 429=%s.",
+                request_label,
+                cooldown_seconds,
+                consecutive_429,
+                DEFAULT_MAX_CONSECUTIVE_429_RETRIES,
+                interval_text,
+                total_rate_limit_events,
+            )
+            time.sleep(cooldown_seconds)
 
 
 def normalized(value: Any) -> str:
@@ -622,15 +728,18 @@ def search_all(
     result: list[Any] = []
     start_at = 0
     while True:
-        if request_guard is not None:
-            request_guard.before_request(
-                f"{request_label}, startAt={start_at}, maxResults={page_size}"
-            )
-        page = jira.search_issues(
-            jql,
-            startAt=start_at,
-            maxResults=page_size,
-            fields=",".join(dict.fromkeys(fields)),
+        page_label = (
+            f"{request_label}, startAt={start_at}, maxResults={page_size}"
+        )
+        page = jira_call_with_429_recovery(
+            lambda: jira.search_issues(
+                jql,
+                startAt=start_at,
+                maxResults=page_size,
+                fields=",".join(dict.fromkeys(fields)),
+            ),
+            request_guard=request_guard,
+            request_label=page_label,
         )
         items = list(page)
         result.extend(items)
@@ -731,12 +840,16 @@ def fetch_release_details(
         # Если метаданные уже пришли из Search, точным GET забираем только
         # issuelinks. В корпоративной Jira именно это поле в Search усекается.
         field_csv = "issuelinks" if candidate is not None else full_field_csv
-        if request_guard is not None:
-            request_guard.before_request(
-                f"точный состав релиза {key} ({index}/{len(release_key_list)})"
-            )
+        request_label = (
+            f"точный состав релиза {key} "
+            f"({index}/{len(release_key_list)})"
+        )
         try:
-            exact_release = jira.issue(key, fields=field_csv)
+            exact_release = jira_call_with_429_recovery(
+                lambda: jira.issue(key, fields=field_csv),
+                request_guard=request_guard,
+                request_label=request_label,
+            )
         except Exception as exc:
             raise RuntimeError(
                 f"Не удалось точно получить состав релиза {key}: {exc}"
@@ -1476,7 +1589,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             "Jira-запросов: "
             f"{request_guard.requests_made}/{request_guard.max_requests}; "
-            f"интервал ≥ {request_guard.min_interval_seconds:g} с"
+            f"интервал ≥ {request_guard.min_interval_seconds:g} с; "
+            f"HTTP 429: {request_guard.rate_limit_events}"
         )
         print(f"Excel: {Path(output_path).expanduser().resolve()}")
         return 0
@@ -1486,7 +1600,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if request_guard is not None:
             print(
                 "Jira-запросов до остановки: "
-                f"{request_guard.requests_made}/{request_guard.max_requests}",
+                f"{request_guard.requests_made}/{request_guard.max_requests}; "
+                f"HTTP 429: {request_guard.rate_limit_events}",
                 file=sys.stderr,
             )
         return 1
