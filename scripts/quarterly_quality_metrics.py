@@ -692,9 +692,53 @@ def field_values_over_history(
     return list(dict.fromkeys(value.strip() for value in values if value.strip()))
 
 
+def detection_stage_values_from_history_html(
+    document: str,
+    rules: MetricRules,
+) -> list[str]:
+    """Extract PSI/PROM values from the Server/DC change-history HTML tab."""
+
+    normalized_document = normalized(document)
+    if (
+        "login-form" in normalized_document
+        or "id=\"login\"" in normalized_document
+        or "name=\"os_username\"" in normalized_document
+    ):
+        raise RuntimeError("Jira вернула страницу входа вместо истории задачи.")
+
+    blocks = re.findall(r"<tr\b[^>]*>.*?</tr\s*>", document, flags=re.I | re.S)
+    if not blocks:
+        blocks = re.findall(r"<li\b[^>]*>.*?</li\s*>", document, flags=re.I | re.S)
+    if not blocks:
+        blocks = [document]
+
+    result: list[str] = []
+    for block in blocks:
+        without_markup = re.sub(r"<[^>]+>", " ", block)
+        text = normalized(html.unescape(without_markup))
+        field_matches = (
+            "этап обнаруж" in text
+            or ("detection" in text and "stage" in text)
+        )
+        if not field_matches:
+            continue
+        if any(
+            re.search(rf"(?<!\w){re.escape(value)}(?!\w)", text)
+            for value in rules.prom_detection_stages
+        ):
+            result.append("ПРОМ")
+        if any(
+            re.search(rf"(?<!\w){re.escape(value)}(?!\w)", text)
+            for value in rules.psi_detection_stages
+        ):
+            result.append("ПСИ")
+    return list(dict.fromkeys(result))
+
+
 def with_detection_stage_history(
     issue: Mapping[str, Any],
     detection_stage_field_id: str,
+    additional_values: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Copy an issue and expose every detection stage seen in its changelog."""
 
@@ -710,6 +754,11 @@ def with_detection_stage_history(
         issue,
         detection_stage_field_id,
         ("Этап обнаружения", "Detection Stage"),
+    )
+    history_values.extend(
+        value
+        for value in additional_values
+        if value and value not in history_values
     )
     if not history_values:
         history_values = named_values(current_value)
@@ -889,6 +938,48 @@ class RestClient:
                     f"{attempt + 1}/{attempts} через {delay:g} с",
                     error=True,
                 )
+                time.sleep(delay)
+                continue
+            raise HttpRequestError(self.service, response.status_code, response.text)
+        raise AssertionError("unreachable")
+
+    def request_text(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[Mapping[str, Any]] = None,
+    ) -> str:
+        """Request an authenticated HTML page with the same retry policy."""
+
+        url = f"{self.settings.url.rstrip('/')}/{path.lstrip('/')}"
+        attempts = 4 if method.upper() == "GET" else 1
+        for attempt in range(1, attempts + 1):
+            try:
+                response = self.session.request(
+                    method=method,
+                    url=url,
+                    params=params,
+                    headers={"Accept": "text/html,application/xhtml+xml"},
+                    timeout=self.settings.timeout_seconds,
+                    verify=self.settings.verify_ssl,
+                )
+            except Exception as exc:
+                if attempt >= attempts:
+                    raise RuntimeError(
+                        f"{self.service}: ошибка запроса {url}: {exc}"
+                    ) from exc
+                delay = min(2 ** (attempt - 1), 8)
+                time.sleep(delay)
+                continue
+
+            if 200 <= response.status_code < 300:
+                return response.text
+            if (
+                response.status_code in RETRYABLE_HTTP_STATUSES
+                and attempt < attempts
+            ):
+                delay = min(2 ** (attempt - 1), 8)
                 time.sleep(delay)
                 continue
             raise HttpRequestError(self.service, response.status_code, response.text)
@@ -1086,85 +1177,19 @@ class JiraClient:
                 )
         return result
 
-    def changelog(
-        self,
-        issue_key: str,
-        *,
-        page_size: int = 100,
-    ) -> dict[str, Any]:
-        """Load a complete Jira changelog, including histories past expand limits."""
+    def issue_history_html(self, issue_key: str) -> str:
+        """Load the full Server/DC history tab when REST changelog is limited."""
 
-        start_at = 0
-        histories: list[dict[str, Any]] = []
-        while True:
-            data = self.rest.request_json(
-                "GET",
-                f"/rest/api/2/issue/{issue_key}/changelog",
-                params={"startAt": start_at, "maxResults": page_size},
-            )
-            if not isinstance(data, Mapping):
-                raise RuntimeError(
-                    f"Jira changelog {issue_key} вернул неожиданный ответ."
+        return self.rest.request_text(
+            "GET",
+            f"/browse/{issue_key}",
+            params={
+                "page": (
+                    "com.atlassian.jira.plugin.system.issuetabpanels:"
+                    "changehistory-tabpanel"
                 )
-            page = data.get("values")
-            if not isinstance(page, list):
-                page = data.get("histories")
-            if not isinstance(page, list):
-                raise RuntimeError(
-                    f"Jira changelog {issue_key}: нет массива histories/values."
-                )
-            histories.extend(item for item in page if isinstance(item, dict))
-            start_at += len(page)
-            total = int(data.get("total") or len(histories))
-            if not page or start_at >= total:
-                return {
-                    "startAt": 0,
-                    "maxResults": len(histories),
-                    "total": total,
-                    "histories": histories,
-                }
-
-    def changelogs_individually(
-        self,
-        issue_keys: Iterable[str],
-        *,
-        progress_label: str = "",
-    ) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
-        """Load complete paginated changelogs with Jira-friendly pacing."""
-
-        keys = sorted(
-            {
-                str(issue_key).strip().upper()
-                for issue_key in issue_keys
-                if str(issue_key).strip()
-            }
+            },
         )
-        result: dict[str, dict[str, Any]] = {}
-        errors: dict[str, str] = {}
-        previous_request_started = 0.0
-        for index, key in enumerate(keys, start=1):
-            since_previous_start = (
-                time.perf_counter() - previous_request_started
-                if previous_request_started
-                else JIRA_ISSUE_REQUEST_INTERVAL_SECONDS
-            )
-            pacing_delay = max(
-                0.0,
-                JIRA_ISSUE_REQUEST_INTERVAL_SECONDS - since_previous_start,
-            )
-            if pacing_delay:
-                time.sleep(pacing_delay)
-            previous_request_started = time.perf_counter()
-            try:
-                result[key] = self.changelog(key)
-            except Exception as exc:
-                errors[key] = str(exc)
-            if progress_label and (index % 10 == 0 or index == len(keys)):
-                execution_log(
-                    f"{progress_label}: {index}/{len(keys)}, "
-                    f"ошибок={len(errors)}"
-                )
-        return result, errors
 
 
 def find_jira_field_id(
@@ -1368,36 +1393,101 @@ def collect_created_bugs(
         f"Jira: заведённых Bug/Defect найдено={len(candidates)}; "
         f"Closed High+ для проверки всей истории этапа={len(history_keys)}"
     )
-    changelogs, errors = jira.changelogs_individually(
+    detailed, errors = jira.issues_individually(
         history_keys,
-        progress_label="Jira: полный changelog багов",
+        fields,
+        max_workers=JIRA_LINK_WORKERS,
+        progress_label="Jira: changelog багов",
+        expand="changelog",
     )
-    if errors or len(changelogs) != len(set(history_keys)):
-        missing = sorted(set(history_keys) - set(changelogs))
+    if errors or len(detailed) != len(set(history_keys)):
+        missing = sorted(set(history_keys) - set(detailed))
         details = "; ".join(
             f"{key}: {errors.get(key, 'пустой ответ Jira')}"
             for key in missing[:5]
         )
         raise RuntimeError(
-            "Jira не вернула полный changelog всех Closed High+ багов; "
+            "Jira не вернула changelog всех Closed High+ багов; "
             f"публикация остановлена. {details}"
         )
-
-    candidates_by_key = {
-        str(issue.get("key") or "").strip().upper(): issue
-        for issue in candidates
-        if str(issue.get("key") or "").strip()
-    }
-    detailed: dict[str, dict[str, Any]] = {}
-    for key, changelog in changelogs.items():
-        issue = dict(candidates_by_key[key])
-        issue["changelog"] = changelog
-        detailed[key] = issue
 
     detailed_with_stage_history = {
         key: with_detection_stage_history(issue, detection_stage_field_id)
         for key, issue in detailed.items()
     }
+
+    # Old Jira Server/DC versions expose only a limited changelog window in
+    # REST and do not implement /issue/{key}/changelog at all. For unresolved
+    # bugs with a truncated REST history, the standard full History tab is the
+    # only API-accessible source for older custom-field values.
+    html_history_keys: list[str] = []
+    for key, issue in detailed.items():
+        metric_issue = detailed_with_stage_history[key]
+        if classify_eligible_detection_stage(
+            issue_field(metric_issue, detection_stage_field_id),
+            rules,
+        ) is not None:
+            continue
+        changelog = issue.get("changelog")
+        histories = changelog.get("histories") if isinstance(changelog, Mapping) else None
+        if not isinstance(histories, list):
+            html_history_keys.append(key)
+            continue
+        total = int(changelog.get("total") or len(histories))
+        if "total" not in changelog or total > len(histories):
+            html_history_keys.append(key)
+
+    execution_log(
+        "Jira: REST-история не содержит ПСИ/ПРОМ и обрезана для "
+        f"{len(html_history_keys)} багов; проверяю полную вкладку History"
+    )
+    html_history_errors: dict[str, str] = {}
+    html_history_found = 0
+    previous_request_started = 0.0
+    for index, key in enumerate(html_history_keys, start=1):
+        since_previous_start = (
+            time.perf_counter() - previous_request_started
+            if previous_request_started
+            else JIRA_ISSUE_REQUEST_INTERVAL_SECONDS
+        )
+        pacing_delay = max(
+            0.0,
+            JIRA_ISSUE_REQUEST_INTERVAL_SECONDS - since_previous_start,
+        )
+        if pacing_delay:
+            time.sleep(pacing_delay)
+        previous_request_started = time.perf_counter()
+        try:
+            history_html = jira.issue_history_html(key)
+            additional_values = detection_stage_values_from_history_html(
+                history_html,
+                rules,
+            )
+        except Exception as exc:
+            html_history_errors[key] = str(exc)
+        else:
+            if additional_values:
+                html_history_found += 1
+                detailed_with_stage_history[key] = with_detection_stage_history(
+                    detailed[key],
+                    detection_stage_field_id,
+                    additional_values,
+                )
+        if index % 10 == 0 or index == len(html_history_keys):
+            execution_log(
+                f"Jira: полная History: {index}/{len(html_history_keys)}, "
+                f"с найденным ПСИ/ПРОМ={html_history_found}, "
+                f"ошибок={len(html_history_errors)}"
+            )
+    if html_history_errors:
+        example_key = sorted(html_history_errors)[0]
+        execution_log(
+            "Jira: не удалось прочитать HTML History для "
+            f"{len(html_history_errors)} багов; продолжаю по доступной REST-истории. "
+            f"Пример {example_key}: {html_history_errors[example_key]}",
+            error=True,
+        )
+
     result: list[dict[str, Any]] = []
     for issue in candidates:
         key = str(issue.get("key") or "").strip().upper()
@@ -1405,7 +1495,8 @@ def collect_created_bugs(
 
     execution_log(
         f"Jira: баги команд загружены={len(result)}, "
-        f"полная история этапа загружена для={len(detailed_with_stage_history)} "
+        f"REST/HTML-история этапа обработана для="
+        f"{len(detailed_with_stage_history)} "
         f"({elapsed_seconds(started)})"
     )
     return result, jql
@@ -2906,15 +2997,8 @@ def write_reference_debug_report(
         ("*all", "issuelinks"),
         max_workers=JIRA_LINK_WORKERS,
         progress_label="Jira: debug спорных задач",
+        expand="changelog",
     )
-    debug_changelogs, debug_changelog_errors = jira.changelogs_individually(
-        exact_debug_issues,
-        progress_label="Jira: debug полный changelog",
-    )
-    for key, changelog in debug_changelogs.items():
-        exact_debug_issues[key]["changelog"] = changelog
-    for key, error in debug_changelog_errors.items():
-        debug_issue_errors[key] = f"changelog: {error}"
     exact_debug_issues = {
         key: with_detection_stage_history(issue, detection_stage_field_id)
         for key, issue in exact_debug_issues.items()
