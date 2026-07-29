@@ -251,6 +251,87 @@ def service_name_index(catalog: Mapping[str, ServiceInfo]) -> dict[str, str]:
     return result
 
 
+def partial_catalog_service_ids(
+    text: str,
+    catalog: Mapping[str, ServiceInfo],
+    by_name: Mapping[str, str],
+) -> tuple[str, ...]:
+    """
+    Find КЭ by a partial Jira value.
+
+    Jira may return values such as ``SmartProfile (2295205)`` or
+    ``КЭ=2295205 / SmartProfile`` instead of a bare serviceId. Exact matches
+    still have priority. A shortened value is accepted only when it points to
+    exactly one catalog entry.
+    """
+
+    normalized_text = normalized(text)
+    if not normalized_text:
+        return ()
+
+    service_ids_by_normalized = {
+        normalized(service_id): service_id for service_id in catalog
+    }
+    exact_service_id = service_ids_by_normalized.get(normalized_text)
+    if exact_service_id:
+        return (exact_service_id,)
+
+    contained_service_ids = sorted(
+        (
+            normalized_text.find(normalized_service_id),
+            -len(normalized_service_id),
+            service_id,
+        )
+        for normalized_service_id, service_id in service_ids_by_normalized.items()
+        if normalized_service_id and normalized_service_id in normalized_text
+    )
+    if contained_service_ids:
+        return unique_preserving_order(
+            service_id for _, _, service_id in contained_service_ids
+        )
+
+    # Не матчим слишком короткие фрагменты: они почти гарантированно
+    # неоднозначны среди сотен КЭ.
+    if len(normalized_text) >= 4:
+        shortened_id_matches = unique_preserving_order(
+            service_id
+            for normalized_service_id, service_id in service_ids_by_normalized.items()
+            if normalized_text in normalized_service_id
+        )
+        if len(shortened_id_matches) == 1:
+            return shortened_id_matches
+
+    exact_name = by_name.get(normalized_text)
+    if exact_name:
+        return (exact_name,)
+
+    contained_names = [
+        (len(name), service_id)
+        for name, service_id in by_name.items()
+        if len(name) >= 4 and name in normalized_text
+    ]
+    if contained_names:
+        longest_length = max(length for length, _ in contained_names)
+        longest_matches = unique_preserving_order(
+            service_id
+            for length, service_id in contained_names
+            if length == longest_length
+        )
+        if len(longest_matches) == 1:
+            return longest_matches
+
+    if len(normalized_text) >= 4:
+        shortened_name_matches = unique_preserving_order(
+            service_id
+            for name, service_id in by_name.items()
+            if normalized_text in name
+        )
+        if len(shortened_name_matches) == 1:
+            return shortened_name_matches
+
+    return ()
+
+
 def extract_service_ids(
     raw_ke_value: Any,
     catalog: Mapping[str, ServiceInfo],
@@ -279,8 +360,9 @@ def extract_service_ids(
                 if not text:
                     continue
                 candidates.append(text)
-                if text in catalog:
-                    found.append(text)
+                matched_ids = partial_catalog_service_ids(text, catalog, by_name)
+                if matched_ids:
+                    found.extend(matched_ids)
                     return
             for key in ("value", "name"):
                 if value.get(key) is not None:
@@ -295,17 +377,9 @@ def extract_service_ids(
         text = str(value).strip()
         if not text:
             return
-        if text in catalog:
-            found.append(text)
-            return
-        parenthesized = re.findall(r"\(([A-Za-zА-Яа-я0-9_-]+)\)", text)
-        for candidate in reversed(parenthesized):
-            if candidate in catalog:
-                found.append(candidate)
-                return
-        matched_by_name = by_name.get(normalized(text))
-        if matched_by_name:
-            found.append(matched_by_name)
+        matched_ids = partial_catalog_service_ids(text, catalog, by_name)
+        if matched_ids:
+            found.extend(matched_ids)
             return
         if re.fullmatch(r"[A-Za-zА-Яа-я0-9_-]+", text):
             found.append(text)
