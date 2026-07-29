@@ -72,10 +72,12 @@ DEFAULT_STORY_TYPES = ("Story",)
 DEFAULT_STORY_STATUSES = ("Done", "Сделано", "Готово")
 DEFAULT_BUG_TYPES = ("Bug", "Defect", "Ошибка")
 DEFAULT_EXCLUDED_BUG_STATUSES = ("Отклонен исполнителем",)
+# В части Jira-проектов высокий приоритет хранится под стандартным именем Major.
 DEFAULT_BUG_PRIORITIES = (
     "Critical",
     "Crytical",
     "Blocker",
+    "Major",
     "Высокий",
     "Блокирующий",
 )
@@ -2460,7 +2462,7 @@ def render_confluence_html(
         "В баги входят заведённые за отчётный период в Jira-проектах команд "
         "задачи типа Bug в любом статусе, кроме «Отклонен исполнителем», "
         "с приоритетом "
-        "Critical/Crytical, Blocker, Высокий или Блокирующий "
+        "Critical/Crytical, Blocker, Major, Высокий или Блокирующий "
         "и этапом обнаружения PSI/ПСИ или PROM/ПРОМ в истории задачи. "
         "Поэтому последующее изменение ПРОМ на другое значение не исключает "
         "баг из метрики. "
