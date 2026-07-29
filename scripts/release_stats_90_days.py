@@ -11,6 +11,10 @@
 
 Story и Bug считаются только среди задач, связанных с релизом связью
 ``consist of`` / ``is part of``. Счёт ведётся по уникальным Jira-ключам.
+
+Запросы выполняются последовательно. Скрипт ограничивает их частоту и общее
+количество, не использует автоматические retry. Точный GET нужен только для
+связей релиза: Jira Search может возвращать урезанный ``issuelinks``.
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ import logging
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -42,9 +47,14 @@ DEFAULT_STORY_TYPES = frozenset(("story", "user story", "история"))
 DEFAULT_BUG_TYPES = frozenset(("bug", "defect", "ошибка"))
 DEFAULT_TIMEZONE = "Europe/Moscow"
 DEFAULT_DAYS = 90
-DEFAULT_KE_BATCH_SIZE = 80
+DEFAULT_KE_BATCH_SIZE = 160
 DEFAULT_ISSUE_BATCH_SIZE = 100
-DEFAULT_PAGE_SIZE = 100
+DEFAULT_PAGE_SIZE = 500
+DEFAULT_MIN_REQUEST_INTERVAL_SECONDS = 1.0
+DEFAULT_MAX_JIRA_REQUESTS = 150
+DEFAULT_MAX_RELEASE_DETAIL_REQUESTS = 90
+DEFAULT_CONNECT_TIMEOUT_SECONDS = 10
+DEFAULT_READ_TIMEOUT_SECONDS = 60
 
 HEADERS = (
     "Дата релиза",
@@ -81,6 +91,55 @@ class ReleaseRow:
             self.story_count,
             self.bug_count,
         ]
+
+
+@dataclass
+class JiraRequestGuard:
+    min_interval_seconds: float = DEFAULT_MIN_REQUEST_INTERVAL_SECONDS
+    max_requests: int = DEFAULT_MAX_JIRA_REQUESTS
+    requests_made: int = 0
+    _last_request_started_at: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.min_interval_seconds < 0:
+            raise ValueError("Минимальный интервал Jira-запросов не может быть < 0.")
+        if self.max_requests <= 0:
+            raise ValueError("Лимит Jira-запросов должен быть больше 0.")
+
+    @property
+    def remaining_requests(self) -> int:
+        return self.max_requests - self.requests_made
+
+    def require_capacity(self, request_count: int, label: str) -> None:
+        if request_count < 0:
+            raise ValueError("Число резервируемых Jira-запросов не может быть < 0.")
+        if request_count > self.remaining_requests:
+            raise RuntimeError(
+                "Остановлено защитой Jira до начала серии запросов: "
+                f"для операции «{label}» нужно {request_count}, доступно "
+                f"{self.remaining_requests} из общего лимита {self.max_requests}."
+            )
+
+    def before_request(self, label: str) -> None:
+        self.require_capacity(1, label)
+
+        now = time.monotonic()
+        if self._last_request_started_at is not None:
+            wait_seconds = (
+                self.min_interval_seconds
+                - (now - self._last_request_started_at)
+            )
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+
+        self.requests_made += 1
+        self._last_request_started_at = time.monotonic()
+        logging.debug(
+            "Jira request %s/%s: %s",
+            self.requests_made,
+            self.max_requests,
+            label,
+        )
 
 
 def normalized(value: Any) -> str:
@@ -475,6 +534,22 @@ def jql_value(value: str) -> str:
     return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def jql_field(field: str) -> str:
+    value = field.strip()
+    if not value:
+        raise ValueError("JQL-поле не может быть пустым.")
+    custom_field_match = re.fullmatch(
+        r"customfield_(\d+)",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if custom_field_match:
+        return f"cf[{custom_field_match.group(1)}]"
+    if re.fullmatch(r"cf\[\d+]|[\wА-Яа-яЁё]+", value):
+        return value
+    return jql_value(value)
+
+
 def batches(values: Sequence[str], size: int) -> Iterable[Sequence[str]]:
     if size <= 0:
         raise ValueError("Размер пакета должен быть положительным.")
@@ -489,26 +564,36 @@ def build_release_jql(
     project: str = DEFAULT_PROJECT,
     issue_type: str = DEFAULT_RELEASE_ISSUE_TYPE,
     ke_jql_field: str = DEFAULT_RELEASE_KE_JQL_FIELD,
+    prod_date_field: str | None = None,
+    start_date: date | None = None,
+    end_date: date | None = None,
+    installed_only: bool = False,
 ) -> str:
     values = ", ".join(jql_value(value) for value in service_ids)
-    ke_field = ke_jql_field.strip()
-    if not ke_field:
-        raise ValueError("JQL-поле КЭ не может быть пустым.")
-    custom_field_match = re.fullmatch(
-        r"customfield_(\d+)",
-        ke_field,
-        flags=re.IGNORECASE,
-    )
-    if custom_field_match:
-        ke_field = f"cf[{custom_field_match.group(1)}]"
-    elif not re.fullmatch(r"cf\[\d+]|[\wА-Яа-яЁё]+", ke_field):
-        ke_field = jql_value(ke_field)
-    return (
-        f"project = {jql_value(project)} "
-        f"AND {ke_field} in ({values}) "
-        f"AND type = {jql_value(issue_type)} "
-        f'AND created >= "{created_since}"'
-    )
+    if (start_date is None) != (end_date is None):
+        raise ValueError("Для JQL-периода нужны одновременно start_date и end_date.")
+    if start_date is not None and end_date is not None and start_date > end_date:
+        raise ValueError("Начало JQL-периода не может быть позже конца.")
+    if start_date is not None and not prod_date_field:
+        raise ValueError("Для JQL-периода нужно поле даты релиза.")
+
+    clauses = [
+        f"project = {jql_value(project)}",
+        f"{jql_field(ke_jql_field)} in ({values})",
+        f"type = {jql_value(issue_type)}",
+        f'created >= "{created_since}"',
+    ]
+    if start_date is not None and end_date is not None:
+        date_field = jql_field(str(prod_date_field))
+        clauses.extend(
+            (
+                f'{date_field} >= "{start_date.isoformat()}"',
+                f'{date_field} <= "{end_date.isoformat()}"',
+            )
+        )
+    if installed_only:
+        clauses.append('status = "Установлен на ПРОМ"')
+    return " AND ".join(clauses)
 
 
 def search_all(
@@ -517,10 +602,16 @@ def search_all(
     fields: Sequence[str],
     *,
     page_size: int,
+    request_guard: JiraRequestGuard | None = None,
+    request_label: str = "JQL search",
 ) -> list[Any]:
     result: list[Any] = []
     start_at = 0
     while True:
+        if request_guard is not None:
+            request_guard.before_request(
+                f"{request_label}, startAt={start_at}, maxResults={page_size}"
+            )
         page = jira.search_issues(
             jql,
             startAt=start_at,
@@ -547,10 +638,15 @@ def collect_release_candidates(
     *,
     created_since: str,
     ke_jql_field: str,
+    prod_date_field: str | None = None,
+    start_date: date | None = None,
+    end_date: date | None = None,
+    installed_only: bool = False,
     release_fields: Sequence[str],
     ke_batch_size: int,
     page_size: int,
     verbose: bool,
+    request_guard: JiraRequestGuard | None = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {}
     service_id_list = list(unique_preserving_order(service_ids))
@@ -560,6 +656,10 @@ def collect_release_candidates(
             service_batch,
             created_since=created_since,
             ke_jql_field=ke_jql_field,
+            prod_date_field=prod_date_field,
+            start_date=start_date,
+            end_date=end_date,
+            installed_only=installed_only,
         )
         if verbose:
             logging.info(
@@ -568,7 +668,14 @@ def collect_release_candidates(
                 len(batch_list),
                 len(service_batch),
             )
-        for issue in search_all(jira, jql, release_fields, page_size=page_size):
+        for issue in search_all(
+            jira,
+            jql,
+            release_fields,
+            page_size=page_size,
+            request_guard=request_guard,
+            request_label=f"релизы, пакет КЭ {index}/{len(batch_list)}",
+        ):
             key = issue_key(issue)
             if key:
                 result[key] = issue
@@ -581,24 +688,87 @@ def fetch_release_details(
     fields: Sequence[str],
     *,
     verbose: bool,
+    preloaded: Mapping[str, Any] | None = None,
+    max_detail_requests: int = DEFAULT_MAX_RELEASE_DETAIL_REQUESTS,
+    request_guard: JiraRequestGuard | None = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {}
-    field_csv = ",".join(dict.fromkeys(fields))
-    for index, key in enumerate(release_keys, start=1):
+    preloaded = preloaded or {}
+    release_key_list = list(unique_preserving_order(release_keys))
+    if max_detail_requests < 0:
+        raise ValueError("Лимит точных GET релизов не может быть < 0.")
+    if len(release_key_list) > max_detail_requests:
+        raise RuntimeError(
+            "Остановлено защитой Jira до точного чтения состава: найдено "
+            f"{len(release_key_list)} релизов, разрешено не более "
+            f"{max_detail_requests}. Уменьшите период либо осознанно увеличьте "
+            "--max-release-detail-requests."
+        )
+    if request_guard is not None:
+        request_guard.require_capacity(
+            len(release_key_list),
+            f"точный состав {len(release_key_list)} релизов",
+        )
+
+    requested_fields = tuple(dict.fromkeys(fields))
+    full_field_csv = ",".join(requested_fields)
+    for index, key in enumerate(release_key_list, start=1):
+        candidate = preloaded.get(key)
+        # Если метаданные уже пришли из Search, точным GET забираем только
+        # issuelinks. В корпоративной Jira именно это поле в Search усекается.
+        field_csv = "issuelinks" if candidate is not None else full_field_csv
+        if request_guard is not None:
+            request_guard.before_request(
+                f"точный состав релиза {key} ({index}/{len(release_key_list)})"
+            )
         try:
-            release = jira.issue(key, fields=field_csv)
+            exact_release = jira.issue(key, fields=field_csv)
         except Exception as exc:
             raise RuntimeError(
-                f"Не удалось получить полный состав релиза {key}: {exc}"
+                f"Не удалось точно получить состав релиза {key}: {exc}"
             ) from exc
-        if not has_issue_field(release, "issuelinks"):
+        if (
+            not has_issue_field(exact_release, "issuelinks")
+            or field_value(exact_release, "issuelinks") is None
+        ):
             raise RuntimeError(
-                f"Jira GET релиза {key} не вернул fields.issuelinks; "
+                f"Точный GET релиза {key} не вернул fields.issuelinks; "
                 "нельзя достоверно посчитать Story/Bug."
             )
-        result[key] = release
-        if verbose and (index == 1 or index % 20 == 0 or index == len(release_keys)):
-            logging.info("Загружено полных релизов: %s/%s", index, len(release_keys))
+
+        if candidate is None:
+            result[key] = exact_release
+        else:
+            raw_candidate = raw_value(candidate)
+            raw_fields = (
+                raw_candidate.get("fields")
+                if isinstance(raw_candidate, Mapping)
+                else None
+            )
+            if isinstance(raw_fields, Mapping):
+                merged_fields = dict(raw_fields)
+            else:
+                merged_fields = {
+                    field: field_value(candidate, field)
+                    for field in requested_fields
+                    if field != "issuelinks" and has_issue_field(candidate, field)
+                }
+            merged_fields["issuelinks"] = field_value(
+                exact_release,
+                "issuelinks",
+            )
+            result[key] = {"key": key, "fields": merged_fields}
+
+        if verbose and (
+            index == 1
+            or index % 10 == 0
+            or index == len(release_key_list)
+        ):
+            logging.info(
+                "Точно загружен состав релизов: %s/%s",
+                index,
+                len(release_key_list),
+            )
     return result
 
 
@@ -609,46 +779,56 @@ def fetch_linked_issues(
     issue_batch_size: int,
     page_size: int,
     verbose: bool,
+    request_guard: JiraRequestGuard | None = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {}
     unique_keys = list(unique_preserving_order(issue_keys))
     batch_list = list(batches(unique_keys, issue_batch_size))
+    if request_guard is not None:
+        request_guard.require_capacity(
+            len(batch_list),
+            f"{len(batch_list)} пакетных запросов задач состава",
+        )
     for index, key_batch in enumerate(batch_list, start=1):
         key_jql = ", ".join(jql_value(key) for key in key_batch)
         jql = f"key in ({key_jql})"
+        loaded_in_batch: set[str] = set()
         for issue in search_all(
             jira,
             jql,
             ("issuetype",),
             page_size=page_size,
+            request_guard=request_guard,
+            request_label=f"задачи состава, пакет {index}/{len(batch_list)}",
         ):
             key = issue_key(issue)
             if key:
                 result[key] = issue
+                loaded_in_batch.add(key)
+        missing_in_batch = [
+            key for key in key_batch if key not in loaded_in_batch
+        ]
+        if missing_in_batch:
+            raise RuntimeError(
+                "Jira не вернула все задачи из consist of при пакетном поиске; "
+                "выгрузка остановлена без одиночных повторных запросов. "
+                f"Не получено: {', '.join(missing_in_batch[:20])}."
+            )
+        without_issue_type = [
+            key
+            for key in key_batch
+            if not has_issue_field(result[key], "issuetype")
+        ]
+        if without_issue_type:
+            raise RuntimeError(
+                "Jira не вернула fields.issuetype для задач состава: "
+                f"{', '.join(without_issue_type[:20])}; нельзя достоверно "
+                "посчитать Story/Bug."
+            )
         if verbose:
             logging.info(
                 "Загружен пакет задач состава %s/%s", index, len(batch_list)
             )
-
-    missing = [key for key in unique_keys if key not in result]
-    failures: list[str] = []
-    for key in missing:
-        try:
-            issue = jira.issue(key, fields="issuetype")
-        except Exception as exc:
-            failures.append(f"{key}: {exc}")
-            continue
-        loaded_key = issue_key(issue) or key
-        result[loaded_key] = issue
-
-    unresolved = [key for key in unique_keys if key not in result]
-    if unresolved:
-        details = "; ".join(failures[:5])
-        suffix = f"; ещё {len(unresolved) - 5}" if len(unresolved) > 5 else ""
-        raise RuntimeError(
-            "Jira не вернула все задачи из consist of; выгрузка остановлена. "
-            f"Не получено: {', '.join(unresolved[:20])}. {details}{suffix}"
-        )
     return result
 
 
@@ -916,12 +1096,23 @@ def create_jira_client(*, verify_ssl: bool) -> tuple[Any, Mapping[str, Any]]:
             "В config.py не задан Jira token: нужен "
             "config['jira']['token'] или JIRA_API_TOKEN."
         )
+    client_options = {
+        "options": options,
+        # Не делаем скрытый /serverInfo при создании клиента и не умножаем
+        # нагрузку автоматическими retry. Любая сетевая ошибка завершает запуск.
+        "get_server_info": False,
+        "max_retries": 0,
+        "timeout": (
+            DEFAULT_CONNECT_TIMEOUT_SECONDS,
+            DEFAULT_READ_TIMEOUT_SECONDS,
+        ),
+    }
     if auth_mode == "basic":
         if not username:
             raise RuntimeError("Для Jira basic auth нужен username/email.")
-        client = JIRA(options=options, basic_auth=(username, token))
+        client = JIRA(**client_options, basic_auth=(username, token))
     elif auth_mode == "token":
-        client = JIRA(options=options, token_auth=token)
+        client = JIRA(**client_options, token_auth=token)
     else:
         raise RuntimeError("JIRA_AUTH_MODE должен быть token или basic.")
     return client, jira_config
@@ -964,8 +1155,8 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--created-since",
         default=DEFAULT_CREATED_SINCE,
         help=(
-            "Нижняя граница created в исходном JQL dpm2.py; фактические "
-            "90 дней всё равно фильтруются по дате установки на ПРОМ."
+            "Дополнительная нижняя граница created из JQL dpm2.py. Окно "
+            "последних N дней также фильтруется в Jira по дате установки."
         ),
     )
     parser.add_argument(
@@ -1009,12 +1200,40 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "плановые и отменённые задачи исключаются."
         ),
     )
+    parser.add_argument(
+        "--min-request-interval",
+        type=float,
+        default=DEFAULT_MIN_REQUEST_INTERVAL_SECONDS,
+        help=(
+            "Минимальная пауза между Jira-запросами в секундах; "
+            f"по умолчанию {DEFAULT_MIN_REQUEST_INTERVAL_SECONDS}."
+        ),
+    )
+    parser.add_argument(
+        "--max-jira-requests",
+        type=int,
+        default=DEFAULT_MAX_JIRA_REQUESTS,
+        help=(
+            "Жёсткий лимит Jira-запросов за один запуск; "
+            f"по умолчанию {DEFAULT_MAX_JIRA_REQUESTS}."
+        ),
+    )
+    parser.add_argument(
+        "--max-release-detail-requests",
+        type=int,
+        default=DEFAULT_MAX_RELEASE_DETAIL_REQUESTS,
+        help=(
+            "Предельное число последовательных точных GET состава релизов; "
+            f"по умолчанию {DEFAULT_MAX_RELEASE_DETAIL_REQUESTS}."
+        ),
+    )
     parser.add_argument("--verbose", action="store_true", help="Подробный лог.")
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_arguments(argv)
+    request_guard: JiraRequestGuard | None = None
     logging.basicConfig(
         level=logging.INFO if args.verbose else logging.WARNING,
         format="%(asctime)s %(levelname)s %(message)s",
@@ -1029,6 +1248,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             else Path.cwd()
             / f"release_stats_{start_date.isoformat()}_{end_date.isoformat()}.xlsx"
         )
+        request_guard = JiraRequestGuard(
+            min_interval_seconds=args.min_request_interval,
+            max_requests=args.max_jira_requests,
+        )
+        if args.max_release_detail_requests < 0:
+            raise ValueError(
+                "--max-release-detail-requests не может быть меньше 0."
+            )
 
         catalog = load_service_catalog(args.mapping.expanduser().resolve())
         jira, jira_config = create_jira_client(verify_ssl=args.verify_ssl)
@@ -1053,10 +1280,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             tuple(catalog),
             created_since=args.created_since,
             ke_jql_field=args.ke_jql_field,
+            prod_date_field=prod_date_field_id,
+            start_date=start_date,
+            end_date=end_date,
+            installed_only=not args.include_non_installed,
             release_fields=release_fields,
             ke_batch_size=DEFAULT_KE_BATCH_SIZE,
             page_size=DEFAULT_PAGE_SIZE,
             verbose=args.verbose,
+            request_guard=request_guard,
         )
 
         candidate_dates = {
@@ -1111,11 +1343,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             in_period_keys,
             detail_fields,
             verbose=args.verbose,
+            preloaded=candidates,
+            max_detail_requests=args.max_release_detail_requests,
+            request_guard=request_guard,
         )
         for key, release in full_releases.items():
             if parse_jira_date(field_value(release, prod_date_field_id)) is None:
                 raise RuntimeError(
-                    f"Точный GET релиза {key} не вернул корректную дату "
+                    f"Данные релиза {key} не содержат корректную дату "
                     f"из поля {prod_date_field_id}."
                 )
             if (
@@ -1123,7 +1358,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 and not named_text(field_value(release, "status"))
             ):
                 raise RuntimeError(
-                    f"Точный GET релиза {key} не вернул status; "
+                    f"Данные релиза {key} не содержат status; "
                     "нельзя применить фильтр «Установлен на ПРОМ»."
                 )
         releases = {
@@ -1156,6 +1391,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             issue_batch_size=DEFAULT_ISSUE_BATCH_SIZE,
             page_size=DEFAULT_PAGE_SIZE,
             verbose=args.verbose,
+            request_guard=request_guard,
         )
 
         rows, unknown_service_ids = make_release_rows(
@@ -1182,11 +1418,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                 + ", ".join(sorted(unknown_service_ids)),
                 file=sys.stderr,
             )
+        print(
+            "Jira-запросов: "
+            f"{request_guard.requests_made}/{request_guard.max_requests}; "
+            f"интервал ≥ {request_guard.min_interval_seconds:g} с"
+        )
         print(f"Excel: {Path(output_path).expanduser().resolve()}")
         return 0
     except Exception as exc:
         logging.exception("Ошибка выполнения") if args.verbose else None
         print(f"Ошибка: {exc}", file=sys.stderr)
+        if request_guard is not None:
+            print(
+                "Jira-запросов до остановки: "
+                f"{request_guard.requests_made}/{request_guard.max_requests}",
+                file=sys.stderr,
+            )
         return 1
 
 
