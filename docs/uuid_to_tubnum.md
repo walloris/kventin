@@ -1,13 +1,17 @@
 # Выгрузка `uuid,tubNum` из Addressbook
 
-Утилита `scripts/uuid_to_tubnum.py` читает UUID из второго столбца CSV,
-берёт URL, браузерные заголовки и cookies из сохранённой curl-команды в RTF,
-запрашивает `/api/home/empInfoFull` и формирует CSV с колонками
-`uuid,tubNum`.
+Обе утилиты читают UUID из второго столбца CSV, запрашивают
+`/api/home/empInfoFull` и формируют CSV с колонками `uuid,tubNum`:
 
-Скрипт не печатает cookies, авторизационные заголовки или тела ошибочных
-ответов. HTTPS-проверка не отключается, а cookies разрешено отправлять только
-на явно заданный хост. Ответы с несколькими несопоставленными `tubNum`
+- `scripts/uuid_to_tubnum_browser.py` выполняет запрос внутри видимого
+  авторизованного Chrome. Это рекомендуемый режим, если `requests` не
+  принимает корпоративную TLS-цепочку;
+- `scripts/uuid_to_tubnum.py` использует сохранённую curl-команду из RTF и
+  обычный Python HTTP-клиент.
+
+Скрипты не печатают cookies, авторизационные заголовки или тела ошибочных
+ответов. HTTPS-проверка по умолчанию включена, а cookies используются только
+на явно заданном хосте. Ответы с несколькими несопоставленными `tubNum`
 отклоняются, чтобы не записать табельный номер другой сущности.
 
 ## Подготовка
@@ -20,6 +24,89 @@ python3 -m venv .venv
 source .venv/bin/activate
 python3 -m pip install -r requirements-addressbook.txt
 ```
+
+## Рекомендуемый запуск через Chrome
+
+В этом режиме RTF, `--request-rtf` и `--auto-reauth` не нужны. Chrome сам
+проходит OIDC/SPNEGO, предъявляет `.p12` и хранит cookies. Скрипт выполняет
+`fetch` прямо внутри страницы и не копирует cookies или токены в Python.
+
+В Bash задайте две переменные:
+
+```bash
+export CLIENT_CERT='/path/to/client-cert.p12'
+read -s -p 'Пароль от .p12: ' CLIENT_CERT_PASSPHRASE
+echo
+export CLIENT_CERT_PASSPHRASE
+```
+
+Сначала проверьте конфигурацию без запуска браузера и сети:
+
+```bash
+python3 scripts/uuid_to_tubnum_browser.py \
+  --input /path/to/addr.csv \
+  --output /path/to/uuid_tubnum.csv \
+  --dry-run
+```
+
+Затем выполните пробную выгрузку:
+
+```bash
+python3 scripts/uuid_to_tubnum_browser.py \
+  --input /path/to/addr.csv \
+  --output /path/to/uuid_tubnum.csv \
+  --limit 10 \
+  --rate 1
+```
+
+Откроется отдельное окно установленного Google Chrome с временным обычным
+профилем: Incognito не используется, потому что он может блокировать
+Kerberos/SPNEGO. При необходимости завершите корпоративный вход и не
+закрывайте окно до итогового сообщения скрипта. После проверки уберите
+`--limit`; готовые UUID при повторном запуске будут пропущены.
+
+По умолчанию используется `channel=chrome`. Для корпоративной сборки Chromium
+можно явно задать исполняемый файл:
+
+```bash
+python3 scripts/uuid_to_tubnum_browser.py \
+  --input /path/to/addr.csv \
+  --output /path/to/uuid_tubnum.csv \
+  --browser-executable '/path/to/browser-binary' \
+  --limit 10
+```
+
+Обычный профиль пользователя Chrome не открывается и не изменяется. Отдельный
+профиль создаётся во временном каталоге и вместе с cookies удаляется при
+штатном завершении; HAR/trace не создаются. Клиентский сертификат разрешён
+только точным origins Addressbook и двух наблюдавшихся IdP. Kerberos
+delegation не включается.
+
+Если TLS-ошибку показывает и отдельное окно Chrome, штатное решение —
+установить доверенный корпоративный CA. Только для разрешённого тестового
+стенда можно явно отключить проверку серверного сертификата:
+
+```bash
+python3 scripts/uuid_to_tubnum_browser.py \
+  --input /path/to/addr.csv \
+  --output /path/to/uuid_tubnum.csv \
+  --limit 10 \
+  --rate 1 \
+  --ignore-https-errors
+```
+
+Флаг отключает проверку сертификата сервера для всего отдельного временного
+browser context. В этом режиме скрипт блокирует обычные сетевые запросы вне
+трёх точных HTTPS origins Addressbook/IdP, но использовать его всё равно
+следует только на разрешённом стенде. Это не заменяет `.p12`: флаг относится
+к сертификату сервера, а `.p12` — к клиентскому сертификату. После завершения
+можно удалить пароль из текущего shell:
+
+```bash
+unset CLIENT_CERT_PASSPHRASE
+```
+
+## Запуск через сохранённый curl
 
 ## Проверка без HTTP-запросов
 

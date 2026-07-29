@@ -1,3 +1,4 @@
 -r requirements.txt
+playwright>=1.46.0,<2.0.0
 requests-gssapi>=1.4.0,<2.0.0
 requests-pkcs12>=1.27,<2.0.0
