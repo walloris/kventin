@@ -2,9 +2,9 @@
 """90-day and quarterly Story/Bug quality metrics for Jira/Confluence.
 
 The script finds Story issues from Release 2.0 tickets installed to production,
-collects bugs created in each team's Jira projects, restores their original
-detection stage from changelog, calculates independent rolling-90-day and
-quarter ratios, and publishes both Confluence tables.
+collects bugs created in each team's Jira projects, checks their complete
+detection-stage history, calculates independent rolling-90-day and quarter
+ratios, and publishes both Confluence tables.
 
 Run locally without publishing:
     python scripts/quarterly_quality_metrics.py --no-publish
@@ -63,7 +63,9 @@ DEFAULT_RELEASE_DATE_FIELD_NAME = "Дата завершения установ�
 DEFAULT_RELEASE_DATE_FIELD_ID = "customfield_19400"
 DEFAULT_RELEASE_TYPE_FIELD_ID = "customfield_23500"
 DEFAULT_DETECTION_STAGE_FIELD_ID = "customfield_11507"
+METRIC_INITIAL_DETECTION_STAGE_FIELD = "_metric_initial_detection_stage"
 METRIC_CURRENT_DETECTION_STAGE_FIELD = "_metric_current_detection_stage"
+METRIC_DETECTION_STAGE_HISTORY_FIELD = "_metric_detection_stage_history"
 DEFAULT_CONFLUENCE_PAGE_ID = "24517214638"
 
 DEFAULT_STORY_TYPES = ("Story",)
@@ -144,6 +146,7 @@ TEAM_SETTINGS_JSON = r"""
 [
   {
     "team": "HRP Core UI",
+    "squad_code": "00HC0031",
     "project_keys": ["HRM"],
     "ke_ids": [
       2298599, 3589425, 3304476, 3303802, 3191860, 2288712, 2257858,
@@ -154,6 +157,7 @@ TEAM_SETTINGS_JSON = r"""
   },
   {
     "team": "HRP Core Tech",
+    "squad_code": "00HC0072",
     "project_keys": ["HRC"],
     "ke_ids": [7993288, 2435236, 5374387, 2257817, 2644268, 2298078],
     "as_is_ratio": 0.13,
@@ -161,6 +165,7 @@ TEAM_SETTINGS_JSON = r"""
   },
   {
     "team": "Core UI 2.0 / Neuro UI",
+    "squad_code": "00QV0004",
     "project_keys": ["NEUROUI"],
     "ke_ids": [9643400, 9643401, 9644023, 9644025, 9644020],
     "as_is_ratio": 0.29,
@@ -168,6 +173,7 @@ TEAM_SETTINGS_JSON = r"""
   },
   {
     "team": "Профиль сотрудника",
+    "squad_code": "00HC0050",
     "project_keys": ["SFILE"],
     "ke_ids": [2295205, 8553253],
     "as_is_ratio": 0.21,
@@ -175,6 +181,7 @@ TEAM_SETTINGS_JSON = r"""
   },
   {
     "team": "Продуктовая аналитика",
+    "squad_code": "",
     "project_keys": ["HRPPA"],
     "ke_ids": [],
     "as_is_ratio": 0.80,
@@ -182,6 +189,7 @@ TEAM_SETTINGS_JSON = r"""
   },
   {
     "team": "Люди Сбера",
+    "squad_code": "00QV0017",
     "project_keys": ["SBRPPL"],
     "ke_ids": [],
     "as_is_ratio": null,
@@ -189,6 +197,7 @@ TEAM_SETTINGS_JSON = r"""
   },
   {
     "team": "Задачи и уведомления",
+    "squad_code": "00HC0042",
     "project_keys": ["PERFREVIEW"],
     "ke_ids": [],
     "as_is_ratio": 0.34,
@@ -196,6 +205,7 @@ TEAM_SETTINGS_JSON = r"""
   },
   {
     "team": "Ассистент HR",
+    "squad_code": "00QV0001",
     "project_keys": ["HRPASSIST"],
     "ke_ids": [5366436, 2503797, 3930742, 2836020, 3173847, 10743713],
     "as_is_ratio": 0.09,
@@ -313,6 +323,7 @@ def named_value(value: Any) -> str:
 @dataclass(frozen=True)
 class TeamSpec:
     team: str
+    squad_code: str
     project_keys: tuple[str, ...]
     ke_ids: tuple[int, ...]
     as_is_ratio: Optional[Decimal]
@@ -321,6 +332,7 @@ class TeamSpec:
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "TeamSpec":
         team = str(raw.get("team") or "").strip()
+        squad_code = str(raw.get("squad_code") or "").strip().upper()
         projects_raw = raw.get("project_keys")
         if not isinstance(projects_raw, list):
             raise ValueError(f"{team or 'Команда'}: project_keys должен быть массивом.")
@@ -355,6 +367,7 @@ class TeamSpec:
             raise ValueError(f"{team}: as_is_ratio не может быть отрицательным.")
         return cls(
             team=team,
+            squad_code=squad_code,
             project_keys=project_keys,
             ke_ids=ke_ids,
             as_is_ratio=as_is_ratio,
@@ -621,22 +634,87 @@ def initial_detection_stage_value(
     return issue_field(issue, detection_stage_field_id)
 
 
-def with_initial_detection_stage(
+def changelog_field_events(
+    issue: Mapping[str, Any],
+    field_id: str,
+    field_names: Sequence[str],
+) -> list[dict[str, str]]:
+    changelog = issue.get("changelog")
+    histories = changelog.get("histories") if isinstance(changelog, Mapping) else None
+    if not isinstance(histories, list):
+        return []
+
+    normalized_names = normalized_set(field_names)
+    result: list[dict[str, str]] = []
+    ordered_histories = sorted(
+        (history for history in histories if isinstance(history, Mapping)),
+        key=lambda history: str(history.get("created") or ""),
+    )
+    for history in ordered_histories:
+        items = history.get("items")
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, Mapping):
+                continue
+            item_field_id = str(item.get("fieldId") or "").strip()
+            item_field_name = normalized(item.get("field"))
+            if item_field_id != field_id and item_field_name not in normalized_names:
+                continue
+            result.append(
+                {
+                    "changed_at": str(history.get("created") or ""),
+                    "from": str(item.get("fromString") or ""),
+                    "to": str(item.get("toString") or ""),
+                }
+            )
+    return result
+
+
+def field_values_over_history(
+    issue: Mapping[str, Any],
+    field_id: str,
+    field_names: Sequence[str],
+) -> list[str]:
+    """Return distinct historical and current display values of a Jira field."""
+
+    values: list[str] = []
+    for event in changelog_field_events(issue, field_id, field_names):
+        values.extend((event["from"], event["to"]))
+    values.extend(named_values(issue_field(issue, field_id)))
+    return list(dict.fromkeys(value.strip() for value in values if value.strip()))
+
+
+def with_detection_stage_history(
     issue: Mapping[str, Any],
     detection_stage_field_id: str,
 ) -> dict[str, Any]:
-    """Copy an issue and replace its metric stage with the original value."""
+    """Copy an issue and expose every detection stage seen in its changelog."""
 
     result = dict(issue)
     raw_fields = issue.get("fields")
     fields = dict(raw_fields) if isinstance(raw_fields, Mapping) else {}
-    fields[METRIC_CURRENT_DETECTION_STAGE_FIELD] = fields.get(
-        detection_stage_field_id
-    )
-    fields[detection_stage_field_id] = initial_detection_stage_value(
+    current_value = fields.get(detection_stage_field_id)
+    initial_value = initial_detection_stage_value(
         issue,
         detection_stage_field_id,
     )
+    history_values = field_values_over_history(
+        issue,
+        detection_stage_field_id,
+        ("Этап обнаружения", "Detection Stage"),
+    )
+    if not history_values:
+        history_values = named_values(current_value)
+    fields[METRIC_INITIAL_DETECTION_STAGE_FIELD] = initial_value
+    fields[METRIC_CURRENT_DETECTION_STAGE_FIELD] = fields.get(
+        detection_stage_field_id
+    )
+    fields[METRIC_DETECTION_STAGE_HISTORY_FIELD] = history_values
+    # aggregate_issues reads the configured Jira field. Replacing it with all
+    # historical values makes PROM precedence deterministic and also preserves
+    # bugs that were created as PROM and later changed to another stage.
+    fields[detection_stage_field_id] = history_values
     result["fields"] = fields
     return result
 
@@ -1200,7 +1278,7 @@ def collect_created_bugs(
     detection_stage_field_id: str,
     verbose: bool = False,
 ) -> tuple[list[dict[str, Any]], str]:
-    """Collect bugs created in team projects and restore their original stage."""
+    """Collect bugs created in team projects and load eligible stage history."""
 
     started = time.perf_counter()
     jql = build_created_bugs_jql(team_specs, start=start, end=end)
@@ -1221,7 +1299,8 @@ def collect_created_bugs(
     candidates = jira.search(jql, fields, page_size=1000)
 
     # Changelog is only needed for bugs that pass the inexpensive current
-    # status/priority checks. This keeps the number of individual Jira calls low.
+    # status/priority checks. Metric eligibility uses every historical
+    # detection-stage value, not only the initial or current value.
     history_keys: list[str] = []
     for issue in candidates:
         issue_type = normalized(named_value(issue_field(issue, "issuetype")))
@@ -1238,7 +1317,7 @@ def collect_created_bugs(
 
     execution_log(
         f"Jira: заведённых Bug/Defect найдено={len(candidates)}; "
-        f"Closed High+ для проверки истории этапа={len(history_keys)}"
+        f"Closed High+ для проверки всей истории этапа={len(history_keys)}"
     )
     detailed, errors = jira.issues_individually(
         history_keys,
@@ -1273,18 +1352,18 @@ def collect_created_bugs(
         if total > len(histories):
             issue["changelog"] = jira.changelog(key)
 
-    detailed_with_initial_stage = {
-        key: with_initial_detection_stage(issue, detection_stage_field_id)
+    detailed_with_stage_history = {
+        key: with_detection_stage_history(issue, detection_stage_field_id)
         for key, issue in detailed.items()
     }
     result: list[dict[str, Any]] = []
     for issue in candidates:
         key = str(issue.get("key") or "").strip().upper()
-        result.append(detailed_with_initial_stage.get(key, issue))
+        result.append(detailed_with_stage_history.get(key, issue))
 
     execution_log(
         f"Jira: баги команд загружены={len(result)}, "
-        f"исходный этап восстановлен для={len(detailed_with_initial_stage)} "
+        f"полная история этапа загружена для={len(detailed_with_stage_history)} "
         f"({elapsed_seconds(started)})"
     )
     return result, jql
@@ -1843,15 +1922,22 @@ def print_filter_audit(
         audit[team]["bug_high_plus"] += 1
 
         stage_values = named_values(issue_field(issue, detection_stage_field_id))
-        stage_name = ", ".join(stage_values) or "Без этапа обнаружения"
+        stage_name = ", ".join(stage_values) or "Без этапа обнаружения в истории"
+        initial_stage_values = named_values(
+            issue_field(issue, METRIC_INITIAL_DETECTION_STAGE_FIELD)
+        )
         current_stage_values = named_values(
             issue_field(issue, METRIC_CURRENT_DETECTION_STAGE_FIELD)
         )
-        if current_stage_values:
+        if initial_stage_values and current_stage_values:
+            initial_stage_name = ", ".join(initial_stage_values)
             current_stage_name = ", ".join(current_stage_values)
-            if normalized(current_stage_name) != normalized(stage_name):
+            if normalized(initial_stage_name) != normalized(current_stage_name):
                 audit[team]["bug_stage_changed"] += 1
-                stage_name = f"{stage_name} → сейчас {current_stage_name}"
+                stage_name = (
+                    f"история: {stage_name}; "
+                    f"первый={initial_stage_name}; сейчас={current_stage_name}"
+                )
         if classify_eligible_detection_stage(
             issue_field(issue, detection_stage_field_id),
             rules,
@@ -1868,7 +1954,7 @@ def print_filter_audit(
             f"Story всего={values['story_total']}, Done={values['story_done']}; "
             f"Bug всего={values['bug_total']}, Closed={values['bug_closed']}, "
             f"High+={values['bug_high_plus']}, PSI/ПРОМ={values['bug_eligible']}; "
-            f"этап изменён после заведения={values['bug_stage_changed']}"
+            f"этап менялся={values['bug_stage_changed']}"
         )
         details: list[str] = []
         for field_name, label in (
@@ -2578,32 +2664,161 @@ def load_reference_tasks(
     return dict(result)
 
 
+def flattened_debug_values(value: Any, *, limit: int = 50) -> list[str]:
+    """Flatten a Jira field value into a compact list for the debug JSON."""
+
+    result: list[str] = []
+    stack = [value]
+    while stack and len(result) < limit:
+        current = stack.pop()
+        if current in (None, ""):
+            continue
+        if isinstance(current, Mapping):
+            stack.extend(reversed(list(current.values())))
+            continue
+        if isinstance(current, (list, tuple, set)):
+            stack.extend(reversed(list(current)))
+            continue
+        text = str(current).strip()
+        if text:
+            result.append(text)
+    return list(dict.fromkeys(result))
+
+
+def issue_link_debug_rows(issue: Mapping[str, Any]) -> list[dict[str, str]]:
+    links = issue_field(issue, "issuelinks")
+    if not isinstance(links, list):
+        return []
+    result: list[dict[str, str]] = []
+    for link in links:
+        if not isinstance(link, Mapping):
+            continue
+        for direction in ("outwardIssue", "inwardIssue"):
+            linked = link.get(direction)
+            if not isinstance(linked, Mapping):
+                continue
+            key = str(linked.get("key") or "").strip().upper()
+            if key:
+                result.append(
+                    {
+                        "direction": direction,
+                        "type": issue_link_type_text(link),
+                        "key": key,
+                    }
+                )
+    return result
+
+
+def issue_team_field_candidates(
+    issue: Mapping[str, Any],
+    jira_field_names: Mapping[str, str],
+    team_specs: Sequence[TeamSpec],
+) -> list[dict[str, Any]]:
+    fields = issue.get("fields")
+    if not isinstance(fields, Mapping):
+        return []
+    squad_codes = {spec.squad_code for spec in team_specs if spec.squad_code}
+    name_tokens = ("команд", "squad", "подраздел", "юнит", "team")
+    result: list[dict[str, Any]] = []
+    for field_id, raw_value in fields.items():
+        if raw_value in (None, "", [], {}):
+            continue
+        field_name = jira_field_names.get(str(field_id), str(field_id))
+        values = flattened_debug_values(raw_value)
+        normalized_name = normalized(field_name)
+        joined_values = " ".join(values).upper()
+        if (
+            not any(token in normalized_name for token in name_tokens)
+            and not any(code in joined_values for code in squad_codes)
+        ):
+            continue
+        result.append(
+            {
+                "id": str(field_id),
+                "name": field_name,
+                "values": values,
+            }
+        )
+    return result
+
+
 def issue_debug_snapshot(
     issue: Optional[Mapping[str, Any]],
     *,
     detection_stage_field_id: str,
+    jira_field_names: Mapping[str, str],
+    team_specs: Sequence[TeamSpec],
 ) -> dict[str, Any]:
     if issue is None:
         return {"loaded": False}
+
+    raw_fields = issue.get("fields")
+    fields = raw_fields if isinstance(raw_fields, Mapping) else {}
+    if METRIC_INITIAL_DETECTION_STAGE_FIELD in fields:
+        initial_stage = fields.get(METRIC_INITIAL_DETECTION_STAGE_FIELD)
+    else:
+        initial_stage = initial_detection_stage_value(
+            issue,
+            detection_stage_field_id,
+        )
+    if METRIC_CURRENT_DETECTION_STAGE_FIELD in fields:
+        current_stage = fields.get(METRIC_CURRENT_DETECTION_STAGE_FIELD)
+    else:
+        current_stage = issue_field(issue, detection_stage_field_id)
+    if METRIC_DETECTION_STAGE_HISTORY_FIELD in fields:
+        stage_history = fields.get(METRIC_DETECTION_STAGE_HISTORY_FIELD)
+    else:
+        stage_history = field_values_over_history(
+            issue,
+            detection_stage_field_id,
+            ("Этап обнаружения", "Detection Stage"),
+        )
+
     return {
         "loaded": True,
+        "summary": str(issue_field(issue, "summary") or ""),
         "project": issue_project_key(issue),
         "type": named_value(issue_field(issue, "issuetype")),
         "status": named_value(issue_field(issue, "status")),
         "priority": named_value(issue_field(issue, "priority")),
         "created": str(issue_field(issue, "created") or ""),
         "resolutiondate": str(issue_field(issue, "resolutiondate") or ""),
-        "initial_detection_stage": named_values(
-            issue_field(issue, detection_stage_field_id)
+        "initial_detection_stage": named_values(initial_stage),
+        "current_detection_stage": named_values(current_stage),
+        "detection_stage_history": named_values(stage_history),
+        "history": {
+            "status": changelog_field_events(
+                issue,
+                "status",
+                ("Status", "Статус"),
+            ),
+            "priority": changelog_field_events(
+                issue,
+                "priority",
+                ("Priority", "Приоритет"),
+            ),
+            "detection_stage": changelog_field_events(
+                issue,
+                detection_stage_field_id,
+                ("Этап обнаружения", "Detection Stage"),
+            ),
+        },
+        "team_field_candidates": issue_team_field_candidates(
+            issue,
+            jira_field_names,
+            team_specs,
         ),
-        "current_detection_stage": named_values(
-            issue_field(issue, METRIC_CURRENT_DETECTION_STAGE_FIELD)
-        ),
+        "issue_links": issue_link_debug_rows(issue),
+        "fix_versions": named_values(issue_field(issue, "fixVersions")),
+        "components": named_values(issue_field(issue, "components")),
+        "labels": flattened_debug_values(issue_field(issue, "labels")),
+        "parent": flattened_debug_values(issue_field(issue, "parent")),
     }
 
 
 def write_reference_debug_report(
     *,
+    jira: JiraClient,
     reference_paths: Sequence[Path],
     output_path: Path,
     team_specs: Sequence[TeamSpec],
@@ -2621,6 +2836,62 @@ def write_reference_debug_report(
 ) -> None:
     reference = load_reference_tasks(reference_paths, team_specs)
     metrics_by_team = {metric.team: metric for metric in quarter_metrics}
+    comparison_key_sets: dict[str, dict[str, tuple[set[str], set[str]]]] = {}
+    disputed_keys: set[str] = set()
+    for spec in team_specs:
+        if spec.team not in reference:
+            continue
+        metric = metrics_by_team[spec.team]
+        team_sets: dict[str, tuple[set[str], set[str]]] = {}
+        for issue_type, actual_keys in (
+            ("Story", set(metric.story_keys)),
+            ("Bug", set(metric.bug_keys)),
+        ):
+            expected_keys = reference[spec.team][issue_type]
+            missing = expected_keys - actual_keys
+            extra = actual_keys - expected_keys
+            team_sets[issue_type] = (missing, extra)
+            disputed_keys.update(missing)
+            disputed_keys.update(extra)
+        comparison_key_sets[spec.team] = team_sets
+
+    execution_log(
+        "Debug XLSX: загружаю полные поля и changelog "
+        f"для спорных задач={len(disputed_keys)}"
+    )
+    exact_debug_issues, debug_issue_errors = jira.issues_individually(
+        disputed_keys,
+        ("*all", "issuelinks"),
+        max_workers=JIRA_LINK_WORKERS,
+        progress_label="Jira: debug спорных задач",
+        expand="changelog",
+    )
+    for key, issue in exact_debug_issues.items():
+        changelog = issue.get("changelog")
+        if not isinstance(changelog, Mapping):
+            continue
+        histories = changelog.get("histories")
+        if not isinstance(histories, list):
+            continue
+        total = int(changelog.get("total") or len(histories))
+        if total > len(histories):
+            issue["changelog"] = jira.changelog(key)
+    exact_debug_issues = {
+        key: with_detection_stage_history(issue, detection_stage_field_id)
+        for key, issue in exact_debug_issues.items()
+    }
+    jira_field_names = {
+        str(item.get("id") or ""): str(item.get("name") or item.get("id") or "")
+        for item in jira.fields()
+        if item.get("id")
+    }
+    if debug_issue_errors:
+        execution_log(
+            f"Debug XLSX: не удалось загрузить спорных задач="
+            f"{len(debug_issue_errors)}",
+            error=True,
+        )
+
     released_by_key = {
         str(issue.get("key") or "").strip().upper(): issue
         for issue in released_issues
@@ -2645,10 +2916,12 @@ def write_reference_debug_report(
 
     def task_details(issue_key: str, issue_type: str) -> dict[str, Any]:
         source = released_by_key if issue_type == "Story" else bugs_by_key
-        issue = source.get(issue_key)
+        issue = exact_debug_issues.get(issue_key) or source.get(issue_key)
         snapshot = issue_debug_snapshot(
             issue,
             detection_stage_field_id=detection_stage_field_id,
+            jira_field_names=jira_field_names,
+            team_specs=team_specs,
         )
         if issue_type == "Story":
             linked_releases = sorted(releases_by_issue.get(issue_key, []))
@@ -2699,27 +2972,27 @@ def write_reference_debug_report(
             elif priority not in rules.bug_priorities:
                 snapshot["reason"] = "приоритет не High+"
             elif stage is None:
-                snapshot["reason"] = "исходный этап не PSI/ПРОМ"
+                snapshot["reason"] = "в истории этапа нет PSI/ПРОМ"
             else:
-                snapshot["reason"] = f"должен учитываться как {stage.upper()}"
+                snapshot["reason"] = (
+                    f"должен учитываться по истории как {stage.upper()}"
+                )
         return snapshot
 
     comparisons: dict[str, Any] = {}
     for spec in team_specs:
         if spec.team not in reference:
             continue
-        metric = metrics_by_team[spec.team]
         team_result: dict[str, Any] = {}
-        for issue_type, actual_keys in (
-            ("Story", set(metric.story_keys)),
-            ("Bug", set(metric.bug_keys)),
-        ):
+        for issue_type in ("Story", "Bug"):
             expected_keys = reference[spec.team][issue_type]
-            missing = sorted(expected_keys - actual_keys)
-            extra = sorted(actual_keys - expected_keys)
+            missing_set, extra_set = comparison_key_sets[spec.team][issue_type]
+            actual_count = len(expected_keys) - len(missing_set) + len(extra_set)
+            missing = sorted(missing_set)
+            extra = sorted(extra_set)
             team_result[issue_type] = {
                 "reference_count": len(expected_keys),
-                "script_count": len(actual_keys),
+                "script_count": actual_count,
                 "missing_count": len(missing),
                 "extra_count": len(extra),
                 "missing": [
@@ -2737,6 +3010,7 @@ def write_reference_debug_report(
                     for key in extra
                 ],
             }
+        team_result["squad_code"] = spec.squad_code
         comparisons[spec.team] = team_result
         print(
             f"DEBUG XLSX {spec.team}: "
@@ -2759,6 +3033,7 @@ def write_reference_debug_report(
             "story_start": quarter_story_start.isoformat(),
             "end_exclusive": quarter_end.isoformat(),
         },
+        "debug_issue_errors": debug_issue_errors,
         "comparisons": comparisons,
     }
     output_path.write_text(
@@ -3036,6 +3311,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             debug_output.parent.mkdir(parents=True, exist_ok=True)
             write_reference_debug_report(
+                jira=jira,
                 reference_paths=debug_reference_paths,
                 output_path=debug_output,
                 team_specs=team_specs,
