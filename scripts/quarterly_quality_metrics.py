@@ -604,32 +604,14 @@ def initial_detection_stage_value(
 ) -> Any:
     """Restore the detection stage that was set when the bug was created."""
 
-    changelog = issue.get("changelog")
-    histories = changelog.get("histories") if isinstance(changelog, Mapping) else None
-    if not isinstance(histories, list):
-        return issue_field(issue, detection_stage_field_id)
-
-    ordered_histories = sorted(
-        (history for history in histories if isinstance(history, Mapping)),
-        key=lambda history: str(history.get("created") or ""),
+    events = changelog_field_events(
+        issue,
+        detection_stage_field_id,
+        ("Этап обнаружения", "Detection Stage"),
     )
-    for history in ordered_histories:
-        items = history.get("items")
-        if not isinstance(items, list):
-            continue
-        for item in items:
-            if not isinstance(item, Mapping):
-                continue
-            field_id = str(item.get("fieldId") or "").strip()
-            field_name = normalized(item.get("field"))
-            if (
-                field_id != detection_stage_field_id
-                and field_name not in {"этап обнаружения", "detection stage"}
-            ):
-                continue
-            # fromString is the value before the very first edit, i.e. the
-            # value with which the bug was originally created.
-            return item.get("fromString") or ""
+    if events:
+        # The first `from` value is what was set before the earliest edit.
+        return events[0]["from"]
 
     return issue_field(issue, detection_stage_field_id)
 
@@ -659,13 +641,38 @@ def changelog_field_events(
                 continue
             item_field_id = str(item.get("fieldId") or "").strip()
             item_field_name = normalized(item.get("field"))
-            if item_field_id != field_id and item_field_name not in normalized_names:
+            field_name_matches = (
+                item_field_name in normalized_names
+                or (
+                    "этап" in item_field_name
+                    and "обнаруж" in item_field_name
+                    and any(
+                        "этап" in name and "обнаруж" in name
+                        for name in normalized_names
+                    )
+                )
+                or (
+                    "detection" in item_field_name
+                    and "stage" in item_field_name
+                    and any(
+                        "detection" in name and "stage" in name
+                        for name in normalized_names
+                    )
+                )
+            )
+            if item_field_id != field_id and not field_name_matches:
                 continue
+            from_value = item.get("fromString")
+            if from_value is None:
+                from_value = item.get("from")
+            to_value = item.get("toString")
+            if to_value is None:
+                to_value = item.get("to")
             result.append(
                 {
                     "changed_at": str(history.get("created") or ""),
-                    "from": str(item.get("fromString") or ""),
-                    "to": str(item.get("toString") or ""),
+                    "from": str(from_value or ""),
+                    "to": str(to_value or ""),
                 }
             )
     return result
@@ -1117,6 +1124,48 @@ class JiraClient:
                     "histories": histories,
                 }
 
+    def changelogs_individually(
+        self,
+        issue_keys: Iterable[str],
+        *,
+        progress_label: str = "",
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+        """Load complete paginated changelogs with Jira-friendly pacing."""
+
+        keys = sorted(
+            {
+                str(issue_key).strip().upper()
+                for issue_key in issue_keys
+                if str(issue_key).strip()
+            }
+        )
+        result: dict[str, dict[str, Any]] = {}
+        errors: dict[str, str] = {}
+        previous_request_started = 0.0
+        for index, key in enumerate(keys, start=1):
+            since_previous_start = (
+                time.perf_counter() - previous_request_started
+                if previous_request_started
+                else JIRA_ISSUE_REQUEST_INTERVAL_SECONDS
+            )
+            pacing_delay = max(
+                0.0,
+                JIRA_ISSUE_REQUEST_INTERVAL_SECONDS - since_previous_start,
+            )
+            if pacing_delay:
+                time.sleep(pacing_delay)
+            previous_request_started = time.perf_counter()
+            try:
+                result[key] = self.changelog(key)
+            except Exception as exc:
+                errors[key] = str(exc)
+            if progress_label and (index % 10 == 0 or index == len(keys)):
+                execution_log(
+                    f"{progress_label}: {index}/{len(keys)}, "
+                    f"ошибок={len(errors)}"
+                )
+        return result, errors
+
 
 def find_jira_field_id(
     jira: JiraClient,
@@ -1319,38 +1368,31 @@ def collect_created_bugs(
         f"Jira: заведённых Bug/Defect найдено={len(candidates)}; "
         f"Closed High+ для проверки всей истории этапа={len(history_keys)}"
     )
-    detailed, errors = jira.issues_individually(
+    changelogs, errors = jira.changelogs_individually(
         history_keys,
-        fields,
-        max_workers=JIRA_LINK_WORKERS,
-        progress_label="Jira: changelog багов",
-        expand="changelog",
+        progress_label="Jira: полный changelog багов",
     )
-    if errors or len(detailed) != len(set(history_keys)):
-        missing = sorted(set(history_keys) - set(detailed))
+    if errors or len(changelogs) != len(set(history_keys)):
+        missing = sorted(set(history_keys) - set(changelogs))
         details = "; ".join(
             f"{key}: {errors.get(key, 'пустой ответ Jira')}"
             for key in missing[:5]
         )
         raise RuntimeError(
-            "Jira не вернула changelog всех Closed High+ багов; "
+            "Jira не вернула полный changelog всех Closed High+ багов; "
             f"публикация остановлена. {details}"
         )
 
-    for key, issue in detailed.items():
-        changelog = issue.get("changelog")
-        if not isinstance(changelog, Mapping):
-            raise RuntimeError(
-                f"Jira issue {key}: expand=changelog не вернул changelog."
-            )
-        histories = changelog.get("histories")
-        if not isinstance(histories, list):
-            raise RuntimeError(
-                f"Jira issue {key}: changelog.histories не является массивом."
-            )
-        total = int(changelog.get("total") or len(histories))
-        if total > len(histories):
-            issue["changelog"] = jira.changelog(key)
+    candidates_by_key = {
+        str(issue.get("key") or "").strip().upper(): issue
+        for issue in candidates
+        if str(issue.get("key") or "").strip()
+    }
+    detailed: dict[str, dict[str, Any]] = {}
+    for key, changelog in changelogs.items():
+        issue = dict(candidates_by_key[key])
+        issue["changelog"] = changelog
+        detailed[key] = issue
 
     detailed_with_stage_history = {
         key: with_detection_stage_history(issue, detection_stage_field_id)
@@ -2864,18 +2906,15 @@ def write_reference_debug_report(
         ("*all", "issuelinks"),
         max_workers=JIRA_LINK_WORKERS,
         progress_label="Jira: debug спорных задач",
-        expand="changelog",
     )
-    for key, issue in exact_debug_issues.items():
-        changelog = issue.get("changelog")
-        if not isinstance(changelog, Mapping):
-            continue
-        histories = changelog.get("histories")
-        if not isinstance(histories, list):
-            continue
-        total = int(changelog.get("total") or len(histories))
-        if total > len(histories):
-            issue["changelog"] = jira.changelog(key)
+    debug_changelogs, debug_changelog_errors = jira.changelogs_individually(
+        exact_debug_issues,
+        progress_label="Jira: debug полный changelog",
+    )
+    for key, changelog in debug_changelogs.items():
+        exact_debug_issues[key]["changelog"] = changelog
+    for key, error in debug_changelog_errors.items():
+        debug_issue_errors[key] = f"changelog: {error}"
     exact_debug_issues = {
         key: with_detection_stage_history(issue, detection_stage_field_id)
         for key, issue in exact_debug_issues.items()
