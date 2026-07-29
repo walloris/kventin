@@ -53,6 +53,7 @@ DEFAULT_PAGE_SIZE = 500
 DEFAULT_MIN_REQUEST_INTERVAL_SECONDS = 1.0
 DEFAULT_MAX_JIRA_REQUESTS = 150
 DEFAULT_MAX_RELEASE_DETAIL_REQUESTS = 90
+DEFAULT_MIN_REQUEST_RESERVE = 50
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 10
 DEFAULT_READ_TIMEOUT_SECONDS = 60
 
@@ -140,6 +141,19 @@ class JiraRequestGuard:
             self.max_requests,
             label,
         )
+
+
+def automatic_jira_request_budget(max_release_detail_requests: int) -> int:
+    if max_release_detail_requests < 0:
+        raise ValueError("Лимит точных GET релизов не может быть < 0.")
+    reserve = max(
+        DEFAULT_MIN_REQUEST_RESERVE,
+        (max_release_detail_requests + 3) // 4,
+    )
+    return max(
+        DEFAULT_MAX_JIRA_REQUESTS,
+        max_release_detail_requests + reserve,
+    )
 
 
 def normalized(value: Any) -> str:
@@ -1042,6 +1056,18 @@ def create_jira_client(*, verify_ssl: bool) -> tuple[Any, Mapping[str, Any]]:
             "Не установлен jira. Выполните: pip install jira>=3.5"
         ) from exc
 
+    if not verify_ssl:
+        try:
+            import urllib3
+
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        except (ImportError, AttributeError):
+            pass
+        logging.warning(
+            "Проверка TLS-сертификата Jira отключена; "
+            "повторяющиеся InsecureRequestWarning скрыты."
+        )
+
     config_module = locate_config_module()
     nested_config = getattr(config_module, "config", {})
     if isinstance(nested_config, Mapping):
@@ -1121,7 +1147,8 @@ def create_jira_client(*, verify_ssl: bool) -> tuple[Any, Mapping[str, Any]]:
 def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     script_dir = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(
-        description="Сформировать Excel-статистику Jira-релизов за последние N дней."
+        description="Сформировать Excel-статистику Jira-релизов за последние N дней.",
+        allow_abbrev=False,
     )
     parser.add_argument(
         "--mapping",
@@ -1212,14 +1239,16 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-jira-requests",
         type=int,
-        default=DEFAULT_MAX_JIRA_REQUESTS,
+        default=None,
         help=(
-            "Жёсткий лимит Jira-запросов за один запуск; "
-            f"по умолчанию {DEFAULT_MAX_JIRA_REQUESTS}."
+            "Явный жёсткий лимит Jira-запросов за запуск. Если не задан, "
+            "автоматически согласуется с лимитом точных GET релизов."
         ),
     )
     parser.add_argument(
         "--max-release-detail-requests",
+        "--max-release-detail-request",
+        dest="max_release_detail_requests",
         type=int,
         default=DEFAULT_MAX_RELEASE_DETAIL_REQUESTS,
         help=(
@@ -1248,14 +1277,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             else Path.cwd()
             / f"release_stats_{start_date.isoformat()}_{end_date.isoformat()}.xlsx"
         )
-        request_guard = JiraRequestGuard(
-            min_interval_seconds=args.min_request_interval,
-            max_requests=args.max_jira_requests,
-        )
         if args.max_release_detail_requests < 0:
             raise ValueError(
                 "--max-release-detail-requests не может быть меньше 0."
             )
+        max_jira_requests = (
+            args.max_jira_requests
+            if args.max_jira_requests is not None
+            else automatic_jira_request_budget(
+                args.max_release_detail_requests
+            )
+        )
+        request_guard = JiraRequestGuard(
+            min_interval_seconds=args.min_request_interval,
+            max_requests=max_jira_requests,
+        )
 
         catalog = load_service_catalog(args.mapping.expanduser().resolve())
         jira, jira_config = create_jira_client(verify_ssl=args.verify_ssl)
@@ -1336,6 +1372,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             end_date.isoformat(),
             len(in_period_keys),
         )
+
+        if in_period_keys:
+            minimum_seconds = (
+                max(0, len(in_period_keys) - 1)
+                * request_guard.min_interval_seconds
+            )
+            if minimum_seconds >= 60:
+                duration_text = (
+                    f"минимум ≈{int((minimum_seconds + 59) // 60)} мин"
+                )
+            else:
+                duration_text = f"минимум ≈{minimum_seconds:g} с"
+            print(
+                "Jira: точный состав "
+                f"{len(in_period_keys)} релизов; интервал "
+                f"≥{request_guard.min_interval_seconds:g} с; "
+                f"{duration_text}; общий лимит "
+                f"{request_guard.max_requests}."
+            )
 
         detail_fields = (*release_fields, "issuelinks")
         full_releases = fetch_release_details(
