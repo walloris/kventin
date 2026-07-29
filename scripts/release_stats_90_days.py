@@ -67,6 +67,7 @@ HEADERS = (
     "Тип релиза",
     "КЭ",
     "Кластер",
+    "Команда",
     "Количество сторей в релизе",
     "Количество багов в релизе",
 )
@@ -85,6 +86,7 @@ class ReleaseRow:
     release_type: str
     service_ids: tuple[str, ...]
     clusters: tuple[str, ...]
+    teams: tuple[str, ...]
     story_count: int
     bug_count: int
 
@@ -94,6 +96,7 @@ class ReleaseRow:
             self.release_type,
             ", ".join(self.service_ids) if self.service_ids else "—",
             "; ".join(self.clusters) if self.clusters else "Не найден в справочнике",
+            "; ".join(self.teams) if self.teams else "—",
             self.story_count,
             self.bug_count,
         ]
@@ -954,7 +957,7 @@ def fetch_linked_issues(
         for issue in search_all(
             jira,
             jql,
-            ("issuetype",),
+            ("issuetype", "project"),
             page_size=page_size,
             request_guard=request_guard,
             request_label=f"задачи состава, пакет {index}/{len(batch_list)}",
@@ -983,6 +986,17 @@ def fetch_linked_issues(
                 f"{', '.join(without_issue_type[:20])}; нельзя достоверно "
                 "посчитать Story/Bug."
             )
+        without_project = [
+            key
+            for key in key_batch
+            if not issue_project_team(result[key])
+        ]
+        if without_project:
+            raise RuntimeError(
+                "Jira не вернула project.key/project.name для задач состава: "
+                f"{', '.join(without_project[:20])}; нельзя заполнить "
+                "столбец «Команда»."
+            )
         progress_step = 5 if verbose else 10
         if (
             index == 1
@@ -1010,6 +1024,19 @@ def fetch_linked_issues(
 
 def issue_type_name(issue: Any) -> str:
     return normalized(named_text(field_value(issue, "issuetype")))
+
+
+def issue_project_team(issue: Any) -> str:
+    project = raw_value(field_value(issue, "project"))
+    if isinstance(project, Mapping):
+        project_key = named_text(project.get("key")).upper()
+        project_name = named_text(project.get("name"))
+    else:
+        project_key = named_text(getattr(project, "key", None)).upper()
+        project_name = named_text(getattr(project, "name", None))
+    if project_key and project_name:
+        return f"{project_key} - {project_name}"
+    return project_key or project_name
 
 
 def make_release_rows(
@@ -1043,10 +1070,14 @@ def make_release_rows(
 
         story_keys: set[str] = set()
         bug_keys: set[str] = set()
+        teams: list[str] = []
         for key in linked_keys_by_release.get(release_key, ()):
             issue = linked_issues.get(key)
             if issue is None:
                 continue
+            team = issue_project_team(issue)
+            if team:
+                teams.append(team)
             issue_type = issue_type_name(issue)
             if issue_type in DEFAULT_STORY_TYPES:
                 story_keys.add(key)
@@ -1059,6 +1090,7 @@ def make_release_rows(
                 release_type=release_type(release, release_type_field_id),
                 service_ids=service_ids,
                 clusters=unique_preserving_order(clusters),
+                teams=unique_preserving_order(teams),
                 story_count=len(story_keys),
                 bug_count=len(bug_keys),
             )
@@ -1121,7 +1153,10 @@ def write_excel(rows: Sequence[ReleaseRow], output_path: Path) -> None:
         sheet.cell(row=row_index, column=4).alignment = Alignment(
             horizontal="left", vertical="center", wrap_text=True
         )
-        for column in (5, 6):
+        sheet.cell(row=row_index, column=5).alignment = Alignment(
+            horizontal="left", vertical="center", wrap_text=True
+        )
+        for column in (6, 7):
             sheet.cell(row=row_index, column=column).number_format = "0"
             sheet.cell(row=row_index, column=column).alignment = Alignment(
                 horizontal="right"
@@ -1134,15 +1169,16 @@ def write_excel(rows: Sequence[ReleaseRow], output_path: Path) -> None:
         "B": 15,
         "C": 24,
         "D": 48,
-        "E": 26,
-        "F": 25,
+        "E": 42,
+        "F": 26,
+        "G": 25,
     }
     for column, width in widths.items():
         sheet.column_dimensions[column].width = width
 
     last_row = max(sheet.max_row, 1)
-    sheet.auto_filter.ref = f"A1:F{last_row}"
-    sheet.print_area = f"A1:F{last_row}"
+    sheet.auto_filter.ref = f"A1:G{last_row}"
+    sheet.print_area = f"A1:G{last_row}"
     sheet.print_title_rows = "1:1"
     sheet.sheet_properties.pageSetUpPr.fitToPage = True
     sheet.page_setup.orientation = "landscape"
@@ -1153,7 +1189,7 @@ def write_excel(rows: Sequence[ReleaseRow], output_path: Path) -> None:
     sheet.page_margins.top = 0.5
     sheet.page_margins.bottom = 0.5
     if rows:
-        table = Table(displayName="ReleaseStatsTable", ref=f"A1:F{last_row}")
+        table = Table(displayName="ReleaseStatsTable", ref=f"A1:G{last_row}")
         table.tableStyleInfo = TableStyleInfo(
             name="TableStyleMedium2",
             showFirstColumn=False,
@@ -1180,11 +1216,13 @@ def write_excel(rows: Sequence[ReleaseRow], output_path: Path) -> None:
         for values in check_sheet.iter_rows(min_row=2, values_only=True):
             if not isinstance(values[0], (date, datetime)):
                 raise RuntimeError("Дата релиза записана в XLSX не как дата.")
+            if not isinstance(values[4], str) or not values[4].strip():
+                raise RuntimeError("Команда записана в XLSX некорректно.")
             if (
-                not isinstance(values[4], int)
-                or isinstance(values[4], bool)
-                or not isinstance(values[5], int)
+                not isinstance(values[5], int)
                 or isinstance(values[5], bool)
+                or not isinstance(values[6], int)
+                or isinstance(values[6], bool)
             ):
                 raise RuntimeError("Счётчики Story/Bug записаны в XLSX не как числа.")
     finally:
