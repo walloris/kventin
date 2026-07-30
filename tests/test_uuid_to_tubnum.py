@@ -416,6 +416,13 @@ def test_tubnum_is_associated_with_requested_uuid() -> None:
         )
         == "00123"
     )
+    assert (
+        exporter.find_tubnum(
+            {"empId": UUID, "data": {"person": {"tabNum": "00456"}}},
+            UUID,
+        )
+        == "00456"
+    )
 
     with pytest.raises(exporter.MissingTubNum):
         exporter.find_tubnum(

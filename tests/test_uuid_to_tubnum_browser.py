@@ -529,6 +529,26 @@ def test_transport_classifies_success_and_returns_matching_tubnum() -> None:
     assert page.evaluate_calls[0][1]["timeoutMs"] == 7000
 
 
+def test_transport_accepts_real_addressbook_tabnum_field() -> None:
+    page = FakePage(
+        result={
+            "kind": "ok",
+            "payload": {"empId": UUID, "tabNum": "00456"},
+        }
+    )
+    transport = browser_exporter.BrowserTransport(page)
+
+    assert (
+        transport.fetch_tubnum(
+            UUID,
+            retries=0,
+            max_backoff=1,
+            rate_limiter=NoWaitRateLimiter(),
+        )
+        == "00456"
+    )
+
+
 def test_safe_json_shape_contains_keys_and_types_but_not_values() -> None:
     payload = {
         "data": [

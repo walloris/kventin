@@ -78,6 +78,7 @@ RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 OIDC_REDIRECT_STATUSES = {302, 303}
 AUTH_STATUSES = {401, 403}
+TUBNUM_FIELD_NAMES = ("tubNum", "tabNum")
 
 
 class ConfigError(RuntimeError):
@@ -923,10 +924,11 @@ def _tubnum_candidates(
                 # Вложенный объект с другим UUID считается новой сущностью:
                 # UUID родительского объекта на него не распространяется.
                 uuid_match = False
-        if "tubNum" in value and value["tubNum"] is not None:
-            result = str(value["tubNum"]).strip()
-            if result:
-                candidates.append((result, uuid_match))
+        for field_name in TUBNUM_FIELD_NAMES:
+            if field_name in value and value[field_name] is not None:
+                result = str(value[field_name]).strip()
+                if result:
+                    candidates.append((result, uuid_match))
         for nested in value.values():
             candidates.extend(
                 _tubnum_candidates(nested, requested_uuid, uuid_match)
@@ -964,20 +966,20 @@ def find_tubnum(value: Any, requested_uuid: Optional[str] = None) -> Optional[st
         return next(iter(matched))
     if len(matched) > 1:
         raise AmbiguousTubNum(
-            "в ответе несколько tubNum рядом с запрошенным UUID"
+            "в ответе несколько tabNum/tubNum рядом с запрошенным UUID"
         )
 
     if requested_uuid is not None and _contains_requested_uuid(
         value, requested_uuid
     ):
         raise MissingTubNum(
-            "ответ содержит запрошенный UUID, но рядом с ним нет tubNum"
+            "ответ содержит запрошенный UUID, но рядом с ним нет tabNum/tubNum"
         )
 
     unique = {result for result, _ in candidates}
     if len(unique) == 1:
         return next(iter(unique))
-    raise AmbiguousTubNum("в ответе найдено несколько разных tubNum")
+    raise AmbiguousTubNum("в ответе найдено несколько разных tabNum/tubNum")
 
 
 def retry_after_seconds(response: Response, max_backoff: float) -> Optional[float]:

@@ -794,7 +794,7 @@ class BrowserTransport:
                     ) from exc
                 if tub_num is None:
                     raise core.MissingTubNum(
-                        "в JSON-ответе отсутствует tubNum; "
+                        "в JSON-ответе отсутствует tabNum/tubNum; "
                         f"{missing_tubnum_details(payload)}"
                     )
                 return tub_num
