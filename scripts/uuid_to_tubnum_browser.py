@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -53,6 +54,9 @@ AUTH_SERVER_ALLOWLIST = (
     core.DEFAULT_PRIMARY_IDP_HOST,
     core.DEFAULT_ALT_IDP_HOST,
 )
+SAFE_JSON_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}\Z")
+MAX_JSON_SHAPE_PATHS = 40
+MAX_JSON_SHAPE_DEPTH = 6
 
 _PAGE_FETCH_JAVASCRIPT = """
 async ({url, expectedHost, expectedPath, timeoutMs}) => {
@@ -508,6 +512,48 @@ def _status(result: Mapping[str, Any]) -> Optional[int]:
     return value
 
 
+def safe_json_shape(value: Any) -> str:
+    """Описать только ключи/типы JSON, не включая значения ответа."""
+
+    paths: List[str] = []
+
+    def add(path: str, nested: Any, depth: int) -> None:
+        if len(paths) >= MAX_JSON_SHAPE_PATHS:
+            return
+        if nested is None:
+            kind = "null"
+        elif isinstance(nested, bool):
+            kind = "bool"
+        elif isinstance(nested, (int, float)):
+            kind = "number"
+        elif isinstance(nested, str):
+            kind = "string"
+        elif isinstance(nested, dict):
+            kind = f"object(len={len(nested)})"
+        elif isinstance(nested, list):
+            kind = f"array(len={len(nested)})"
+        else:
+            kind = nested.__class__.__name__
+        paths.append(f"{path}:{kind}")
+
+        if depth >= MAX_JSON_SHAPE_DEPTH:
+            return
+        if isinstance(nested, dict):
+            for raw_key in sorted(nested, key=lambda item: str(item)):
+                if len(paths) >= MAX_JSON_SHAPE_PATHS:
+                    return
+                key = str(raw_key)
+                safe_key = key if SAFE_JSON_KEY.fullmatch(key) else "<redacted-key>"
+                add(f"{path}.{safe_key}", nested[raw_key], depth + 1)
+        elif isinstance(nested, list) and nested:
+            add(f"{path}[]", nested[0], depth + 1)
+
+    add("$", value, 0)
+    if len(paths) >= MAX_JSON_SHAPE_PATHS:
+        paths.append("...")
+    return "; ".join(paths)
+
+
 def _retry_after(
     result: Mapping[str, Any], max_backoff: float
 ) -> Optional[float]:
@@ -689,10 +735,17 @@ class BrowserTransport:
             status = _status(result)
 
             if kind == "ok":
-                tub_num = core.find_tubnum(result.get("payload"), user_uuid)
+                payload = result.get("payload")
+                try:
+                    tub_num = core.find_tubnum(payload, user_uuid)
+                except core.MissingTubNum as exc:
+                    raise core.MissingTubNum(
+                        f"{exc}; JSON shape: {safe_json_shape(payload)}"
+                    ) from exc
                 if tub_num is None:
                     raise core.MissingTubNum(
-                        "в JSON-ответе отсутствует tubNum"
+                        "в JSON-ответе отсутствует tubNum; "
+                        f"JSON shape: {safe_json_shape(payload)}"
                     )
                 return tub_num
             if kind == "auth":

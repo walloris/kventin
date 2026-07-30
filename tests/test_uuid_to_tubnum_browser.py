@@ -529,6 +529,58 @@ def test_transport_classifies_success_and_returns_matching_tubnum() -> None:
     assert page.evaluate_calls[0][1]["timeoutMs"] == 7000
 
 
+def test_safe_json_shape_contains_keys_and_types_but_not_values() -> None:
+    payload = {
+        "data": [
+            {
+                "employeeUuid": UUID,
+                "displayName": "Secret Person",
+                "dynamic-key": "private value",
+            }
+        ],
+        "message": "secret token",
+    }
+
+    shape = browser_exporter.safe_json_shape(payload)
+
+    assert "$.data:array(len=1)" in shape
+    assert "$.data[].employeeUuid:string" in shape
+    assert "$.data[].displayName:string" in shape
+    assert "$.data[].<redacted-key>:string" in shape
+    assert "$.message:string" in shape
+    assert UUID not in shape
+    assert "Secret Person" not in shape
+    assert "private value" not in shape
+    assert "secret token" not in shape
+
+
+def test_missing_tubnum_reports_only_safe_json_shape() -> None:
+    page = FakePage(
+        result={
+            "kind": "ok",
+            "payload": {
+                "data": [],
+                "message": "private backend message",
+            },
+        }
+    )
+    transport = browser_exporter.BrowserTransport(page)
+
+    with pytest.raises(core_exporter.MissingTubNum) as error:
+        transport.fetch_tubnum(
+            UUID,
+            retries=0,
+            max_backoff=1,
+            rate_limiter=NoWaitRateLimiter(),
+        )
+
+    message = str(error.value)
+    assert "JSON shape:" in message
+    assert "$.data:array(len=0)" in message
+    assert "$.message:string" in message
+    assert "private backend message" not in message
+
+
 @pytest.mark.parametrize(
     ("result", "message"),
     [
