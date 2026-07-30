@@ -648,6 +648,41 @@ def test_transport_classifies_auth_as_expired(result, message) -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("api_result", "message"),
+    [
+        ({"kind": "auth"}, "redirect"),
+        ({"kind": "auth", "status": 403}, "HTTP 403"),
+    ],
+)
+def test_record_specific_auth_response_does_not_expire_live_session(
+    api_result,
+    message,
+) -> None:
+    page = FakePage(
+        results=[
+            api_result,
+            {"kind": "ok", "payload": {"authenticated": True}},
+        ]
+    )
+    transport = browser_exporter.BrowserTransport(page)
+
+    with pytest.raises(core_exporter.MissingTubNum, match=message):
+        transport.fetch_tubnum(
+            UUID,
+            retries=0,
+            max_backoff=1,
+            rate_limiter=NoWaitRateLimiter(),
+        )
+
+    assert len(page.evaluate_calls) == 2
+    assert page.evaluate_calls[0][1]["url"] == API_URL
+    assert (
+        page.evaluate_calls[1][1]["url"]
+        == "https://addressbook.sigma.sbrf.ru/api/home/user/getUserData"
+    )
+
+
 @pytest.mark.parametrize("status", [204, 404])
 def test_transport_classifies_missing_record(status: int) -> None:
     transport = browser_exporter.BrowserTransport(

@@ -762,6 +762,16 @@ class BrowserTransport:
             )
         )
 
+    def _session_is_authenticated(self) -> bool:
+        result = _evaluate_fetch(
+            self.page,
+            self.probe_url,
+            self.expected_host,
+            core.ADDRESSBOOK_PROBE_PATH,
+            self.timeout,
+        )
+        return result.get("kind") == "ok"
+
     def fetch_tubnum(
         self,
         user_uuid: str,
@@ -800,6 +810,11 @@ class BrowserTransport:
                 return tub_num
             if kind == "auth":
                 detail = f"HTTP {status}" if status is not None else "redirect"
+                if self._session_is_authenticated():
+                    raise core.MissingTubNum(
+                        f"API вернул {detail} только для этого UUID; "
+                        "общая сессия Addressbook активна"
+                    )
                 raise core.AuthExpired(detail)
             if kind == "missing":
                 detail = f"HTTP {status}" if status is not None else "записи нет"
