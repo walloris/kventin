@@ -2,7 +2,7 @@
 """
 Выгружает tubNum по UUID через авторизованную страницу Addressbook.
 
-Chrome сам хранит клиентский сертификат, cookies и OIDC/SPNEGO-сессию.
+Chromium сам хранит клиентский сертификат, cookies и OIDC/SPNEGO-сессию.
 Python не извлекает их из браузера: API-запрос выполняется через fetch()
 внутри страницы, а наружу возвращается только JSON успешного ответа.
 """
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -152,7 +153,7 @@ async ({url, expectedHost, expectedPath, timeoutMs}) => {
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Выгрузить CSV uuid,tubNum через видимый авторизованный Chrome."
+            "Выгрузить CSV uuid,tubNum через видимый авторизованный Chromium."
         ),
         epilog=(
             "Клиентский .p12 задаётся переменными CLIENT_CERT и "
@@ -219,12 +220,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--login-timeout",
         type=float,
         default=300.0,
-        help="Сколько секунд ждать завершения входа в Chrome (по умолчанию: 300).",
+        help="Сколько секунд ждать завершения входа (по умолчанию: 300).",
     )
     parser.add_argument(
         "--browser-channel",
-        default="chrome",
-        help="Playwright browser channel (по умолчанию: chrome).",
+        default="chromium",
+        help=(
+            "Playwright browser channel; chromium запускает встроенный "
+            "браузер (по умолчанию: chromium)."
+        ),
     )
     parser.add_argument(
         "--browser-executable",
@@ -242,7 +246,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Проверить CSV и .p12 без запуска Chrome и HTTP-запросов.",
+        help="Проверить CSV и .p12 без запуска браузера и HTTP-запросов.",
     )
     args = parser.parse_args(argv)
 
@@ -309,9 +313,50 @@ def build_launch_options(args: argparse.Namespace) -> Dict[str, Any]:
         options["executable_path"] = str(
             _resolve_browser_executable(args.browser_executable)
         )
-    else:
+    elif args.browser_channel.casefold() != "chromium":
         options["channel"] = args.browser_channel
     return options
+
+
+def uses_bundled_chromium(args: argparse.Namespace) -> bool:
+    return (
+        args.browser_executable is None
+        and args.browser_channel.casefold() == "chromium"
+    )
+
+
+def ensure_bundled_chromium(
+    playwright: Any, args: argparse.Namespace
+) -> None:
+    if not uses_bundled_chromium(args):
+        return
+    executable = Path(playwright.chromium.executable_path)
+    if executable.is_file():
+        return
+
+    print(
+        "Playwright Chromium не найден. Устанавливаю его автоматически; "
+        "это выполняется только при первом запуске.",
+        file=sys.stderr,
+    )
+    child_env = os.environ.copy()
+    child_env.pop(core.CLIENT_CERT_ENV, None)
+    child_env.pop(core.CLIENT_CERT_PASSPHRASE_ENV, None)
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            check=False,
+            env=child_env,
+        )
+    except OSError as exc:
+        raise core.ConfigError(
+            "Не удалось запустить автоматическую установку Chromium."
+        ) from exc
+    if result.returncode != 0 or not executable.is_file():
+        raise core.ConfigError(
+            "Автоматическая установка Chromium не завершена. Выполните "
+            "вручную: python -m playwright install chromium"
+        )
 
 
 def _allowed_browser_request(url: str) -> bool:
@@ -432,7 +477,7 @@ def _evaluate_fetch(
     except PlaywrightError as exc:
         if _browser_session_lost(page, exc):
             raise core.AuthExpired(
-                "окно Chrome закрыто или браузерная сессия потеряна"
+                "окно браузера закрыто или браузерная сессия потеряна"
             ) from exc
         return {"kind": "network_error"}
     if not isinstance(result, Mapping):
@@ -555,9 +600,9 @@ class BrowserTransport:
 
     def ensure_authenticated(self) -> None:
         if _page_is_closed(self.page):
-            raise core.AuthExpired("окно Chrome закрыто до завершения входа")
+            raise core.AuthExpired("окно браузера закрыто до завершения входа")
         print(
-            "В открытом Chrome завершите корпоративный вход в Addressbook. "
+            "В открытом Chromium завершите корпоративный вход в Addressbook. "
             "Cookies и токены из браузера не копируются.",
             file=sys.stderr,
         )
@@ -572,7 +617,7 @@ class BrowserTransport:
         except PlaywrightError as exc:
             if _browser_session_lost(self.page, exc):
                 raise core.AuthExpired(
-                    "окно Chrome закрыто или браузерная сессия потеряна"
+                    "окно браузера закрыто или браузерная сессия потеряна"
                 ) from exc
             reason = _safe_navigation_error(exc)
             if reason == "navigation_error" and (
@@ -582,14 +627,16 @@ class BrowserTransport:
                 pass
             else:
                 raise core.ConfigError(
-                    "Chrome не смог открыть Addressbook "
+                    "Chromium не смог открыть Addressbook "
                     f"({reason}). Адрес и секреты не выводятся."
                 ) from exc
 
         deadline = time.monotonic() + self.login_timeout
         while time.monotonic() < deadline:
             if _page_is_closed(self.page):
-                raise core.AuthExpired("окно Chrome закрыто до завершения входа")
+                raise core.AuthExpired(
+                    "окно браузера закрыто до завершения входа"
+                )
 
             if _page_is_addressbook(self.page, self.expected_host):
                 result = _evaluate_fetch(
@@ -828,9 +875,9 @@ def run(args: argparse.Namespace) -> int:
 
     if args.dry_run:
         print(
-            "Проверка завершена: browser=chrome, client_cert=да, "
+            "Проверка завершена: browser=chromium, client_cert=да, "
             f"валидных UUID={valid}, некорректных/пустых={invalid}. "
-            "Chrome и HTTP-запросы не запускались."
+            "Браузер и HTTP-запросы не запускались."
         )
         return 0
     if sync_playwright is None:
@@ -851,6 +898,7 @@ def run(args: argparse.Namespace) -> int:
     with without_client_cert_environment():
         try:
             with sync_playwright() as playwright:
+                ensure_bundled_chromium(playwright, args)
                 with tempfile.TemporaryDirectory(
                     prefix="kventin-addressbook-"
                 ) as profile_dir:
@@ -878,14 +926,14 @@ def run(args: argparse.Namespace) -> int:
         except core.AuthExpired:
             print(
                 "Вход в Addressbook не завершён. CSV не изменён; "
-                "запустите команду снова и завершите вход в открытом Chrome.",
+                "запустите команду снова и завершите вход в Chromium.",
                 file=sys.stderr,
             )
             return 3
         except PlaywrightError as exc:
             reason = _safe_navigation_error(exc)
             raise core.ConfigError(
-                "Playwright/Chrome не запущен "
+                "Playwright Chromium не запущен "
                 f"({reason}). Секреты и адреса не выводятся."
             ) from exc
 

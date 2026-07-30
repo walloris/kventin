@@ -69,8 +69,9 @@ class FakeBrowserContext:
 
 
 class FakeChromium:
-    def __init__(self, context):
+    def __init__(self, context, executable_path="/missing/chromium"):
         self.context = context
+        self.executable_path = executable_path
         self.persistent_calls = []
 
     def launch_persistent_context(self, **kwargs):
@@ -133,7 +134,7 @@ def test_parse_args_has_conservative_browser_export_defaults(
     assert args.progress_every == 100
     assert args.flush_every == 25
     assert args.login_timeout == 300
-    assert args.browser_channel == "chrome"
+    assert args.browser_channel == "chromium"
     assert args.browser_executable is None
     assert args.ignore_https_errors is False
     assert args.dry_run is False
@@ -205,13 +206,13 @@ def test_client_certificate_environment_keeps_initially_missing_values_missing(
     assert core_exporter.CLIENT_CERT_PASSPHRASE_ENV not in os.environ
 
 
-def test_launch_defaults_to_visible_chrome_and_safe_spnego_allowlist(
+def test_launch_defaults_to_visible_bundled_chromium_and_safe_spnego_allowlist(
     tmp_path: Path,
 ) -> None:
     options = browser_exporter.build_launch_options(_parse_args(tmp_path))
 
     assert options["headless"] is False
-    assert options["channel"] == "chrome"
+    assert "channel" not in options
     assert "executable_path" not in options
     assert (
         "--auth-server-allowlist="
@@ -235,6 +236,63 @@ def test_browser_executable_override_takes_precedence_over_channel(
     assert options["headless"] is False
     assert options["executable_path"] == str(executable.resolve())
     assert "channel" not in options
+
+
+def test_missing_bundled_chromium_is_installed_automatically(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    executable = tmp_path / "playwright-chromium"
+    chromium = FakeChromium(
+        FakeBrowserContext(),
+        executable_path=str(executable),
+    )
+    playwright = SimpleNamespace(chromium=chromium)
+    args = _parse_args(tmp_path)
+    captured = {}
+    monkeypatch.setenv(
+        core_exporter.CLIENT_CERT_ENV, "/private/client.p12"
+    )
+    monkeypatch.setenv(
+        core_exporter.CLIENT_CERT_PASSPHRASE_ENV, "top secret"
+    )
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["env"] = kwargs["env"]
+        executable.write_bytes(b"browser")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(browser_exporter.subprocess, "run", fake_run)
+
+    browser_exporter.ensure_bundled_chromium(playwright, args)
+
+    assert captured["command"] == [
+        browser_exporter.sys.executable,
+        "-m",
+        "playwright",
+        "install",
+        "chromium",
+    ]
+    assert core_exporter.CLIENT_CERT_ENV not in captured["env"]
+    assert core_exporter.CLIENT_CERT_PASSPHRASE_ENV not in captured["env"]
+
+
+def test_explicit_browser_channel_does_not_auto_install(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    args = _parse_args(tmp_path, "--browser-channel", "chrome")
+    playwright = SimpleNamespace(
+        chromium=FakeChromium(FakeBrowserContext())
+    )
+
+    def unexpected_run(*_args, **_kwargs):
+        raise AssertionError("installer must not run for an explicit channel")
+
+    monkeypatch.setattr(browser_exporter.subprocess, "run", unexpected_run)
+
+    browser_exporter.ensure_bundled_chromium(playwright, args)
 
 
 def test_launch_uses_ephemeral_persistent_context_not_incognito(
@@ -262,7 +320,7 @@ def test_launch_uses_ephemeral_persistent_context_not_incognito(
     assert options["ignore_https_errors"] is False
     assert options["service_workers"] == "allow"
     assert options["headless"] is False
-    assert options["channel"] == "chrome"
+    assert "channel" not in options
     assert context.route_calls == []
 
 
@@ -433,7 +491,7 @@ def test_closed_page_raises_auth_expired_without_retry_or_raw_error() -> None:
 
     assert limiter.calls == 1
     assert len(page.evaluate_calls) == 1
-    assert "Chrome" in str(error.value)
+    assert "браузера" in str(error.value)
     assert "secret" not in str(error.value)
     assert "internal details" not in str(error.value)
 
