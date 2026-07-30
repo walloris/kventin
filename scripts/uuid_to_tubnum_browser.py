@@ -55,6 +55,10 @@ AUTH_SERVER_ALLOWLIST = (
     core.DEFAULT_ALT_IDP_HOST,
 )
 SAFE_JSON_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}\Z")
+NUMBER_FIELD_HINT = re.compile(
+    r"(tub|tab|tabel|personnel|staff|number|num)",
+    re.IGNORECASE,
+)
 MAX_JSON_SHAPE_PATHS = 40
 MAX_JSON_SHAPE_DEPTH = 6
 
@@ -554,6 +558,52 @@ def safe_json_shape(value: Any) -> str:
     return "; ".join(paths)
 
 
+def _safe_json_key(raw_key: Any) -> str:
+    key = str(raw_key)
+    return key if SAFE_JSON_KEY.fullmatch(key) else "<redacted-key>"
+
+
+def safe_top_level_keys(value: Any) -> str:
+    if not isinstance(value, dict):
+        return "<not-an-object>"
+    return ", ".join(
+        sorted({_safe_json_key(raw_key) for raw_key in value})
+    )
+
+
+def safe_number_field_candidates(value: Any) -> str:
+    """Найти только пути похожих на номер полей, не читая их значения."""
+
+    candidates: List[str] = []
+    queue: List[tuple] = [("$", value, 0)]
+    while queue and len(candidates) < MAX_JSON_SHAPE_PATHS:
+        path, nested, depth = queue.pop(0)
+        if depth >= MAX_JSON_SHAPE_DEPTH:
+            continue
+        if isinstance(nested, dict):
+            for raw_key, child in nested.items():
+                safe_key = _safe_json_key(raw_key)
+                child_path = f"{path}.{safe_key}"
+                if (
+                    safe_key != "<redacted-key>"
+                    and NUMBER_FIELD_HINT.search(safe_key)
+                ):
+                    candidates.append(child_path)
+                queue.append((child_path, child, depth + 1))
+        elif isinstance(nested, list) and nested:
+            queue.append((f"{path}[]", nested[0], depth + 1))
+    return ", ".join(candidates) if candidates else "<none>"
+
+
+def missing_tubnum_details(payload: Any) -> str:
+    return (
+        f"JSON shape: {safe_json_shape(payload)}; "
+        f"top-level keys: {safe_top_level_keys(payload)}; "
+        "number-like key paths: "
+        f"{safe_number_field_candidates(payload)}"
+    )
+
+
 def _retry_after(
     result: Mapping[str, Any], max_backoff: float
 ) -> Optional[float]:
@@ -740,12 +790,12 @@ class BrowserTransport:
                     tub_num = core.find_tubnum(payload, user_uuid)
                 except core.MissingTubNum as exc:
                     raise core.MissingTubNum(
-                        f"{exc}; JSON shape: {safe_json_shape(payload)}"
+                        f"{exc}; {missing_tubnum_details(payload)}"
                     ) from exc
                 if tub_num is None:
                     raise core.MissingTubNum(
                         "в JSON-ответе отсутствует tubNum; "
-                        f"JSON shape: {safe_json_shape(payload)}"
+                        f"{missing_tubnum_details(payload)}"
                     )
                 return tub_num
             if kind == "auth":

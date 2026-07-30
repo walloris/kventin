@@ -554,6 +554,31 @@ def test_safe_json_shape_contains_keys_and_types_but_not_values() -> None:
     assert "secret token" not in shape
 
 
+def test_safe_key_diagnostics_include_names_but_not_values() -> None:
+    payload = {
+        "employeeNumber": "private personnel value",
+        "phones": [{"number": "private phone value"}],
+        UUID: {"tabNumber": "private dynamic value"},
+        "displayName": "Secret Person",
+    }
+
+    top_level = browser_exporter.safe_top_level_keys(payload)
+    candidates = browser_exporter.safe_number_field_candidates(payload)
+
+    assert "<redacted-key>" in top_level
+    assert "displayName" in top_level
+    assert "employeeNumber" in top_level
+    assert "$.employeeNumber" in candidates
+    assert "$.phones[].number" in candidates
+    assert "$.<redacted-key>.tabNumber" in candidates
+    combined = top_level + candidates
+    assert UUID not in combined
+    assert "private personnel value" not in combined
+    assert "private phone value" not in combined
+    assert "private dynamic value" not in combined
+    assert "Secret Person" not in combined
+
+
 def test_missing_tubnum_reports_only_safe_json_shape() -> None:
     page = FakePage(
         result={
@@ -578,6 +603,8 @@ def test_missing_tubnum_reports_only_safe_json_shape() -> None:
     assert "JSON shape:" in message
     assert "$.data:array(len=0)" in message
     assert "$.message:string" in message
+    assert "top-level keys: data, message" in message
+    assert "number-like key paths: <none>" in message
     assert "private backend message" not in message
 
 
