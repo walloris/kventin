@@ -851,18 +851,23 @@ class BrowserTransport:
 
 
 def run_export(args: argparse.Namespace, transport: BrowserTransport) -> int:
-    processed = core.load_processed(args.output)
+    successful = core.load_processed(args.output)
     errors_path = core.default_errors_path(args.output)
+    error_records = core.load_error_records(errors_path, successful)
+    core.write_error_records_atomic(errors_path, error_records)
+    terminal_error_uuids = {
+        record.uuid
+        for record in error_records.values()
+        if record.uuid and not record.retryable
+    }
+    terminal_input_rows = {
+        record.source_row
+        for record in error_records.values()
+        if not record.uuid and not record.retryable
+    }
     output_handle, output_writer = core.open_csv_append(
         args.output, ["uuid", "tubNum"]
     )
-    try:
-        error_handle, error_writer = core.open_csv_append(
-            errors_path, ["uuid", "source_row", "error"]
-        )
-    except Exception:
-        output_handle.close()
-        raise
 
     rate_limiter = core.RateLimiter(args.rate)
     attempted = 0
@@ -870,28 +875,41 @@ def run_export(args: argparse.Namespace, transport: BrowserTransport) -> int:
     no_tubnum = 0
     invalid = 0
     failed = 0
-    skipped = 0
+    skipped_success = 0
+    skipped_terminal_error = 0
+    skipped_duplicate = 0
     consecutive_errors = 0
     stopped_for_auth = False
     reauthentications = 0
+    attempted_this_run = set()
 
     try:
         for source_row, user_uuid, input_error in core.input_rows(
             args.input, args.id_column
         ):
             if input_error or user_uuid is None:
+                if source_row in terminal_input_rows:
+                    skipped_terminal_error += 1
+                    continue
                 invalid += 1
-                error_writer.writerow(
-                    {"uuid": "", "source_row": source_row, "error": input_error}
-                )
+                record = core.error_record_for_input(source_row, input_error or "")
+                error_records[core.error_record_key(record)] = record
+                terminal_input_rows.add(source_row)
                 continue
-            if user_uuid in processed:
-                skipped += 1
+            if user_uuid in successful:
+                skipped_success += 1
+                continue
+            if user_uuid in terminal_error_uuids:
+                skipped_terminal_error += 1
+                continue
+            if user_uuid in attempted_this_run:
+                skipped_duplicate += 1
                 continue
             if args.limit is not None and attempted >= args.limit:
                 break
 
             attempted += 1
+            attempted_this_run.add(user_uuid)
             try:
                 try:
                     tub_num = transport.fetch_tubnum(
@@ -918,20 +936,15 @@ def run_export(args: argparse.Namespace, transport: BrowserTransport) -> int:
                 )
                 break
             except core.FetchError as exc:
+                record = core.error_record_for_fetch(user_uuid, source_row, exc)
+                error_records[core.error_record_key(record)] = record
                 if isinstance(exc, core.MissingTubNum):
                     no_tubnum += 1
                     consecutive_errors = 0
+                    terminal_error_uuids.add(user_uuid)
                 else:
                     failed += 1
                     consecutive_errors += 1
-                error_writer.writerow(
-                    {
-                        "uuid": user_uuid,
-                        "source_row": source_row,
-                        "error": str(exc),
-                    }
-                )
-                error_handle.flush()
                 if (
                     not isinstance(exc, core.MissingTubNum)
                     and consecutive_errors >= args.max_consecutive_errors
@@ -953,12 +966,13 @@ def run_export(args: argparse.Namespace, transport: BrowserTransport) -> int:
 
             consecutive_errors = 0
             output_writer.writerow({"uuid": user_uuid, "tubNum": tub_num})
-            processed.add(user_uuid)
+            output_handle.flush()
+            successful.add(user_uuid)
+            error_records.pop(user_uuid, None)
             written += 1
 
             if written % args.flush_every == 0:
                 output_handle.flush()
-                error_handle.flush()
             if attempted % args.progress_every == 0:
                 print(
                     f"Обработано новых UUID: {attempted}; записано: {written}; "
@@ -967,14 +981,15 @@ def run_export(args: argparse.Namespace, transport: BrowserTransport) -> int:
                 )
     finally:
         output_handle.flush()
-        error_handle.flush()
         output_handle.close()
-        error_handle.close()
+        core.write_error_records_atomic(errors_path, error_records)
 
     print(
         f"Итог: новых попыток={attempted}, записано={written}, "
         f"без tubNum={no_tubnum}, ошибок={failed}, "
-        f"некорректных строк={invalid}, ранее готовых={skipped}, "
+        f"некорректных строк={invalid}, ранее готовых={skipped_success}, "
+        f"ранее без табельника={skipped_terminal_error}, "
+        f"дублей во входе={skipped_duplicate}, "
         f"повторных входов={reauthentications}. "
         f"Результат: {args.output}. Ошибки: {errors_path}."
     )

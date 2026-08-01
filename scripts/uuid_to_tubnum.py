@@ -7,7 +7,7 @@
 * извлекает URL, заголовки и cookies из сохраненного curl в RTF;
 * поддерживает клиентский PKCS#12 из CLIENT_CERT/CLIENT_CERT_PASSPHRASE;
 * пишет CSV строго с колонками uuid,tubNum;
-* безопасно возобновляет работу, пропуская уже записанные UUID;
+* безопасно возобновляет работу, пропуская готовые и конечные исходы;
 * не печатает cookies, заголовки авторизации или тела ответов.
 """
 
@@ -22,6 +22,7 @@ import random
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -79,6 +80,7 @@ REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 OIDC_REDIRECT_STATUSES = {302, 303}
 AUTH_STATUSES = {401, 403}
 TUBNUM_FIELD_NAMES = ("tubNum", "tabNum")
+ERROR_FIELDNAMES = ["uuid", "source_row", "category", "retryable", "error"]
 
 
 class ConfigError(RuntimeError):
@@ -140,6 +142,15 @@ class Endpoint:
 class ClientCertificate:
     path: Path
     password: str = field(repr=False)
+
+
+@dataclass(frozen=True)
+class ErrorRecord:
+    uuid: str
+    source_row: int
+    category: str
+    retryable: bool
+    error: str
 
 
 class RateLimiter:
@@ -1140,6 +1151,176 @@ def default_errors_path(output_path: Path) -> Path:
     return output_path.with_name(f"{output_path.stem}.errors{suffix}")
 
 
+def error_record_key(record: ErrorRecord) -> str:
+    return record.uuid or f"source-row:{record.source_row}"
+
+
+def error_record_for_input(source_row: int, reason: str) -> ErrorRecord:
+    return ErrorRecord(
+        uuid="",
+        source_row=source_row,
+        category="invalid_input",
+        retryable=False,
+        error=reason,
+    )
+
+
+def error_record_for_fetch(
+    user_uuid: str, source_row: int, exc: FetchError
+) -> ErrorRecord:
+    message = str(exc)
+    if isinstance(exc, MissingTubNum):
+        lowered = message.casefold()
+        if "http 204" in lowered or "http 404" in lowered:
+            category = "not_found"
+        elif "только для этого uuid" in lowered:
+            category = "record_unavailable"
+        else:
+            category = "no_tab_num"
+        retryable = False
+    else:
+        category = "request_error"
+        retryable = True
+    return ErrorRecord(
+        uuid=user_uuid,
+        source_row=source_row,
+        category=category,
+        retryable=retryable,
+        error=message,
+    )
+
+
+def _legacy_error_record(
+    user_uuid: str, source_row: int, message: str
+) -> ErrorRecord:
+    lowered = message.casefold()
+    if not user_uuid:
+        category, retryable = "invalid_input", False
+    elif "http 204" in lowered or "http 404" in lowered:
+        category, retryable = "not_found", False
+    elif "только для этого uuid" in lowered:
+        category, retryable = "record_unavailable", False
+    elif (
+        "отсутствует tubnum" in lowered
+        or "отсутствует tabnum/tubnum" in lowered
+        or "нет tabnum/tubnum" in lowered
+    ):
+        category, retryable = "no_tab_num", False
+    else:
+        category, retryable = "request_error", True
+    return ErrorRecord(
+        uuid=user_uuid,
+        source_row=source_row,
+        category=category,
+        retryable=retryable,
+        error=message,
+    )
+
+
+def load_error_records(
+    path: Path, successful_uuids: Set[str]
+) -> Dict[str, ErrorRecord]:
+    """Load and de-duplicate old or current error CSV; latest row wins."""
+
+    records: Dict[str, ErrorRecord] = {}
+    if not path.exists() or path.stat().st_size == 0:
+        return records
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        old_fields = ["uuid", "source_row", "error"]
+        if reader.fieldnames not in (old_fields, ERROR_FIELDNAMES):
+            raise ConfigError(
+                f"У файла ошибок {path} неожиданные колонки. Ожидаются "
+                "uuid,source_row,error либо новый формат с category,retryable."
+            )
+        legacy = reader.fieldnames == old_fields
+        for line_number, row in enumerate(reader, start=2):
+            raw_uuid = (row.get("uuid") or "").strip()
+            user_uuid = canonical_uuid(raw_uuid) if raw_uuid else ""
+            if raw_uuid and user_uuid is None:
+                raise ConfigError(
+                    f"В файле ошибок {path} строка {line_number} содержит "
+                    "некорректный UUID."
+                )
+            try:
+                source_row = int((row.get("source_row") or "").strip())
+            except ValueError as exc:
+                raise ConfigError(
+                    f"В файле ошибок {path} строка {line_number} содержит "
+                    "некорректный source_row."
+                ) from exc
+            if source_row < 2:
+                raise ConfigError(
+                    f"В файле ошибок {path} строка {line_number} содержит "
+                    "некорректный source_row."
+                )
+            message = (row.get("error") or "").strip()
+            if not message:
+                raise ConfigError(
+                    f"В файле ошибок {path} строка {line_number} не содержит "
+                    "причину ошибки."
+                )
+            if legacy:
+                record = _legacy_error_record(
+                    user_uuid or "", source_row, message
+                )
+            else:
+                category = (row.get("category") or "").strip()
+                retryable_text = (row.get("retryable") or "").strip().casefold()
+                if not category or retryable_text not in {"true", "false"}:
+                    raise ConfigError(
+                        f"В файле ошибок {path} строка {line_number} содержит "
+                        "некорректные category/retryable."
+                    )
+                record = ErrorRecord(
+                    uuid=user_uuid or "",
+                    source_row=source_row,
+                    category=category,
+                    retryable=retryable_text == "true",
+                    error=message,
+                )
+            if record.uuid in successful_uuids:
+                continue
+            records[error_record_key(record)] = record
+    return records
+
+
+def write_error_records_atomic(
+    path: Path, records: Mapping[str, ErrorRecord]
+) -> None:
+    """Replace the error CSV atomically with one current row per outcome."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(
+            descriptor, "w", encoding="utf-8-sig", newline=""
+        ) as handle:
+            writer = csv.DictWriter(handle, fieldnames=ERROR_FIELDNAMES)
+            writer.writeheader()
+            for record in sorted(
+                records.values(), key=lambda item: (item.source_row, item.uuid)
+            ):
+                writer.writerow(
+                    {
+                        "uuid": record.uuid,
+                        "source_row": record.source_row,
+                        "category": record.category,
+                        "retryable": str(record.retryable).lower(),
+                        "error": record.error,
+                    }
+                )
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
 def input_rows(
     path: Path, id_column: int
 ) -> Iterable[Tuple[int, Optional[str], Optional[str]]]:
@@ -1192,8 +1373,20 @@ def run(args: argparse.Namespace) -> int:
         )
         return 0
 
-    processed = load_processed(args.output)
+    successful = load_processed(args.output)
     errors_path = default_errors_path(args.output)
+    error_records = load_error_records(errors_path, successful)
+    write_error_records_atomic(errors_path, error_records)
+    terminal_error_uuids = {
+        record.uuid
+        for record in error_records.values()
+        if record.uuid and not record.retryable
+    }
+    terminal_input_rows = {
+        record.source_row
+        for record in error_records.values()
+        if not record.uuid and not record.retryable
+    }
     tls_verify = resolve_tls_verify(args.ca_bundle)
     session = create_session(
         curl_request,
@@ -1205,13 +1398,6 @@ def run(args: argparse.Namespace) -> int:
         output_handle, output_writer = open_csv_append(
             args.output, ["uuid", "tubNum"]
         )
-        try:
-            error_handle, error_writer = open_csv_append(
-                errors_path, ["uuid", "source_row", "error"]
-            )
-        except Exception:
-            output_handle.close()
-            raise
     except Exception:
         session.close()
         raise
@@ -1222,28 +1408,41 @@ def run(args: argparse.Namespace) -> int:
     no_tubnum = 0
     invalid = 0
     failed = 0
-    skipped = 0
+    skipped_success = 0
+    skipped_terminal_error = 0
+    skipped_duplicate = 0
     consecutive_errors = 0
     stopped_for_auth = False
     reauthentications = 0
+    attempted_this_run: Set[str] = set()
 
     try:
         for source_row, user_uuid, input_error in input_rows(
             args.input, args.id_column
         ):
             if input_error or user_uuid is None:
+                if source_row in terminal_input_rows:
+                    skipped_terminal_error += 1
+                    continue
                 invalid += 1
-                error_writer.writerow(
-                    {"uuid": "", "source_row": source_row, "error": input_error}
-                )
+                record = error_record_for_input(source_row, input_error or "")
+                error_records[error_record_key(record)] = record
+                terminal_input_rows.add(source_row)
                 continue
-            if user_uuid in processed:
-                skipped += 1
+            if user_uuid in successful:
+                skipped_success += 1
+                continue
+            if user_uuid in terminal_error_uuids:
+                skipped_terminal_error += 1
+                continue
+            if user_uuid in attempted_this_run:
+                skipped_duplicate += 1
                 continue
             if args.limit is not None and attempted >= args.limit:
                 break
 
             attempted += 1
+            attempted_this_run.add(user_uuid)
             try:
                 try:
                     tub_num = fetch_tubnum(
@@ -1301,20 +1500,15 @@ def run(args: argparse.Namespace) -> int:
                 )
                 break
             except FetchError as exc:
+                record = error_record_for_fetch(user_uuid, source_row, exc)
+                error_records[error_record_key(record)] = record
                 if isinstance(exc, MissingTubNum):
                     no_tubnum += 1
                     consecutive_errors = 0
+                    terminal_error_uuids.add(user_uuid)
                 else:
                     failed += 1
                     consecutive_errors += 1
-                error_writer.writerow(
-                    {
-                        "uuid": user_uuid,
-                        "source_row": source_row,
-                        "error": str(exc),
-                    }
-                )
-                error_handle.flush()
                 if (
                     not isinstance(exc, MissingTubNum)
                     and consecutive_errors >= args.max_consecutive_errors
@@ -1337,12 +1531,13 @@ def run(args: argparse.Namespace) -> int:
 
             consecutive_errors = 0
             output_writer.writerow({"uuid": user_uuid, "tubNum": tub_num})
-            processed.add(user_uuid)
+            output_handle.flush()
+            successful.add(user_uuid)
+            error_records.pop(user_uuid, None)
             written += 1
 
             if written % args.flush_every == 0:
                 output_handle.flush()
-                error_handle.flush()
             if attempted % args.progress_every == 0:
                 print(
                     f"Обработано новых UUID: {attempted}; записано: {written}; "
@@ -1351,15 +1546,16 @@ def run(args: argparse.Namespace) -> int:
                 )
     finally:
         output_handle.flush()
-        error_handle.flush()
         output_handle.close()
-        error_handle.close()
+        write_error_records_atomic(errors_path, error_records)
         session.close()
 
     print(
         f"Итог: новых попыток={attempted}, записано={written}, "
         f"без tubNum={no_tubnum}, ошибок={failed}, "
-        f"некорректных строк={invalid}, ранее готовых={skipped}, "
+        f"некорректных строк={invalid}, ранее готовых={skipped_success}, "
+        f"ранее без табельника={skipped_terminal_error}, "
+        f"дублей во входе={skipped_duplicate}, "
         f"повторных входов={reauthentications}. "
         f"Результат: {args.output}. Ошибки: {errors_path}."
     )

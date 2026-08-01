@@ -804,3 +804,95 @@ def test_run_export_does_not_reauthenticate_twice_for_same_uuid(
     assert transport.ensure_authenticated_calls == 1
     assert len(transport.fetch_calls) == 2
     assert _read_result(args.output) == []
+
+
+def test_run_export_migrates_legacy_errors_and_skips_terminal_outcomes(
+    tmp_path: Path,
+) -> None:
+    successful_uuid = UUID
+    terminal_uuid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    retryable_uuid = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    missing_uuid = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+    args = _parse_args(tmp_path, "--rate", "0", "--retries", "0")
+    args.input.write_text(
+        "name,uuid\n"
+        f"success,{successful_uuid}\n"
+        f"terminal,{terminal_uuid}\n"
+        f"retryable,{retryable_uuid}\n"
+        f"missing,{missing_uuid}\n"
+        f"duplicate,{missing_uuid}\n",
+        encoding="utf-8",
+    )
+    with args.output.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["uuid", "tubNum"])
+        writer.writeheader()
+        writer.writerow({"uuid": successful_uuid, "tubNum": "100"})
+
+    errors_path = core_exporter.default_errors_path(args.output)
+    with errors_path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(
+            handle, fieldnames=["uuid", "source_row", "error"]
+        )
+        writer.writeheader()
+        for source_row in (3, 3):
+            writer.writerow(
+                {
+                    "uuid": terminal_uuid,
+                    "source_row": source_row,
+                    "error": "API вернул redirect только для этого UUID",
+                }
+            )
+        for source_row in (4, 4):
+            writer.writerow(
+                {
+                    "uuid": retryable_uuid,
+                    "source_row": source_row,
+                    "error": "после 5 попыток: browser_network_error",
+                }
+            )
+
+    transport = FakeTransport(
+        [
+            "200",
+            core_exporter.MissingTubNum(
+                "в JSON-ответе отсутствует tabNum/tubNum"
+            ),
+        ]
+    )
+    assert browser_exporter.run_export(args, transport) == 1
+    assert [item[0] for item in transport.fetch_calls] == [
+        retryable_uuid,
+        missing_uuid,
+    ]
+    assert _read_result(args.output) == [
+        {"uuid": successful_uuid, "tubNum": "100"},
+        {"uuid": retryable_uuid, "tubNum": "200"},
+    ]
+    with errors_path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        errors = list(reader)
+        assert reader.fieldnames == core_exporter.ERROR_FIELDNAMES
+    assert errors == [
+        {
+            "uuid": terminal_uuid,
+            "source_row": "3",
+            "category": "record_unavailable",
+            "retryable": "false",
+            "error": "API вернул redirect только для этого UUID",
+        },
+        {
+            "uuid": missing_uuid,
+            "source_row": "5",
+            "category": "no_tab_num",
+            "retryable": "false",
+            "error": "в JSON-ответе отсутствует tabNum/tubNum",
+        },
+    ]
+
+    second_transport = FakeTransport([])
+    assert browser_exporter.run_export(args, second_transport) == 0
+    assert second_transport.fetch_calls == []
+    assert _read_result(args.output) == [
+        {"uuid": successful_uuid, "tubNum": "100"},
+        {"uuid": retryable_uuid, "tubNum": "200"},
+    ]
