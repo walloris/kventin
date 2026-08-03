@@ -76,6 +76,9 @@ ALLOWED_TESTERS = {
     "Симиник Даниил Григорьевич", "Федоров Никита Андреевич",
     "Чиж Мария Михайловна", "Синица Захар Алексеевич", "Абдулгалимов Гамзат Абусуньянович"
 }
+WORKLOG_EXEMPT_COMMENT_AUTHORS = {
+    "Никонов Александр Алексеевич",
+}
 
 # Статус ТК, который считается утверждённым (Approved)
 ZEPHYR_APPROVED_STATUS = "Approved"
@@ -1153,6 +1156,7 @@ class ReleaseValidator:
         self._zephyr_cycle_search_debug_logged: set[str] = set()
         self._dev_status_payload_cache: dict[str, list[tuple[str, str, dict]]] = {}
         self._pull_request_evidence_cache: dict[str, Optional[str]] = {}
+        self._pull_request_only_evidence_cache: dict[str, Optional[str]] = {}
         self._release_pr_targets_cache: dict[str, list[tuple[object, list[object]]]] = {}
         self._merged_pull_request_evidence_cache: dict[str, Optional[str]] = {}
         self._zephyr_cycle_cache = self._load_zephyr_cycle_cache()
@@ -2998,10 +3002,18 @@ class ReleaseValidator:
                 artifact = self.jira_main.issue(artifact_key)
                 comments = self.jira_main.comments(artifact.key)
                 comment_authors: set[str] = set()
+                worklog_required_comment_authors: set[str] = set()
+                worklog_exempt_authors_normalized = {
+                    normalize_field_text(author).casefold()
+                    for author in WORKLOG_EXEMPT_COMMENT_AUTHORS
+                }
                 for comment in comments:
                     author_name = self._get_author_name(comment.author)
-                    if is_allowed_tester(author_name):
+                    is_exempt_author = normalize_field_text(author_name).casefold() in worklog_exempt_authors_normalized
+                    if is_allowed_tester(author_name) or is_exempt_author:
                         comment_authors.add(author_name)
+                    if is_allowed_tester(author_name) and not is_exempt_author:
+                        worklog_required_comment_authors.add(author_name)
 
                 if not comment_authors:
                     self._log_issue(artifact, "error", "Нет комментариев от тестировщика")
@@ -3023,7 +3035,7 @@ class ReleaseValidator:
                             continue
                         worklog_authors.update(self._get_tester_worklog_authors(task_issue))
 
-                missing_time_authors = sorted(comment_authors - worklog_authors)
+                missing_time_authors = sorted(worklog_required_comment_authors - worklog_authors)
                 if missing_time_authors:
                     self._log_issue(
                         artifact,
@@ -3035,7 +3047,7 @@ class ReleaseValidator:
                     self._log_issue(
                         artifact,
                         "success",
-                        "У всех тестировщиков с комментариями есть списанное время ✓"
+                        "У всех тестировщиков с комментариями, для которых требуется worklog, есть списанное время ✓"
                     )
             except Exception as e:
                 self._log_issue(artifact_key, "error", f"Ошибка проверки артефактов: {e}")
@@ -3126,8 +3138,8 @@ class ReleaseValidator:
         "PERFREVIEW": 5.2,
         "HRPASSIST": 10.0,
     }
-    STORY_MIN_TESTING_RATIO = 0.75
-    STORY_MAX_TESTING_RATIO = 1.25
+    STORY_MIN_TESTING_RATIO = 0.90
+    STORY_MAX_TESTING_RATIO = 1.10
 
     def _extract_story_requirements_rows(self, raw_val: object) -> dict[str, dict]:
         field_value = extract_jira_field_value(raw_val)
@@ -3503,6 +3515,8 @@ class ReleaseValidator:
             if target_days is not None:
                 min_days = target_days * self.STORY_MIN_TESTING_RATIO
                 max_days = target_days * self.STORY_MAX_TESTING_RATIO
+                min_percent = int(self.STORY_MIN_TESTING_RATIO * 100)
+                max_percent = int(self.STORY_MAX_TESTING_RATIO * 100)
                 try:
                     if story_full is None:
                         story_full = self.jira_main.issue(story.key, expand='changelog')
@@ -3518,7 +3532,7 @@ class ReleaseValidator:
                         self._log_issue(
                             story, "error",
                             f"Story: суммарное время в тест-статусах "
-                            f"({actual_days_rounded} д.) больше 125% норматива "
+                            f"({actual_days_rounded} д.) больше {max_percent}% норматива "
                             f"({max_days_rounded} д. из {target_days_rounded} д.) "
                             f"для проектной области {story_project}"
                         )
@@ -3526,7 +3540,7 @@ class ReleaseValidator:
                         self._log_issue(
                             story, "error",
                             f"Story: суммарное время в тест-статусах "
-                            f"({actual_days_rounded} д.) меньше 75% норматива "
+                            f"({actual_days_rounded} д.) меньше {min_percent}% норматива "
                             f"({min_days_rounded} д. из {target_days_rounded} д.) "
                             f"для проектной области {story_project}"
                         )
@@ -3534,7 +3548,8 @@ class ReleaseValidator:
                         self._log_issue(
                             story, "success",
                             f"Story: время в тест-статусах {actual_days_rounded} д. "
-                            f"в пределах 75–125% норматива ({min_days_rounded}–{max_days_rounded} д.) ✓"
+                            f"в пределах {min_percent}–{max_percent}% норматива "
+                            f"({min_days_rounded}–{max_days_rounded} д.) ✓"
                         )
                 except Exception as e:
                     self._log_issue(
@@ -3835,6 +3850,95 @@ class ReleaseValidator:
             self._pull_request_evidence_cache[cache_key] = evidence
         return evidence
 
+    def _find_issue_pull_request_only_evidence(self, issue) -> Optional[str]:
+        issue_key = str(getattr(issue, 'key', '') or '')
+        issue_id = str(getattr(issue, 'id', '') or '')
+        cache_key = issue_key or issue_id
+        if cache_key and cache_key in self._pull_request_only_evidence_cache:
+            return self._pull_request_only_evidence_cache[cache_key]
+
+        evidence = self._find_issue_pull_request_only_evidence_uncached(issue_key, issue_id)
+        if cache_key:
+            self._pull_request_only_evidence_cache[cache_key] = evidence
+        return evidence
+
+    def _find_issue_pull_request_only_evidence_uncached(
+        self,
+        issue_key: str,
+        issue_id: str,
+    ) -> Optional[str]:
+        if issue_id:
+            for application_type, data_type, payload in self._get_dev_status_payloads(issue_id):
+                if self._dev_status_payload_has_pull_request(data_type, payload):
+                    return f"dev-status {application_type}/{data_type}"
+
+        if issue_key:
+            base_url = config['jira']['url'].rstrip('/')
+
+            try:
+                response = self.jira_http.get(
+                    f"{base_url}/rest/api/2/issue/{issue_key}/remotelink",
+                    timeout=12,
+                )
+                if response.status_code == 200 and self._json_contains_pull_request(response.json()):
+                    return "Jira remote links"
+            except Exception:
+                pass
+
+            try:
+                properties_response = self.jira_http.get(
+                    f"{base_url}/rest/api/2/issue/{issue_key}/properties",
+                    timeout=12,
+                )
+                if properties_response.status_code == 200:
+                    properties_payload = properties_response.json()
+                    if self._json_contains_pull_request(properties_payload):
+                        return "Jira issue properties"
+                    for item in properties_payload.get('keys', []) if isinstance(properties_payload, dict) else []:
+                        property_key = item.get('key', '') if isinstance(item, dict) else ''
+                        if not property_key or not self._is_relevant_jira_property_key(property_key):
+                            continue
+                        property_response = self.jira_http.get(
+                            f"{base_url}/rest/api/2/issue/{issue_key}/properties/{property_key}",
+                            timeout=12,
+                        )
+                        if property_response.status_code == 200 and self._json_contains_pull_request(property_response.json()):
+                            return f"Jira issue property {property_key}"
+            except Exception:
+                pass
+
+            try:
+                issue_full = self.jira_main.issue(
+                    issue_key,
+                    fields='summary,description,issuelinks,*all',
+                    expand='renderedFields,names,schema',
+                )
+                if self._json_contains_pull_request(getattr(issue_full, 'raw', {})):
+                    return "Jira issue raw/rendered fields"
+            except Exception:
+                pass
+
+            try:
+                comments = self.jira_main.comments(issue_key)
+                comment_bodies = [getattr(comment, 'body', '') for comment in comments]
+                if self._json_contains_pull_request(comment_bodies):
+                    return "Jira comments"
+            except Exception:
+                pass
+
+            try:
+                html_response = self.jira_http.get(
+                    f"{base_url}/browse/{issue_key}",
+                    headers={'Accept': 'text/html,application/xhtml+xml'},
+                    timeout=12,
+                )
+                if html_response.status_code == 200 and self._json_contains_pull_request(html_response.text):
+                    return "Jira issue HTML"
+            except Exception:
+                pass
+
+        return None
+
     def _find_issue_pull_request_evidence_uncached(
         self,
         issue,
@@ -3989,14 +4093,15 @@ class ReleaseValidator:
         issue_types = {'story', 'bug', 'defect', 'ошибка'}
 
         linked_keys = self._get_consist_of_issues(release_key)
-        if not linked_keys:
-            self._release_pr_targets_cache[release_key] = []
-            return []
+        if linked_keys:
+            keys_str = ",".join(linked_keys)
+            jql = f'parent = {release_key} OR key in ({keys_str})'
+        else:
+            jql = f'parent = {release_key}'
 
-        keys_str = ",".join(linked_keys)
         try:
             release_issues = self.jira_main.search_issues(
-                f'key in ({keys_str})',
+                jql,
                 fields='summary,issuetype,assignee,labels,issuelinks',
                 maxResults=500
             )
@@ -4056,35 +4161,30 @@ class ReleaseValidator:
         if not targets:
             return
 
-        print(f"   Проверка Pull Request/commit для {len(targets)} Story/Bug...")
+        print(f"   Проверка Pull Request для {len(targets)} Story/Bug...")
 
-        for target_issue, issues_to_check in targets:
-            pr_issue = None
+        for target_issue, _issues_to_check in targets:
             pr_evidence = None
-            for issue_to_check in issues_to_check:
-                try:
-                    evidence = self._find_issue_pull_request_evidence(issue_to_check)
-                    if pr_issue is None and evidence:
-                        pr_issue = issue_to_check
-                        pr_evidence = evidence
-                except Exception as e:
-                    self._log_issue(
-                        target_issue,
-                        "warning",
-                        f"Pull Request/commit: не удалось проверить {issue_to_check.key}: {e}"
-                    )
+            try:
+                pr_evidence = self._find_issue_pull_request_only_evidence(target_issue)
+            except Exception as e:
+                self._log_issue(
+                    target_issue,
+                    "warning",
+                    f"Pull Request: не удалось проверить {target_issue.key}: {e}"
+                )
 
-            if pr_issue:
+            if pr_evidence:
                 self._log_issue(
                     target_issue,
                     "success",
-                    f"Pull Request/commit найден в {pr_issue.key} ({pr_evidence}) ✓"
+                    f"Pull Request найден в {target_issue.key} ({pr_evidence}) ✓"
                 )
             else:
                 self._log_issue(
                     target_issue,
                     "error",
-                    "Pull Request/commit не найден. Для каждой Story/Bug в составе релиза должен быть PR или commit"
+                    "Pull Request не найден. Для каждой Story/Bug в составе релиза должен быть PR на самой задаче"
                 )
 
     @staticmethod
