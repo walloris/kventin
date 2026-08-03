@@ -19,6 +19,7 @@ import argparse
 import glob
 import html
 import json
+import os
 import re
 import sys
 import time
@@ -64,6 +65,17 @@ DEFAULT_RELEASE_DATE_FIELD_ID = "customfield_19400"
 DEFAULT_RELEASE_TYPE_FIELD_ID = "customfield_23500"
 DEFAULT_DETECTION_STAGE_FIELD_ID = "customfield_11507"
 DEFAULT_SKIP_DEFECT_REASON_FIELD_ID = "customfield_16801"
+DEFAULT_TEAM_ASSIGNMENT_FIELD_IDS = tuple(
+    field_id.strip()
+    for field_id in re.split(r"[,;\s]+", os.environ.get("QUALITY_METRIC_TEAM_FIELD_IDS", ""))
+    if field_id.strip()
+)
+DEFAULT_TEAM_ASSIGNMENT_FIELD_NAME_TOKENS = (
+    "команд",
+    "squad",
+    "сквад",
+    "team",
+)
 METRIC_INITIAL_DETECTION_STAGE_FIELD = "_metric_initial_detection_stage"
 METRIC_CURRENT_DETECTION_STAGE_FIELD = "_metric_current_detection_stage"
 METRIC_DETECTION_STAGE_HISTORY_FIELD = "_metric_detection_stage_history"
@@ -478,6 +490,17 @@ class TeamMetric:
     bug_keys: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class MetricForecast:
+    projected_stories: int
+    projected_bugs: int
+    projected_ratio: Optional[Decimal]
+    projected_attainment_percent: Optional[Decimal]
+    teams_on_target: int
+    team_count: int
+    factor: Decimal
+
+
 def calculate_metric(spec: TeamSpec, counts: TeamCounts) -> TeamMetric:
     calculated_target = spec.target_ratio
     minimum_target = (
@@ -797,11 +820,61 @@ def with_detection_stage_history(
     return result
 
 
+def team_aliases(spec: TeamSpec) -> frozenset[str]:
+    aliases = {normalized(spec.team)}
+    if spec.squad_code:
+        aliases.add(spec.squad_code.casefold())
+    if spec.team == "Core UI 2.0 / Neuro UI":
+        aliases.add(normalized("CoreUI 2.0"))
+        aliases.add(normalized("Core UI 2.0"))
+    return frozenset(alias for alias in aliases if alias)
+
+
+def issue_assignment_team(
+    issue: Mapping[str, Any],
+    team_specs: Sequence[TeamSpec],
+    team_assignment_field_ids: Sequence[str],
+) -> Optional[str]:
+    if not team_assignment_field_ids:
+        return None
+
+    field_values = [
+        issue_field(issue, field_id)
+        for field_id in team_assignment_field_ids
+        if issue_field(issue, field_id) not in (None, "", [], {})
+    ]
+    if not field_values:
+        return None
+
+    text_parts = []
+    for value in field_values:
+        text_parts.extend(named_values(value))
+        try:
+            text_parts.append(json.dumps(value, ensure_ascii=False, default=str))
+        except Exception:
+            text_parts.append(str(value))
+    raw_joined_text = " ".join(text_parts)
+    joined_text = normalized(raw_joined_text)
+
+    matched = [
+        spec.team
+        for spec in team_specs
+        if any(alias and alias in joined_text for alias in team_aliases(spec))
+    ]
+    unique = list(dict.fromkeys(matched))
+    if len(unique) == 1:
+        return unique[0]
+    if re.search(r"\b\d{2}[A-ZА-Я]{2}\d{4}\b", raw_joined_text.upper()):
+        return ""
+    return None
+
+
 def aggregate_issues(
     team_specs: Sequence[TeamSpec],
     issues: Iterable[Mapping[str, Any]],
     rules: MetricRules,
     detection_stage_field_id: str,
+    team_assignment_field_ids: Sequence[str] = (),
 ) -> dict[str, TeamCounts]:
     counts = {spec.team: TeamCounts() for spec in team_specs}
     project_to_team = {
@@ -816,7 +889,11 @@ def aggregate_issues(
         seen_keys.add(key)
 
         project_key = issue_project_key(issue)
-        team = project_to_team.get(project_key)
+        team = issue_assignment_team(issue, team_specs, team_assignment_field_ids)
+        if team == "":
+            continue
+        if team is None:
+            team = project_to_team.get(project_key)
         if team is None:
             continue
 
@@ -1331,6 +1408,20 @@ def find_jira_field_id(
     )
 
 
+def find_team_assignment_field_ids(jira: "JiraClient") -> tuple[str, ...]:
+    explicit_ids = tuple(dict.fromkeys(DEFAULT_TEAM_ASSIGNMENT_FIELD_IDS))
+    fields = jira.fields()
+    token_matches = []
+    for item in fields:
+        field_id = str(item.get("id") or "").strip()
+        field_name = normalized(item.get("name"))
+        if not field_id:
+            continue
+        if any(token in field_name for token in DEFAULT_TEAM_ASSIGNMENT_FIELD_NAME_TOKENS):
+            token_matches.append(field_id)
+    return tuple(dict.fromkeys((*explicit_ids, *token_matches)))
+
+
 def build_release_jql(
     *,
     project: str,
@@ -1378,6 +1469,7 @@ def collect_created_bugs(
     start: date,
     end: date,
     detection_stage_field_id: str,
+    team_assignment_field_ids: Sequence[str] = (),
     verbose: bool = False,
 ) -> tuple[list[dict[str, Any]], str]:
     """Collect bugs created in team projects and load eligible stage history."""
@@ -1394,6 +1486,7 @@ def collect_created_bugs(
         "resolutiondate",
         detection_stage_field_id,
         DEFAULT_SKIP_DEFECT_REASON_FIELD_ID,
+        *team_assignment_field_ids,
     )
     execution_log(
         "Jira: ищу заведённые баги в пространствах команд "
@@ -1624,6 +1717,7 @@ def collect_released_issues(
     release_type_field_id: str,
     detection_stage_field_id: str,
     link_keywords: Sequence[str],
+    team_assignment_field_ids: Sequence[str] = (),
     verbose: bool = False,
 ) -> tuple[
     list[dict[str, Any]],
@@ -1719,6 +1813,7 @@ def collect_released_issues(
         "resolutiondate",
         "priority",
         detection_stage_field_id,
+        *team_assignment_field_ids,
     )
     issues_by_key: dict[str, dict[str, Any]] = {}
     all_linked_keys: set[str] = set()
@@ -2039,6 +2134,7 @@ def print_filter_audit(
     issues: Sequence[Mapping[str, Any]],
     rules: MetricRules,
     detection_stage_field_id: str,
+    team_assignment_field_ids: Sequence[str] = (),
 ) -> None:
     """Explain how Story/Bug candidates pass through metric filters."""
 
@@ -2059,10 +2155,16 @@ def print_filter_audit(
         for spec in team_specs
     }
     outside_projects: Counter[str] = Counter()
+    outside_assignment: Counter[str] = Counter()
 
     for issue in issues:
         project_key = issue_project_key(issue) or "БЕЗ ПРОЕКТА"
-        team = project_to_team.get(project_key)
+        team = issue_assignment_team(issue, team_specs, team_assignment_field_ids)
+        if team == "":
+            outside_assignment[project_key] += 1
+            continue
+        if team is None:
+            team = project_to_team.get(project_key)
         if team is None:
             outside_projects[project_key] += 1
             continue
@@ -2166,6 +2268,12 @@ def print_filter_audit(
             for project_key, count in outside_projects.most_common()
         )
         print("  Вне настроенных команд: " + rendered)
+    if outside_assignment:
+        rendered = ", ".join(
+            f"{project_key}={count}"
+            for project_key, count in outside_assignment.most_common()
+        )
+        print("  Вне выбранной команды по полю команды/сквада: " + rendered)
 
 
 def decimal_text(value: Decimal, places: int = 3) -> str:
@@ -2208,6 +2316,85 @@ def attainment_text(metric: TeamMetric) -> str:
     if metric.target_attainment_percent is None:
         return "—"
     return f"{decimal_text(metric.target_attainment_percent, 1)}%"
+
+
+def period_forecast_factor(start: date, end: date, as_of: date) -> Decimal:
+    total_days = max(1, (end - start).days)
+    if as_of < start:
+        return Decimal(0)
+    elapsed_days = min(total_days, (as_of - start).days + 1)
+    return Decimal(total_days) / Decimal(max(1, elapsed_days))
+
+
+def projected_count(value: int, factor: Decimal) -> int:
+    if factor <= 0:
+        return 0
+    return int((Decimal(value) * factor).to_integral_value(rounding=ROUND_HALF_UP))
+
+
+def forecast_metric(metrics: Sequence[TeamMetric], start: date, end: date, as_of: date) -> MetricForecast:
+    factor = period_forecast_factor(start, end, as_of)
+    projected_stories = sum(projected_count(metric.stories, factor) for metric in metrics)
+    projected_bugs = sum(projected_count(metric.bugs, factor) for metric in metrics)
+
+    if projected_stories > 0:
+        projected_ratio = (Decimal(projected_bugs) / Decimal(projected_stories)).quantize(
+            Decimal("0.01"),
+            rounding=ROUND_HALF_UP,
+        )
+    else:
+        projected_ratio = None
+
+    weighted_target_numerator = sum(
+        Decimal(projected_count(metric.stories, factor)) * metric.target_ratio
+        for metric in metrics
+    )
+    projected_target = (
+        weighted_target_numerator / Decimal(projected_stories)
+        if projected_stories > 0
+        else None
+    )
+
+    if projected_ratio is None or projected_ratio == 0:
+        projected_attainment = Decimal(100)
+    elif projected_target is None:
+        projected_attainment = None
+    else:
+        projected_attainment = (projected_target / projected_ratio) * Decimal(100)
+
+    forecasted_team_states = 0
+    for metric in metrics:
+        team_stories = projected_count(metric.stories, factor)
+        team_bugs = projected_count(metric.bugs, factor)
+        if team_stories == 0 or team_bugs == 0:
+            forecasted_team_states += 1
+            continue
+        team_ratio = (Decimal(team_bugs) / Decimal(team_stories)).quantize(
+            Decimal("0.01"),
+            rounding=ROUND_HALF_UP,
+        )
+        if team_ratio <= metric.target_ratio:
+            forecasted_team_states += 1
+
+    return MetricForecast(
+        projected_stories=projected_stories,
+        projected_bugs=projected_bugs,
+        projected_ratio=projected_ratio,
+        projected_attainment_percent=projected_attainment,
+        teams_on_target=forecasted_team_states,
+        team_count=len(metrics),
+        factor=factor,
+    )
+
+
+def forecast_text(forecast: MetricForecast) -> str:
+    return (
+        f"Прогноз метрики качества: Story≈{forecast.projected_stories}; "
+        f"баги≈{forecast.projected_bugs}; "
+        f"факт≈{ratio_text(forecast.projected_ratio, forecast.projected_bugs, forecast.projected_stories)}; "
+        f"выполнение≈{decimal_text(forecast.projected_attainment_percent, 1) if forecast.projected_attainment_percent is not None else '—'}%; "
+        f"цель выполнят {forecast.teams_on_target} из {forecast.team_count} команд"
+    )
 
 
 def render_console(metrics: Sequence[TeamMetric]) -> str:
@@ -2320,6 +2507,7 @@ def render_metric_section_html(
     title: str,
     start: date,
     end: date,
+    as_of: date,
     release_count: int,
     hotfix_count: int,
     accent: str,
@@ -2452,6 +2640,19 @@ def render_metric_section_html(
         parts.append("</tr>")
 
     parts.append("</tbody></table>")
+    section_forecast = forecast_metric(metrics, start, end, as_of)
+    parts.extend(
+        (
+            '<div style="background-color:#E6FCFF;border-left:5px solid #00A3BF;'
+            'border-radius:6px;color:#0747A6;font-size:13px;margin:8px 0 16px;'
+            'padding:10px 13px;">',
+            f"<strong>{html.escape(forecast_text(section_forecast))}</strong>",
+            '<div style="color:#5E6C84;font-size:11px;margin-top:4px;">'
+            f"Линейный прогноз по текущему темпу на {html.escape((end - timedelta(days=1)).strftime('%d.%m.%Y'))}; "
+            f"коэффициент периода ×{html.escape(decimal_text(section_forecast.factor, 2))}.</div>",
+            "</div>",
+        )
+    )
     return "".join(parts)
 
 
@@ -2486,6 +2687,7 @@ def render_confluence_html(
             title=f"Текущий квартал · {quarter_start.year} Q{quarter}",
             start=quarter_start,
             end=quarter_end,
+            as_of=generated_at.date(),
             release_count=quarter_release_count,
             hotfix_count=quarter_hotfix_count,
             accent="#6554C0",
@@ -2495,6 +2697,7 @@ def render_confluence_html(
             title="Последние 90 дней",
             start=rolling_start,
             end=rolling_end,
+            as_of=generated_at.date(),
             release_count=rolling_release_count,
             hotfix_count=rolling_hotfix_count,
             accent="#0052CC",
@@ -3157,6 +3360,7 @@ def write_project_debug_report(
     release_date_field_id: str,
     release_type_field_id: str,
     detection_stage_field_id: str,
+    team_assignment_field_ids: Sequence[str] = (),
 ) -> None:
     """Write a self-contained, read-only audit for one Jira project."""
 
@@ -3265,6 +3469,15 @@ def write_project_debug_report(
         )
         common_checks = (
             ("project совпадает", issue_project_key(issue) == project_key),
+            (
+                "команда/сквад совпадает",
+                issue_assignment_team(
+                    issue,
+                    (project_spec,),
+                    team_assignment_field_ids,
+                )
+                != "",
+            ),
             ("тип Story", type_ok),
             ("статус/категория Done", status_ok),
             ("resolutiondate заполнена", resolved is not None),
@@ -3323,6 +3536,15 @@ def write_project_debug_report(
         )
         common_checks = (
             ("project совпадает", issue_project_key(issue) == project_key),
+            (
+                "команда/сквад совпадает",
+                issue_assignment_team(
+                    issue,
+                    (project_spec,),
+                    team_assignment_field_ids,
+                )
+                != "",
+            ),
             ("тип Bug", type_ok),
             ("статус не Отклонен исполнителем", status_ok),
             ("дефект не был известен в релизе", skip_reason_ok),
@@ -3385,12 +3607,14 @@ def write_project_debug_report(
         [*rolling_story_issues, *rolling_bug_issues],
         rules,
         detection_stage_field_id,
+        team_assignment_field_ids,
     )[project_spec.team]
     quarter_counts = aggregate_issues(
         (project_spec,),
         [*quarter_story_issues, *quarter_bug_issues],
         rules,
         detection_stage_field_id,
+        team_assignment_field_ids,
     )[project_spec.team]
     rolling_metric = calculate_metric(project_spec, rolling_counts)
     quarter_metric = calculate_metric(project_spec, quarter_counts)
@@ -4084,6 +4308,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         detection_stage_field_id = DEFAULT_DETECTION_STAGE_FIELD_ID
         release_type_field_id = DEFAULT_RELEASE_TYPE_FIELD_ID
+        team_assignment_field_ids = find_team_assignment_field_ids(jira)
+        if team_assignment_field_ids:
+            rendered_team_fields = ", ".join(team_assignment_field_ids[:20])
+            suffix = (
+                f", +{len(team_assignment_field_ids) - 20}"
+                if len(team_assignment_field_ids) > 20
+                else ""
+            )
+            execution_log(
+                "Jira: поля команды/сквада для метрики="
+                f"{rendered_team_fields}{suffix}"
+            )
 
         (
             releases,
@@ -4103,6 +4339,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             release_type_field_id=release_type_field_id,
             detection_stage_field_id=detection_stage_field_id,
             link_keywords=DEFAULT_RELEASE_LINK_KEYWORDS,
+            team_assignment_field_ids=team_assignment_field_ids,
             verbose=args.verbose,
         )
         created_bugs, bugs_jql = collect_created_bugs(
@@ -4112,6 +4349,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             start=collection_start,
             end=collection_end,
             detection_stage_field_id=detection_stage_field_id,
+            team_assignment_field_ids=team_assignment_field_ids,
             verbose=args.verbose,
         )
 
@@ -4189,6 +4427,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 rolling_metric_issues,
                 rules,
                 detection_stage_field_id,
+                team_assignment_field_ids,
             )
             print(f"\n=== {quarter_start.year} Q{quarter}: аудит ===")
             print(
@@ -4201,6 +4440,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 quarter_metric_issues,
                 rules,
                 detection_stage_field_id,
+                team_assignment_field_ids,
             )
 
         metrics_started = time.perf_counter()
@@ -4210,12 +4450,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             rolling_metric_issues,
             rules,
             detection_stage_field_id,
+            team_assignment_field_ids,
         )
         quarter_counts = aggregate_issues(
             active_team_specs,
             quarter_metric_issues,
             rules,
             detection_stage_field_id,
+            team_assignment_field_ids,
         )
         rolling_metrics = [
             calculate_metric(spec, rolling_counts[spec.team])
@@ -4286,6 +4528,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 release_date_field_id=release_date_field_id,
                 release_type_field_id=release_type_field_id,
                 detection_stage_field_id=detection_stage_field_id,
+                team_assignment_field_ids=team_assignment_field_ids,
             )
         generated_at = datetime.now().astimezone()
         report_html = render_confluence_html(
@@ -4318,6 +4561,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"заведённых багов до фильтров: {len(rolling_bugs)}"
         )
         print(render_console(rolling_metrics))
+        print(
+            forecast_text(
+                forecast_metric(rolling_metrics, rolling_start, rolling_end, generated_at.date())
+            )
+        )
 
         print(
             f"\n{quarter_start.year} Q{quarter}: {quarter_start.isoformat()} — "
@@ -4331,6 +4579,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"заведённых багов до фильтров: {len(quarter_bugs)}"
         )
         print(render_console(quarter_metrics))
+        print(
+            forecast_text(
+                forecast_metric(quarter_metrics, quarter_start, quarter_end, generated_at.date())
+            )
+        )
 
         if args.verbose:
             print(f"\nФактический JQL релизов: {release_jql}")
