@@ -1370,11 +1370,13 @@ def collect_created_bugs(
     started = time.perf_counter()
     jql = build_created_bugs_jql(team_specs, start=start, end=end)
     fields = (
+        "summary",
         "project",
         "issuetype",
         "status",
         "priority",
         "created",
+        "resolutiondate",
         detection_stage_field_id,
     )
     execution_log(
@@ -1688,9 +1690,11 @@ def collect_released_issues(
                 print(f"  {status_name}: {count}")
 
     issue_fields = (
+        "summary",
         "project",
         "issuetype",
         "status",
+        "created",
         "resolutiondate",
         "priority",
         detection_stage_field_id,
@@ -2981,6 +2985,458 @@ def issue_debug_snapshot(
     }
 
 
+def debug_decimal(value: Optional[Decimal]) -> Optional[str]:
+    """Serialize Decimal values without losing the exact metric arithmetic."""
+
+    return None if value is None else format(value, "f")
+
+
+def metric_calculation_debug(metric: TeamMetric) -> dict[str, Any]:
+    """Expose every input and intermediate value used by calculate_metric()."""
+
+    exact_ratio = (
+        Decimal(metric.bugs) / Decimal(metric.stories)
+        if metric.stories
+        else None
+    )
+    bug_budget = int(
+        (Decimal(metric.stories) * metric.target_ratio).to_integral_value(
+            rounding=ROUND_FLOOR
+        )
+    )
+    stories_needed_total = (
+        int(
+            (Decimal(metric.bugs) / metric.target_ratio).to_integral_value(
+                rounding=ROUND_CEILING
+            )
+        )
+        if metric.stories and metric.bugs
+        else 0
+    )
+    return {
+        "inputs": {
+            "stories": metric.stories,
+            "bugs_total": metric.bugs,
+            "bugs_psi": metric.psi_bugs,
+            "bugs_prom": metric.prom_bugs,
+            "as_is_ratio": debug_decimal(metric.as_is_ratio),
+            "a_times_as_is_plus_b": debug_decimal(
+                metric.calculated_target_ratio
+            ),
+            "as_is_times_0_8": debug_decimal(metric.minimum_target_ratio),
+        },
+        "formulas": {
+            "effective_target": (
+                "max(A × AS IS + B; AS IS × 0.8)"
+                if metric.as_is_ratio is not None
+                else "A × AS IS + B (AS IS отсутствует)"
+            ),
+            "actual_exact": "bugs_total / stories",
+            "actual_display": "round_half_up(actual_exact, 2)",
+            "attainment_percent": (
+                "effective_target / actual_display × 100; "
+                "при 0 Story или 0 багов = 100"
+            ),
+            "bug_budget": "floor(stories × effective_target)",
+            "additional_bugs_allowed": "max(0; bug_budget - bugs_total)",
+            "stories_needed_total": "ceil(bugs_total / effective_target)",
+            "additional_stories_required": (
+                "max(0; stories_needed_total - stories)"
+            ),
+        },
+        "intermediate": {
+            "effective_target": debug_decimal(metric.target_ratio),
+            "actual_exact": debug_decimal(exact_ratio),
+            "actual_display": debug_decimal(metric.actual_ratio),
+            "bug_budget": bug_budget,
+            "stories_needed_total": stories_needed_total,
+        },
+        "result": {
+            "state": metric.state,
+            "target_attainment_percent": debug_decimal(
+                metric.target_attainment_percent
+            ),
+            "additional_bugs_allowed": metric.additional_bugs_allowed,
+            "additional_stories_required": metric.additional_stories_required,
+            "counted_story_keys": list(metric.story_keys),
+            "counted_bug_keys": list(metric.bug_keys),
+        },
+    }
+
+
+def issue_filter_result(
+    checks: Sequence[tuple[str, bool]],
+) -> dict[str, Any]:
+    """Return an ordered PASS/FAIL trace and human-readable reject reasons."""
+
+    failed = [name for name, passed in checks if not passed]
+    return {
+        "checks": [
+            {"name": name, "passed": passed}
+            for name, passed in checks
+        ],
+        "passed": not failed,
+        "failed_checks": failed,
+    }
+
+
+def write_project_debug_report(
+    *,
+    output_path: Path,
+    project_key: str,
+    team_spec: TeamSpec,
+    rules: MetricRules,
+    rolling_start: date,
+    rolling_end: date,
+    quarter_start: date,
+    quarter_end: date,
+    quarter_story_start: date,
+    quarter: int,
+    releases: Sequence[Mapping[str, Any]],
+    released_issues: Sequence[Mapping[str, Any]],
+    created_bugs: Sequence[Mapping[str, Any]],
+    issue_keys_by_release: Mapping[str, set[str]],
+    release_jql: str,
+    bugs_jql: str,
+    release_date_field_id: str,
+    release_type_field_id: str,
+    detection_stage_field_id: str,
+) -> None:
+    """Write a self-contained, read-only audit for one Jira project."""
+
+    project_key = project_key.strip().upper()
+    project_spec = TeamSpec(
+        team=team_spec.team,
+        squad_code=team_spec.squad_code,
+        project_keys=(project_key,),
+        ke_ids=team_spec.ke_ids,
+        as_is_ratio=team_spec.as_is_ratio,
+        target_ratio=team_spec.target_ratio,
+    )
+    project_release_items = sorted(
+        (
+            issue
+            for issue in released_issues
+            if issue_project_key(issue) == project_key
+        ),
+        key=lambda issue: str(issue.get("key") or ""),
+    )
+    project_bugs = sorted(
+        (
+            issue
+            for issue in created_bugs
+            if issue_project_key(issue) == project_key
+        ),
+        key=lambda issue: str(issue.get("key") or ""),
+    )
+    project_item_keys = {
+        str(issue.get("key") or "").strip().upper()
+        for issue in project_release_items
+        if str(issue.get("key") or "").strip()
+    }
+
+    releases_by_issue: dict[str, list[str]] = defaultdict(list)
+    for release_key, issue_keys in issue_keys_by_release.items():
+        for issue_key in issue_keys:
+            normalized_key = str(issue_key).strip().upper()
+            if normalized_key in project_item_keys:
+                releases_by_issue[normalized_key].append(release_key)
+
+    release_by_key = {
+        str(release.get("key") or "").strip().upper(): release
+        for release in releases
+        if str(release.get("key") or "").strip()
+    }
+    relevant_release_keys = sorted(
+        {
+            release_key
+            for release_key, issue_keys in issue_keys_by_release.items()
+            if project_item_keys.intersection(issue_keys)
+        }
+    )
+    release_rows: list[dict[str, Any]] = []
+    for release_key in relevant_release_keys:
+        release = release_by_key.get(release_key)
+        if release is None:
+            continue
+        installed = parse_jira_date(issue_field(release, release_date_field_id))
+        linked_project_keys = sorted(
+            project_item_keys.intersection(
+                issue_keys_by_release.get(release_key, set())
+            )
+        )
+        release_rows.append(
+            {
+                "key": release_key,
+                "summary": str(issue_field(release, "summary") or ""),
+                "status": named_value(issue_field(release, "status")),
+                "installed_date": installed.isoformat() if installed else "",
+                "release_type": named_values(
+                    issue_field(release, release_type_field_id)
+                ),
+                "is_hotfix": is_hotfix_release(
+                    release,
+                    release_type_field_id,
+                    DEFAULT_HOTFIX_VALUES,
+                ),
+                "in_rolling_90_days": bool(
+                    installed and rolling_start <= installed < rolling_end
+                ),
+                "in_quarter": bool(
+                    installed and quarter_start <= installed < quarter_end
+                ),
+                "consist_of_total": len(
+                    issue_keys_by_release.get(release_key, set())
+                ),
+                "consist_of_project_count": len(linked_project_keys),
+                "consist_of_project_keys": linked_project_keys,
+            }
+        )
+
+    story_rows: list[dict[str, Any]] = []
+    for issue in project_release_items:
+        key = str(issue.get("key") or "").strip().upper()
+        issue_type = normalized(named_value(issue_field(issue, "issuetype")))
+        raw_status = issue_field(issue, "status")
+        resolved = parse_jira_date(issue_field(issue, "resolutiondate"))
+        type_ok = issue_type in rules.story_types
+        status_ok = story_has_done_status(raw_status, rules)
+        rolling_date_ok = bool(
+            resolved and rolling_start <= resolved < rolling_end
+        )
+        quarter_date_ok = bool(
+            resolved and quarter_story_start <= resolved < quarter_end
+        )
+        common_checks = (
+            ("project совпадает", issue_project_key(issue) == project_key),
+            ("тип Story", type_ok),
+            ("статус/категория Done", status_ok),
+            ("resolutiondate заполнена", resolved is not None),
+        )
+        rolling_filter = issue_filter_result(
+            (*common_checks, ("resolutiondate входит в 90 дней", rolling_date_ok))
+        )
+        quarter_filter = issue_filter_result(
+            (*common_checks, ("resolutiondate входит в квартал", quarter_date_ok))
+        )
+        raw_status_category = (
+            raw_status.get("statusCategory")
+            if isinstance(raw_status, Mapping)
+            else None
+        )
+        story_rows.append(
+            {
+                "key": key,
+                "summary": str(issue_field(issue, "summary") or ""),
+                "type": named_value(issue_field(issue, "issuetype")),
+                "status": named_value(raw_status),
+                "status_category": named_value(raw_status_category),
+                "created": str(issue_field(issue, "created") or ""),
+                "resolutiondate": str(issue_field(issue, "resolutiondate") or ""),
+                "linked_installed_releases": sorted(
+                    releases_by_issue.get(key, [])
+                ),
+                "rolling_90_days": rolling_filter,
+                "quarter": quarter_filter,
+            }
+        )
+
+    bug_rows: list[dict[str, Any]] = []
+    for issue in project_bugs:
+        key = str(issue.get("key") or "").strip().upper()
+        raw_status = issue_field(issue, "status")
+        issue_type = normalized(named_value(issue_field(issue, "issuetype")))
+        priority = normalized(named_value(issue_field(issue, "priority")))
+        created = parse_jira_date(issue_field(issue, "created"))
+        stage = classify_eligible_detection_stage(
+            issue_field(issue, detection_stage_field_id),
+            rules,
+        )
+        type_ok = issue_type in rules.bug_types
+        status_ok = bug_has_eligible_status(raw_status, rules)
+        priority_ok = priority in rules.bug_priorities
+        rolling_date_ok = bool(
+            created and rolling_start <= created < rolling_end
+        )
+        quarter_date_ok = bool(
+            created and quarter_start <= created < quarter_end
+        )
+        common_checks = (
+            ("project совпадает", issue_project_key(issue) == project_key),
+            ("тип Bug", type_ok),
+            ("статус не Отклонен исполнителем", status_ok),
+            ("приоритет High+", priority_ok),
+            ("в истории этапа есть PSI/ПРОМ", stage is not None),
+        )
+        snapshot = issue_debug_snapshot(
+            issue,
+            detection_stage_field_id=detection_stage_field_id,
+            jira_field_names={},
+            team_specs=(project_spec,),
+        )
+        snapshot.update(
+            {
+                "key": key,
+                "classified_detection_stage": (
+                    stage.upper() if stage else None
+                ),
+                "full_changelog_loaded": (
+                    "changelog" in issue
+                    or METRIC_DETECTION_STAGE_HISTORY_FIELD
+                    in (
+                        issue.get("fields")
+                        if isinstance(issue.get("fields"), Mapping)
+                        else {}
+                    )
+                ),
+                "rolling_90_days": issue_filter_result(
+                    (*common_checks, ("created входит в 90 дней", rolling_date_ok))
+                ),
+                "quarter": issue_filter_result(
+                    (*common_checks, ("created входит в квартал", quarter_date_ok))
+                ),
+            }
+        )
+        bug_rows.append(snapshot)
+
+    rolling_story_issues = [
+        issue
+        for issue, row in zip(project_release_items, story_rows)
+        if row["rolling_90_days"]["passed"]
+    ]
+    quarter_story_issues = [
+        issue
+        for issue, row in zip(project_release_items, story_rows)
+        if row["quarter"]["passed"]
+    ]
+    rolling_bug_issues = [
+        issue
+        for issue, row in zip(project_bugs, bug_rows)
+        if row["rolling_90_days"]["passed"]
+    ]
+    quarter_bug_issues = [
+        issue
+        for issue, row in zip(project_bugs, bug_rows)
+        if row["quarter"]["passed"]
+    ]
+    rolling_counts = aggregate_issues(
+        (project_spec,),
+        [*rolling_story_issues, *rolling_bug_issues],
+        rules,
+        detection_stage_field_id,
+    )[project_spec.team]
+    quarter_counts = aggregate_issues(
+        (project_spec,),
+        [*quarter_story_issues, *quarter_bug_issues],
+        rules,
+        detection_stage_field_id,
+    )[project_spec.team]
+    rolling_metric = calculate_metric(project_spec, rolling_counts)
+    quarter_metric = calculate_metric(project_spec, quarter_counts)
+
+    def decision_summary(
+        rows: Sequence[Mapping[str, Any]],
+        period_name: str,
+    ) -> dict[str, Any]:
+        failed_checks: Counter[str] = Counter()
+        counted = 0
+        for row in rows:
+            decision = row.get(period_name)
+            if not isinstance(decision, Mapping):
+                continue
+            if decision.get("passed") is True:
+                counted += 1
+            for check in decision.get("failed_checks") or []:
+                failed_checks[str(check)] += 1
+        return {
+            "found": len(rows),
+            "counted": counted,
+            "excluded": len(rows) - counted,
+            "failed_checks": dict(failed_checks.most_common()),
+        }
+
+    payload = {
+        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "read_only": True,
+        "project": project_key,
+        "team": team_spec.team,
+        "squad_code": team_spec.squad_code,
+        "periods": {
+            "rolling_90_days": {
+                "start_inclusive": rolling_start.isoformat(),
+                "end_exclusive": rolling_end.isoformat(),
+                "display_end": (rolling_end - timedelta(days=1)).isoformat(),
+            },
+            "quarter": {
+                "name": f"{quarter_start.year} Q{quarter}",
+                "start_inclusive": quarter_start.isoformat(),
+                "story_start_inclusive": quarter_story_start.isoformat(),
+                "end_exclusive": quarter_end.isoformat(),
+                "display_end": (quarter_end - timedelta(days=1)).isoformat(),
+            },
+        },
+        "rules": {
+            "story_types": sorted(rules.story_types),
+            "story_done_statuses": sorted(rules.story_statuses),
+            "bug_types": sorted(rules.bug_types),
+            "excluded_bug_statuses": sorted(rules.excluded_bug_statuses),
+            "bug_high_plus_priorities": sorted(rules.bug_priorities),
+            "psi_detection_stages": sorted(rules.psi_detection_stages),
+            "prom_detection_stages": sorted(rules.prom_detection_stages),
+            "detection_stage_field_id": detection_stage_field_id,
+            "story_period_field": "resolutiondate",
+            "bug_period_field": "created",
+            "story_source": "consist of установленных Release 2.0",
+            "bug_source": "JQL по Jira project",
+        },
+        "queries": {
+            "release_jql": release_jql,
+            "created_bugs_jql": bugs_jql,
+        },
+        "source_counts": {
+            "installed_releases_global": len(releases),
+            "installed_releases_with_project_items": len(release_rows),
+            "consist_of_items_global": len(released_issues),
+            "consist_of_items_project": len(project_release_items),
+            "created_bug_candidates_project": len(project_bugs),
+        },
+        "decision_summary": {
+            "rolling_90_days": {
+                "release_consist_of_items": decision_summary(
+                    story_rows,
+                    "rolling_90_days",
+                ),
+                "created_bug_candidates": decision_summary(
+                    bug_rows,
+                    "rolling_90_days",
+                ),
+            },
+            "quarter": {
+                "release_consist_of_items": decision_summary(
+                    story_rows,
+                    "quarter",
+                ),
+                "created_bug_candidates": decision_summary(
+                    bug_rows,
+                    "quarter",
+                ),
+            },
+        },
+        "releases_with_project_items": release_rows,
+        "release_consist_of_items": story_rows,
+        "created_bug_candidates": bug_rows,
+        "calculations": {
+            "rolling_90_days": metric_calculation_debug(rolling_metric),
+            "quarter": metric_calculation_debug(quarter_metric),
+        },
+    }
+    output_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(f"DEBUG_PROJECT_JSON={output_path.resolve()}")
+
+
 def write_reference_debug_report(
     *,
     jira: JiraClient,
@@ -3231,18 +3687,30 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--debug-output",
+        "--debug-project",
+        metavar="JIRA_PROJECT",
         help=(
-            "Путь для JSON-аудита --debug-reference. По умолчанию файл "
-            "quarterly_reference_debug_<timestamp>.json в текущем каталоге."
+            "Собрать подробный JSON-аудит одного Jira project: найденные "
+            "релизы и consist-of задачи, кандидаты Bug, PASS/FAIL каждого "
+            "фильтра и полный расчёт. Публикация автоматически отключается."
         ),
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--debug-output",
+        help=(
+            "Путь для JSON-аудита --debug-reference или --debug-project. "
+            "По умолчанию имя формируется автоматически в текущем каталоге."
+        ),
+    )
+    args = parser.parse_args(argv)
+    if args.debug_reference and args.debug_project:
+        parser.error("--debug-reference и --debug-project нельзя использовать вместе")
+    return args
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
-    if args.debug_reference:
+    if args.debug_reference or args.debug_project:
         args.no_publish = True
     job_started = time.perf_counter()
     execution_log(
@@ -3253,6 +3721,38 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         team_specs = load_team_specs()
         rules = MetricRules.defaults()
+        debug_project = str(args.debug_project or "").strip().upper()
+        debug_team_spec = next(
+            (
+                spec
+                for spec in team_specs
+                if debug_project in spec.project_keys
+            ),
+            None,
+        )
+        if debug_project and debug_team_spec is None:
+            configured_projects = sorted(
+                project_key
+                for spec in team_specs
+                for project_key in spec.project_keys
+            )
+            raise RuntimeError(
+                f"Jira project {debug_project} не привязан ни к одной команде. "
+                f"Настроены: {', '.join(configured_projects)}"
+            )
+        if debug_team_spec is not None:
+            active_team_specs: tuple[TeamSpec, ...] = (
+                TeamSpec(
+                    team=debug_team_spec.team,
+                    squad_code=debug_team_spec.squad_code,
+                    project_keys=(debug_project,),
+                    ke_ids=debug_team_spec.ke_ids,
+                    as_is_ratio=debug_team_spec.as_is_ratio,
+                    target_ratio=debug_team_spec.target_ratio,
+                ),
+            )
+        else:
+            active_team_specs = tuple(team_specs)
         debug_reference_paths = (
             expand_debug_reference_paths(args.debug_reference)
             if args.debug_reference
@@ -3266,6 +3766,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             execution_log(
                 f"Debug XLSX: файлов эталона={len(debug_reference_paths)}; "
                 "публикация Confluence отключена"
+            )
+        if debug_project:
+            execution_log(
+                f"Debug project: {debug_project}, "
+                f"команда={debug_team_spec.team}; публикация отключена"
             )
         today = datetime.now().astimezone().date()
         if args.quarter:
@@ -3283,7 +3788,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"{(rolling_end - timedelta(days=1)).isoformat()}; "
             f"{quarter_start.year} Q{quarter} {quarter_start.isoformat()} — "
             f"{(quarter_end - timedelta(days=1)).isoformat()}; "
-            f"команд={len(team_specs)}"
+            f"команд={len(active_team_specs)}"
         )
 
         execution_log("Загружаю настройки Jira из config.py")
@@ -3337,7 +3842,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         created_bugs, bugs_jql = collect_created_bugs(
             jira,
-            team_specs,
+            active_team_specs,
             rules,
             start=collection_start,
             end=collection_end,
@@ -3415,7 +3920,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             print_issue_inventory(rolling_metric_issues)
             print_filter_audit(
-                team_specs,
+                active_team_specs,
                 rolling_metric_issues,
                 rules,
                 detection_stage_field_id,
@@ -3427,7 +3932,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             print_issue_inventory(quarter_metric_issues)
             print_filter_audit(
-                team_specs,
+                active_team_specs,
                 quarter_metric_issues,
                 rules,
                 detection_stage_field_id,
@@ -3436,22 +3941,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         metrics_started = time.perf_counter()
         execution_log("Рассчитываю метрики команд и формирую таблицы")
         rolling_counts = aggregate_issues(
-            team_specs,
+            active_team_specs,
             rolling_metric_issues,
             rules,
             detection_stage_field_id,
         )
         quarter_counts = aggregate_issues(
-            team_specs,
+            active_team_specs,
             quarter_metric_issues,
             rules,
             detection_stage_field_id,
         )
         rolling_metrics = [
-            calculate_metric(spec, rolling_counts[spec.team]) for spec in team_specs
+            calculate_metric(spec, rolling_counts[spec.team])
+            for spec in active_team_specs
         ]
         quarter_metrics = [
-            calculate_metric(spec, quarter_counts[spec.team]) for spec in team_specs
+            calculate_metric(spec, quarter_counts[spec.team])
+            for spec in active_team_specs
         ]
         if debug_reference_paths:
             debug_output = (
@@ -3480,6 +3987,39 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 releases=releases,
                 issue_keys_by_release=issue_keys_by_release,
                 release_date_field_id=release_date_field_id,
+                detection_stage_field_id=detection_stage_field_id,
+            )
+        if debug_project:
+            debug_output = (
+                Path(args.debug_output).expanduser()
+                if args.debug_output
+                else Path.cwd()
+                / (
+                    f"quarterly_project_debug_{debug_project}_"
+                    + datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
+                    + ".json"
+                )
+            )
+            debug_output.parent.mkdir(parents=True, exist_ok=True)
+            write_project_debug_report(
+                output_path=debug_output,
+                project_key=debug_project,
+                team_spec=active_team_specs[0],
+                rules=rules,
+                rolling_start=rolling_start,
+                rolling_end=rolling_end,
+                quarter_start=quarter_start,
+                quarter_end=quarter_end,
+                quarter_story_start=quarter_story_start,
+                quarter=quarter,
+                releases=releases,
+                released_issues=released_issues,
+                created_bugs=created_bugs,
+                issue_keys_by_release=issue_keys_by_release,
+                release_jql=release_jql,
+                bugs_jql=bugs_jql,
+                release_date_field_id=release_date_field_id,
+                release_type_field_id=release_type_field_id,
                 detection_stage_field_id=detection_stage_field_id,
             )
         generated_at = datetime.now().astimezone()
