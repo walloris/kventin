@@ -2885,7 +2885,23 @@ def issue_team_field_candidates(
     if not isinstance(fields, Mapping):
         return []
     squad_codes = {spec.squad_code for spec in team_specs if spec.squad_code}
-    name_tokens = ("команд", "squad", "подраздел", "юнит", "team")
+    name_tokens = (
+        "команд",
+        "squad",
+        "подраздел",
+        "юнит",
+        "team",
+        "кэ",
+        "конфигурац",
+        "service",
+        "сервис",
+        "продукт",
+        "кластер",
+        "трайб",
+        "дит",
+        "причин",
+        "исключ",
+    )
     result: list[dict[str, Any]] = []
     for field_id, raw_value in fields.items():
         if raw_value in (None, "", [], {}):
@@ -3435,6 +3451,137 @@ def write_project_debug_report(
     print(f"DEBUG_PROJECT_JSON={output_path.resolve()}")
 
 
+def write_issue_debug_report(
+    *,
+    jira: JiraClient,
+    issue_key: str,
+    output_path: Path,
+    team_specs: Sequence[TeamSpec],
+    rules: MetricRules,
+    detection_stage_field_id: str,
+) -> None:
+    """Download every field of one issue for a focused metric diagnosis."""
+
+    issue_key = issue_key.strip().upper()
+    jira_fields = jira.fields()
+    jira_field_names = {
+        str(item.get("id") or ""): str(item.get("name") or item.get("id") or "")
+        for item in jira_fields
+        if item.get("id")
+    }
+    issue = jira.issue(
+        issue_key,
+        ("*all", "issuelinks"),
+        expand="changelog",
+    )
+    history_html_error = ""
+    html_stage_values: list[str] = []
+    try:
+        html_stage_values = detection_stage_values_from_history_html(
+            jira.issue_history_html(issue_key),
+            rules,
+        )
+    except Exception as exc:
+        history_html_error = str(exc)
+    metric_issue = with_detection_stage_history(
+        issue,
+        detection_stage_field_id,
+        html_stage_values,
+    )
+    snapshot = issue_debug_snapshot(
+        metric_issue,
+        detection_stage_field_id=detection_stage_field_id,
+        jira_field_names=jira_field_names,
+        team_specs=team_specs,
+    )
+    project_key = issue_project_key(metric_issue)
+    configured_team = next(
+        (
+            spec
+            for spec in team_specs
+            if project_key in spec.project_keys
+        ),
+        None,
+    )
+    priority = normalized(named_value(issue_field(metric_issue, "priority")))
+    stage = classify_eligible_detection_stage(
+        issue_field(metric_issue, detection_stage_field_id),
+        rules,
+    )
+    raw_fields = metric_issue.get("fields")
+    all_fields = raw_fields if isinstance(raw_fields, Mapping) else {}
+    assignment_field_ids = {
+        str(row.get("id") or "")
+        for row in snapshot.get("team_field_candidates", [])
+        if isinstance(row, Mapping)
+    }
+    assignment_fields = [
+        {
+            "id": field_id,
+            "name": jira_field_names.get(field_id, field_id),
+            "values": flattened_debug_values(value),
+        }
+        for field_id, value in all_fields.items()
+        if str(field_id) in assignment_field_ids
+    ]
+    all_nonempty_fields = [
+        {
+            "id": str(field_id),
+            "name": jira_field_names.get(str(field_id), str(field_id)),
+            "values": flattened_debug_values(value),
+        }
+        for field_id, value in all_fields.items()
+        if value not in (None, "", [], {})
+    ]
+    all_nonempty_fields.sort(
+        key=lambda row: (
+            normalized(str(row["name"])),
+            str(row["id"]),
+        )
+    )
+    payload = {
+        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "read_only": True,
+        "issue_key": issue_key,
+        "project_mapped_team": (
+            {
+                "team": configured_team.team,
+                "squad_code": configured_team.squad_code,
+                "project_keys": list(configured_team.project_keys),
+                "ke_ids": list(configured_team.ke_ids),
+            }
+            if configured_team is not None
+            else None
+        ),
+        "metric_filters": issue_filter_result(
+            (
+                (
+                    "тип Bug",
+                    normalized(named_value(issue_field(metric_issue, "issuetype")))
+                    in rules.bug_types,
+                ),
+                (
+                    "статус не Отклонен исполнителем",
+                    bug_has_eligible_status(issue_field(metric_issue, "status"), rules),
+                ),
+                ("приоритет High+", priority in rules.bug_priorities),
+                ("в истории этапа есть PSI/ПРОМ", stage is not None),
+            )
+        ),
+        "classified_detection_stage": stage.upper() if stage else None,
+        "html_history_stage_values": html_stage_values,
+        "html_history_error": history_html_error,
+        "issue": snapshot,
+        "assignment_field_candidates": assignment_fields,
+        "all_nonempty_fields": all_nonempty_fields,
+    }
+    output_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(f"DEBUG_ISSUE_JSON={output_path.resolve()}")
+
+
 def write_reference_debug_report(
     *,
     jira: JiraClient,
@@ -3694,21 +3841,41 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--debug-issue",
+        metavar="JIRA_KEY",
+        help=(
+            "Быстро скачать все поля и changelog одной Jira-задачи для "
+            "точечной диагностики фильтров. Публикация автоматически отключается."
+        ),
+    )
+    parser.add_argument(
         "--debug-output",
         help=(
-            "Путь для JSON-аудита --debug-reference или --debug-project. "
+            "Путь для JSON-аудита --debug-reference, --debug-project или "
+            "--debug-issue. "
             "По умолчанию имя формируется автоматически в текущем каталоге."
         ),
     )
     args = parser.parse_args(argv)
-    if args.debug_reference and args.debug_project:
-        parser.error("--debug-reference и --debug-project нельзя использовать вместе")
+    debug_modes = sum(
+        bool(value)
+        for value in (
+            args.debug_reference,
+            args.debug_project,
+            args.debug_issue,
+        )
+    )
+    if debug_modes > 1:
+        parser.error(
+            "--debug-reference, --debug-project и --debug-issue "
+            "нельзя использовать вместе"
+        )
     return args
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
-    if args.debug_reference or args.debug_project:
+    if args.debug_reference or args.debug_project or args.debug_issue:
         args.no_publish = True
     job_started = time.perf_counter()
     execution_log(
@@ -3720,6 +3887,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         team_specs = load_team_specs()
         rules = MetricRules.defaults()
         debug_project = str(args.debug_project or "").strip().upper()
+        debug_issue = str(args.debug_issue or "").strip().upper()
+        if debug_issue and not re.fullmatch(r"[A-Z][A-Z0-9_]*-\d+", debug_issue):
+            raise RuntimeError(
+                f"Некорректный Jira key для --debug-issue: {debug_issue}"
+            )
         debug_team_spec = next(
             (
                 spec
@@ -3770,6 +3942,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 f"Debug project: {debug_project}, "
                 f"команда={debug_team_spec.team}; публикация отключена"
             )
+        if debug_issue:
+            execution_log(
+                f"Debug issue: {debug_issue}; публикация отключена"
+            )
         today = datetime.now().astimezone().date()
         if args.quarter:
             quarter_start, quarter_calendar_end, quarter = parse_quarter(args.quarter)
@@ -3791,6 +3967,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         execution_log("Загружаю настройки Jira из config.py")
         jira = JiraClient(load_jira_settings())
+        if debug_issue:
+            debug_output = (
+                Path(args.debug_output).expanduser()
+                if args.debug_output
+                else Path.cwd()
+                / (
+                    f"quarterly_issue_debug_{debug_issue}_"
+                    + datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
+                    + ".json"
+                )
+            )
+            debug_output.parent.mkdir(parents=True, exist_ok=True)
+            write_issue_debug_report(
+                jira=jira,
+                issue_key=debug_issue,
+                output_path=debug_output,
+                team_specs=team_specs,
+                rules=rules,
+                detection_stage_field_id=DEFAULT_DETECTION_STAGE_FIELD_ID,
+            )
+            execution_log(
+                f"Готово за {elapsed_seconds(job_started)}; "
+                "Confluence не изменён (--debug-issue)"
+            )
+            return 0
         release_date_name = DEFAULT_RELEASE_DATE_FIELD_NAME
         field_lookup_started = time.perf_counter()
         execution_log(
