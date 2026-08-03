@@ -63,6 +63,7 @@ DEFAULT_RELEASE_DATE_FIELD_NAME = "Дата завершения установ�
 DEFAULT_RELEASE_DATE_FIELD_ID = "customfield_19400"
 DEFAULT_RELEASE_TYPE_FIELD_ID = "customfield_23500"
 DEFAULT_DETECTION_STAGE_FIELD_ID = "customfield_11507"
+DEFAULT_SKIP_DEFECT_REASON_FIELD_ID = "customfield_16801"
 METRIC_INITIAL_DETECTION_STAGE_FIELD = "_metric_initial_detection_stage"
 METRIC_CURRENT_DETECTION_STAGE_FIELD = "_metric_current_detection_stage"
 METRIC_DETECTION_STAGE_HISTORY_FIELD = "_metric_detection_stage_history"
@@ -72,6 +73,7 @@ DEFAULT_STORY_TYPES = ("Story",)
 DEFAULT_STORY_STATUSES = ("Done", "Сделано", "Готово")
 DEFAULT_BUG_TYPES = ("Bug", "Defect", "Ошибка")
 DEFAULT_EXCLUDED_BUG_STATUSES = ("Отклонен исполнителем",)
+DEFAULT_EXCLUDED_SKIP_DEFECT_REASONS = ("Ошибка была известна в релизе",)
 DEFAULT_BUG_PRIORITIES = (
     "Critical",
     "Crytical",
@@ -423,6 +425,7 @@ class MetricRules:
     story_statuses: frozenset[str]
     bug_types: frozenset[str]
     excluded_bug_statuses: frozenset[str]
+    excluded_skip_defect_reasons: frozenset[str]
     bug_priorities: frozenset[str]
     psi_detection_stages: frozenset[str]
     prom_detection_stages: frozenset[str]
@@ -434,6 +437,9 @@ class MetricRules:
             story_statuses=normalized_set(DEFAULT_STORY_STATUSES),
             bug_types=normalized_set(DEFAULT_BUG_TYPES),
             excluded_bug_statuses=normalized_set(DEFAULT_EXCLUDED_BUG_STATUSES),
+            excluded_skip_defect_reasons=normalized_set(
+                DEFAULT_EXCLUDED_SKIP_DEFECT_REASONS
+            ),
             bug_priorities=normalized_set(DEFAULT_BUG_PRIORITIES),
             psi_detection_stages=normalized_set(DEFAULT_PSI_DETECTION_STAGES),
             prom_detection_stages=normalized_set(DEFAULT_PROM_DETECTION_STAGES),
@@ -593,6 +599,13 @@ def bug_has_eligible_status(raw_status: Any, rules: MetricRules) -> bool:
         normalized(named_value(raw_status))
         not in rules.excluded_bug_statuses
     )
+
+
+def bug_has_eligible_skip_reason(raw_reason: Any, rules: MetricRules) -> bool:
+    """Exclude defects that the corporate metric marks as known in release."""
+
+    reasons = {normalized(value) for value in named_values(raw_reason)}
+    return not bool(reasons & rules.excluded_skip_defect_reasons)
 
 
 def classify_eligible_detection_stage(
@@ -818,6 +831,10 @@ def aggregate_issues(
         if (
             issue_type not in rules.bug_types
             or not bug_has_eligible_status(raw_status, rules)
+            or not bug_has_eligible_skip_reason(
+                issue_field(issue, DEFAULT_SKIP_DEFECT_REASON_FIELD_ID),
+                rules,
+            )
         ):
             continue
 
@@ -1376,6 +1393,7 @@ def collect_created_bugs(
         "created",
         "resolutiondate",
         detection_stage_field_id,
+        DEFAULT_SKIP_DEFECT_REASON_FIELD_ID,
     )
     execution_log(
         "Jira: ищу заведённые баги в пространствах команд "
@@ -1398,13 +1416,18 @@ def collect_created_bugs(
             key
             and issue_type in rules.bug_types
             and bug_has_eligible_status(raw_status, rules)
+            and bug_has_eligible_skip_reason(
+                issue_field(issue, DEFAULT_SKIP_DEFECT_REASON_FIELD_ID),
+                rules,
+            )
             and priority in rules.bug_priorities
         ):
             history_keys.append(key)
 
     execution_log(
         f"Jira: заведённых Bug/Defect найдено={len(candidates)}; "
-        "High+ без статуса «Отклонен исполнителем» для проверки "
+        "High+ без статуса «Отклонен исполнителем» и без заранее "
+        "известных дефектов для проверки "
         f"истории этапа={len(history_keys)}"
     )
     detailed, errors = jira.issues_individually(
@@ -2029,6 +2052,7 @@ def print_filter_audit(
         spec.team: {
             "story_status": Counter(),
             "bug_status": Counter(),
+            "bug_skip_reason": Counter(),
             "bug_priority": Counter(),
             "bug_detection_stage": Counter(),
         }
@@ -2061,6 +2085,20 @@ def print_filter_audit(
             rejected_values[team]["bug_status"][status_name] += 1
             continue
         audit[team]["bug_status_eligible"] += 1
+
+        skip_reason_name = (
+            named_value(
+                issue_field(issue, DEFAULT_SKIP_DEFECT_REASON_FIELD_ID)
+            )
+            or "Причина не указана"
+        )
+        if not bug_has_eligible_skip_reason(
+            issue_field(issue, DEFAULT_SKIP_DEFECT_REASON_FIELD_ID),
+            rules,
+        ):
+            rejected_values[team]["bug_skip_reason"][skip_reason_name] += 1
+            continue
+        audit[team]["bug_not_known_in_release"] += 1
 
         priority_name = named_value(issue_field(issue, "priority")) or "Без приоритета"
         if normalized(priority_name) not in rules.bug_priorities:
@@ -2101,6 +2139,7 @@ def print_filter_audit(
             f"Story всего={values['story_total']}, Done={values['story_done']}; "
             f"Bug всего={values['bug_total']}, "
             f"статус допустим={values['bug_status_eligible']}, "
+            f"не известен заранее={values['bug_not_known_in_release']}, "
             f"High+={values['bug_high_plus']}, PSI/ПРОМ={values['bug_eligible']}; "
             f"этап менялся={values['bug_stage_changed']}"
         )
@@ -2108,6 +2147,7 @@ def print_filter_audit(
         for field_name, label in (
             ("story_status", "Story-статусы"),
             ("bug_status", "исключённые Bug-статусы"),
+            ("bug_skip_reason", "исключённые причины пропуска"),
             ("bug_priority", "приоритеты"),
             ("bug_detection_stage", "этапы обнаружения"),
         ):
@@ -2463,6 +2503,8 @@ def render_confluence_html(
         'font-size:12px;margin-top:14px;padding:11px 13px;">',
         "В баги входят заведённые за отчётный период в Jira-проектах команд "
         "задачи типа Bug в любом статусе, кроме «Отклонен исполнителем», "
+        "за исключением задач с причиной пропуска дефекта "
+        "«Ошибка была известна в релизе», "
         "с приоритетом "
         "Critical/Crytical, Blocker, Высокий или Блокирующий "
         "и этапом обнаружения PSI/ПСИ или PROM/ПРОМ в истории задачи. "
@@ -3268,6 +3310,10 @@ def write_project_debug_report(
         )
         type_ok = issue_type in rules.bug_types
         status_ok = bug_has_eligible_status(raw_status, rules)
+        skip_reason_ok = bug_has_eligible_skip_reason(
+            issue_field(issue, DEFAULT_SKIP_DEFECT_REASON_FIELD_ID),
+            rules,
+        )
         priority_ok = priority in rules.bug_priorities
         rolling_date_ok = bool(
             created and rolling_start <= created < rolling_end
@@ -3279,6 +3325,7 @@ def write_project_debug_report(
             ("project совпадает", issue_project_key(issue) == project_key),
             ("тип Bug", type_ok),
             ("статус не Отклонен исполнителем", status_ok),
+            ("дефект не был известен в релизе", skip_reason_ok),
             ("приоритет High+", priority_ok),
             ("в истории этапа есть PSI/ПРОМ", stage is not None),
         )
@@ -3394,6 +3441,9 @@ def write_project_debug_report(
             "story_done_statuses": sorted(rules.story_statuses),
             "bug_types": sorted(rules.bug_types),
             "excluded_bug_statuses": sorted(rules.excluded_bug_statuses),
+            "excluded_skip_defect_reasons": sorted(
+                rules.excluded_skip_defect_reasons
+            ),
             "bug_high_plus_priorities": sorted(rules.bug_priorities),
             "psi_detection_stages": sorted(rules.psi_detection_stages),
             "prom_detection_stages": sorted(rules.prom_detection_stages),
@@ -3564,6 +3614,16 @@ def write_issue_debug_report(
                     "статус не Отклонен исполнителем",
                     bug_has_eligible_status(issue_field(metric_issue, "status"), rules),
                 ),
+                (
+                    "дефект не был известен в релизе",
+                    bug_has_eligible_skip_reason(
+                        issue_field(
+                            metric_issue,
+                            DEFAULT_SKIP_DEFECT_REASON_FIELD_ID,
+                        ),
+                        rules,
+                    ),
+                ),
                 ("приоритет High+", priority in rules.bug_priorities),
                 ("в истории этапа есть PSI/ПРОМ", stage is not None),
             )
@@ -3724,6 +3784,11 @@ def write_reference_debug_report(
                 snapshot["reason"] = "created вне квартала"
             elif not bug_has_eligible_status(issue_field(issue, "status"), rules):
                 snapshot["reason"] = "статус «Отклонен исполнителем»"
+            elif not bug_has_eligible_skip_reason(
+                issue_field(issue, DEFAULT_SKIP_DEFECT_REASON_FIELD_ID),
+                rules,
+            ):
+                snapshot["reason"] = "дефект был известен в релизе"
             elif priority not in rules.bug_priorities:
                 snapshot["reason"] = "приоритет не High+"
             elif stage is None:
@@ -3804,6 +3869,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "Собирает за последние 90 дней и отдельно за квартал отношение "
             "заведённых в Jira-проектах команд High+ PSI/ПРОМ-багов "
             "в любом статусе, кроме «Отклонен исполнителем», "
+            "исключая заранее известные в релизе дефекты, "
             "к зарелизенным Story и публикует таблицы в Confluence."
         )
     )
