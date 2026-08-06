@@ -2713,6 +2713,8 @@ def render_confluence_html(
         "и этапом обнаружения PSI/ПСИ или PROM/ПРОМ в истории задачи. "
         "Поэтому последующее изменение ПРОМ на другое значение не исключает "
         "баг из метрики. "
+        "Story учитывается только из consist of релиза, установленного на ПРОМ "
+        "в том же отчётном периоде, и при попадании resolutiondate Story в период. "
         "Для совпадения с корпоративной квартальной выгрузкой Story ночного "
         "batch последнего дня предыдущего квартала относятся к новому кварталу. "
         "Эффективная цель = max(A × AS IS + B; AS IS × 0,8). "
@@ -3407,6 +3409,31 @@ def write_project_debug_report(
         for release in releases
         if str(release.get("key") or "").strip()
     }
+
+    def linked_release_dates(issue_key: str) -> list[tuple[str, Optional[date]]]:
+        return [
+            (
+                release_key,
+                parse_jira_date(
+                    issue_field(
+                        release_by_key.get(release_key, {}),
+                        release_date_field_id,
+                    )
+                ),
+            )
+            for release_key in sorted(releases_by_issue.get(issue_key, []))
+        ]
+
+    def has_linked_release_in_period(
+        issue_key: str,
+        start: date,
+        end: date,
+    ) -> bool:
+        return any(
+            installed is not None and start <= installed < end
+            for _, installed in linked_release_dates(issue_key)
+        )
+
     relevant_release_keys = sorted(
         {
             release_key
@@ -3461,6 +3488,16 @@ def write_project_debug_report(
         resolved = parse_jira_date(issue_field(issue, "resolutiondate"))
         type_ok = issue_type in rules.story_types
         status_ok = story_has_done_status(raw_status, rules)
+        rolling_release_ok = has_linked_release_in_period(
+            key,
+            rolling_start,
+            rolling_end,
+        )
+        quarter_release_ok = has_linked_release_in_period(
+            key,
+            quarter_start,
+            quarter_end,
+        )
         rolling_date_ok = bool(
             resolved and rolling_start <= resolved < rolling_end
         )
@@ -3483,10 +3520,18 @@ def write_project_debug_report(
             ("resolutiondate заполнена", resolved is not None),
         )
         rolling_filter = issue_filter_result(
-            (*common_checks, ("resolutiondate входит в 90 дней", rolling_date_ok))
+            (
+                *common_checks,
+                ("релиз установлен в пределах 90 дней", rolling_release_ok),
+                ("resolutiondate входит в 90 дней", rolling_date_ok),
+            )
         )
         quarter_filter = issue_filter_result(
-            (*common_checks, ("resolutiondate входит в квартал", quarter_date_ok))
+            (
+                *common_checks,
+                ("релиз установлен в квартале", quarter_release_ok),
+                ("resolutiondate входит в квартал", quarter_date_ok),
+            )
         )
         raw_status_category = (
             raw_status.get("statusCategory")
@@ -3505,6 +3550,15 @@ def write_project_debug_report(
                 "linked_installed_releases": sorted(
                     releases_by_issue.get(key, [])
                 ),
+                "linked_release_dates": [
+                    {
+                        "key": release_key,
+                        "installed_date": (
+                            installed.isoformat() if installed else ""
+                        ),
+                    }
+                    for release_key, installed in linked_release_dates(key)
+                ],
                 "rolling_90_days": rolling_filter,
                 "quarter": quarter_filter,
             }
@@ -3672,7 +3726,9 @@ def write_project_debug_report(
             "psi_detection_stages": sorted(rules.psi_detection_stages),
             "prom_detection_stages": sorted(rules.prom_detection_stages),
             "detection_stage_field_id": detection_stage_field_id,
-            "story_period_field": "resolutiondate",
+            "story_period_fields": (
+                "дата установки связанного Release 2.0 + resolutiondate Story"
+            ),
             "bug_period_field": "created",
             "story_source": "consist of установленных Release 2.0",
             "bug_source": "JQL по Jira project",
@@ -3965,6 +4021,14 @@ def write_reference_debug_report(
         )
         if issue_type == "Story":
             linked_releases = sorted(releases_by_issue.get(issue_key, []))
+            linked_quarter_release = any(
+                installed is not None
+                and quarter_start <= installed < quarter_end
+                for installed in (
+                    release_dates.get(release_key)
+                    for release_key in linked_releases
+                )
+            )
             snapshot["installed_releases"] = [
                 {
                     "key": release_key,
@@ -3983,6 +4047,8 @@ def write_reference_debug_report(
                 snapshot["reason"] = (
                     "нет в consist of установленных релизов объединённой выборки"
                 )
+            elif not linked_quarter_release:
+                snapshot["reason"] = "нет consist-of релиза, установленного в квартале"
             elif not story_has_done_status(issue_field(issue, "status"), rules):
                 snapshot["reason"] = "Story не в Done"
             elif resolved is None:
@@ -4353,7 +4419,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             verbose=args.verbose,
         )
 
-        rolling_releases, _ = select_period_data(
+        # Story must belong to a release installed inside the same reporting
+        # period. Filtering the union only by Story.resolutiondate leaks items
+        # from Q2 releases into Q3 when those items are closed later.
+        rolling_releases, rolling_release_issues = select_period_data(
             releases,
             released_issues,
             issue_keys_by_release,
@@ -4361,7 +4430,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             end=rolling_end,
             release_date_field_id=release_date_field_id,
         )
-        quarter_releases, _ = select_period_data(
+        quarter_releases, quarter_release_issues = select_period_data(
             releases,
             released_issues,
             issue_keys_by_release,
@@ -4370,7 +4439,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             release_date_field_id=release_date_field_id,
         )
         rolling_stories = select_released_stories(
-            released_issues,
+            rolling_release_issues,
             rules,
             start=rolling_start,
             end=rolling_end,
@@ -4379,7 +4448,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             days=QUARTER_STORY_LOOKBACK_DAYS
         )
         quarter_stories = select_released_stories(
-            released_issues,
+            quarter_release_issues,
             rules,
             start=quarter_story_start,
             end=quarter_end,
