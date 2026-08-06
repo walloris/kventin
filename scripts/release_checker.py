@@ -3825,9 +3825,14 @@ class ReleaseValidator:
 
         details = payload.get('detail') if isinstance(payload, dict) else None
         if data_type == 'pullrequest':
-            evidence = self._extract_pull_request_evidence(details)
+            evidence = self._extract_pull_request_evidence(
+                details,
+                in_pull_request_context=True,
+            )
             if evidence:
                 return evidence
+            if details not in (None, '', [], {}):
+                return "dev-status pullrequest detail"
 
         return None
 
@@ -5148,19 +5153,25 @@ def _diag_pr(validator: 'ReleaseValidator', issue_key: str):
     issue_id = str(getattr(issue, 'id', '') or '')
     print(f"Jira issue id: {issue_id}  type: {issue.fields.issuetype.name}  summary: {issue.fields.summary}")
     print(f"Labels: {', '.join(getattr(issue.fields, 'labels', []) or []) or 'None'}")
-    evidence = validator._find_issue_pull_request_evidence(issue)
-    print(f"Parser verdict: has_pr={'yes' if evidence else 'no'}")
-    print(f"Evidence: {evidence or 'None'}")
+    strict_evidence = validator._find_issue_pull_request_only_evidence(issue)
+    broad_evidence = validator._find_issue_pull_request_evidence(issue)
+    print(f"Report parser verdict: has_pr={'yes' if strict_evidence else 'no'}")
+    print(f"Report evidence: {strict_evidence or 'None'}")
+    print(f"Broad legacy evidence: {broad_evidence or 'None'}")
 
     for application_type, data_type, payload in validator._get_dev_status_payloads(issue_id):
         raw = json.dumps(payload, ensure_ascii=False)
         raw_casefold = raw.casefold()
-        has_pr = validator._dev_status_payload_has_pull_request(data_type, payload)
+        pr_evidence = validator._dev_status_pull_request_evidence(data_type, payload)
+        has_pr = pr_evidence is not None
         print(f"\nPayload applicationType={application_type} dataType={data_type}")
         print(f"  has_pr={'yes' if has_pr else 'no'}")
+        print(f"  evidence={pr_evidence or 'None'}")
         print(f"  top-level={', '.join(sorted(payload.keys())) if isinstance(payload, dict) else type(payload).__name__}")
         print(f"  contains pullrequest-ish={'yes' if 'pullrequest' in re.sub(r'[^a-z0-9]+', '', raw_casefold) else 'no'}")
         print(f"  contains url={'yes' if 'url' in raw_casefold else 'no'}")
+        print(f"  detail_type={type(payload.get('detail')).__name__ if isinstance(payload, dict) else 'n/a'}")
+        print(f"  detail_len={len(payload.get('detail') or []) if isinstance(payload, dict) and isinstance(payload.get('detail'), list) else 'n/a'}")
         print(f"  contains files={'yes' if 'files' in raw_casefold else 'no'}")
         if has_pr or 'pullrequest' in re.sub(r'[^a-z0-9]+', '', raw_casefold):
             for matched in re.finditer(r'.{0,100}(pullrequest|pull_request|pull request|url|files).{0,180}', raw, flags=re.IGNORECASE):
