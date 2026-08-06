@@ -541,20 +541,19 @@ Task внутри Story [HRC-4316]: не заполнен Epic Link (customfield
 Для Story проверяется только сама Story. PR в Task внутри Story не засчитывается для этой проверки.
 Для Bug/Defect/Ошибка проверяется сама задача.
 
-Алгоритм поиска сначала использует основной рабочий вариант dev-status, затем fallback-варианты:
+Алгоритм поиска засчитывает только реальные Pull Request-объекты или PR-ссылки:
 
 - dev-status `pullrequest`;
-- dev-status `repository`;
+- структурные PR-данные из dev-status `repository`;
 - Jira remote links;
 - Jira issue properties;
-- raw/rendered fields;
-- comments;
-- browse HTML.
+
+Обычный текст в description/comments/raw/rendered/html и commit без PR не считается Pull Request.
 
 Успех:
 
 ```text
-Pull Request найден в HRC-4360 (dev-status stash/repository) ✓
+Pull Request найден в HRC-4360 (dev-status stash/pullrequest: https://stash/.../pull-requests/42) ✓
 ```
 
 Ошибка:

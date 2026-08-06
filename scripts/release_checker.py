@@ -1600,7 +1600,10 @@ class ReleaseValidator:
         property_key_lower = property_key.casefold()
         return any(
             marker in property_key_lower
-            for marker in ('zephyr', 'tm4j', 'atm', 'test', 'cycle', 'run')
+            for marker in (
+                'zephyr', 'tm4j', 'atm', 'test', 'cycle', 'run',
+                'dev', 'development', 'stash', 'bitbucket', 'pull', 'vcs',
+            )
         )
 
     @staticmethod
@@ -3656,27 +3659,112 @@ class ReleaseValidator:
             return ', '.join(dict.fromkeys(markers)) if markers else None
         return None
 
-    def _json_contains_pull_request(self, value: object) -> bool:
-        if isinstance(value, str):
-            value_normalized = value.casefold()
-            value_compact = re.sub(r'[^a-zа-я0-9/#-]+', '', value_normalized)
-            return (
-                bool(re.search(r'\bpull\s*request\s*#\d+', value_normalized, flags=re.IGNORECASE))
-                or '/pull-requests/' in value_normalized
-                or 'pullrequest' in value_compact
-            )
+    @staticmethod
+    def _is_pull_request_key(key: object) -> bool:
+        key_compact = re.sub(r'[^a-zа-я0-9]+', '', str(key).casefold())
+        return key_compact in {
+            'pullrequest',
+            'pullrequests',
+            'pullrequestid',
+            'pullrequesturl',
+            'pullrequeststatus',
+            'pullrequeststate',
+            'pullrequestname',
+            'pullrequesttitle',
+        } or key_compact.startswith('pullrequest')
+
+    @staticmethod
+    def _is_pull_request_url(value: object) -> bool:
+        text = str(value or '').casefold()
+        return bool(
+            re.search(r'/(pull-requests|pullrequests|pull)/\d+(?:\b|[/?#])', text)
+        )
+
+    def _pull_request_evidence_from_mapping(self, value: dict) -> Optional[str]:
+        pr_id = (
+            value.get('id')
+            or value.get('pullRequestId')
+            or value.get('pullrequestId')
+            or value.get('number')
+            or value.get('displayId')
+            or value.get('key')
+        )
+        title = value.get('title') or value.get('name') or value.get('summary')
+        url = value.get('url') or value.get('link') or value.get('href') or value.get('self')
+
+        if url and self._is_pull_request_url(url):
+            return str(url)
+        if pr_id:
+            return f"PR {pr_id}"
+        if title:
+            return str(title)
+        return None
+
+    def _extract_pull_request_evidence(
+        self,
+        value: object,
+        *,
+        in_pull_request_context: bool = False,
+    ) -> Optional[str]:
+        """Return evidence only for structured Pull Request data, not text mentions."""
+
+        if isinstance(value, list):
+            for item in value:
+                evidence = self._extract_pull_request_evidence(
+                    item,
+                    in_pull_request_context=in_pull_request_context,
+                )
+                if evidence:
+                    return evidence
+            if in_pull_request_context and value:
+                return "PR list"
+            return None
+
         if isinstance(value, dict):
             for key, item in value.items():
-                key_normalized = str(key).casefold()
-                key_compact = re.sub(r'[^a-zа-я0-9]+', '', key_normalized)
-                if 'pullrequest' in key_compact or 'pullrequests' in key_compact:
-                    if item:
-                        return True
-                if self._json_contains_pull_request(item):
-                    return True
-        elif isinstance(value, list):
-            return any(self._json_contains_pull_request(item) for item in value)
-        return False
+                key_is_pr = self._is_pull_request_key(key)
+                if key_is_pr and item not in (None, '', [], {}):
+                    evidence = self._extract_pull_request_evidence(
+                        item,
+                        in_pull_request_context=True,
+                    )
+                    if evidence:
+                        return evidence
+                    if isinstance(item, str):
+                        if self._is_pull_request_url(item):
+                            return item
+                    return f"PR field {key}"
+                if (
+                    str(key).casefold() in {'url', 'href', 'self', 'link'}
+                    and self._is_pull_request_url(item)
+                ):
+                    return str(item)
+
+            if in_pull_request_context:
+                evidence = self._pull_request_evidence_from_mapping(value)
+                if evidence:
+                    return evidence
+
+            for item in value.values():
+                if isinstance(item, (dict, list)):
+                    evidence = self._extract_pull_request_evidence(
+                        item,
+                        in_pull_request_context=in_pull_request_context,
+                    )
+                    if evidence:
+                        return evidence
+            return None
+
+        if isinstance(value, str) and in_pull_request_context:
+            if self._is_pull_request_url(value):
+                return value
+            match = re.search(r'\bpull\s*request\s*#?\s*(\d+)\b', value, flags=re.IGNORECASE)
+            if match:
+                return f"PR {match.group(1)}"
+        return None
+
+    def _json_contains_pull_request(self, value: object) -> bool:
+        return self._extract_pull_request_evidence(value) is not None
 
     def _json_contains_commit(self, value: object) -> bool:
         if isinstance(value, str):
@@ -3730,20 +3818,21 @@ class ReleaseValidator:
         self._dev_status_payload_cache[issue_id] = payloads
         return payloads
 
-    def _dev_status_payload_has_pull_request(self, data_type: str, payload: dict) -> bool:
-        if self._json_contains_pull_request(payload):
-            return True
+    def _dev_status_pull_request_evidence(self, data_type: str, payload: dict) -> Optional[str]:
+        evidence = self._extract_pull_request_evidence(payload)
+        if evidence:
+            return evidence
 
         details = payload.get('detail') if isinstance(payload, dict) else None
-        if isinstance(details, list):
-            return any(self._json_contains_pull_request(item) for item in details)
-        if isinstance(details, dict):
-            return self._json_contains_pull_request(details)
-
         if data_type == 'pullrequest':
-            return bool(details)
+            evidence = self._extract_pull_request_evidence(details)
+            if evidence:
+                return evidence
 
-        return False
+        return None
+
+    def _dev_status_payload_has_pull_request(self, data_type: str, payload: dict) -> bool:
+        return self._dev_status_pull_request_evidence(data_type, payload) is not None
 
     def _dev_status_payload_has_commit(self, data_type: str, payload: dict) -> bool:
         if self._json_contains_commit(payload):
@@ -3869,8 +3958,9 @@ class ReleaseValidator:
     ) -> Optional[str]:
         if issue_id:
             for application_type, data_type, payload in self._get_dev_status_payloads(issue_id):
-                if self._dev_status_payload_has_pull_request(data_type, payload):
-                    return f"dev-status {application_type}/{data_type}"
+                pr_evidence = self._dev_status_pull_request_evidence(data_type, payload)
+                if pr_evidence:
+                    return f"dev-status {application_type}/{data_type}: {pr_evidence}"
 
         if issue_key:
             base_url = config['jira']['url'].rstrip('/')
@@ -3880,8 +3970,10 @@ class ReleaseValidator:
                     f"{base_url}/rest/api/2/issue/{issue_key}/remotelink",
                     timeout=12,
                 )
-                if response.status_code == 200 and self._json_contains_pull_request(response.json()):
-                    return "Jira remote links"
+                if response.status_code == 200:
+                    pr_evidence = self._extract_pull_request_evidence(response.json())
+                    if pr_evidence:
+                        return f"Jira remote links: {pr_evidence}"
             except Exception:
                 pass
 
@@ -3892,8 +3984,6 @@ class ReleaseValidator:
                 )
                 if properties_response.status_code == 200:
                     properties_payload = properties_response.json()
-                    if self._json_contains_pull_request(properties_payload):
-                        return "Jira issue properties"
                     for item in properties_payload.get('keys', []) if isinstance(properties_payload, dict) else []:
                         property_key = item.get('key', '') if isinstance(item, dict) else ''
                         if not property_key or not self._is_relevant_jira_property_key(property_key):
@@ -3902,38 +3992,10 @@ class ReleaseValidator:
                             f"{base_url}/rest/api/2/issue/{issue_key}/properties/{property_key}",
                             timeout=12,
                         )
-                        if property_response.status_code == 200 and self._json_contains_pull_request(property_response.json()):
-                            return f"Jira issue property {property_key}"
-            except Exception:
-                pass
-
-            try:
-                issue_full = self.jira_main.issue(
-                    issue_key,
-                    fields='summary,description,issuelinks,*all',
-                    expand='renderedFields,names,schema',
-                )
-                if self._json_contains_pull_request(getattr(issue_full, 'raw', {})):
-                    return "Jira issue raw/rendered fields"
-            except Exception:
-                pass
-
-            try:
-                comments = self.jira_main.comments(issue_key)
-                comment_bodies = [getattr(comment, 'body', '') for comment in comments]
-                if self._json_contains_pull_request(comment_bodies):
-                    return "Jira comments"
-            except Exception:
-                pass
-
-            try:
-                html_response = self.jira_http.get(
-                    f"{base_url}/browse/{issue_key}",
-                    headers={'Accept': 'text/html,application/xhtml+xml'},
-                    timeout=12,
-                )
-                if html_response.status_code == 200 and self._json_contains_pull_request(html_response.text):
-                    return "Jira issue HTML"
+                        if property_response.status_code == 200:
+                            pr_evidence = self._extract_pull_request_evidence(property_response.json())
+                            if pr_evidence:
+                                return f"Jira issue property {property_key}: {pr_evidence}"
             except Exception:
                 pass
 
@@ -3947,12 +4009,9 @@ class ReleaseValidator:
     ) -> Optional[str]:
         if issue_id:
             for application_type, data_type, payload in self._get_dev_status_payloads(issue_id):
-                if self._dev_status_payload_has_pull_request(data_type, payload):
-                    return f"dev-status {application_type}/{data_type}"
-
-            for application_type, data_type, payload in self._get_dev_status_payloads(issue_id):
-                if self._dev_status_payload_has_commit(data_type, payload):
-                    return f"dev-status {application_type}/{data_type} commit"
+                pr_evidence = self._dev_status_pull_request_evidence(data_type, payload)
+                if pr_evidence:
+                    return f"dev-status {application_type}/{data_type}: {pr_evidence}"
 
         if issue_key:
             base_url = config['jira']['url'].rstrip('/')
@@ -3964,10 +4023,9 @@ class ReleaseValidator:
                 )
                 if response.status_code == 200:
                     remote_links_payload = response.json()
-                    if self._json_contains_pull_request(remote_links_payload):
-                        return "Jira remote links"
-                    if self._json_contains_commit(remote_links_payload):
-                        return "Jira remote links commit"
+                    pr_evidence = self._extract_pull_request_evidence(remote_links_payload)
+                    if pr_evidence:
+                        return f"Jira remote links: {pr_evidence}"
             except Exception:
                 pass
 
@@ -3978,10 +4036,6 @@ class ReleaseValidator:
                 )
                 if properties_response.status_code == 200:
                     properties_payload = properties_response.json()
-                    if self._json_contains_pull_request(properties_payload):
-                        return "Jira issue properties"
-                    if self._json_contains_commit(properties_payload):
-                        return "Jira issue properties commit"
                     for item in properties_payload.get('keys', []) if isinstance(properties_payload, dict) else []:
                         property_key = item.get('key', '') if isinstance(item, dict) else ''
                         if not property_key or not self._is_relevant_jira_property_key(property_key):
@@ -3992,48 +4046,9 @@ class ReleaseValidator:
                         )
                         if property_response.status_code == 200:
                             property_payload = property_response.json()
-                            if self._json_contains_pull_request(property_payload):
-                                return f"Jira issue property {property_key}"
-                            if self._json_contains_commit(property_payload):
-                                return f"Jira issue property {property_key} commit"
-            except Exception:
-                pass
-
-            try:
-                issue_full = self.jira_main.issue(
-                    issue_key,
-                    fields='summary,description,issuelinks,*all',
-                    expand='renderedFields,names,schema',
-                )
-                issue_raw = getattr(issue_full, 'raw', {})
-                if self._json_contains_pull_request(issue_raw):
-                    return "Jira issue raw/rendered fields"
-                if self._json_contains_commit(issue_raw):
-                    return "Jira issue raw/rendered fields commit"
-            except Exception:
-                pass
-
-            try:
-                comments = self.jira_main.comments(issue_key)
-                comment_bodies = [getattr(comment, 'body', '') for comment in comments]
-                if self._json_contains_pull_request(comment_bodies):
-                    return "Jira comments"
-                if self._json_contains_commit(comment_bodies):
-                    return "Jira comments commit"
-            except Exception:
-                pass
-
-            try:
-                html_response = self.jira_http.get(
-                    f"{base_url}/browse/{issue_key}",
-                    headers={'Accept': 'text/html,application/xhtml+xml'},
-                    timeout=12,
-                )
-                if html_response.status_code == 200:
-                    if self._json_contains_pull_request(html_response.text):
-                        return "Jira issue HTML"
-                    if self._json_contains_commit(html_response.text):
-                        return "Jira issue HTML commit"
+                            pr_evidence = self._extract_pull_request_evidence(property_payload)
+                            if pr_evidence:
+                                return f"Jira issue property {property_key}: {pr_evidence}"
             except Exception:
                 pass
 
