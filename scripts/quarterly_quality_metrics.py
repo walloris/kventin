@@ -64,7 +64,6 @@ DEFAULT_RELEASE_DATE_FIELD_NAME = "Дата завершения установ�
 DEFAULT_RELEASE_DATE_FIELD_ID = "customfield_19400"
 DEFAULT_RELEASE_TYPE_FIELD_ID = "customfield_23500"
 DEFAULT_DETECTION_STAGE_FIELD_ID = "customfield_11507"
-DEFAULT_SKIP_DEFECT_REASON_FIELD_ID = "customfield_16801"
 DEFAULT_TEAM_ASSIGNMENT_FIELD_IDS = tuple(
     field_id.strip()
     for field_id in re.split(r"[,;\s]+", os.environ.get("QUALITY_METRIC_TEAM_FIELD_IDS", ""))
@@ -85,11 +84,11 @@ DEFAULT_STORY_TYPES = ("Story",)
 DEFAULT_STORY_STATUSES = ("Done", "Сделано", "Готово")
 DEFAULT_BUG_TYPES = ("Bug", "Defect", "Ошибка")
 DEFAULT_EXCLUDED_BUG_STATUSES = ("Отклонен исполнителем",)
-DEFAULT_EXCLUDED_SKIP_DEFECT_REASONS = ("Ошибка была известна в релизе",)
 DEFAULT_BUG_PRIORITIES = (
     "Critical",
     "Crytical",
     "Blocker",
+    "Major",
     "Высокий",
     "Блокирующий",
 )
@@ -100,10 +99,11 @@ DEFAULT_HOTFIX_VALUES = ("Hotfix",)
 DEFAULT_INSTALLED_RELEASE_STATUSES = (
     "Установлен на ПРОМ",
 )
-# Корпоративная Q3-выгрузка относит к кварталу ночной batch Story,
-# закрытый в последний календарный день предыдущего квартала (например,
-# 30.06 22:05 для Q3). Сдвиг применяется только к квартальному срезу;
-# последние 90 дней остаются строго календарными.
+# Корпоративная Q3-выгрузка относит к кварталу ночной batch релизов с датой
+# установки в последний календарный день предыдущего квартала (например,
+# релиз 30.06 со Story, закрытой 01.07). Сдвиг применяется только к источнику
+# Story квартального среза; релизные итоги и последние 90 дней остаются
+# строго календарными.
 QUARTER_STORY_LOOKBACK_DAYS = 1
 EXCLUDED_METRIC_KE_IDS = frozenset((9362600, 9535069))
 RELEASE_KE_IDS = tuple(
@@ -437,7 +437,6 @@ class MetricRules:
     story_statuses: frozenset[str]
     bug_types: frozenset[str]
     excluded_bug_statuses: frozenset[str]
-    excluded_skip_defect_reasons: frozenset[str]
     bug_priorities: frozenset[str]
     psi_detection_stages: frozenset[str]
     prom_detection_stages: frozenset[str]
@@ -449,9 +448,6 @@ class MetricRules:
             story_statuses=normalized_set(DEFAULT_STORY_STATUSES),
             bug_types=normalized_set(DEFAULT_BUG_TYPES),
             excluded_bug_statuses=normalized_set(DEFAULT_EXCLUDED_BUG_STATUSES),
-            excluded_skip_defect_reasons=normalized_set(
-                DEFAULT_EXCLUDED_SKIP_DEFECT_REASONS
-            ),
             bug_priorities=normalized_set(DEFAULT_BUG_PRIORITIES),
             psi_detection_stages=normalized_set(DEFAULT_PSI_DETECTION_STAGES),
             prom_detection_stages=normalized_set(DEFAULT_PROM_DETECTION_STAGES),
@@ -622,13 +618,6 @@ def bug_has_eligible_status(raw_status: Any, rules: MetricRules) -> bool:
         normalized(named_value(raw_status))
         not in rules.excluded_bug_statuses
     )
-
-
-def bug_has_eligible_skip_reason(raw_reason: Any, rules: MetricRules) -> bool:
-    """Exclude defects that the corporate metric marks as known in release."""
-
-    reasons = {normalized(value) for value in named_values(raw_reason)}
-    return not bool(reasons & rules.excluded_skip_defect_reasons)
 
 
 def classify_eligible_detection_stage(
@@ -869,6 +858,56 @@ def issue_assignment_team(
     return None
 
 
+def issue_assignment_debug(
+    issue: Mapping[str, Any],
+    team_specs: Sequence[TeamSpec],
+    team_assignment_field_ids: Sequence[str],
+) -> dict[str, Any]:
+    """Explain whether a team came from a Jira field or project fallback."""
+
+    candidate_fields = [
+        {
+            "id": field_id,
+            "values": flattened_debug_values(issue_field(issue, field_id)),
+        }
+        for field_id in team_assignment_field_ids
+        if issue_field(issue, field_id) not in (None, "", [], {})
+    ]
+    explicit_team = issue_assignment_team(
+        issue,
+        team_specs,
+        team_assignment_field_ids,
+    )
+    project_key = issue_project_key(issue)
+    project_team = next(
+        (
+            spec.team
+            for spec in team_specs
+            if project_key in spec.project_keys
+        ),
+        None,
+    )
+    if explicit_team == "":
+        source = "другое значение команды/сквада"
+        final_team = None
+    elif explicit_team is not None:
+        source = "явное поле команды/сквада"
+        final_team = explicit_team
+    elif candidate_fields:
+        source = "fallback по Jira project после нераспознанных полей"
+        final_team = project_team
+    else:
+        source = "fallback по Jira project; поля команды/сквада пусты"
+        final_team = project_team
+    return {
+        "source": source,
+        "explicit_team": explicit_team or None,
+        "project_fallback_team": project_team,
+        "final_team": final_team,
+        "candidate_fields": candidate_fields,
+    }
+
+
 def aggregate_issues(
     team_specs: Sequence[TeamSpec],
     issues: Iterable[Mapping[str, Any]],
@@ -908,10 +947,6 @@ def aggregate_issues(
         if (
             issue_type not in rules.bug_types
             or not bug_has_eligible_status(raw_status, rules)
-            or not bug_has_eligible_skip_reason(
-                issue_field(issue, DEFAULT_SKIP_DEFECT_REASON_FIELD_ID),
-                rules,
-            )
         ):
             continue
 
@@ -1485,7 +1520,6 @@ def collect_created_bugs(
         "created",
         "resolutiondate",
         detection_stage_field_id,
-        DEFAULT_SKIP_DEFECT_REASON_FIELD_ID,
         *team_assignment_field_ids,
     )
     execution_log(
@@ -1509,18 +1543,13 @@ def collect_created_bugs(
             key
             and issue_type in rules.bug_types
             and bug_has_eligible_status(raw_status, rules)
-            and bug_has_eligible_skip_reason(
-                issue_field(issue, DEFAULT_SKIP_DEFECT_REASON_FIELD_ID),
-                rules,
-            )
             and priority in rules.bug_priorities
         ):
             history_keys.append(key)
 
     execution_log(
         f"Jira: заведённых Bug/Defect найдено={len(candidates)}; "
-        "High+ без статуса «Отклонен исполнителем» и без заранее "
-        "известных дефектов для проверки "
+        "High+ без статуса «Отклонен исполнителем» для проверки "
         f"истории этапа={len(history_keys)}"
     )
     detailed, errors = jira.issues_individually(
@@ -2148,7 +2177,6 @@ def print_filter_audit(
         spec.team: {
             "story_status": Counter(),
             "bug_status": Counter(),
-            "bug_skip_reason": Counter(),
             "bug_priority": Counter(),
             "bug_detection_stage": Counter(),
         }
@@ -2187,20 +2215,6 @@ def print_filter_audit(
             rejected_values[team]["bug_status"][status_name] += 1
             continue
         audit[team]["bug_status_eligible"] += 1
-
-        skip_reason_name = (
-            named_value(
-                issue_field(issue, DEFAULT_SKIP_DEFECT_REASON_FIELD_ID)
-            )
-            or "Причина не указана"
-        )
-        if not bug_has_eligible_skip_reason(
-            issue_field(issue, DEFAULT_SKIP_DEFECT_REASON_FIELD_ID),
-            rules,
-        ):
-            rejected_values[team]["bug_skip_reason"][skip_reason_name] += 1
-            continue
-        audit[team]["bug_not_known_in_release"] += 1
 
         priority_name = named_value(issue_field(issue, "priority")) or "Без приоритета"
         if normalized(priority_name) not in rules.bug_priorities:
@@ -2241,7 +2255,6 @@ def print_filter_audit(
             f"Story всего={values['story_total']}, Done={values['story_done']}; "
             f"Bug всего={values['bug_total']}, "
             f"статус допустим={values['bug_status_eligible']}, "
-            f"не известен заранее={values['bug_not_known_in_release']}, "
             f"High+={values['bug_high_plus']}, PSI/ПРОМ={values['bug_eligible']}; "
             f"этап менялся={values['bug_stage_changed']}"
         )
@@ -2249,7 +2262,6 @@ def print_filter_audit(
         for field_name, label in (
             ("story_status", "Story-статусы"),
             ("bug_status", "исключённые Bug-статусы"),
-            ("bug_skip_reason", "исключённые причины пропуска"),
             ("bug_priority", "приоритеты"),
             ("bug_detection_stage", "этапы обнаружения"),
         ):
@@ -2706,10 +2718,8 @@ def render_confluence_html(
         'font-size:12px;margin-top:14px;padding:11px 13px;">',
         "В баги входят заведённые за отчётный период в Jira-проектах команд "
         "задачи типа Bug в любом статусе, кроме «Отклонен исполнителем», "
-        "за исключением задач с причиной пропуска дефекта "
-        "«Ошибка была известна в релизе», "
         "с приоритетом "
-        "Critical/Crytical, Blocker, Высокий или Блокирующий "
+        "Critical/Crytical, Blocker, Major, Высокий или Блокирующий "
         "и этапом обнаружения PSI/ПСИ или PROM/ПРОМ в истории задачи. "
         "Поэтому последующее изменение ПРОМ на другое значение не исключает "
         "баг из метрики. "
@@ -3495,7 +3505,7 @@ def write_project_debug_report(
         )
         quarter_release_ok = has_linked_release_in_period(
             key,
-            quarter_start,
+            quarter_story_start,
             quarter_end,
         )
         rolling_date_ok = bool(
@@ -3529,7 +3539,10 @@ def write_project_debug_report(
         quarter_filter = issue_filter_result(
             (
                 *common_checks,
-                ("релиз установлен в квартале", quarter_release_ok),
+                (
+                    "релиз установлен в квартале с ночной границей",
+                    quarter_release_ok,
+                ),
                 ("resolutiondate входит в квартал", quarter_date_ok),
             )
         )
@@ -3547,6 +3560,11 @@ def write_project_debug_report(
                 "status_category": named_value(raw_status_category),
                 "created": str(issue_field(issue, "created") or ""),
                 "resolutiondate": str(issue_field(issue, "resolutiondate") or ""),
+                "team_assignment": issue_assignment_debug(
+                    issue,
+                    (project_spec,),
+                    team_assignment_field_ids,
+                ),
                 "linked_installed_releases": sorted(
                     releases_by_issue.get(key, [])
                 ),
@@ -3577,10 +3595,6 @@ def write_project_debug_report(
         )
         type_ok = issue_type in rules.bug_types
         status_ok = bug_has_eligible_status(raw_status, rules)
-        skip_reason_ok = bug_has_eligible_skip_reason(
-            issue_field(issue, DEFAULT_SKIP_DEFECT_REASON_FIELD_ID),
-            rules,
-        )
         priority_ok = priority in rules.bug_priorities
         rolling_date_ok = bool(
             created and rolling_start <= created < rolling_end
@@ -3601,7 +3615,6 @@ def write_project_debug_report(
             ),
             ("тип Bug", type_ok),
             ("статус не Отклонен исполнителем", status_ok),
-            ("дефект не был известен в релизе", skip_reason_ok),
             ("приоритет High+", priority_ok),
             ("в истории этапа есть PSI/ПРОМ", stage is not None),
         )
@@ -3625,6 +3638,11 @@ def write_project_debug_report(
                         if isinstance(issue.get("fields"), Mapping)
                         else {}
                     )
+                ),
+                "team_assignment": issue_assignment_debug(
+                    issue,
+                    (project_spec,),
+                    team_assignment_field_ids,
                 ),
                 "rolling_90_days": issue_filter_result(
                     (*common_checks, ("created входит в 90 дней", rolling_date_ok))
@@ -3719,9 +3737,6 @@ def write_project_debug_report(
             "story_done_statuses": sorted(rules.story_statuses),
             "bug_types": sorted(rules.bug_types),
             "excluded_bug_statuses": sorted(rules.excluded_bug_statuses),
-            "excluded_skip_defect_reasons": sorted(
-                rules.excluded_skip_defect_reasons
-            ),
             "bug_high_plus_priorities": sorted(rules.bug_priorities),
             "psi_detection_stages": sorted(rules.psi_detection_stages),
             "prom_detection_stages": sorted(rules.prom_detection_stages),
@@ -3894,16 +3909,6 @@ def write_issue_debug_report(
                     "статус не Отклонен исполнителем",
                     bug_has_eligible_status(issue_field(metric_issue, "status"), rules),
                 ),
-                (
-                    "дефект не был известен в релизе",
-                    bug_has_eligible_skip_reason(
-                        issue_field(
-                            metric_issue,
-                            DEFAULT_SKIP_DEFECT_REASON_FIELD_ID,
-                        ),
-                        rules,
-                    ),
-                ),
                 ("приоритет High+", priority in rules.bug_priorities),
                 ("в истории этапа есть PSI/ПРОМ", stage is not None),
             )
@@ -3939,6 +3944,7 @@ def write_reference_debug_report(
     issue_keys_by_release: Mapping[str, set[str]],
     release_date_field_id: str,
     detection_stage_field_id: str,
+    team_assignment_field_ids: Sequence[str] = (),
 ) -> None:
     reference = load_reference_tasks(reference_paths, team_specs)
     metrics_by_team = {metric.team: metric for metric in quarter_metrics}
@@ -4019,11 +4025,17 @@ def write_reference_debug_report(
             jira_field_names=jira_field_names,
             team_specs=team_specs,
         )
+        if issue is not None:
+            snapshot["team_assignment"] = issue_assignment_debug(
+                issue,
+                team_specs,
+                team_assignment_field_ids,
+            )
         if issue_type == "Story":
             linked_releases = sorted(releases_by_issue.get(issue_key, []))
             linked_quarter_release = any(
                 installed is not None
-                and quarter_start <= installed < quarter_end
+                and quarter_story_start <= installed < quarter_end
                 for installed in (
                     release_dates.get(release_key)
                     for release_key in linked_releases
@@ -4048,7 +4060,10 @@ def write_reference_debug_report(
                     "нет в consist of установленных релизов объединённой выборки"
                 )
             elif not linked_quarter_release:
-                snapshot["reason"] = "нет consist-of релиза, установленного в квартале"
+                snapshot["reason"] = (
+                    "нет consist-of релиза, установленного в квартале "
+                    "с ночной границей"
+                )
             elif not story_has_done_status(issue_field(issue, "status"), rules):
                 snapshot["reason"] = "Story не в Done"
             elif resolved is None:
@@ -4074,11 +4089,6 @@ def write_reference_debug_report(
                 snapshot["reason"] = "created вне квартала"
             elif not bug_has_eligible_status(issue_field(issue, "status"), rules):
                 snapshot["reason"] = "статус «Отклонен исполнителем»"
-            elif not bug_has_eligible_skip_reason(
-                issue_field(issue, DEFAULT_SKIP_DEFECT_REASON_FIELD_ID),
-                rules,
-            ):
-                snapshot["reason"] = "дефект был известен в релизе"
             elif priority not in rules.bug_priorities:
                 snapshot["reason"] = "приоритет не High+"
             elif stage is None:
@@ -4159,7 +4169,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "Собирает за последние 90 дней и отдельно за квартал отношение "
             "заведённых в Jira-проектах команд High+ PSI/ПРОМ-багов "
             "в любом статусе, кроме «Отклонен исполнителем», "
-            "исключая заранее известные в релизе дефекты, "
             "к зарелизенным Story и публикует таблицы в Confluence."
         )
     )
@@ -4311,7 +4320,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         quarter_end = quarter_calendar_end
         rolling_end = today + timedelta(days=1)
         rolling_start = rolling_end - timedelta(days=90)
-        collection_start = min(rolling_start, quarter_start)
+        quarter_story_start = quarter_start - timedelta(
+            days=QUARTER_STORY_LOOKBACK_DAYS
+        )
+        collection_start = min(rolling_start, quarter_story_start)
         collection_end = max(rolling_end, quarter_end)
         execution_log(
             f"Периоды: 90 дней {rolling_start.isoformat()} — "
@@ -4430,11 +4442,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             end=rolling_end,
             release_date_field_id=release_date_field_id,
         )
-        quarter_releases, quarter_release_issues = select_period_data(
+        quarter_releases, _ = select_period_data(
             releases,
             released_issues,
             issue_keys_by_release,
             start=quarter_start,
+            end=quarter_end,
+            release_date_field_id=release_date_field_id,
+        )
+        _, quarter_story_release_issues = select_period_data(
+            releases,
+            released_issues,
+            issue_keys_by_release,
+            start=quarter_story_start,
             end=quarter_end,
             release_date_field_id=release_date_field_id,
         )
@@ -4444,11 +4464,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             start=rolling_start,
             end=rolling_end,
         )
-        quarter_story_start = quarter_start - timedelta(
-            days=QUARTER_STORY_LOOKBACK_DAYS
-        )
         quarter_stories = select_released_stories(
-            quarter_release_issues,
+            quarter_story_release_issues,
             rules,
             start=quarter_story_start,
             end=quarter_end,
@@ -4564,6 +4581,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 issue_keys_by_release=issue_keys_by_release,
                 release_date_field_id=release_date_field_id,
                 detection_stage_field_id=detection_stage_field_id,
+                team_assignment_field_ids=team_assignment_field_ids,
             )
         if debug_project:
             debug_output = (
