@@ -54,6 +54,9 @@ JIRA_RATE_LIMIT_RECOVERY_SECONDS = 30
 # также принудительно отключает verify для этих подключений.
 VERIFY_SSL = False
 DEFAULT_RELEASE_PROJECT = "HRPRELEASE"
+# Релизы Ассистента HR с КЭ HRApp (5366436) также создаются в SDTR
+# (например, SDTR-2215) и должны участвовать в том же consist-of сборе.
+DEFAULT_ADDITIONAL_RELEASE_PROJECTS = ("SDTR",)
 DEFAULT_RELEASE_ISSUE_TYPE = "Release 2.0"
 DEFAULT_RELEASE_CREATED_SINCE = "2025-09-01"
 DEFAULT_RELEASE_KE_FIELD_NAME = "КЭ"
@@ -1466,14 +1469,27 @@ def find_team_assignment_field_ids(jira: "JiraClient") -> tuple[str, ...]:
 def build_release_jql(
     *,
     project: str,
+    additional_projects: Sequence[str] = (),
     issue_type: str,
     ke_field_name: str,
     ke_ids: Sequence[int],
     created_since: str,
 ) -> str:
+    projects = tuple(
+        dict.fromkeys(
+            value.strip().upper()
+            for value in (project, *additional_projects)
+            if value.strip()
+        )
+    )
+    if len(projects) == 1:
+        project_clause = f"project={jql_value(projects[0])}"
+    else:
+        project_values = ", ".join(jql_value(value) for value in projects)
+        project_clause = f"project in ({project_values})"
     ke_ids_jql = ", ".join(str(value) for value in dict.fromkeys(ke_ids))
     clauses = [
-        f"project={jql_value(project)} "
+        f"{project_clause} "
         f"AND type = {jql_value(issue_type)} "
         f'AND created >= "{created_since}"'
     ]
@@ -1757,6 +1773,7 @@ def collect_released_issues(
     team_assignment_field_ids: Sequence[str] = (),
     verbose: bool = False,
     team_project_keys: Sequence[str] = (),
+    additional_release_projects: Sequence[str] = (),
 ) -> tuple[
     list[dict[str, Any]],
     list[dict[str, Any]],
@@ -1777,6 +1794,7 @@ def collect_released_issues(
     )
     release_jql = build_release_jql(
         project=release_project,
+        additional_projects=additional_release_projects,
         issue_type=release_issue_type,
         ke_field_name=release_ke_field_name,
         ke_ids=release_ke_ids,
@@ -1786,7 +1804,8 @@ def collect_released_issues(
         print(f"JQL релизов Release 2.0: {release_jql}")
     release_search_started = time.perf_counter()
     execution_log(
-        "Jira: поиск всех Release 2.0 "
+        "Jira: поиск всех Release 2.0 в проектах "
+        f"{', '.join((release_project, *additional_release_projects))} "
         f"для диапазона {start.isoformat()} — "
         f"{(end - timedelta(days=1)).isoformat()}"
     )
@@ -4544,6 +4563,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 for spec in active_team_specs
                 for project_key in spec.project_keys
             ),
+            additional_release_projects=DEFAULT_ADDITIONAL_RELEASE_PROJECTS,
         )
         created_bugs, bugs_jql = collect_created_bugs(
             jira,
