@@ -88,7 +88,6 @@ DEFAULT_BUG_PRIORITIES = (
     "Critical",
     "Crytical",
     "Blocker",
-    "Major",
     "Высокий",
     "Блокирующий",
 )
@@ -146,6 +145,7 @@ RELEASE_KE_IDS = tuple(
             8553253,
             9644020,
             10743713,
+            15112079,
         )
     )
 )
@@ -205,7 +205,7 @@ TEAM_SETTINGS_JSON = r"""
     "team": "Люди Сбера",
     "squad_code": "00QV0017",
     "project_keys": ["SBRPPL"],
-    "ke_ids": [],
+    "ke_ids": [15112079],
     "as_is_ratio": null,
     "target_ratio": 0.10
   },
@@ -3066,13 +3066,26 @@ def reference_team_name(raw_name: str, team_specs: Sequence[TeamSpec]) -> str:
 def load_reference_tasks(
     paths: Sequence[Path],
     team_specs: Sequence[TeamSpec],
-) -> dict[str, dict[str, set[str]]]:
-    result: dict[str, dict[str, set[str]]] = defaultdict(
-        lambda: {"Story": set(), "Bug": set()}
-    )
+) -> dict[str, dict[str, dict[str, set[str]]]]:
+    result: dict[str, dict[str, dict[str, set[str]]]] = {
+        "quarter": defaultdict(lambda: {"Story": set(), "Bug": set()}),
+        "rolling_90_days": defaultdict(lambda: {"Story": set(), "Bug": set()}),
+    }
     configured_teams = {spec.team for spec in team_specs}
     for path in paths:
         rows = read_jira_metric_xlsx(path)
+        selection = " ".join(
+            str(value or "")
+            for value in (rows[0] if rows else [])
+        ).casefold()
+        if "90 дней" in selection:
+            period_name = "rolling_90_days"
+        elif re.search(r"\bq[1-4]\s+\d{4}\b", selection):
+            period_name = "quarter"
+        else:
+            # Summary exports do not contain issue keys and are not a task
+            # reference for either reporting period.
+            continue
         for row in rows[2:]:
             if len(row) < 4:
                 continue
@@ -3084,8 +3097,12 @@ def load_reference_tasks(
             if team not in configured_teams or issue_type not in {"Story", "Bug"}:
                 continue
             if issue_key:
-                result[team][issue_type].add(issue_key)
-    return dict(result)
+                result[period_name][team][issue_type].add(issue_key)
+    return {
+        period_name: dict(team_values)
+        for period_name, team_values in result.items()
+        if team_values
+    }
 
 
 def flattened_debug_values(value: Any, *, limit: int = 50) -> list[str]:
@@ -3934,7 +3951,10 @@ def write_reference_debug_report(
     output_path: Path,
     team_specs: Sequence[TeamSpec],
     rules: MetricRules,
+    rolling_metrics: Sequence[TeamMetric],
     quarter_metrics: Sequence[TeamMetric],
+    rolling_start: date,
+    rolling_end: date,
     quarter_start: date,
     quarter_end: date,
     quarter_story_start: date,
@@ -3947,25 +3967,48 @@ def write_reference_debug_report(
     team_assignment_field_ids: Sequence[str] = (),
 ) -> None:
     reference = load_reference_tasks(reference_paths, team_specs)
-    metrics_by_team = {metric.team: metric for metric in quarter_metrics}
-    comparison_key_sets: dict[str, dict[str, tuple[set[str], set[str]]]] = {}
+    period_configs = {
+        "quarter": {
+            "label": f"{quarter_start.year} Q{quarter_bounds(quarter_start)[2]}",
+            "metrics": {metric.team: metric for metric in quarter_metrics},
+            "issue_start": quarter_start,
+            "story_start": quarter_story_start,
+            "end": quarter_end,
+        },
+        "rolling_90_days": {
+            "label": "90 дней",
+            "metrics": {metric.team: metric for metric in rolling_metrics},
+            "issue_start": rolling_start,
+            "story_start": rolling_start,
+            "end": rolling_end,
+        },
+    }
+    comparison_key_sets: dict[
+        str,
+        dict[str, dict[str, tuple[set[str], set[str]]]],
+    ] = {}
     disputed_keys: set[str] = set()
-    for spec in team_specs:
-        if spec.team not in reference:
-            continue
-        metric = metrics_by_team[spec.team]
-        team_sets: dict[str, tuple[set[str], set[str]]] = {}
-        for issue_type, actual_keys in (
-            ("Story", set(metric.story_keys)),
-            ("Bug", set(metric.bug_keys)),
-        ):
-            expected_keys = reference[spec.team][issue_type]
-            missing = expected_keys - actual_keys
-            extra = actual_keys - expected_keys
-            team_sets[issue_type] = (missing, extra)
-            disputed_keys.update(missing)
-            disputed_keys.update(extra)
-        comparison_key_sets[spec.team] = team_sets
+    for period_name, reference_by_team in reference.items():
+        config = period_configs[period_name]
+        metrics_by_team = config["metrics"]
+        period_sets: dict[str, dict[str, tuple[set[str], set[str]]]] = {}
+        for spec in team_specs:
+            if spec.team not in reference_by_team:
+                continue
+            metric = metrics_by_team[spec.team]
+            team_sets: dict[str, tuple[set[str], set[str]]] = {}
+            for issue_type, actual_keys in (
+                ("Story", set(metric.story_keys)),
+                ("Bug", set(metric.bug_keys)),
+            ):
+                expected_keys = reference_by_team[spec.team][issue_type]
+                missing = expected_keys - actual_keys
+                extra = actual_keys - expected_keys
+                team_sets[issue_type] = (missing, extra)
+                disputed_keys.update(missing)
+                disputed_keys.update(extra)
+            period_sets[spec.team] = team_sets
+        comparison_key_sets[period_name] = period_sets
 
     execution_log(
         "Debug XLSX: загружаю полные поля и changelog "
@@ -4016,7 +4059,17 @@ def write_reference_debug_report(
         for issue_key in issue_keys:
             releases_by_issue[issue_key].append(release_key)
 
-    def task_details(issue_key: str, issue_type: str) -> dict[str, Any]:
+    def task_details(
+        issue_key: str,
+        issue_type: str,
+        period_name: str,
+        expected_team: str,
+    ) -> dict[str, Any]:
+        config = period_configs[period_name]
+        issue_start = config["issue_start"]
+        story_start = config["story_start"]
+        period_end = config["end"]
+        period_label = str(config["label"])
         source = released_by_key if issue_type == "Story" else bugs_by_key
         issue = exact_debug_issues.get(issue_key) or source.get(issue_key)
         snapshot = issue_debug_snapshot(
@@ -4031,11 +4084,24 @@ def write_reference_debug_report(
                 team_specs,
                 team_assignment_field_ids,
             )
+        assigned_team = (
+            issue_assignment_team(
+                issue,
+                team_specs,
+                team_assignment_field_ids,
+            )
+            if issue is not None
+            else None
+        )
+        wrong_assignment = (
+            assigned_team == ""
+            or assigned_team not in (None, expected_team)
+        )
         if issue_type == "Story":
             linked_releases = sorted(releases_by_issue.get(issue_key, []))
-            linked_quarter_release = any(
+            linked_period_release = any(
                 installed is not None
-                and quarter_story_start <= installed < quarter_end
+                and story_start <= installed < period_end
                 for installed in (
                     release_dates.get(release_key)
                     for release_key in linked_releases
@@ -4059,17 +4125,23 @@ def write_reference_debug_report(
                 snapshot["reason"] = (
                     "нет в consist of установленных релизов объединённой выборки"
                 )
-            elif not linked_quarter_release:
+            elif wrong_assignment:
                 snapshot["reason"] = (
-                    "нет consist-of релиза, установленного в квартале "
-                    "с ночной границей"
+                    "КЭ/команда задачи относится к другой или ненастроенной "
+                    "проектной области"
+                )
+            elif not linked_period_release:
+                snapshot["reason"] = (
+                    f"нет consist-of релиза, установленного за {period_label}"
                 )
             elif not story_has_done_status(issue_field(issue, "status"), rules):
                 snapshot["reason"] = "Story не в Done"
             elif resolved is None:
                 snapshot["reason"] = "не заполнена resolutiondate"
-            elif not (quarter_story_start <= resolved < quarter_end):
-                snapshot["reason"] = "resolutiondate вне границы Story квартала"
+            elif not (story_start <= resolved < period_end):
+                snapshot["reason"] = (
+                    f"resolutiondate вне границы Story за {period_label}"
+                )
             else:
                 snapshot["reason"] = "должна учитываться"
         else:
@@ -4085,8 +4157,13 @@ def write_reference_debug_report(
             )
             if issue is None:
                 snapshot["reason"] = "нет в JQL заведённых Bug объединённого периода"
-            elif created is None or not (quarter_start <= created < quarter_end):
-                snapshot["reason"] = "created вне квартала"
+            elif wrong_assignment:
+                snapshot["reason"] = (
+                    "КЭ/команда задачи относится к другой или ненастроенной "
+                    "проектной области"
+                )
+            elif created is None or not (issue_start <= created < period_end):
+                snapshot["reason"] = f"created вне периода {period_label}"
             elif not bug_has_eligible_status(issue_field(issue, "status"), rules):
                 snapshot["reason"] = "статус «Отклонен исполнителем»"
             elif priority not in rules.bug_priorities:
@@ -4100,58 +4177,88 @@ def write_reference_debug_report(
         return snapshot
 
     comparisons: dict[str, Any] = {}
-    for spec in team_specs:
-        if spec.team not in reference:
+    for period_name in ("quarter", "rolling_90_days"):
+        reference_by_team = reference.get(period_name, {})
+        if not reference_by_team:
             continue
-        team_result: dict[str, Any] = {}
-        for issue_type in ("Story", "Bug"):
-            expected_keys = reference[spec.team][issue_type]
-            missing_set, extra_set = comparison_key_sets[spec.team][issue_type]
-            actual_count = len(expected_keys) - len(missing_set) + len(extra_set)
-            missing = sorted(missing_set)
-            extra = sorted(extra_set)
-            team_result[issue_type] = {
-                "reference_count": len(expected_keys),
-                "script_count": actual_count,
-                "missing_count": len(missing),
-                "extra_count": len(extra),
-                "missing": [
-                    {
-                        "key": key,
-                        **task_details(key, issue_type),
-                    }
-                    for key in missing
-                ],
-                "extra": [
-                    {
-                        "key": key,
-                        **task_details(key, issue_type),
-                    }
-                    for key in extra
-                ],
-            }
-        team_result["squad_code"] = spec.squad_code
-        comparisons[spec.team] = team_result
-        print(
-            f"DEBUG XLSX {spec.team}: "
-            f"Story {team_result['Story']['script_count']}/"
-            f"{team_result['Story']['reference_count']} "
-            f"(нет={team_result['Story']['missing_count']}, "
-            f"лишних={team_result['Story']['extra_count']}); "
-            f"Bug {team_result['Bug']['script_count']}/"
-            f"{team_result['Bug']['reference_count']} "
-            f"(нет={team_result['Bug']['missing_count']}, "
-            f"лишних={team_result['Bug']['extra_count']})"
-        )
+        config = period_configs[period_name]
+        metrics_by_team = config["metrics"]
+        period_result: dict[str, Any] = {}
+        for spec in team_specs:
+            if spec.team not in reference_by_team:
+                continue
+            metric = metrics_by_team[spec.team]
+            team_result: dict[str, Any] = {}
+            for issue_type, actual_keys in (
+                ("Story", set(metric.story_keys)),
+                ("Bug", set(metric.bug_keys)),
+            ):
+                expected_keys = reference_by_team[spec.team][issue_type]
+                missing_set, extra_set = comparison_key_sets[period_name][spec.team][
+                    issue_type
+                ]
+                missing = sorted(missing_set)
+                extra = sorted(extra_set)
+                team_result[issue_type] = {
+                    "reference_count": len(expected_keys),
+                    "script_count": len(actual_keys),
+                    "missing_count": len(missing),
+                    "extra_count": len(extra),
+                    "missing": [
+                        {
+                            "key": key,
+                            **task_details(
+                                key,
+                                issue_type,
+                                period_name,
+                                spec.team,
+                            ),
+                        }
+                        for key in missing
+                    ],
+                    "extra": [
+                        {
+                            "key": key,
+                            **task_details(
+                                key,
+                                issue_type,
+                                period_name,
+                                spec.team,
+                            ),
+                        }
+                        for key in extra
+                    ],
+                }
+            team_result["squad_code"] = spec.squad_code
+            period_result[spec.team] = team_result
+            print(
+                f"DEBUG XLSX {config['label']} · {spec.team}: "
+                f"Story {team_result['Story']['script_count']}/"
+                f"{team_result['Story']['reference_count']} "
+                f"(нет={team_result['Story']['missing_count']}, "
+                f"лишних={team_result['Story']['extra_count']}); "
+                f"Bug {team_result['Bug']['script_count']}/"
+                f"{team_result['Bug']['reference_count']} "
+                f"(нет={team_result['Bug']['missing_count']}, "
+                f"лишних={team_result['Bug']['extra_count']})"
+            )
+        comparisons[period_name] = period_result
 
     payload = {
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "read_only": True,
         "reference_files": [str(path) for path in reference_paths],
-        "quarter": {
-            "display_start": quarter_start.isoformat(),
-            "story_start": quarter_story_start.isoformat(),
-            "end_exclusive": quarter_end.isoformat(),
+        "periods": {
+            "quarter": {
+                "display_start": quarter_start.isoformat(),
+                "story_start": quarter_story_start.isoformat(),
+                "end_exclusive": quarter_end.isoformat(),
+            },
+            "rolling_90_days": {
+                "display_start": rolling_start.isoformat(),
+                "story_start": rolling_start.isoformat(),
+                "end_exclusive": rolling_end.isoformat(),
+            },
         },
         "debug_issue_errors": debug_issue_errors,
         "comparisons": comparisons,
@@ -4571,7 +4678,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 output_path=debug_output,
                 team_specs=team_specs,
                 rules=rules,
+                rolling_metrics=rolling_metrics,
                 quarter_metrics=quarter_metrics,
+                rolling_start=rolling_start,
+                rolling_end=rolling_end,
                 quarter_start=quarter_start,
                 quarter_end=quarter_end,
                 quarter_story_start=quarter_story_start,
