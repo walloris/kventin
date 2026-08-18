@@ -57,6 +57,10 @@ DEFAULT_RELEASE_PROJECT = "HRPRELEASE"
 DEFAULT_RELEASE_ISSUE_TYPE = "Release 2.0"
 DEFAULT_RELEASE_CREATED_SINCE = "2025-09-01"
 DEFAULT_RELEASE_KE_FIELD_NAME = "КЭ"
+# КЭ используются как справочник команд, но не ограничивают поиск релизов:
+# источником Story являются все установленные Release 2.0 за период, после
+# чего consist-of задачи фильтруются по Jira project настроенных команд.
+DEFAULT_FILTER_RELEASES_BY_KE = False
 # Фактическое имя customfield_19400 в Jira. Несмотря на суффикс «(план)»,
 # именно это поле отображается в карточке Release 2.0 и содержит дату,
 # по которой dpm2 относит установленный релиз к отчётному периоду.
@@ -64,7 +68,6 @@ DEFAULT_RELEASE_DATE_FIELD_NAME = "Дата завершения установ�
 DEFAULT_RELEASE_DATE_FIELD_ID = "customfield_19400"
 DEFAULT_RELEASE_TYPE_FIELD_ID = "customfield_23500"
 DEFAULT_DETECTION_STAGE_FIELD_ID = "customfield_11507"
-DEFAULT_SKIP_DEFECT_REASON_FIELD_ID = "customfield_16801"
 DEFAULT_TEAM_ASSIGNMENT_FIELD_IDS = tuple(
     field_id.strip()
     for field_id in re.split(r"[,;\s]+", os.environ.get("QUALITY_METRIC_TEAM_FIELD_IDS", ""))
@@ -85,7 +88,6 @@ DEFAULT_STORY_TYPES = ("Story",)
 DEFAULT_STORY_STATUSES = ("Done", "Сделано", "Готово")
 DEFAULT_BUG_TYPES = ("Bug", "Defect", "Ошибка")
 DEFAULT_EXCLUDED_BUG_STATUSES = ("Отклонен исполнителем",)
-DEFAULT_EXCLUDED_SKIP_DEFECT_REASONS = ("Ошибка была известна в релизе",)
 DEFAULT_BUG_PRIORITIES = (
     "Critical",
     "Crytical",
@@ -155,9 +157,9 @@ RELEASE_KE_IDS = tuple(
 RETRYABLE_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504}
 AS_IS_FLOOR_MULTIPLIER = Decimal("0.8")
 
-# target_ratio — уже рассчитанный коэффициент A × AS IS + B из целевой
-# таблицы. Итоговый коэффициент дополнительно ограничивается снизу значением
-# as_is_ratio × AS_IS_FLOOR_MULTIPLIER.
+# target_ratio — актуальная «Цель 2026» из целевой таблицы (результат
+# A × AS IS + B). Итоговый коэффициент дополнительно ограничивается снизу
+# значением as_is_ratio × AS_IS_FLOOR_MULTIPLIER по заданной бизнес-формуле.
 TEAM_SETTINGS_JSON = r"""
 [
   {
@@ -185,7 +187,7 @@ TEAM_SETTINGS_JSON = r"""
     "project_keys": ["NEUROUI"],
     "ke_ids": [9643400, 9643401, 9644023, 9644025, 9644020],
     "as_is_ratio": 0.29,
-    "target_ratio": 0.24
+    "target_ratio": 0.35
   },
   {
     "team": "Профиль сотрудника",
@@ -193,7 +195,7 @@ TEAM_SETTINGS_JSON = r"""
     "project_keys": ["SFILE"],
     "ke_ids": [2295205, 8553253],
     "as_is_ratio": 0.21,
-    "target_ratio": 0.24
+    "target_ratio": 0.35
   },
   {
     "team": "Продуктовая аналитика",
@@ -201,7 +203,7 @@ TEAM_SETTINGS_JSON = r"""
     "project_keys": ["HRPPA"],
     "ke_ids": [],
     "as_is_ratio": 0.80,
-    "target_ratio": 0.10
+    "target_ratio": 0.65
   },
   {
     "team": "Люди Сбера",
@@ -217,7 +219,7 @@ TEAM_SETTINGS_JSON = r"""
     "project_keys": ["PERFREVIEW"],
     "ke_ids": [],
     "as_is_ratio": 0.34,
-    "target_ratio": 0.33
+    "target_ratio": 0.20
   },
   {
     "team": "Ассистент HR",
@@ -225,7 +227,7 @@ TEAM_SETTINGS_JSON = r"""
     "project_keys": ["HRPASSIST"],
     "ke_ids": [5366436, 2503797, 3930742, 2836020, 3173847, 10743713],
     "as_is_ratio": 0.09,
-    "target_ratio": 0.09
+    "target_ratio": 0.20
   }
 ]
 """
@@ -439,7 +441,6 @@ class MetricRules:
     story_statuses: frozenset[str]
     bug_types: frozenset[str]
     excluded_bug_statuses: frozenset[str]
-    excluded_skip_defect_reasons: frozenset[str]
     bug_priorities: frozenset[str]
     psi_detection_stages: frozenset[str]
     prom_detection_stages: frozenset[str]
@@ -451,9 +452,6 @@ class MetricRules:
             story_statuses=normalized_set(DEFAULT_STORY_STATUSES),
             bug_types=normalized_set(DEFAULT_BUG_TYPES),
             excluded_bug_statuses=normalized_set(DEFAULT_EXCLUDED_BUG_STATUSES),
-            excluded_skip_defect_reasons=normalized_set(
-                DEFAULT_EXCLUDED_SKIP_DEFECT_REASONS
-            ),
             bug_priorities=normalized_set(DEFAULT_BUG_PRIORITIES),
             psi_detection_stages=normalized_set(DEFAULT_PSI_DETECTION_STAGES),
             prom_detection_stages=normalized_set(DEFAULT_PROM_DETECTION_STAGES),
@@ -478,6 +476,7 @@ class TeamMetric:
     calculated_target_ratio: Decimal
     minimum_target_ratio: Optional[Decimal]
     target_ratio: Decimal
+    defect_limit_ratio: Decimal
     stories: int
     bugs: int
     psi_bugs: int
@@ -510,11 +509,12 @@ def calculate_metric(spec: TeamSpec, counts: TeamCounts) -> TeamMetric:
         if spec.as_is_ratio is not None
         else None
     )
-    target = (
+    defect_limit = (
         max(calculated_target, minimum_target)
         if minimum_target is not None
         else calculated_target
     )
+    target = calculated_target
     stories = counts.stories
     bugs = counts.bugs
 
@@ -542,11 +542,10 @@ def calculate_metric(spec: TeamSpec, counts: TeamCounts) -> TeamMetric:
         infinite_attainment = False
         state = "Цель выполнена" if actual_ratio <= target else "Ниже цели"
 
-    # Запас багов и Story до цели считаются по точному неравенству
-    # bugs / stories <= target. Округление выше нужно только для отображения
-    # и процента выполнения по правилам эталонной таблицы.
+    # Запас багов использует коэффициент лимита с нижней границей 80% AS IS.
+    # Story до цели и выполнение используют актуальную «Цель 2026» напрямую.
     bug_budget = int(
-        (Decimal(stories) * target).to_integral_value(rounding=ROUND_FLOOR)
+        (Decimal(stories) * defect_limit).to_integral_value(rounding=ROUND_FLOOR)
     )
     additional_bugs_allowed = max(0, bug_budget - bugs)
 
@@ -567,6 +566,7 @@ def calculate_metric(spec: TeamSpec, counts: TeamCounts) -> TeamMetric:
         calculated_target_ratio=calculated_target,
         minimum_target_ratio=minimum_target,
         target_ratio=target,
+        defect_limit_ratio=defect_limit,
         stories=stories,
         bugs=bugs,
         psi_bugs=counts.psi_bugs,
@@ -624,13 +624,6 @@ def bug_has_eligible_status(raw_status: Any, rules: MetricRules) -> bool:
         normalized(named_value(raw_status))
         not in rules.excluded_bug_statuses
     )
-
-
-def bug_has_eligible_skip_reason(raw_reason: Any, rules: MetricRules) -> bool:
-    """Exclude defects that the corporate metric marks as known in release."""
-
-    reasons = {normalized(value) for value in named_values(raw_reason)}
-    return not bool(reasons & rules.excluded_skip_defect_reasons)
 
 
 def classify_eligible_detection_stage(
@@ -960,10 +953,6 @@ def aggregate_issues(
         if (
             issue_type not in rules.bug_types
             or not bug_has_eligible_status(raw_status, rules)
-            or not bug_has_eligible_skip_reason(
-                issue_field(issue, DEFAULT_SKIP_DEFECT_REASON_FIELD_ID),
-                rules,
-            )
         ):
             continue
 
@@ -1483,12 +1472,14 @@ def build_release_jql(
     created_since: str,
 ) -> str:
     ke_ids_jql = ", ".join(str(value) for value in dict.fromkeys(ke_ids))
-    return (
+    clauses = [
         f"project={jql_value(project)} "
-        f"AND {ke_field_name} in ({ke_ids_jql}) "
         f"AND type = {jql_value(issue_type)} "
         f'AND created >= "{created_since}"'
-    )
+    ]
+    if ke_ids_jql:
+        clauses.append(f" AND {ke_field_name} in ({ke_ids_jql})")
+    return "".join(clauses)
 
 
 def build_created_bugs_jql(
@@ -1537,7 +1528,6 @@ def collect_created_bugs(
         "created",
         "resolutiondate",
         detection_stage_field_id,
-        DEFAULT_SKIP_DEFECT_REASON_FIELD_ID,
         *team_assignment_field_ids,
     )
     execution_log(
@@ -1561,18 +1551,13 @@ def collect_created_bugs(
             key
             and issue_type in rules.bug_types
             and bug_has_eligible_status(raw_status, rules)
-            and bug_has_eligible_skip_reason(
-                issue_field(issue, DEFAULT_SKIP_DEFECT_REASON_FIELD_ID),
-                rules,
-            )
             and priority in rules.bug_priorities
         ):
             history_keys.append(key)
 
     execution_log(
         f"Jira: заведённых Bug/Defect найдено={len(candidates)}; "
-        "High+ без статуса «Отклонен исполнителем» и без заранее "
-        "известных дефектов для проверки "
+        "High+ без статуса «Отклонен исполнителем» для проверки "
         f"истории этапа={len(history_keys)}"
     )
     detailed, errors = jira.issues_individually(
@@ -1771,6 +1756,7 @@ def collect_released_issues(
     link_keywords: Sequence[str],
     team_assignment_field_ids: Sequence[str] = (),
     verbose: bool = False,
+    team_project_keys: Sequence[str] = (),
 ) -> tuple[
     list[dict[str, Any]],
     list[dict[str, Any]],
@@ -1778,6 +1764,11 @@ def collect_released_issues(
     dict[str, set[str]],
 ]:
     collection_started = time.perf_counter()
+    configured_projects = {
+        str(project_key).strip().upper()
+        for project_key in team_project_keys
+        if str(project_key).strip()
+    }
     release_fields = (
         "summary",
         "status",
@@ -1792,10 +1783,10 @@ def collect_released_issues(
         created_since=release_created_since,
     )
     if verbose:
-        print(f"JQL релизов (как в dpm2.py): {release_jql}")
+        print(f"JQL релизов Release 2.0: {release_jql}")
     release_search_started = time.perf_counter()
     execution_log(
-        "Jira: поиск Release 2.0 по КЭ "
+        "Jira: поиск всех Release 2.0 "
         f"для диапазона {start.isoformat()} — "
         f"{(end - timedelta(days=1)).isoformat()}"
     )
@@ -1970,6 +1961,12 @@ def collect_released_issues(
             continue
 
         linked_keys = release_linked_keys(full_release, link_keywords)
+        if configured_projects:
+            linked_keys = {
+                key
+                for key in linked_keys
+                if key.partition("-")[0] in configured_projects
+            }
         issue_keys_by_release[release_key] = set(linked_keys)
         all_linked_keys.update(linked_keys)
 
@@ -2001,8 +1998,20 @@ def collect_released_issues(
             "публикация остановлена. "
             f"{details}{suffix}"
         )
+    relevant_release_keys = {
+        release_key
+        for release_key, linked_keys in issue_keys_by_release.items()
+        if linked_keys
+    }
+    releases = [
+        release
+        for release in releases
+        if str(release.get("key") or "").strip().upper()
+        in relevant_release_keys
+    ]
     execution_log(
-        f"Jira: связи релизов загружены, "
+        f"Jira: связи релизов загружены, релизов с задачами команд="
+        f"{len(releases)}, "
         f"уникальных consist-of ключей={len(all_linked_keys)} "
         f"({elapsed_seconds(release_links_started)})"
     )
@@ -2192,7 +2201,6 @@ def print_filter_audit(
         spec.team: {
             "story_status": Counter(),
             "bug_status": Counter(),
-            "bug_skip_reason": Counter(),
             "bug_priority": Counter(),
             "bug_detection_stage": Counter(),
         }
@@ -2231,20 +2239,6 @@ def print_filter_audit(
             rejected_values[team]["bug_status"][status_name] += 1
             continue
         audit[team]["bug_status_eligible"] += 1
-
-        skip_reason_name = (
-            named_value(
-                issue_field(issue, DEFAULT_SKIP_DEFECT_REASON_FIELD_ID)
-            )
-            or "Причина не указана"
-        )
-        if not bug_has_eligible_skip_reason(
-            issue_field(issue, DEFAULT_SKIP_DEFECT_REASON_FIELD_ID),
-            rules,
-        ):
-            rejected_values[team]["bug_skip_reason"][skip_reason_name] += 1
-            continue
-        audit[team]["bug_not_known_in_release"] += 1
 
         priority_name = named_value(issue_field(issue, "priority")) or "Без приоритета"
         if normalized(priority_name) not in rules.bug_priorities:
@@ -2285,7 +2279,6 @@ def print_filter_audit(
             f"Story всего={values['story_total']}, Done={values['story_done']}; "
             f"Bug всего={values['bug_total']}, "
             f"статус допустим={values['bug_status_eligible']}, "
-            f"не известен заранее={values['bug_not_known_in_release']}, "
             f"High+={values['bug_high_plus']}, PSI/ПРОМ={values['bug_eligible']}; "
             f"этап менялся={values['bug_stage_changed']}"
         )
@@ -2293,7 +2286,6 @@ def print_filter_audit(
         for field_name, label in (
             ("story_status", "Story-статусы"),
             ("bug_status", "исключённые Bug-статусы"),
-            ("bug_skip_reason", "исключённые причины пропуска"),
             ("bug_priority", "приоритеты"),
             ("bug_detection_stage", "этапы обнаружения"),
         ):
@@ -2338,11 +2330,11 @@ def target_text(value: Decimal) -> str:
 def target_formula_text(metric: TeamMetric) -> str:
     if metric.as_is_ratio is None or metric.minimum_target_ratio is None:
         return (
-            f"AS IS — · расчёт {decimal_text(metric.calculated_target_ratio, 3)}"
+            f"AS IS — · цель {decimal_text(metric.calculated_target_ratio, 3)}"
         )
     return (
         f"AS IS {decimal_text(metric.as_is_ratio, 3)} · "
-        f"расчёт {decimal_text(metric.calculated_target_ratio, 3)} · "
+        f"цель {decimal_text(metric.calculated_target_ratio, 3)} · "
         f"80% AS IS {decimal_text(metric.minimum_target_ratio, 3)}"
     )
 
@@ -2446,8 +2438,8 @@ def render_console(metrics: Sequence[TeamMetric]) -> str:
         "Команда",
         "Jira",
         "AS IS",
-        "A×AS IS+B",
-        "Цель",
+        "Цель 2026",
+        "Коэф. лимита",
         "Story",
         "Баги",
         "PSI",
@@ -2467,7 +2459,7 @@ def render_console(metrics: Sequence[TeamMetric]) -> str:
                 else "—"
             ),
             decimal_text(metric.calculated_target_ratio, 2),
-            decimal_text(metric.target_ratio, 2),
+            decimal_text(metric.defect_limit_ratio, 2),
             str(metric.stories),
             str(metric.bugs),
             str(metric.psi_bugs),
@@ -2586,8 +2578,9 @@ def render_metric_section_html(
         'border-radius:6px;color:#403294;margin-bottom:15px;padding:10px 13px;">',
         f'<strong>Цель выполняют {teams_on_target} из {len(metrics)} команд.</strong> '
         "Факт = баги / Story и округляется до сотых; выполнение = целевой "
-        "коэффициент / факт × 100%. Эффективная цель = максимум из "
-        "расчёта A × AS IS + B и 80% от AS IS. При нуле багов выполнение равно 100%. "
+        "коэффициент 2026 / факт × 100%. Нижняя граница 80% от AS IS "
+        "применяется только к лимиту допустимых багов. "
+        "При нуле багов выполнение равно 100%. "
         "Чем выше процент выполнения, тем лучше.",
         "</div>",
         '<table class="confluenceTable" style="border-collapse:collapse;'
@@ -2634,7 +2627,11 @@ def render_metric_section_html(
         )
         target_background = "#FFF0B3" if as_is_floor_applied(metric) else "#EAE6FF"
         target_color = "#974F0C" if as_is_floor_applied(metric) else "#403294"
-        floor_note = " · применён минимум" if as_is_floor_applied(metric) else ""
+        floor_note = (
+            " · минимум применён только к лимиту багов"
+            if as_is_floor_applied(metric)
+            else ""
+        )
         parts.append(
             f'<td style="{base_cell}background-color:{target_background};'
             f'color:{target_color};font-weight:bold;">'
@@ -2750,8 +2747,6 @@ def render_confluence_html(
         'font-size:12px;margin-top:14px;padding:11px 13px;">',
         "В баги входят заведённые за отчётный период в Jira-проектах команд "
         "задачи типа Bug в любом статусе, кроме «Отклонен исполнителем», "
-        "за исключением задач с причиной пропуска дефекта "
-        "«Ошибка была известна в релизе», "
         "с приоритетом "
         "Critical/Crytical, Blocker, Высокий или Блокирующий "
         "и этапом обнаружения PSI/ПСИ или PROM/ПРОМ в истории задачи. "
@@ -2762,8 +2757,9 @@ def render_confluence_html(
         "собственная resolutiondate Story границы периода не задаёт. "
         "Для совпадения с корпоративной квартальной выгрузкой Story ночного "
         "batch последнего дня предыдущего квартала относятся к новому кварталу. "
-        "Эффективная цель = max(A × AS IS + B; AS IS × 0,8). "
-        "Лимит дефектов = floor(эффективная цель × Story). "
+        "Выполнение и Story до цели считаются по «Цели 2026». "
+        "Коэффициент лимита дефектов = max(Цель 2026; AS IS × 0,8). "
+        "Лимит дефектов = floor(коэффициент лимита × Story). "
         "«Ещё ПРОМ-багов» — целый запас до этого лимита; «Story до цели» — "
         "минимальное число дополнительных Story для возвращения к 100%.",
         f"<br/>Обновлено автоматически: "
@@ -3323,7 +3319,7 @@ def metric_calculation_debug(metric: TeamMetric) -> dict[str, Any]:
         else None
     )
     bug_budget = int(
-        (Decimal(metric.stories) * metric.target_ratio).to_integral_value(
+        (Decimal(metric.stories) * metric.defect_limit_ratio).to_integral_value(
             rounding=ROUND_FLOOR
         )
     )
@@ -3343,13 +3339,13 @@ def metric_calculation_debug(metric: TeamMetric) -> dict[str, Any]:
             "bugs_psi": metric.psi_bugs,
             "bugs_prom": metric.prom_bugs,
             "as_is_ratio": debug_decimal(metric.as_is_ratio),
-            "a_times_as_is_plus_b": debug_decimal(
+            "target_2026": debug_decimal(
                 metric.calculated_target_ratio
             ),
             "as_is_times_0_8": debug_decimal(metric.minimum_target_ratio),
         },
         "formulas": {
-            "effective_target": (
+            "defect_limit_ratio": (
                 "max(A × AS IS + B; AS IS × 0.8)"
                 if metric.as_is_ratio is not None
                 else "A × AS IS + B (AS IS отсутствует)"
@@ -3357,18 +3353,19 @@ def metric_calculation_debug(metric: TeamMetric) -> dict[str, Any]:
             "actual_exact": "bugs_total / stories",
             "actual_display": "round_half_up(actual_exact, 2)",
             "attainment_percent": (
-                "effective_target / actual_display × 100; "
+                "target_2026 / actual_display × 100; "
                 "при 0 Story или 0 багов = 100"
             ),
-            "bug_budget": "floor(stories × effective_target)",
+            "bug_budget": "floor(stories × defect_limit_ratio)",
             "additional_bugs_allowed": "max(0; bug_budget - bugs_total)",
-            "stories_needed_total": "ceil(bugs_total / effective_target)",
+            "stories_needed_total": "ceil(bugs_total / target_2026)",
             "additional_stories_required": (
                 "max(0; stories_needed_total - stories)"
             ),
         },
         "intermediate": {
-            "effective_target": debug_decimal(metric.target_ratio),
+            "target_2026": debug_decimal(metric.target_ratio),
+            "defect_limit_ratio": debug_decimal(metric.defect_limit_ratio),
             "actual_exact": debug_decimal(exact_ratio),
             "actual_display": debug_decimal(metric.actual_ratio),
             "bug_budget": bug_budget,
@@ -3637,10 +3634,6 @@ def write_project_debug_report(
         )
         type_ok = issue_type in rules.bug_types
         status_ok = bug_has_eligible_status(raw_status, rules)
-        skip_reason_ok = bug_has_eligible_skip_reason(
-            issue_field(issue, DEFAULT_SKIP_DEFECT_REASON_FIELD_ID),
-            rules,
-        )
         priority_ok = priority in rules.bug_priorities
         rolling_date_ok = bool(
             created and rolling_start <= created < rolling_end
@@ -3661,7 +3654,6 @@ def write_project_debug_report(
             ),
             ("тип Bug", type_ok),
             ("статус не Отклонен исполнителем", status_ok),
-            ("дефект не был известен в релизе", skip_reason_ok),
             ("приоритет High+", priority_ok),
             ("в истории этапа есть PSI/ПРОМ", stage is not None),
         )
@@ -3784,9 +3776,6 @@ def write_project_debug_report(
             "story_done_statuses": sorted(rules.story_statuses),
             "bug_types": sorted(rules.bug_types),
             "excluded_bug_statuses": sorted(rules.excluded_bug_statuses),
-            "excluded_skip_defect_reasons": sorted(
-                rules.excluded_skip_defect_reasons
-            ),
             "bug_high_plus_priorities": sorted(rules.bug_priorities),
             "psi_detection_stages": sorted(rules.psi_detection_stages),
             "prom_detection_stages": sorted(rules.prom_detection_stages),
@@ -3956,16 +3945,6 @@ def write_issue_debug_report(
                 (
                     "статус не Отклонен исполнителем",
                     bug_has_eligible_status(issue_field(metric_issue, "status"), rules),
-                ),
-                (
-                    "дефект не был известен в релизе",
-                    bug_has_eligible_skip_reason(
-                        issue_field(
-                            metric_issue,
-                            DEFAULT_SKIP_DEFECT_REASON_FIELD_ID,
-                        ),
-                        rules,
-                    ),
                 ),
                 ("приоритет High+", priority in rules.bug_priorities),
                 ("в истории этапа есть PSI/ПРОМ", stage is not None),
@@ -4198,13 +4177,6 @@ def write_reference_debug_report(
                 snapshot["reason"] = f"created вне периода {period_label}"
             elif not bug_has_eligible_status(issue_field(issue, "status"), rules):
                 snapshot["reason"] = "статус «Отклонен исполнителем»"
-            elif not bug_has_eligible_skip_reason(
-                issue_field(issue, DEFAULT_SKIP_DEFECT_REASON_FIELD_ID),
-                rules,
-            ):
-                snapshot["reason"] = (
-                    "причина пропуска «Ошибка была известна в релизе»"
-                )
             elif priority not in rules.bug_priorities:
                 snapshot["reason"] = "приоритет не High+"
             elif stage is None:
@@ -4315,7 +4287,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "Собирает за последние 90 дней и отдельно за квартал отношение "
             "заведённых в Jira-проектах команд High+ PSI/ПРОМ-багов "
             "в любом статусе, кроме «Отклонен исполнителем», "
-            "и не известных заранее в релизе, "
             "к зарелизенным Story и публикует таблицы в Confluence."
         )
     )
@@ -4558,7 +4529,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             release_project=DEFAULT_RELEASE_PROJECT,
             release_issue_type=DEFAULT_RELEASE_ISSUE_TYPE,
             release_ke_field_name=DEFAULT_RELEASE_KE_FIELD_NAME,
-            release_ke_ids=RELEASE_KE_IDS,
+            release_ke_ids=(
+                RELEASE_KE_IDS if DEFAULT_FILTER_RELEASES_BY_KE else ()
+            ),
             release_created_since=DEFAULT_RELEASE_CREATED_SINCE,
             release_date_field_id=release_date_field_id,
             release_type_field_id=release_type_field_id,
@@ -4566,6 +4539,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             link_keywords=DEFAULT_RELEASE_LINK_KEYWORDS,
             team_assignment_field_ids=team_assignment_field_ids,
             verbose=args.verbose,
+            team_project_keys=tuple(
+                project_key
+                for spec in active_team_specs
+                for project_key in spec.project_keys
+            ),
         )
         created_bugs, bugs_jql = collect_created_bugs(
             jira,
