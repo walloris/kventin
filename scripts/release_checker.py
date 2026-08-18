@@ -3129,15 +3129,15 @@ class ReleaseValidator:
 
         return total_seconds / 86400.0
 
-    # Целевое суммарное время (в днях) нахождения Story
+    # Целевое суммарное время 2026 (в днях) нахождения Story
     # в статусах тестирования по проектной области.
     STORY_MONITORED_STATUSES = ["READY FOR IFT", "IFT", "READY FOR UAT", "UAT"]
     STORY_MAX_TESTING_DAYS: dict[str, float] = {
-        "HRM":        8.9,
-        "HRC":        9.9,
+        "HRM":        6.0,
+        "HRC":        6.0,
         "NEUROUI":    5.5,
         "SFILE":      6.0,
-        "SBRPPL":     6.0,
+        "HRPPA":      3.6,
         "PERFREVIEW": 5.2,
         "HRPASSIST": 10.0,
     }

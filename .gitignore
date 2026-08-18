@@ -2,6 +2,8 @@
 .env
 .env.local
 *.pem
+zurab_bot/data/
+zurab_bot/.env
 
 # Python
 .venv/

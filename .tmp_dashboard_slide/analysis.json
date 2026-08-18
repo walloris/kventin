@@ -1,0 +1,472 @@
+{
+  "scope": {
+    "block": "Люди и культура",
+    "tribe": "Пульс-Каркас",
+    "cluster": "Каркас"
+  },
+  "teamCount": 8,
+  "completeTeams": 1,
+  "teamsAtOrAbove80": 5,
+  "achievedChecks": 29,
+  "totalChecks": 39,
+  "teams": [
+    {
+      "team": "Задачи и уведомления",
+      "completion": 100,
+      "achieved": 5,
+      "total": 5,
+      "sourceRow": 17
+    },
+    {
+      "team": "Люди Сбера",
+      "completion": 80,
+      "achieved": 4,
+      "total": 5,
+      "sourceRow": 29
+    },
+    {
+      "team": "Профиль сотрудника",
+      "completion": 80,
+      "achieved": 4,
+      "total": 5,
+      "sourceRow": 53
+    },
+    {
+      "team": "CoreUI 2.0",
+      "completion": 80,
+      "achieved": 4,
+      "total": 5,
+      "sourceRow": 65
+    },
+    {
+      "team": "HRP Core Tech",
+      "completion": 80,
+      "achieved": 4,
+      "total": 5,
+      "sourceRow": 77
+    },
+    {
+      "team": "Ассистент HR",
+      "completion": 60,
+      "achieved": 3,
+      "total": 5,
+      "sourceRow": 5
+    },
+    {
+      "team": "HRP Core UI",
+      "completion": 60,
+      "achieved": 3,
+      "total": 5,
+      "sourceRow": 89
+    },
+    {
+      "team": "Продуктовая аналитика",
+      "completion": 50,
+      "achieved": 2,
+      "total": 4,
+      "sourceRow": 41
+    }
+  ],
+  "metricSummary": [
+    {
+      "metric": "Индекс достаточности описания задач для принятия решений об участии в ПСИ",
+      "achievedTeams": 7,
+      "measuredTeams": 7,
+      "shareAchieved": 100,
+      "observations": [
+        {
+          "team": "Ассистент HR",
+          "actual": 100,
+          "target": 95,
+          "rawActual": "100,0%",
+          "measured": true,
+          "achieved": true,
+          "sourceRow": 14
+        },
+        {
+          "team": "Задачи и уведомления",
+          "actual": 100,
+          "target": 95,
+          "rawActual": "100,0%",
+          "measured": true,
+          "achieved": true,
+          "sourceRow": 26
+        },
+        {
+          "team": "Люди Сбера",
+          "actual": 100,
+          "target": 95,
+          "rawActual": "100,0%",
+          "measured": true,
+          "achieved": true,
+          "sourceRow": 38
+        },
+        {
+          "team": "Продуктовая аналитика",
+          "actual": null,
+          "target": 95,
+          "rawActual": "Нет Релизов",
+          "measured": false,
+          "achieved": null,
+          "sourceRow": 50
+        },
+        {
+          "team": "Профиль сотрудника",
+          "actual": 100,
+          "target": 95,
+          "rawActual": "100,0%",
+          "measured": true,
+          "achieved": true,
+          "sourceRow": 62
+        },
+        {
+          "team": "CoreUI 2.0",
+          "actual": 100,
+          "target": 95,
+          "rawActual": "100,0%",
+          "measured": true,
+          "achieved": true,
+          "sourceRow": 74
+        },
+        {
+          "team": "HRP Core Tech",
+          "actual": 100,
+          "target": 95,
+          "rawActual": "100,0%",
+          "measured": true,
+          "achieved": true,
+          "sourceRow": 86
+        },
+        {
+          "team": "HRP Core UI",
+          "actual": 100,
+          "target": 95,
+          "rawActual": "100,0%",
+          "measured": true,
+          "achieved": true,
+          "sourceRow": 98
+        }
+      ]
+    },
+    {
+      "metric": "Индекс зрелости выполнения архитектурных требований по Истории перед ПСИ",
+      "achievedTeams": 8,
+      "measuredTeams": 8,
+      "shareAchieved": 100,
+      "observations": [
+        {
+          "team": "Ассистент HR",
+          "actual": 100,
+          "target": 70,
+          "rawActual": "100,0%",
+          "measured": true,
+          "achieved": true,
+          "sourceRow": 16
+        },
+        {
+          "team": "Задачи и уведомления",
+          "actual": 100,
+          "target": 70,
+          "rawActual": "100,0%",
+          "measured": true,
+          "achieved": true,
+          "sourceRow": 28
+        },
+        {
+          "team": "Люди Сбера",
+          "actual": 100,
+          "target": 70,
+          "rawActual": "100,0%",
+          "measured": true,
+          "achieved": true,
+          "sourceRow": 40
+        },
+        {
+          "team": "Продуктовая аналитика",
+          "actual": 100,
+          "target": 70,
+          "rawActual": "100,0%",
+          "measured": true,
+          "achieved": true,
+          "sourceRow": 52
+        },
+        {
+          "team": "Профиль сотрудника",
+          "actual": 100,
+          "target": 70,
+          "rawActual": "100,0%",
+          "measured": true,
+          "achieved": true,
+          "sourceRow": 64
+        },
+        {
+          "team": "CoreUI 2.0",
+          "actual": 100,
+          "target": 70,
+          "rawActual": "100,0%",
+          "measured": true,
+          "achieved": true,
+          "sourceRow": 76
+        },
+        {
+          "team": "HRP Core Tech",
+          "actual": 100,
+          "target": 70,
+          "rawActual": "100,0%",
+          "measured": true,
+          "achieved": true,
+          "sourceRow": 88
+        },
+        {
+          "team": "HRP Core UI",
+          "actual": 100,
+          "target": 70,
+          "rawActual": "100,0%",
+          "measured": true,
+          "achieved": true,
+          "sourceRow": 100
+        }
+      ]
+    },
+    {
+      "metric": "Доля Историй и Багов, связанных с кодом",
+      "achievedTeams": 6,
+      "measuredTeams": 8,
+      "shareAchieved": 75,
+      "observations": [
+        {
+          "team": "Ассистент HR",
+          "actual": 17.5,
+          "target": 80,
+          "rawActual": "17,5%",
+          "measured": true,
+          "achieved": false,
+          "sourceRow": 8
+        },
+        {
+          "team": "Задачи и уведомления",
+          "actual": 91.7,
+          "target": 80,
+          "rawActual": "91,7%",
+          "measured": true,
+          "achieved": true,
+          "sourceRow": 20
+        },
+        {
+          "team": "Люди Сбера",
+          "actual": 91.7,
+          "target": 80,
+          "rawActual": "91,7%",
+          "measured": true,
+          "achieved": true,
+          "sourceRow": 32
+        },
+        {
+          "team": "Продуктовая аналитика",
+          "actual": 100,
+          "target": 80,
+          "rawActual": "100,0%",
+          "measured": true,
+          "achieved": true,
+          "sourceRow": 44
+        },
+        {
+          "team": "Профиль сотрудника",
+          "actual": 90.5,
+          "target": 80,
+          "rawActual": "90,5%",
+          "measured": true,
+          "achieved": true,
+          "sourceRow": 56
+        },
+        {
+          "team": "CoreUI 2.0",
+          "actual": 89,
+          "target": 80,
+          "rawActual": "89,0%",
+          "measured": true,
+          "achieved": true,
+          "sourceRow": 68
+        },
+        {
+          "team": "HRP Core Tech",
+          "actual": 91.5,
+          "target": 80,
+          "rawActual": "91,5%",
+          "measured": true,
+          "achieved": true,
+          "sourceRow": 80
+        },
+        {
+          "team": "HRP Core UI",
+          "actual": 76.4,
+          "target": 80,
+          "rawActual": "76,4%",
+          "measured": true,
+          "achieved": false,
+          "sourceRow": 92
+        }
+      ]
+    },
+    {
+      "metric": "Доля авторазвертываний ПРОД",
+      "achievedTeams": 6,
+      "measuredTeams": 8,
+      "shareAchieved": 75,
+      "observations": [
+        {
+          "team": "Ассистент HR",
+          "actual": 93.8,
+          "target": 98,
+          "rawActual": "93,8%",
+          "measured": true,
+          "achieved": false,
+          "sourceRow": 12
+        },
+        {
+          "team": "Задачи и уведомления",
+          "actual": 100,
+          "target": 98,
+          "rawActual": "100,0%",
+          "measured": true,
+          "achieved": true,
+          "sourceRow": 24
+        },
+        {
+          "team": "Люди Сбера",
+          "actual": 100,
+          "target": 98,
+          "rawActual": "100,0%",
+          "measured": true,
+          "achieved": true,
+          "sourceRow": 36
+        },
+        {
+          "team": "Продуктовая аналитика",
+          "actual": 85.7,
+          "target": 98,
+          "rawActual": "85,7%",
+          "measured": true,
+          "achieved": false,
+          "sourceRow": 48
+        },
+        {
+          "team": "Профиль сотрудника",
+          "actual": 100,
+          "target": 98,
+          "rawActual": "100,0%",
+          "measured": true,
+          "achieved": true,
+          "sourceRow": 60
+        },
+        {
+          "team": "CoreUI 2.0",
+          "actual": 99.2,
+          "target": 98,
+          "rawActual": "99,2%",
+          "measured": true,
+          "achieved": true,
+          "sourceRow": 72
+        },
+        {
+          "team": "HRP Core Tech",
+          "actual": 100,
+          "target": 98,
+          "rawActual": "100,0%",
+          "measured": true,
+          "achieved": true,
+          "sourceRow": 84
+        },
+        {
+          "team": "HRP Core UI",
+          "actual": 98.7,
+          "target": 98,
+          "rawActual": "98,7%",
+          "measured": true,
+          "achieved": true,
+          "sourceRow": 96
+        }
+      ]
+    },
+    {
+      "metric": "Доля PR, связанных с задачей",
+      "achievedTeams": 2,
+      "measuredTeams": 8,
+      "shareAchieved": 25,
+      "observations": [
+        {
+          "team": "Ассистент HR",
+          "actual": 81.6,
+          "target": 80,
+          "rawActual": "81,6%",
+          "measured": true,
+          "achieved": true,
+          "sourceRow": 9
+        },
+        {
+          "team": "Задачи и уведомления",
+          "actual": 83.1,
+          "target": 80,
+          "rawActual": "83,1%",
+          "measured": true,
+          "achieved": true,
+          "sourceRow": 21
+        },
+        {
+          "team": "Люди Сбера",
+          "actual": 67.2,
+          "target": 80,
+          "rawActual": "67,2%",
+          "measured": true,
+          "achieved": false,
+          "sourceRow": 33
+        },
+        {
+          "team": "Продуктовая аналитика",
+          "actual": 64.3,
+          "target": 80,
+          "rawActual": "64,3%",
+          "measured": true,
+          "achieved": false,
+          "sourceRow": 45
+        },
+        {
+          "team": "Профиль сотрудника",
+          "actual": 72.5,
+          "target": 80,
+          "rawActual": "72,5%",
+          "measured": true,
+          "achieved": false,
+          "sourceRow": 57
+        },
+        {
+          "team": "CoreUI 2.0",
+          "actual": 77.4,
+          "target": 80,
+          "rawActual": "77,4%",
+          "measured": true,
+          "achieved": false,
+          "sourceRow": 69
+        },
+        {
+          "team": "HRP Core Tech",
+          "actual": 79.1,
+          "target": 80,
+          "rawActual": "79,1%",
+          "measured": true,
+          "achieved": false,
+          "sourceRow": 81
+        },
+        {
+          "team": "HRP Core UI",
+          "actual": 73.2,
+          "target": 80,
+          "rawActual": "73,2%",
+          "measured": true,
+          "achieved": false,
+          "sourceRow": 93
+        }
+      ]
+    }
+  ]
+}

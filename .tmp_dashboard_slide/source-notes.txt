@@ -1,0 +1,6 @@
+Source workbook: /Users/walloris/Downloads/5828d199-db9f-45e6-9d2f-c8e4fe9f986f.xlsx
+Sheet: Sheet1
+Scope: Блок «Люди и культура» → трайб «Пульс-Каркас» → кластер «Каркас»
+Team summary rows: 5, 17, 29, 41, 53, 65, 77, 89
+Metric detail rows used for aggregation: 8–16, 20–28, 32–40, 44–52, 56–64, 68–76, 80–88, 92–100
+Calculations: team completion from «Доля метрик»; metric success = value >= target; documentation uses n=7 because «Продуктовая аналитика» has «Нет Релизов».
