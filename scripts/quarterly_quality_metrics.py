@@ -2545,14 +2545,62 @@ def attainment_visual(metric: TeamMetric) -> str:
     )
 
 
-def kpi_cell(label: str, value: str, background: str, color: str = "#FFFFFF") -> str:
+def summary_card(
+    label: str,
+    value: str,
+    subtitle: str,
+    accent: str,
+) -> str:
     return (
-        f'<td style="background-color:{background};border:6px solid #FFFFFF;'
-        'border-radius:10px;padding:14px;text-align:center;width:20%;">'
-        f'<div style="color:{color};font-size:11px;font-weight:bold;'
+        '<td style="background-color:#FFFFFF;border:6px solid #F4F5F7;'
+        f'border-top:4px solid {accent};padding:12px 14px;text-align:left;'
+        'vertical-align:top;width:25%;">'
+        f'<div style="color:{accent};font-size:10px;font-weight:bold;'
         f'letter-spacing:.04em;text-transform:uppercase;">{html.escape(label)}</div>'
-        f'<div style="color:{color};font-size:24px;font-weight:bold;'
-        f'margin-top:4px;">{html.escape(value)}</div></td>'
+        '<div style="color:#172B4D;font-size:22px;font-weight:bold;'
+        f'margin-top:3px;">{html.escape(value)}</div>'
+        '<div style="color:#6B778C;font-size:10px;margin-top:2px;">'
+        f'{html.escape(subtitle)}</div></td>'
+    )
+
+
+def bug_count_text(count: int) -> str:
+    last_two = count % 100
+    last = count % 10
+    if 11 <= last_two <= 14:
+        noun = "багов"
+    elif last == 1:
+        noun = "баг"
+    elif 2 <= last <= 4:
+        noun = "бага"
+    else:
+        noun = "багов"
+    return f"{count} {noun}"
+
+
+def metric_action_html(metric: TeamMetric) -> str:
+    if metric.additional_stories_required > 0:
+        return (
+            '<div style="color:#BF2600;font-size:14px;font-weight:bold;">'
+            f'+{metric.additional_stories_required} Story</div>'
+            '<div style="color:#6B778C;font-size:10px;margin-top:2px;">'
+            'нужно до цели</div>'
+        )
+    if metric.additional_bugs_allowed > 0:
+        return (
+            '<div style="color:#006644;font-size:14px;font-weight:bold;">'
+            f'Ещё {bug_count_text(metric.additional_bugs_allowed)}</div>'
+            '<div style="color:#6B778C;font-size:10px;margin-top:2px;">'
+            'до лимита</div>'
+        )
+    if metric.stories == 0:
+        return (
+            '<div style="color:#006644;font-weight:bold;">✓ Цель выполнена</div>'
+            '<div style="color:#6B778C;font-size:10px;margin-top:2px;">нет Story</div>'
+        )
+    return (
+        '<div style="color:#006644;font-weight:bold;">✓ Цель выполнена</div>'
+        '<div style="color:#6B778C;font-size:10px;margin-top:2px;">запас исчерпан</div>'
     )
 
 
@@ -2562,7 +2610,6 @@ def render_metric_section_html(
     title: str,
     start: date,
     end: date,
-    as_of: date,
     release_count: int,
     hotfix_count: int,
     accent: str,
@@ -2579,52 +2626,64 @@ def render_metric_section_html(
     )
 
     parts = [
-        f'<div style="background-color:{accent};border-radius:9px;color:#FFFFFF;'
-        'font-size:20px;font-weight:bold;margin:18px 0 10px;padding:13px 16px;">',
-        html.escape(title),
-        f'<div style="color:#DEEBFF;font-size:12px;font-weight:normal;margin-top:4px;">'
-        f"{html.escape(period)}</div>",
+        '<div style="border-bottom:2px solid #DFE1E6;margin:22px 0 10px;'
+        'padding:0 2px 10px;">',
+        f'<span style="color:{accent};font-size:20px;font-weight:bold;">'
+        f'{html.escape(title)}</span>',
+        '<span style="color:#6B778C;font-size:12px;margin-left:10px;">'
+        f'{html.escape(period)}</span>',
+        f'<span style="background-color:{"#E3FCEF" if teams_on_target == len(metrics) else "#FFF0B3"};'
+        'border-radius:12px;color:#172B4D;float:right;font-size:11px;'
+        f'font-weight:bold;padding:4px 9px;">В цели {teams_on_target}/{len(metrics)}</span>',
         "</div>",
-        '<table style="border-collapse:separate;border-spacing:0;margin:0 0 14px 0;'
+        '<table style="background-color:#F4F5F7;border-collapse:separate;'
+        'border-spacing:0;margin:0 0 10px 0;'
         'table-layout:fixed;width:100%;"><tbody><tr>',
-        kpi_cell("Период", period, "#0052CC"),
-        kpi_cell("Плановые релизы", str(planned_release_count), "#6554C0"),
-        kpi_cell("Hotfix", str(hotfix_count), "#FF8B00"),
-        kpi_cell("Story Done", str(story_count), "#00875A"),
-        kpi_cell("Баги PSI / ПРОМ", f"{bug_count} · {psi_bug_count}/{prom_bug_count}", "#DE350B"),
+        summary_card(
+            "Релизы",
+            str(release_count),
+            f"плановые {planned_release_count} · hotfix {hotfix_count}",
+            "#6554C0",
+        ),
+        summary_card("Story", str(story_count), "Done из consist of", "#00875A"),
+        summary_card(
+            "Баги",
+            str(bug_count),
+            f"PSI {psi_bug_count} · ПРОМ {prom_bug_count}",
+            "#DE350B",
+        ),
+        summary_card(
+            "Команды в цели",
+            f"{teams_on_target}/{len(metrics)}",
+            "выполнение 100% и выше",
+            "#0052CC",
+        ),
         "</tr></tbody></table>",
-        '<div style="background-color:#EAE6FF;border-left:5px solid #6554C0;'
-        'border-radius:6px;color:#403294;margin-bottom:15px;padding:10px 13px;">',
-        f'<strong>Цель выполняют {teams_on_target} из {len(metrics)} команд.</strong> '
-        "Факт = баги / Story и округляется до сотых; выполнение = целевой "
-        "коэффициент 2026 / факт × 100%. Нижняя граница 80% от AS IS "
-        "применяется только к лимиту допустимых багов. "
-        "При нуле багов выполнение равно 100%. "
-        "Чем выше процент выполнения, тем лучше.",
+        '<div style="background-color:#F4F5F7;border-radius:6px;color:#5E6C84;'
+        'font-size:11px;margin-bottom:10px;padding:8px 11px;">'
+        '<strong style="color:#172B4D;">Как читать:</strong> факт = баги / Story. '
+        'Чем меньше факт и выше выполнение, тем лучше. Зелёный — цель выполнена; '
+        'красный — нужны дополнительные Story.',
         "</div>",
         '<table class="confluenceTable" style="border-collapse:collapse;'
-        'border:1px solid #C1C7D0;font-size:13px;width:100%;"><thead><tr>',
+        'border:1px solid #C1C7D0;font-size:12px;table-layout:fixed;'
+        'width:100%;"><thead><tr>',
     ]
     headers = (
         "Команда",
-        "Jira",
-        "Цель",
-        "Story Done",
-        "Баги High+ PSI/ПРОМ",
-        "PSI",
-        "ПРОМ",
+        "Цель 2026",
+        "Story",
+        "Баги",
         "Факт",
-        "Выполнение цели",
-        "Состояние",
-        "Ещё ПРОМ-багов до лимита",
-        "Story до цели",
+        "Выполнение",
+        "Что дальше",
     )
     for header in headers:
         parts.append(
-            '<th style="background-color:#F4F5F7;border:1px solid #C1C7D0;'
-            'color:#172B4D;font-size:12px;font-weight:bold;padding:9px 7px;'
+            '<th style="background-color:#172B4D;border:1px solid #344563;'
+            'color:#FFFFFF;font-size:11px;font-weight:bold;padding:9px 8px;'
             'text-align:center;vertical-align:middle;">'
-            f'<span style="color:#172B4D;font-weight:bold;">'
+            f'<span style="color:#FFFFFF;font-weight:bold;">'
             f"{html.escape(header)}</span></th>"
         )
     parts.append("</tr></thead><tbody>")
@@ -2633,87 +2692,135 @@ def render_metric_section_html(
         row_background = "#FFFFFF" if index % 2 == 0 else "#F7F9FC"
         base_cell = (
             f"background-color:{row_background};border:1px solid #DFE1E6;"
-            "padding:9px 7px;text-align:center;vertical-align:middle;"
+            "padding:10px 8px;text-align:center;vertical-align:middle;"
+        )
+        state_accent = "#36B37E" if metric.state == "Цель выполнена" else "#FF5630"
+        parts.append(
+            f'<tr><td style="{base_cell}border-left:4px solid {state_accent};'
+            f'color:#172B4D;font-weight:bold;text-align:left;">{html.escape(metric.team)}'
+            '<div style="color:#6B778C;font-size:10px;font-weight:normal;margin-top:3px;">'
+            f'{html.escape(", ".join(metric.project_keys))}</div></td>'
         )
         parts.append(
-            f'<tr><td style="{base_cell}color:#172B4D;font-weight:bold;'
-            f'text-align:left;">{html.escape(metric.team)}</td>'
+            f'<td style="{base_cell}color:#403294;font-size:14px;font-weight:bold;">'
+            f'{html.escape(decimal_text(metric.target_ratio * 100, 0))}%</td>'
         )
         parts.append(
-            f'<td style="{base_cell}"><span style="background-color:#DEEBFF;'
-            'border-radius:10px;color:#0747A6;font-weight:bold;padding:3px 7px;">'
-            f'{html.escape(", ".join(metric.project_keys))}</span></td>'
-        )
-        target_background = "#FFF0B3" if as_is_floor_applied(metric) else "#EAE6FF"
-        target_color = "#974F0C" if as_is_floor_applied(metric) else "#403294"
-        floor_note = (
-            " · минимум применён только к лимиту багов"
-            if as_is_floor_applied(metric)
-            else ""
-        )
-        parts.append(
-            f'<td style="{base_cell}background-color:{target_background};'
-            f'color:{target_color};font-weight:bold;">'
-            f'<div>{html.escape(target_text(metric.target_ratio))}</div>'
-            f'<div style="font-size:10px;font-weight:normal;margin-top:3px;">'
-            f'{html.escape(target_formula_text(metric) + floor_note)}</div></td>'
-        )
-        parts.append(
-            f'<td style="{base_cell}color:#006644;font-size:16px;'
+            f'<td style="{base_cell}color:#172B4D;font-size:16px;'
             f'font-weight:bold;">{metric.stories}</td>'
         )
         parts.append(
             f'<td style="{base_cell}color:#BF2600;font-size:16px;'
-            f'font-weight:bold;">{metric.bugs}</td>'
-        )
-        parts.append(
-            f'<td style="{base_cell}background-color:#E6FCFF;color:#0065FF;'
-            f'font-weight:bold;">{metric.psi_bugs}</td>'
-        )
-        parts.append(
-            f'<td style="{base_cell}background-color:#FFF0B3;color:#974F0C;'
-            f'font-weight:bold;">{metric.prom_bugs}</td>'
+            f'font-weight:bold;">{metric.bugs}'
+            '<div style="color:#6B778C;font-size:10px;font-weight:normal;margin-top:3px;">'
+            f'PSI {metric.psi_bugs} · ПРОМ {metric.prom_bugs}</div></td>'
         )
         ratio_background = "#E3FCEF" if metric.state == "Цель выполнена" else "#FFEBE6"
         ratio_color = "#006644" if metric.state == "Цель выполнена" else "#BF2600"
         parts.append(
             f'<td style="{base_cell}background-color:{ratio_background};'
-            f'color:{ratio_color};font-weight:bold;">'
-            f'{html.escape(ratio_text(metric.actual_ratio, metric.bugs, metric.stories))}</td>'
+            f'color:{ratio_color};font-size:14px;font-weight:bold;">'
+            f'{html.escape(decimal_text(metric.actual_ratio * 100, 1) + "%" if metric.actual_ratio is not None else "—")}'
+            '<div style="font-size:10px;font-weight:normal;margin-top:3px;">'
+            f'{html.escape(decimal_text(metric.actual_ratio, 2) if metric.actual_ratio is not None else "")}</div></td>'
         )
         parts.append(f'<td style="{base_cell}">{attainment_visual(metric)}</td>')
-        parts.append(f'<td style="{base_cell}">{state_badge(metric)}</td>')
-        capacity_background = "#E3FCEF" if metric.additional_bugs_allowed > 0 else row_background
-        capacity_color = "#006644" if metric.additional_bugs_allowed > 0 else "#5E6C84"
         parts.append(
-            f'<td style="{base_cell}background-color:{capacity_background};'
-            f'color:{capacity_color};font-size:16px;font-weight:bold;">'
-            f"{metric.additional_bugs_allowed}</td>"
-        )
-        stories_background = "#FFEBE6" if metric.additional_stories_required > 0 else "#E3FCEF"
-        stories_color = "#BF2600" if metric.additional_stories_required > 0 else "#006644"
-        parts.append(
-            f'<td style="{base_cell}background-color:{stories_background};'
-            f'color:{stories_color};font-size:16px;font-weight:bold;">'
-            f"{metric.additional_stories_required}</td>"
+            f'<td style="{base_cell}">{metric_action_html(metric)}</td>'
         )
         parts.append("</tr>")
 
     parts.append("</tbody></table>")
-    section_forecast = forecast_metric(metrics, start, end, as_of)
-    parts.extend(
-        (
-            '<div style="background-color:#E6FCFF;border-left:5px solid #00A3BF;'
-            'border-radius:6px;color:#0747A6;font-size:13px;margin:8px 0 16px;'
-            'padding:10px 13px;">',
-            f"<strong>{html.escape(forecast_text(section_forecast))}</strong>",
-            '<div style="color:#5E6C84;font-size:11px;margin-top:4px;">'
-            f"Линейный прогноз по текущему темпу на {html.escape((end - timedelta(days=1)).strftime('%d.%m.%Y'))}; "
-            f"коэффициент периода ×{html.escape(decimal_text(section_forecast.factor, 2))}.</div>",
-            "</div>",
-        )
-    )
     return "".join(parts)
+
+
+def render_hidden_issue_details(
+    *,
+    rolling_metrics: Sequence[TeamMetric],
+    quarter_metrics: Sequence[TeamMetric],
+    rolling_start: date,
+    rolling_end: date,
+    quarter_start: date,
+    quarter_end: date,
+    quarter: int,
+    generated_at: datetime,
+) -> str:
+    """Render a collapsed, copy-friendly audit of every counted issue key."""
+
+    lines = [
+        "ТЕХНИЧЕСКАЯ ДЕТАЛИЗАЦИЯ МЕТРИКИ",
+        f"Сформировано: {generated_at.isoformat(timespec='seconds')}",
+        "",
+        "Правила:",
+        "- Story: текущий статус Done, связь consist of с релизом, "
+        "установленным на ПРОМ в периоде.",
+        "- Bug: создан в периоде в пространстве команды, любой статус, кроме "
+        "«Отклонен исполнителем», приоритет High+ и этап обнаружения PSI/ПРОМ "
+        "в текущем значении или истории.",
+        "- Причина пропуска «Ошибка была известна в релизе» не исключает Bug.",
+        "- Факт = Bug / Story; выполнение = Цель 2026 / Факт.",
+        "",
+    ]
+
+    periods = (
+        (
+            f"{quarter_start.year} Q{quarter}",
+            quarter_start,
+            quarter_end,
+            quarter_metrics,
+        ),
+        ("Последние 90 дней", rolling_start, rolling_end, rolling_metrics),
+    )
+    for period_title, period_start, period_end, metrics in periods:
+        lines.extend(
+            (
+                "=" * 72,
+                f"ПЕРИОД: {period_title} | "
+                f"{period_start.strftime('%d.%m.%Y')}–"
+                f"{(period_end - timedelta(days=1)).strftime('%d.%m.%Y')}",
+                "=" * 72,
+            )
+        )
+        for metric in metrics:
+            actual = (
+                decimal_text(metric.actual_ratio, 2)
+                if metric.actual_ratio is not None
+                else "—"
+            )
+            lines.extend(
+                (
+                    "",
+                    f"[{metric.team}] Jira: {', '.join(metric.project_keys)}",
+                    f"Итог: Story={metric.stories}; Bug={metric.bugs}; "
+                    f"PSI={metric.psi_bugs}; ПРОМ={metric.prom_bugs}; "
+                    f"Факт={actual}; Цель={decimal_text(metric.target_ratio, 2)}",
+                    f"Story ({len(metric.story_keys)}): "
+                    f"{', '.join(metric.story_keys) or '—'}",
+                    f"Bug ({len(metric.bug_keys)}): "
+                    f"{', '.join(metric.bug_keys) or '—'}",
+                )
+            )
+        lines.append("")
+
+    details = html.escape("\n".join(lines))
+    return (
+        '<div style="border-top:1px solid #DFE1E6;margin-top:18px;padding-top:12px;">'
+        '<ac:structured-macro ac:name="expand">'
+        '<ac:parameter ac:name="title">Техническая детализация для сверки '
+        '— все учтённые Story и Bug</ac:parameter>'
+        '<ac:rich-text-body>'
+        '<div style="background-color:#F4F5F7;border-left:4px solid #0052CC;'
+        'color:#42526E;margin-bottom:10px;padding:10px 12px;">'
+        'Если цифры расходятся с дашбордом, раскройте блок, скопируйте его '
+        'целиком и пришлите для сравнения.</div>'
+        '<pre style="background-color:#FFFFFF;border:1px solid #C1C7D0;'
+        'color:#172B4D;font-size:11px;line-height:1.45;overflow-wrap:anywhere;'
+        'padding:12px;white-space:pre-wrap;word-break:break-word;">'
+        f'{details}</pre>'
+        '</ac:rich-text-body>'
+        '</ac:structured-macro>'
+        '</div>'
+    )
 
 
 def render_confluence_html(
@@ -2732,22 +2839,22 @@ def render_confluence_html(
     generated_at: datetime,
 ) -> str:
     parts = [
-        '<div style="background-color:#172B4D;border-radius:12px;'
-        'color:#FFFFFF;margin-bottom:14px;padding:20px 22px;">',
-        '<div style="color:#79F2C0;font-size:12px;font-weight:bold;'
-        'letter-spacing:.08em;text-transform:uppercase;">Quality Radar</div>',
-        '<div style="font-size:25px;font-weight:bold;margin-top:5px;">'
-        "Качество релизов команд · квартал и 90 дней</div>",
-        '<div style="color:#B3D4FF;font-size:13px;margin-top:7px;">'
-        "Story из установленных на ПРОМ релизов · критичные PSI/ПРОМ-баги, "
-        "заведённые в Jira-пространствах команд</div>",
+        '<div style="background-color:#172B4D;border-left:7px solid #36B37E;'
+        'border-radius:10px;color:#FFFFFF;margin-bottom:16px;padding:18px 20px;">',
+        '<div style="color:#FFFFFF;font-size:25px;font-weight:bold;">'
+        "Качество релизов</div>",
+        '<div style="color:#B3D4FF;font-size:13px;margin-top:5px;">'
+        "Коротко о главном: текущий квартал и последние 90 дней</div>",
+        '<div style="color:#79F2C0;font-size:11px;margin-top:9px;">'
+        'Факт = баги / Story &nbsp;·&nbsp; 100% и выше — цель выполнена '
+        '&nbsp;·&nbsp; Обновлено '
+        f"{html.escape(generated_at.strftime('%d.%m.%Y %H:%M'))}</div>",
         "</div>",
         render_metric_section_html(
             quarter_metrics,
             title=f"Текущий квартал · {quarter_start.year} Q{quarter}",
             start=quarter_start,
             end=quarter_end,
-            as_of=generated_at.date(),
             release_count=quarter_release_count,
             hotfix_count=quarter_hotfix_count,
             accent="#6554C0",
@@ -2757,33 +2864,20 @@ def render_confluence_html(
             title="Последние 90 дней",
             start=rolling_start,
             end=rolling_end,
-            as_of=generated_at.date(),
             release_count=rolling_release_count,
             hotfix_count=rolling_hotfix_count,
             accent="#0052CC",
         ),
-        '<div style="background-color:#F4F5F7;border-radius:7px;color:#5E6C84;'
-        'font-size:12px;margin-top:14px;padding:11px 13px;">',
-        "В баги входят заведённые за отчётный период в Jira-проектах команд "
-        "задачи типа Bug в любом статусе, кроме «Отклонен исполнителем», "
-        "с приоритетом "
-        "Critical/Crytical, Blocker, Высокий или Блокирующий "
-        "и этапом обнаружения PSI/ПСИ или PROM/ПРОМ в истории задачи. "
-        "Поэтому последующее изменение ПРОМ на другое значение не исключает "
-        "баг из метрики. "
-        "Story учитывается только из consist of релиза, установленного на ПРОМ "
-        "в том же отчётном периоде, если текущий статус Story — Done; "
-        "собственная resolutiondate Story границы периода не задаёт. "
-        "Для совпадения с корпоративной квартальной выгрузкой Story ночного "
-        "batch последнего дня предыдущего квартала относятся к новому кварталу. "
-        "Выполнение и Story до цели считаются по «Цели 2026». "
-        "Коэффициент лимита дефектов = max(Цель 2026; AS IS × 0,8). "
-        "Лимит дефектов = floor(коэффициент лимита × Story). "
-        "«Ещё ПРОМ-багов» — целый запас до этого лимита; «Story до цели» — "
-        "минимальное число дополнительных Story для возвращения к 100%.",
-        f"<br/>Обновлено автоматически: "
-        f"{html.escape(generated_at.isoformat(timespec='seconds'))}.",
-        "</div>",
+        render_hidden_issue_details(
+            rolling_metrics=rolling_metrics,
+            quarter_metrics=quarter_metrics,
+            rolling_start=rolling_start,
+            rolling_end=rolling_end,
+            quarter_start=quarter_start,
+            quarter_end=quarter_end,
+            quarter=quarter,
+            generated_at=generated_at,
+        ),
     ]
     return "".join(parts)
 
