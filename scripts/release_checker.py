@@ -77,8 +77,10 @@ ALLOWED_TESTERS = {
     "Чиж Мария Михайловна", "Синица Захар Алексеевич", "Абдулгалимов Гамзат Абусуньянович"
 }
 WORKLOG_EXEMPT_COMMENT_AUTHORS = {
+    "Метляев Игорь Андреевич",
     "Никонов Александр Алексеевич",
 }
+WORKLOG_EXEMPT_EXCLUDED_PROJECTS = {"HRC"}
 
 # Статус ТК, который считается утверждённым (Approved)
 ZEPHYR_APPROVED_STATUS = "Approved"
@@ -2923,6 +2925,23 @@ class ReleaseValidator:
             return author_obj.name
         return str(author_obj)
 
+    @staticmethod
+    def _issue_project_key(issue: object) -> str:
+        issue_key = str(getattr(issue, 'key', '') or '').strip().upper()
+        if '-' in issue_key:
+            return issue_key.split('-', 1)[0]
+        return ''
+
+    @staticmethod
+    def _is_worklog_exempt_comment_author(author_name: str, project_key: str) -> bool:
+        if project_key.strip().upper() in WORKLOG_EXEMPT_EXCLUDED_PROJECTS:
+            return False
+        author_normalized = normalize_field_text(author_name).casefold()
+        return author_normalized in {
+            normalize_field_text(author).casefold()
+            for author in WORKLOG_EXEMPT_COMMENT_AUTHORS
+        }
+
     def _get_tester_worklog_authors(self, issue: object) -> set[str]:
         """Возвращает множество тестировщиков со списанием времени > 0 в задаче."""
         authors: set[str] = set()
@@ -3003,16 +3022,16 @@ class ReleaseValidator:
         for artifact_key in artifact_keys:
             try:
                 artifact = self.jira_main.issue(artifact_key)
+                artifact_project = self._issue_project_key(artifact)
                 comments = self.jira_main.comments(artifact.key)
                 comment_authors: set[str] = set()
                 worklog_required_comment_authors: set[str] = set()
-                worklog_exempt_authors_normalized = {
-                    normalize_field_text(author).casefold()
-                    for author in WORKLOG_EXEMPT_COMMENT_AUTHORS
-                }
                 for comment in comments:
                     author_name = self._get_author_name(comment.author)
-                    is_exempt_author = normalize_field_text(author_name).casefold() in worklog_exempt_authors_normalized
+                    is_exempt_author = self._is_worklog_exempt_comment_author(
+                        author_name,
+                        artifact_project,
+                    )
                     if is_allowed_tester(author_name) or is_exempt_author:
                         comment_authors.add(author_name)
                     if is_allowed_tester(author_name) and not is_exempt_author:
