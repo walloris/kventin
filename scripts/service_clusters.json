@@ -1,0 +1,2042 @@
+[
+  {
+    "serviceId": "10132339",
+    "cluster": "Базовые сервисы платформы / Пульс каркас",
+    "service": "ConfigPVSDebugLogs"
+  },
+  {
+    "serviceId": "10322115",
+    "cluster": "Базовые сервисы платформы / Пульс каркас",
+    "service": "ConfigPVSBusinessLog"
+  },
+  {
+    "serviceId": "12098618",
+    "cluster": "Базовые сервисы платформы / Пульс каркас",
+    "service": "ConfigPVSAPIGateway"
+  },
+  {
+    "serviceId": "12573486",
+    "cluster": "Базовые сервисы платформы / Пульс каркас",
+    "service": "SmartSpeechAdapter"
+  },
+  {
+    "serviceId": "12619952",
+    "cluster": "Базовые сервисы платформы / Пульс каркас",
+    "service": "HRP.DSS"
+  },
+  {
+    "serviceId": "14538405",
+    "cluster": "Базовые сервисы платформы / Пульс каркас",
+    "service": "FileGenerator"
+  },
+  {
+    "serviceId": "14641441",
+    "cluster": "Базовые сервисы платформы / Пульс каркас",
+    "service": "CompanyWizard"
+  },
+  {
+    "serviceId": "2137112",
+    "cluster": "Базовые сервисы платформы / Пульс каркас",
+    "service": "OrgStructure"
+  },
+  {
+    "serviceId": "2137115",
+    "cluster": "Базовые сервисы платформы / Пульс каркас",
+    "service": "PersonProfile"
+  },
+  {
+    "serviceId": "2159511",
+    "cluster": "Базовые сервисы платформы / Пульс каркас",
+    "service": "Authorization"
+  },
+  {
+    "serviceId": "2229085",
+    "cluster": "Базовые сервисы платформы / Пульс каркас",
+    "service": "ContentStorage"
+  },
+  {
+    "serviceId": "2484880",
+    "cluster": "Базовые сервисы платформы / Пульс каркас",
+    "service": "HRP.PersonifiedBackConnector (Интеграция с ЕАСУП по SAML2)"
+  },
+  {
+    "serviceId": "2599010",
+    "cluster": "Базовые сервисы платформы / Пульс каркас",
+    "service": "HRP: LocalList (Локальные справочники)"
+  },
+  {
+    "serviceId": "2792102",
+    "cluster": "Базовые сервисы платформы / Пульс каркас",
+    "service": "HRP.TechBackConnector (Интеграционный коннектор Пульс-ЕАСУП)"
+  },
+  {
+    "serviceId": "3064108",
+    "cluster": "Базовые сервисы платформы / Пульс каркас",
+    "service": "ConfigManager"
+  },
+  {
+    "serviceId": "3266000",
+    "cluster": "Базовые сервисы платформы / Пульс каркас",
+    "service": "HRP.IntegrationTransformationServices (Сервисы трансформации и интеграции)"
+  },
+  {
+    "serviceId": "3427185",
+    "cluster": "Базовые сервисы платформы / Пульс каркас",
+    "service": "SignService"
+  },
+  {
+    "serviceId": "3504806",
+    "cluster": "Базовые сервисы платформы / Пульс каркас",
+    "service": "BPMSAdapters"
+  },
+  {
+    "serviceId": "4064113",
+    "cluster": "Базовые сервисы платформы / Пульс каркас",
+    "service": "DataSync"
+  },
+  {
+    "serviceId": "4262898",
+    "cluster": "Базовые сервисы платформы / Пульс каркас",
+    "service": "HRP.Delegation"
+  },
+  {
+    "serviceId": "4420588",
+    "cluster": "Базовые сервисы платформы / Пульс каркас",
+    "service": "HRSystemBackConnector"
+  },
+  {
+    "serviceId": "4783174",
+    "cluster": "Базовые сервисы платформы / Пульс каркас",
+    "service": "ConfigManagerApp"
+  },
+  {
+    "serviceId": "5255333",
+    "cluster": "Базовые сервисы платформы / Пульс каркас",
+    "service": "HCMAdapters"
+  },
+  {
+    "serviceId": "5414745",
+    "cluster": "Базовые сервисы платформы / Пульс каркас",
+    "service": "HRP.IdMapper(Сервис хранения Id)"
+  },
+  {
+    "serviceId": "5444473",
+    "cluster": "Базовые сервисы платформы / Пульс каркас",
+    "service": "AIGateway"
+  },
+  {
+    "serviceId": "7043999",
+    "cluster": "Базовые сервисы платформы / Пульс каркас",
+    "service": "PayScale"
+  },
+  {
+    "serviceId": "7546332",
+    "cluster": "Базовые сервисы платформы / Пульс каркас",
+    "service": "CompanyManagerAgent"
+  },
+  {
+    "serviceId": "7639845",
+    "cluster": "Базовые сервисы платформы / Пульс каркас",
+    "service": "Integration-TFS"
+  },
+  {
+    "serviceId": "7735485",
+    "cluster": "Базовые сервисы платформы / Пульс каркас",
+    "service": "DLPBridge"
+  },
+  {
+    "serviceId": "7948983",
+    "cluster": "Базовые сервисы платформы / Пульс каркас",
+    "service": "DebugLogs (Журналирование Debug-логов)"
+  },
+  {
+    "serviceId": "7949012",
+    "cluster": "Базовые сервисы платформы / Пульс каркас",
+    "service": "BusinessLogs (Журнал изменений бизнес-данных)"
+  },
+  {
+    "serviceId": "8077069",
+    "cluster": "Базовые сервисы платформы / Пульс каркас",
+    "service": "ServiceLogs"
+  },
+  {
+    "serviceId": "8412160",
+    "cluster": "Базовые сервисы платформы / Пульс каркас",
+    "service": "SpineAddress"
+  },
+  {
+    "serviceId": "8444777",
+    "cluster": "Базовые сервисы платформы / Пульс каркас",
+    "service": "APIGateway"
+  },
+  {
+    "serviceId": "8507227",
+    "cluster": "Базовые сервисы платформы / Пульс каркас",
+    "service": "HumanProfile"
+  },
+  {
+    "serviceId": "9168919",
+    "cluster": "Базовые сервисы платформы / Пульс каркас",
+    "service": "IDP OCR Adapter"
+  },
+  {
+    "serviceId": "9472870",
+    "cluster": "Базовые сервисы платформы / Пульс каркас",
+    "service": "IDP Adapter"
+  },
+  {
+    "serviceId": "9805733",
+    "cluster": "Базовые сервисы платформы / Пульс каркас",
+    "service": "spine-apim-rest-api"
+  },
+  {
+    "serviceId": "9978175",
+    "cluster": "Базовые сервисы платформы / Пульс каркас",
+    "service": "EPKAdapter"
+  },
+  {
+    "serviceId": "9980426",
+    "cluster": "Базовые сервисы платформы / Пульс каркас",
+    "service": "PeopleProfile"
+  },
+  {
+    "serviceId": "10123849",
+    "cluster": "Мотивация / Мотивация и забота",
+    "service": "MySalesKPI"
+  },
+  {
+    "serviceId": "11067936",
+    "cluster": "Мотивация / Мотивация и забота",
+    "service": "LifeCase"
+  },
+  {
+    "serviceId": "14448007",
+    "cluster": "Мотивация / Мотивация и забота",
+    "service": "SkillSet"
+  },
+  {
+    "serviceId": "14870130",
+    "cluster": "Мотивация / Мотивация и забота",
+    "service": "Viewer.Motivation"
+  },
+  {
+    "serviceId": "14898261",
+    "cluster": "Мотивация / Мотивация и забота",
+    "service": "CheckinsAgent"
+  },
+  {
+    "serviceId": "2431371",
+    "cluster": "Мотивация / Мотивация и забота",
+    "service": "JobProfile"
+  },
+  {
+    "serviceId": "2649588",
+    "cluster": "Мотивация / Мотивация и забота",
+    "service": "PerformanceManagementReviewFromSAP"
+  },
+  {
+    "serviceId": "2852791",
+    "cluster": "Мотивация / Мотивация и забота",
+    "service": "RTFValues"
+  },
+  {
+    "serviceId": "2875472",
+    "cluster": "Мотивация / Мотивация и забота",
+    "service": "Sales&KPI"
+  },
+  {
+    "serviceId": "3092618",
+    "cluster": "Мотивация / Мотивация и забота",
+    "service": "PerformanceReview"
+  },
+  {
+    "serviceId": "3531658",
+    "cluster": "Мотивация / Мотивация и забота",
+    "service": "SAPLegacyLauncher"
+  },
+  {
+    "serviceId": "4123157",
+    "cluster": "Мотивация / Мотивация и забота",
+    "service": "CloudPDForum"
+  },
+  {
+    "serviceId": "4830725",
+    "cluster": "Мотивация / Мотивация и забота",
+    "service": "PerformanceData"
+  },
+  {
+    "serviceId": "6119378",
+    "cluster": "Мотивация / Мотивация и забота",
+    "service": "HRP.YBonus"
+  },
+  {
+    "serviceId": "6384191",
+    "cluster": "Мотивация / Мотивация и забота",
+    "service": "PerformanceAssistant"
+  },
+  {
+    "serviceId": "8249175",
+    "cluster": "Мотивация / Мотивация и забота",
+    "service": "LTI"
+  },
+  {
+    "serviceId": "9358246",
+    "cluster": "Мотивация / Мотивация и забота",
+    "service": "PerformanceCheckins"
+  },
+  {
+    "serviceId": "9828137",
+    "cluster": "Мотивация / Мотивация и забота",
+    "service": "BonusAgent"
+  },
+  {
+    "serviceId": "10690149",
+    "cluster": "Каркас / Пульс-Каркас",
+    "service": "AI.Experiments"
+  },
+  {
+    "serviceId": "10743713",
+    "cluster": "Каркас / Пульс-Каркас",
+    "service": "Agent.DA.HR.BAC"
+  },
+  {
+    "serviceId": "12558489",
+    "cluster": "Каркас / Пульс-Каркас",
+    "service": "WSGateway"
+  },
+  {
+    "serviceId": "15118343",
+    "cluster": "Каркас / Пульс-Каркас",
+    "service": "ConfigPVSSearch"
+  },
+  {
+    "serviceId": "2257817",
+    "cluster": "Каркас / Пульс-Каркас",
+    "service": "Notification"
+  },
+  {
+    "serviceId": "2257858",
+    "cluster": "Каркас / Пульс-Каркас",
+    "service": "HRP.IOS (Мобильное приложение)"
+  },
+  {
+    "serviceId": "2288712",
+    "cluster": "Каркас / Пульс-Каркас",
+    "service": "HRP.Search"
+  },
+  {
+    "serviceId": "2295205",
+    "cluster": "Каркас / Пульс-Каркас",
+    "service": "SmartProfile"
+  },
+  {
+    "serviceId": "2298078",
+    "cluster": "Каркас / Пульс-Каркас",
+    "service": "HRP.Events (Маршрутизация событий)"
+  },
+  {
+    "serviceId": "2298599",
+    "cluster": "Каркас / Пульс-Каркас",
+    "service": "HRP.CoreUI (Общие сервисы для веб и мобильных приложений)"
+  },
+  {
+    "serviceId": "2503797",
+    "cluster": "Каркас / Пульс-Каркас",
+    "service": "DA.HR-Assistant"
+  },
+  {
+    "serviceId": "2644268",
+    "cluster": "Каркас / Пульс-Каркас",
+    "service": "PerfTracker"
+  },
+  {
+    "serviceId": "2799892",
+    "cluster": "Каркас / Пульс-Каркас",
+    "service": "FrontendCoreTech"
+  },
+  {
+    "serviceId": "2935717",
+    "cluster": "Каркас / Пульс-Каркас",
+    "service": "HRP.Android (Мобильное приложение)"
+  },
+  {
+    "serviceId": "3191860",
+    "cluster": "Каркас / Пульс-Каркас",
+    "service": "HRP.LandingBuilder"
+  },
+  {
+    "serviceId": "3303802",
+    "cluster": "Каркас / Пульс-Каркас",
+    "service": "HRP.CoreUI-Dates (Сервис Важных событий пользователя)"
+  },
+  {
+    "serviceId": "3304476",
+    "cluster": "Каркас / Пульс-Каркас",
+    "service": "HRP.CoreUI-Posts (Сервис постов пользователя)"
+  },
+  {
+    "serviceId": "3521872",
+    "cluster": "Каркас / Пульс-Каркас",
+    "service": "HRP.iOS МП.МП-iPAD"
+  },
+  {
+    "serviceId": "3589425",
+    "cluster": "Каркас / Пульс-Каркас",
+    "service": "HRP.CoreUI-Admin"
+  },
+  {
+    "serviceId": "3930742",
+    "cluster": "Каркас / Пульс-Каркас",
+    "service": "HRHandlers"
+  },
+  {
+    "serviceId": "5374387",
+    "cluster": "Каркас / Пульс-Каркас",
+    "service": "HRP.Analytics-Pulsometer (Сбор и обработка событий продуктовой аналитики)"
+  },
+  {
+    "serviceId": "5452082",
+    "cluster": "Каркас / Пульс-Каркас",
+    "service": "HRP.CoreUI-Launchpad (сервис списка приложений)"
+  },
+  {
+    "serviceId": "5452083",
+    "cluster": "Каркас / Пульс-Каркас",
+    "service": "HRP.CoreUI-Support (сервис поддержки)"
+  },
+  {
+    "serviceId": "5452084",
+    "cluster": "Каркас / Пульс-Каркас",
+    "service": "HRP.CoreUI-Configurator (технический сервис)"
+  },
+  {
+    "serviceId": "5452085",
+    "cluster": "Каркас / Пульс-Каркас",
+    "service": "HRP.CoreUI-GlobalSearch (сервис поиска)"
+  },
+  {
+    "serviceId": "6355438",
+    "cluster": "Каркас / Пульс-Каркас",
+    "service": "SberTab"
+  },
+  {
+    "serviceId": "7993288",
+    "cluster": "Каркас / Пульс-Каркас",
+    "service": "CoreTech (Технологические компоненты фронт)"
+  },
+  {
+    "serviceId": "8077298",
+    "cluster": "Каркас / Пульс-Каркас",
+    "service": "HRP.CoreUI-Widget-search"
+  },
+  {
+    "serviceId": "8553253",
+    "cluster": "Каркас / Пульс-Каркас",
+    "service": "HumanSmartProfile"
+  },
+  {
+    "serviceId": "9643401",
+    "cluster": "Каркас / Пульс-Каркас",
+    "service": "NeuroSearchBar (Строка поиска)"
+  },
+  {
+    "serviceId": "9644020",
+    "cluster": "Каркас / Пульс-Каркас",
+    "service": "HRP.CoreUI-Neuro (Сервис роутинга и отрисовки AI главной страницы)"
+  },
+  {
+    "serviceId": "9644023",
+    "cluster": "Каркас / Пульс-Каркас",
+    "service": "WidgetCreator (Создание виджетов онлайн и оффлайн)"
+  },
+  {
+    "serviceId": "9644025",
+    "cluster": "Каркас / Пульс-Каркас",
+    "service": "WidgetLake (Хранение виджетов Пульс)"
+  },
+  {
+    "serviceId": "14447962",
+    "cluster": "Обучение / Обучение",
+    "service": "SkillCore"
+  },
+  {
+    "serviceId": "15112079",
+    "cluster": "Обучение / Обучение",
+    "service": "PeopleActivities"
+  },
+  {
+    "serviceId": "2243902",
+    "cluster": "Обучение / Обучение",
+    "service": "xAPI"
+  },
+  {
+    "serviceId": "2298102",
+    "cluster": "Обучение / Обучение",
+    "service": "AssignmentCore"
+  },
+  {
+    "serviceId": "2424634",
+    "cluster": "Обучение / Обучение",
+    "service": "LearningCatalog"
+  },
+  {
+    "serviceId": "2425117",
+    "cluster": "Обучение / Обучение",
+    "service": "PlaylistBuilder"
+  },
+  {
+    "serviceId": "2425423",
+    "cluster": "Обучение / Обучение",
+    "service": "MediaEditor"
+  },
+  {
+    "serviceId": "2425974",
+    "cluster": "Обучение / Обучение",
+    "service": "SpineFeed"
+  },
+  {
+    "serviceId": "2427679",
+    "cluster": "Обучение / Обучение",
+    "service": "OnSiteActivities"
+  },
+  {
+    "serviceId": "2435396",
+    "cluster": "Обучение / Обучение",
+    "service": "Assessment"
+  },
+  {
+    "serviceId": "2453280",
+    "cluster": "Обучение / Обучение",
+    "service": "Assignment.Rules"
+  },
+  {
+    "serviceId": "2561726",
+    "cluster": "Обучение / Обучение",
+    "service": "Модель рекомендаций обучения"
+  },
+  {
+    "serviceId": "2692243",
+    "cluster": "Обучение / Обучение",
+    "service": "LearningHistory"
+  },
+  {
+    "serviceId": "2945513",
+    "cluster": "Обучение / Обучение",
+    "service": "Marathon"
+  },
+  {
+    "serviceId": "3077037",
+    "cluster": "Обучение / Обучение",
+    "service": "LearningTaskReview"
+  },
+  {
+    "serviceId": "3092298",
+    "cluster": "Обучение / Обучение",
+    "service": "LearningStreams"
+  },
+  {
+    "serviceId": "3921604",
+    "cluster": "Обучение / Обучение",
+    "service": "CourseCreator"
+  },
+  {
+    "serviceId": "4265540",
+    "cluster": "Обучение / Обучение",
+    "service": "HRP.LearningBudget"
+  },
+  {
+    "serviceId": "4386656",
+    "cluster": "Обучение / Обучение",
+    "service": "LPS"
+  },
+  {
+    "serviceId": "5015750",
+    "cluster": "Обучение / Обучение",
+    "service": "LearningReader"
+  },
+  {
+    "serviceId": "5152054",
+    "cluster": "Обучение / Обучение",
+    "service": "LearningBICloud"
+  },
+  {
+    "serviceId": "5707580",
+    "cluster": "Обучение / Обучение",
+    "service": "LearningControlPanel"
+  },
+  {
+    "serviceId": "8693296",
+    "cluster": "Обучение / Обучение",
+    "service": "ActivitiesPoster"
+  },
+  {
+    "serviceId": "9336469",
+    "cluster": "Обучение / Обучение",
+    "service": "Peer2Peer"
+  },
+  {
+    "serviceId": "9681132",
+    "cluster": "Обучение / Обучение",
+    "service": "Tagging"
+  },
+  {
+    "serviceId": "9681137",
+    "cluster": "Обучение / Обучение",
+    "service": "CatalogAICore"
+  },
+  {
+    "serviceId": "9898177",
+    "cluster": "Обучение / Обучение",
+    "service": "LearningCollections"
+  },
+  {
+    "serviceId": "9935931",
+    "cluster": "Обучение / Обучение",
+    "service": "LearningHelper"
+  },
+  {
+    "serviceId": "9935936",
+    "cluster": "Обучение / Обучение",
+    "service": "LearningAiCourseGeneration"
+  },
+  {
+    "serviceId": "11228674",
+    "cluster": "Исследование и аналитика / Исследование и аналитика",
+    "service": "DataPlatform-Compute"
+  },
+  {
+    "serviceId": "12061763",
+    "cluster": "Исследование и аналитика / Исследование и аналитика",
+    "service": "DataPlatform-DataCatalog"
+  },
+  {
+    "serviceId": "13416033",
+    "cluster": "Исследование и аналитика / Исследование и аналитика",
+    "service": "DataPlatform-Heimdall"
+  },
+  {
+    "serviceId": "14638855",
+    "cluster": "Исследование и аналитика / Исследование и аналитика",
+    "service": "DataPlatform-MemAI"
+  },
+  {
+    "serviceId": "15006062",
+    "cluster": "Исследование и аналитика / Исследование и аналитика",
+    "service": "DataPlatform-BI"
+  },
+  {
+    "serviceId": "15419382",
+    "cluster": "Исследование и аналитика / Исследование и аналитика",
+    "service": "ConfigPVSDataCatalog"
+  },
+  {
+    "serviceId": "2420667",
+    "cluster": "Исследование и аналитика / Исследование и аналитика",
+    "service": "DataLab"
+  },
+  {
+    "serviceId": "2435236",
+    "cluster": "Исследование и аналитика / Исследование и аналитика",
+    "service": "Analytics"
+  },
+  {
+    "serviceId": "2887531",
+    "cluster": "Исследование и аналитика / Исследование и аналитика",
+    "service": "Datalab-ETL"
+  },
+  {
+    "serviceId": "3072563",
+    "cluster": "Исследование и аналитика / Исследование и аналитика",
+    "service": "Datalab-Bootstrap"
+  },
+  {
+    "serviceId": "3304474",
+    "cluster": "Исследование и аналитика / Исследование и аналитика",
+    "service": "HRP.DataLab-Bootstrap-Ansible (Обновления скриптов ВМ)"
+  },
+  {
+    "serviceId": "3639631",
+    "cluster": "Исследование и аналитика / Исследование и аналитика",
+    "service": "Дашборд Эффективности"
+  },
+  {
+    "serviceId": "3918956",
+    "cluster": "Исследование и аналитика / Исследование и аналитика",
+    "service": "Widgets"
+  },
+  {
+    "serviceId": "4731180",
+    "cluster": "Исследование и аналитика / Исследование и аналитика",
+    "service": "DataLab-APIs"
+  },
+  {
+    "serviceId": "5147861",
+    "cluster": "Исследование и аналитика / Исследование и аналитика",
+    "service": "BI Dashboards"
+  },
+  {
+    "serviceId": "5147863",
+    "cluster": "Исследование и аналитика / Исследование и аналитика",
+    "service": "BI Superset"
+  },
+  {
+    "serviceId": "6536527",
+    "cluster": "Исследование и аналитика / Исследование и аналитика",
+    "service": "Analytics-Insights"
+  },
+  {
+    "serviceId": "6884356",
+    "cluster": "Исследование и аналитика / Исследование и аналитика",
+    "service": "DataPlatform-DAGs-Cloud"
+  },
+  {
+    "serviceId": "6920388",
+    "cluster": "Исследование и аналитика / Исследование и аналитика",
+    "service": "Analytics-Registry"
+  },
+  {
+    "serviceId": "6920434",
+    "cluster": "Исследование и аналитика / Исследование и аналитика",
+    "service": "Analytics-Metrics"
+  },
+  {
+    "serviceId": "6932742",
+    "cluster": "Исследование и аналитика / Исследование и аналитика",
+    "service": "DataPlatform-ETL"
+  },
+  {
+    "serviceId": "6932748",
+    "cluster": "Исследование и аналитика / Исследование и аналитика",
+    "service": "DataPlatform-DAGs"
+  },
+  {
+    "serviceId": "7523815",
+    "cluster": "Исследование и аналитика / Исследование и аналитика",
+    "service": "DataLab-Stream"
+  },
+  {
+    "serviceId": "7523819",
+    "cluster": "Исследование и аналитика / Исследование и аналитика",
+    "service": "DataLab-QuerySet"
+  },
+  {
+    "serviceId": "7827244",
+    "cluster": "Исследование и аналитика / Исследование и аналитика",
+    "service": "DataPlatform-CDC"
+  },
+  {
+    "serviceId": "7976148",
+    "cluster": "Исследование и аналитика / Исследование и аналитика",
+    "service": "BI Viewer. Superset"
+  },
+  {
+    "serviceId": "8504373",
+    "cluster": "Исследование и аналитика / Исследование и аналитика",
+    "service": "AI ML Framework"
+  },
+  {
+    "serviceId": "9362600",
+    "cluster": "Исследование и аналитика / Исследование и аналитика",
+    "service": "Analytics Agent"
+  },
+  {
+    "serviceId": "9535069",
+    "cluster": "Исследование и аналитика / Исследование и аналитика",
+    "service": "DataPlatform-ML"
+  },
+  {
+    "serviceId": "10035373",
+    "cluster": "PROкадры / Пульс ядро",
+    "service": "PowerOfAttorney"
+  },
+  {
+    "serviceId": "10665209",
+    "cluster": "PROкадры / Пульс ядро",
+    "service": "AgentTeam"
+  },
+  {
+    "serviceId": "11037417",
+    "cluster": "PROкадры / Пульс ядро",
+    "service": "DisciplinaryAction"
+  },
+  {
+    "serviceId": "13121815",
+    "cluster": "PROкадры / Пульс ядро",
+    "service": "JobDescriptionMain"
+  },
+  {
+    "serviceId": "14058486",
+    "cluster": "PROкадры / Пульс ядро",
+    "service": "DocumentConverter"
+  },
+  {
+    "serviceId": "14229171",
+    "cluster": "PROкадры / Пульс ядро",
+    "service": "Redundancy"
+  },
+  {
+    "serviceId": "14229187",
+    "cluster": "PROкадры / Пульс ядро",
+    "service": "NullificationContract"
+  },
+  {
+    "serviceId": "14679042",
+    "cluster": "PROкадры / Пульс ядро",
+    "service": "StopFixed-termContract"
+  },
+  {
+    "serviceId": "2517090",
+    "cluster": "PROкадры / Пульс ядро",
+    "service": "HRP.HR-services (Кадровые сервисы)"
+  },
+  {
+    "serviceId": "2875790",
+    "cluster": "PROкадры / Пульс ядро",
+    "service": "HRP.Team schedule (Управление временем команды)"
+  },
+  {
+    "serviceId": "2993681",
+    "cluster": "PROкадры / Пульс ядро",
+    "service": "JobDescription"
+  },
+  {
+    "serviceId": "3191884",
+    "cluster": "PROкадры / Пульс ядро",
+    "service": "Dismiss"
+  },
+  {
+    "serviceId": "3265866",
+    "cluster": "PROкадры / Пульс ядро",
+    "service": "HRP.PersonConsents.PD (Управление согласиями на обработку персональных данных)"
+  },
+  {
+    "serviceId": "3457038",
+    "cluster": "PROкадры / Пульс ядро",
+    "service": "PersonalData"
+  },
+  {
+    "serviceId": "3746927",
+    "cluster": "PROкадры / Пульс ядро",
+    "service": "ITContractors"
+  },
+  {
+    "serviceId": "3925447",
+    "cluster": "PROкадры / Пульс ядро",
+    "service": "Подбор"
+  },
+  {
+    "serviceId": "3925448",
+    "cluster": "PROкадры / Пульс ядро",
+    "service": "Команда"
+  },
+  {
+    "serviceId": "4083646",
+    "cluster": "PROкадры / Пульс ядро",
+    "service": "HireAndFire"
+  },
+  {
+    "serviceId": "4187438",
+    "cluster": "PROкадры / Пульс ядро",
+    "service": "CloudServiceOrder"
+  },
+  {
+    "serviceId": "5255459",
+    "cluster": "PROкадры / Пульс ядро",
+    "service": "ДГПХ (SAP)"
+  },
+  {
+    "serviceId": "5301506",
+    "cluster": "PROкадры / Пульс ядро",
+    "service": "NewComerAccess"
+  },
+  {
+    "serviceId": "5347979",
+    "cluster": "PROкадры / Пульс ядро",
+    "service": "EmployeeMain-Wf"
+  },
+  {
+    "serviceId": "7011284",
+    "cluster": "PROкадры / Пульс ядро",
+    "service": "Hire (Приём)"
+  },
+  {
+    "serviceId": "7011305",
+    "cluster": "PROкадры / Пульс ядро",
+    "service": "HRP.Transfer"
+  },
+  {
+    "serviceId": "7011307",
+    "cluster": "PROкадры / Пульс ядро",
+    "service": "Dismissal"
+  },
+  {
+    "serviceId": "7517078",
+    "cluster": "PROкадры / Пульс ядро",
+    "service": "Team"
+  },
+  {
+    "serviceId": "8210876",
+    "cluster": "PROкадры / Пульс ядро",
+    "service": "Hire-rules"
+  },
+  {
+    "serviceId": "8249047",
+    "cluster": "PROкадры / Пульс ядро",
+    "service": "HireGPH"
+  },
+  {
+    "serviceId": "8425585",
+    "cluster": "PROкадры / Пульс ядро",
+    "service": "Viewer.My-team.Team"
+  },
+  {
+    "serviceId": "8475829",
+    "cluster": "PROкадры / Пульс ядро",
+    "service": "Fire-rules"
+  },
+  {
+    "serviceId": "8475969",
+    "cluster": "PROкадры / Пульс ядро",
+    "service": "Contractors"
+  },
+  {
+    "serviceId": "8485956",
+    "cluster": "PROкадры / Пульс ядро",
+    "service": "DocumentConstructorMain (конструктор документов)"
+  },
+  {
+    "serviceId": "8487869",
+    "cluster": "PROкадры / Пульс ядро",
+    "service": "CloudTeam"
+  },
+  {
+    "serviceId": "8837544",
+    "cluster": "PROкадры / Пульс ядро",
+    "service": "PersonalReportsOrder (Заказ справок по сотруднику)"
+  },
+  {
+    "serviceId": "8837587",
+    "cluster": "PROкадры / Пульс ядро",
+    "service": "ReportsEmployee (Справки кадровые)"
+  },
+  {
+    "serviceId": "9738044",
+    "cluster": "PROкадры / Пульс ядро",
+    "service": "PersonConsentsExtendedForm"
+  },
+  {
+    "serviceId": "9857471",
+    "cluster": "PROкадры / Пульс ядро",
+    "service": "AgentReportsEmployee (Агент справок кадровых)"
+  },
+  {
+    "serviceId": "10873994",
+    "cluster": "Подбор и перемещения / Подбор и перемещения",
+    "service": "AgentCareerAssistant"
+  },
+  {
+    "serviceId": "11614515",
+    "cluster": "Подбор и перемещения / Подбор и перемещения",
+    "service": "Recruitment.CandidateSearch"
+  },
+  {
+    "serviceId": "11829435",
+    "cluster": "Подбор и перемещения / Подбор и перемещения",
+    "service": "Recruitment.TelegramBot"
+  },
+  {
+    "serviceId": "11829437",
+    "cluster": "Подбор и перемещения / Подбор и перемещения",
+    "service": "Agent.Screener"
+  },
+  {
+    "serviceId": "11829477",
+    "cluster": "Подбор и перемещения / Подбор и перемещения",
+    "service": "Recruitment.SberChatBot"
+  },
+  {
+    "serviceId": "11947283",
+    "cluster": "Подбор и перемещения / Подбор и перемещения",
+    "service": "Recruitment.Referral"
+  },
+  {
+    "serviceId": "12404336",
+    "cluster": "Подбор и перемещения / Подбор и перемещения",
+    "service": "Recruitment.Sourcing"
+  },
+  {
+    "serviceId": "14229229",
+    "cluster": "Подбор и перемещения / Подбор и перемещения",
+    "service": "Recruitment.Screener"
+  },
+  {
+    "serviceId": "14229262",
+    "cluster": "Подбор и перемещения / Подбор и перемещения",
+    "service": "Recruitment.Prescreening"
+  },
+  {
+    "serviceId": "14949500",
+    "cluster": "Подбор и перемещения / Подбор и перемещения",
+    "service": "Recruitment.MaxBot"
+  },
+  {
+    "serviceId": "2257839",
+    "cluster": "Подбор и перемещения / Подбор и перемещения",
+    "service": "HRP.RecruitingMain (Подбор персонала)"
+  },
+  {
+    "serviceId": "2591045",
+    "cluster": "Подбор и перемещения / Подбор и перемещения",
+    "service": "PersonConsents"
+  },
+  {
+    "serviceId": "2616232",
+    "cluster": "Подбор и перемещения / Подбор и перемещения",
+    "service": "CareerOpportunities"
+  },
+  {
+    "serviceId": "2903316",
+    "cluster": "Подбор и перемещения / Подбор и перемещения",
+    "service": "HRP.Scheduler"
+  },
+  {
+    "serviceId": "3658544",
+    "cluster": "Подбор и перемещения / Подбор и перемещения",
+    "service": "Модуль для взаимодействия с работными сайтами"
+  },
+  {
+    "serviceId": "4085754",
+    "cluster": "Подбор и перемещения / Подбор и перемещения",
+    "service": "Внешний кандидат"
+  },
+  {
+    "serviceId": "4110753",
+    "cluster": "Подбор и перемещения / Подбор и перемещения",
+    "service": "Recruitment.Career-portal"
+  },
+  {
+    "serviceId": "4117933",
+    "cluster": "Подбор и перемещения / Подбор и перемещения",
+    "service": "Recruitment.Business_admin"
+  },
+  {
+    "serviceId": "4183799",
+    "cluster": "Подбор и перемещения / Подбор и перемещения",
+    "service": "Onboarding"
+  },
+  {
+    "serviceId": "4199652",
+    "cluster": "Подбор и перемещения / Подбор и перемещения",
+    "service": "Recruitment.Data-Migration"
+  },
+  {
+    "serviceId": "4399443",
+    "cluster": "Подбор и перемещения / Подбор и перемещения",
+    "service": "Recruitment.Proxy-Mef"
+  },
+  {
+    "serviceId": "4399513",
+    "cluster": "Подбор и перемещения / Подбор и перемещения",
+    "service": "Recruitment.Recruiting-Main"
+  },
+  {
+    "serviceId": "4399629",
+    "cluster": "Подбор и перемещения / Подбор и перемещения",
+    "service": "Recruitment.Analytics"
+  },
+  {
+    "serviceId": "4399630",
+    "cluster": "Подбор и перемещения / Подбор и перемещения",
+    "service": "Recruitment.Internal-Candidate"
+  },
+  {
+    "serviceId": "4399631",
+    "cluster": "Подбор и перемещения / Подбор и перемещения",
+    "service": "Recruitment.Communication-Сonnector"
+  },
+  {
+    "serviceId": "4406994",
+    "cluster": "Подбор и перемещения / Подбор и перемещения",
+    "service": "Recruitment.Integration-Connectors"
+  },
+  {
+    "serviceId": "4755211",
+    "cluster": "Подбор и перемещения / Подбор и перемещения",
+    "service": "HRP.Recruitment.Publications"
+  },
+  {
+    "serviceId": "4778966",
+    "cluster": "Подбор и перемещения / Подбор и перемещения",
+    "service": "Оффер"
+  },
+  {
+    "serviceId": "5084254",
+    "cluster": "Подбор и перемещения / Подбор и перемещения",
+    "service": "Call-Registry"
+  },
+  {
+    "serviceId": "9681363",
+    "cluster": "Подбор и перемещения / Подбор и перемещения",
+    "service": "Agent.Sourcer"
+  },
+  {
+    "serviceId": "12895138",
+    "cluster": "Сопровождение / Пульс каркас",
+    "service": "AIOpsAgent-tools"
+  },
+  {
+    "serviceId": "14335719",
+    "cluster": "Сопровождение / Пульс каркас",
+    "service": "HRP.Monitoring.SecmanExporter"
+  },
+  {
+    "serviceId": "15119098",
+    "cluster": "Сопровождение / Пульс каркас",
+    "service": "ConfigPVSTechLogs"
+  },
+  {
+    "serviceId": "2230545",
+    "cluster": "Сопровождение / Пульс каркас",
+    "service": "SOWA"
+  },
+  {
+    "serviceId": "2778418",
+    "cluster": "Сопровождение / Пульс каркас",
+    "service": "BootstrapVMConfigurations"
+  },
+  {
+    "serviceId": "2795027",
+    "cluster": "Сопровождение / Пульс каркас",
+    "service": "BuildDeployConfiguration"
+  },
+  {
+    "serviceId": "2802481",
+    "cluster": "Сопровождение / Пульс каркас",
+    "service": "ClientsCertificatesManagement"
+  },
+  {
+    "serviceId": "3189741",
+    "cluster": "Сопровождение / Пульс каркас",
+    "service": "Monitoring"
+  },
+  {
+    "serviceId": "5452087",
+    "cluster": "Сопровождение / Пульс каркас",
+    "service": "VictoriaMetrics"
+  },
+  {
+    "serviceId": "5532607",
+    "cluster": "Сопровождение / Пульс каркас",
+    "service": "Blackbox"
+  },
+  {
+    "serviceId": "5548548",
+    "cluster": "Сопровождение / Пульс каркас",
+    "service": "HRP.Monitoring.Grafana"
+  },
+  {
+    "serviceId": "6579717",
+    "cluster": "Сопровождение / Пульс каркас",
+    "service": "GlobalDictionaries"
+  },
+  {
+    "serviceId": "6579750",
+    "cluster": "Сопровождение / Пульс каркас",
+    "service": "TechCompanyManager"
+  },
+  {
+    "serviceId": "7060581",
+    "cluster": "Сопровождение / Пульс каркас",
+    "service": "Миграция архивных кадровых данных (HRP)"
+  },
+  {
+    "serviceId": "7170702",
+    "cluster": "Сопровождение / Пульс каркас",
+    "service": "SRE_Service_mesh"
+  },
+  {
+    "serviceId": "7941647",
+    "cluster": "Сопровождение / Пульс каркас",
+    "service": "BootstrapVMConfigurations.RPM.Base"
+  },
+  {
+    "serviceId": "7941650",
+    "cluster": "Сопровождение / Пульс каркас",
+    "service": "BootstrapVMConfigurations.RPM.Bootstrap"
+  },
+  {
+    "serviceId": "7941653",
+    "cluster": "Сопровождение / Пульс каркас",
+    "service": "BootstrapVMConfigurations.RPM.Logs"
+  },
+  {
+    "serviceId": "7941654",
+    "cluster": "Сопровождение / Пульс каркас",
+    "service": "BootstrapVMConfigurations.RPM.SynGX"
+  },
+  {
+    "serviceId": "7947121",
+    "cluster": "Сопровождение / Пульс каркас",
+    "service": "TechLogs"
+  },
+  {
+    "serviceId": "8091425",
+    "cluster": "Сопровождение / Пульс каркас",
+    "service": "SRE Infra.SEDR"
+  },
+  {
+    "serviceId": "9803854",
+    "cluster": "Сопровождение / Пульс каркас",
+    "service": "HRP.Monitoring.VMStorage"
+  },
+  {
+    "serviceId": "9803862",
+    "cluster": "Сопровождение / Пульс каркас",
+    "service": "HRP.Monitoring.VMInsert"
+  },
+  {
+    "serviceId": "9803865",
+    "cluster": "Сопровождение / Пульс каркас",
+    "service": "HRP.Monitoring.VMSelect"
+  },
+  {
+    "serviceId": "9803886",
+    "cluster": "Сопровождение / Пульс каркас",
+    "service": "HRP.Monitoring.VMAuth"
+  },
+  {
+    "serviceId": "9806080",
+    "cluster": "Сопровождение / Пульс каркас",
+    "service": "HRP.Monitoring.VMAgent Istio"
+  },
+  {
+    "serviceId": "9806087",
+    "cluster": "Сопровождение / Пульс каркас",
+    "service": "HRP.Monitoring.VMAgent Infra"
+  },
+  {
+    "serviceId": "10003128",
+    "cluster": "Аутентификация / Пульс каркас",
+    "service": "IDS-utils"
+  },
+  {
+    "serviceId": "10141675",
+    "cluster": "Аутентификация / Пульс каркас",
+    "service": "HTTP-counter"
+  },
+  {
+    "serviceId": "2137095",
+    "cluster": "Аутентификация / Пульс каркас",
+    "service": "Authentication"
+  },
+  {
+    "serviceId": "2317743",
+    "cluster": "Аутентификация / Пульс каркас",
+    "service": "HRP.AuditBridge (Аудит)"
+  },
+  {
+    "serviceId": "2331722",
+    "cluster": "Аутентификация / Пульс каркас",
+    "service": "HRP.LoggerBridge (Журналирование)"
+  },
+  {
+    "serviceId": "2602057",
+    "cluster": "Аутентификация / Пульс каркас",
+    "service": "HRP.AuditBridge.UFS (Модуль доставки сообщений аудита в ЕФС.Аудит)"
+  },
+  {
+    "serviceId": "2626213",
+    "cluster": "Аутентификация / Пульс каркас",
+    "service": "HRP.Authentication.Proxy (Внешний прокси)"
+  },
+  {
+    "serviceId": "2626219",
+    "cluster": "Аутентификация / Пульс каркас",
+    "service": "HRP.Authentication.IDS (Аутентификатор)"
+  },
+  {
+    "serviceId": "2626227",
+    "cluster": "Аутентификация / Пульс каркас",
+    "service": "HRP.Authentication.Ingress (Внутренний прокси)"
+  },
+  {
+    "serviceId": "3784193",
+    "cluster": "Аутентификация / Пульс каркас",
+    "service": "DLP.Bridge"
+  },
+  {
+    "serviceId": "3786164",
+    "cluster": "Аутентификация / Пульс каркас",
+    "service": "HRP.Authentication.IAM-cascade"
+  },
+  {
+    "serviceId": "3798272",
+    "cluster": "Аутентификация / Пульс каркас",
+    "service": "AdminIDS"
+  },
+  {
+    "serviceId": "4639256",
+    "cluster": "Аутентификация / Пульс каркас",
+    "service": "HRP.Digital Signature Service"
+  },
+  {
+    "serviceId": "CI04646130",
+    "cluster": "Аутентификация / Пульс каркас",
+    "service": "HRP.Cloud"
+  },
+  {
+    "serviceId": "6579810",
+    "cluster": "Аутентификация / Пульс каркас",
+    "service": "SessionManager"
+  },
+  {
+    "serviceId": "6916838",
+    "cluster": "Аутентификация / Пульс каркас",
+    "service": "Ingress"
+  },
+  {
+    "serviceId": "6932103",
+    "cluster": "Аутентификация / Пульс каркас",
+    "service": "HRP.GlobalAdmin.API"
+  },
+  {
+    "serviceId": "7517741",
+    "cluster": "Аутентификация / Пульс каркас",
+    "service": "CCC.Router"
+  },
+  {
+    "serviceId": "10015140",
+    "cluster": "Кадровый базис / Пульс ядро",
+    "service": "Viewer.Payroll"
+  },
+  {
+    "serviceId": "10400826",
+    "cluster": "Кадровый базис / Пульс ядро",
+    "service": "Loader.Multipurpose1"
+  },
+  {
+    "serviceId": "10400841",
+    "cluster": "Кадровый базис / Пульс ядро",
+    "service": "Loader.Multipurpose2"
+  },
+  {
+    "serviceId": "11956483",
+    "cluster": "Кадровый базис / Пульс ядро",
+    "service": "OrgScope"
+  },
+  {
+    "serviceId": "13442551",
+    "cluster": "Кадровый базис / Пульс ядро",
+    "service": "Viewer.OrgScope"
+  },
+  {
+    "serviceId": "14399103",
+    "cluster": "Кадровый базис / Пульс ядро",
+    "service": "BusinessRoles.ChatBotAssistant"
+  },
+  {
+    "serviceId": "14872319",
+    "cluster": "Кадровый базис / Пульс ядро",
+    "service": "OtherPayees"
+  },
+  {
+    "serviceId": "15055089",
+    "cluster": "Кадровый базис / Пульс ядро",
+    "service": "Loader.Multipurpose3"
+  },
+  {
+    "serviceId": "5112909",
+    "cluster": "Кадровый базис / Пульс ядро",
+    "service": "ProcessManagement"
+  },
+  {
+    "serviceId": "5231533",
+    "cluster": "Кадровый базис / Пульс ядро",
+    "service": "EmployeeMain"
+  },
+  {
+    "serviceId": "5255449",
+    "cluster": "Кадровый базис / Пульс ядро",
+    "service": "HRP.ProcessManagement.Adapters"
+  },
+  {
+    "serviceId": "5255450",
+    "cluster": "Кадровый базис / Пульс ядро",
+    "service": "HRP.ProcessManagement.Flow"
+  },
+  {
+    "serviceId": "5337930",
+    "cluster": "Кадровый базис / Пульс ядро",
+    "service": "BusinessRoles"
+  },
+  {
+    "serviceId": "5347976",
+    "cluster": "Кадровый базис / Пульс ядро",
+    "service": "BusinessRoles.Chains"
+  },
+  {
+    "serviceId": "5347978",
+    "cluster": "Кадровый базис / Пульс ядро",
+    "service": "EmployeeMain-Data"
+  },
+  {
+    "serviceId": "5366614",
+    "cluster": "Кадровый базис / Пульс ядро",
+    "service": "HRP.EmployeeMainMain"
+  },
+  {
+    "serviceId": "5384051",
+    "cluster": "Кадровый базис / Пульс ядро",
+    "service": "HRP.EmployeeMain_back"
+  },
+  {
+    "serviceId": "5414739",
+    "cluster": "Кадровый базис / Пульс ядро",
+    "service": "HCMExchange"
+  },
+  {
+    "serviceId": "6515282",
+    "cluster": "Кадровый базис / Пульс ядро",
+    "service": "EmployeeRate_data"
+  },
+  {
+    "serviceId": "6688419",
+    "cluster": "Кадровый базис / Пульс ядро",
+    "service": "WorkTimePlanning"
+  },
+  {
+    "serviceId": "6920813",
+    "cluster": "Кадровый базис / Пульс ядро",
+    "service": "WorkTimeCalculationAndReport"
+  },
+  {
+    "serviceId": "6936595",
+    "cluster": "Кадровый базис / Пульс ядро",
+    "service": "WorkTimeCalculation"
+  },
+  {
+    "serviceId": "6937065",
+    "cluster": "Кадровый базис / Пульс ядро",
+    "service": "WorkTimeActual-data"
+  },
+  {
+    "serviceId": "7011328",
+    "cluster": "Кадровый базис / Пульс ядро",
+    "service": "MovementEventsData"
+  },
+  {
+    "serviceId": "7202863",
+    "cluster": "Кадровый базис / Пульс ядро",
+    "service": "HREmployeeDataMart"
+  },
+  {
+    "serviceId": "7284109",
+    "cluster": "Кадровый базис / Пульс ядро",
+    "service": "BusinessRoles.Management"
+  },
+  {
+    "serviceId": "7557411",
+    "cluster": "Кадровый базис / Пульс ядро",
+    "service": "HRDataChanger"
+  },
+  {
+    "serviceId": "8049396",
+    "cluster": "Кадровый базис / Пульс ядро",
+    "service": "StaffPlacement"
+  },
+  {
+    "serviceId": "8407074",
+    "cluster": "Кадровый базис / Пульс ядро",
+    "service": "HCMDataMart"
+  },
+  {
+    "serviceId": "8425577",
+    "cluster": "Кадровый базис / Пульс ядро",
+    "service": "Loader.Universal"
+  },
+  {
+    "serviceId": "8436243",
+    "cluster": "Кадровый базис / Пульс ядро",
+    "service": "WorktimeDuration"
+  },
+  {
+    "serviceId": "9856212",
+    "cluster": "Кадровый базис / Пульс ядро",
+    "service": "Viewer.RegPersReports"
+  },
+  {
+    "serviceId": "9910922",
+    "cluster": "Кадровый базис / Пульс ядро",
+    "service": "RegPersReports"
+  },
+  {
+    "serviceId": "11756415",
+    "cluster": "Сервисы самообслуживания / Пульс ядро",
+    "service": "HRSignMatrix"
+  },
+  {
+    "serviceId": "14588458",
+    "cluster": "Сервисы самообслуживания / Пульс ядро",
+    "service": "Viewer.SelfServicesRequests"
+  },
+  {
+    "serviceId": "15044350",
+    "cluster": "Сервисы самообслуживания / Пульс ядро",
+    "service": "MobileCertificate"
+  },
+  {
+    "serviceId": "15044628",
+    "cluster": "Сервисы самообслуживания / Пульс ядро",
+    "service": "MobilePresidentSign"
+  },
+  {
+    "serviceId": "15070492",
+    "cluster": "Сервисы самообслуживания / Пульс ядро",
+    "service": "PresidentHRSign-wf"
+  },
+  {
+    "serviceId": "2680165",
+    "cluster": "Сервисы самообслуживания / Пульс ядро",
+    "service": "MyDocuments"
+  },
+  {
+    "serviceId": "2776644",
+    "cluster": "Сервисы самообслуживания / Пульс ядро",
+    "service": "Deputy (VRIO)"
+  },
+  {
+    "serviceId": "2875879",
+    "cluster": "Сервисы самообслуживания / Пульс ядро",
+    "service": "Absences"
+  },
+  {
+    "serviceId": "3624783",
+    "cluster": "Сервисы самообслуживания / Пульс ядро",
+    "service": "AbsencesMain"
+  },
+  {
+    "serviceId": "3925446",
+    "cluster": "Сервисы самообслуживания / Пульс ядро",
+    "service": "Календарь"
+  },
+  {
+    "serviceId": "4836312",
+    "cluster": "Сервисы самообслуживания / Пульс ядро",
+    "service": "DocumentService"
+  },
+  {
+    "serviceId": "6120433",
+    "cluster": "Сервисы самообслуживания / Пульс ядро",
+    "service": "HRP.VacationPlanning"
+  },
+  {
+    "serviceId": "6937188",
+    "cluster": "Сервисы самообслуживания / Пульс ядро",
+    "service": "WorkTimeActual-wf"
+  },
+  {
+    "serviceId": "7170835",
+    "cluster": "Сервисы самообслуживания / Пульс ядро",
+    "service": "ExecutionManagement"
+  },
+  {
+    "serviceId": "7517081",
+    "cluster": "Сервисы самообслуживания / Пульс ядро",
+    "service": "Calendar (Календарь)"
+  },
+  {
+    "serviceId": "7748676",
+    "cluster": "Сервисы самообслуживания / Пульс ядро",
+    "service": "WorkTimeActual-tw"
+  },
+  {
+    "serviceId": "7945210",
+    "cluster": "Сервисы самообслуживания / Пульс ядро",
+    "service": "SubstitutionMatrixAndDutiesExecution-Wf"
+  },
+  {
+    "serviceId": "7945248",
+    "cluster": "Сервисы самообслуживания / Пульс ядро",
+    "service": "DutiesExecution-Data"
+  },
+  {
+    "serviceId": "7963763",
+    "cluster": "Сервисы самообслуживания / Пульс ядро",
+    "service": "WorkTimeActual-sl"
+  },
+  {
+    "serviceId": "8480618",
+    "cluster": "Сервисы самообслуживания / Пульс ядро",
+    "service": "SignatureCampaign"
+  },
+  {
+    "serviceId": "9549458",
+    "cluster": "Сервисы самообслуживания / Пульс ядро",
+    "service": "Presence-wf"
+  },
+  {
+    "serviceId": "10068610",
+    "cluster": "AI продукты БЛиК / Пульс каркас",
+    "service": "AEF. Оркестратор Пульс 2.0"
+  },
+  {
+    "serviceId": "11421220",
+    "cluster": "AI продукты БЛиК / Пульс каркас",
+    "service": "AIContextManager"
+  },
+  {
+    "serviceId": "8715146",
+    "cluster": "AI продукты БЛиК / Пульс каркас",
+    "service": "SRE-Tools"
+  },
+  {
+    "serviceId": "8833347",
+    "cluster": "AI продукты БЛиК / Пульс каркас",
+    "service": "МиП Развитие и обучение"
+  },
+  {
+    "serviceId": "9643400",
+    "cluster": "AI продукты БЛиК / Пульс каркас",
+    "service": "NeuroOrchestrator"
+  },
+  {
+    "serviceId": "10578237",
+    "cluster": "Забота / Мотивация и забота",
+    "service": "Gratitude"
+  },
+  {
+    "serviceId": "12870105",
+    "cluster": "Забота / Мотивация и забота",
+    "service": "MortgageBenefits"
+  },
+  {
+    "serviceId": "3263321",
+    "cluster": "Забота / Мотивация и забота",
+    "service": "Awarding"
+  },
+  {
+    "serviceId": "4734143",
+    "cluster": "Забота / Мотивация и забота",
+    "service": "Health"
+  },
+  {
+    "serviceId": "2678029",
+    "cluster": "Аналитика и фиксированный доход / Мотивация и забота",
+    "service": "Compensation&Benefits"
+  },
+  {
+    "serviceId": "3813129",
+    "cluster": "Аналитика и фиксированный доход / Мотивация и забота",
+    "service": "CloudPayslip"
+  },
+  {
+    "serviceId": "6515283",
+    "cluster": "Аналитика и фиксированный доход / Мотивация и забота",
+    "service": "EmployeeRate_wf"
+  },
+  {
+    "serviceId": "8327411",
+    "cluster": "Аналитика и фиксированный доход / Мотивация и забота",
+    "service": "HRP.Income"
+  },
+  {
+    "serviceId": "9388043",
+    "cluster": "Аналитика и фиксированный доход / Мотивация и забота",
+    "service": "IncomeRegulation"
+  },
+  {
+    "serviceId": "9836140",
+    "cluster": "Аналитика и фиксированный доход / Мотивация и забота",
+    "service": "SupplementalPayMain"
+  },
+  {
+    "serviceId": "9885226",
+    "cluster": "Аналитика и фиксированный доход / Мотивация и забота",
+    "service": "BenefitsMain"
+  },
+  {
+    "serviceId": "9885260",
+    "cluster": "Аналитика и фиксированный доход / Мотивация и забота",
+    "service": "BenefitsAgent"
+  },
+  {
+    "serviceId": "9885800",
+    "cluster": "Аналитика и фиксированный доход / Мотивация и забота",
+    "service": "SalaryReviewMain"
+  },
+  {
+    "serviceId": "2134811",
+    "cluster": "Блок: Управление благосостоянием",
+    "service": "VirtualTrainer"
+  },
+  {
+    "serviceId": "2633049",
+    "cluster": "Блок: Управление благосостоянием",
+    "service": "HRP.SpeechSimulator (Речевой тренажёр)"
+  },
+  {
+    "serviceId": "3922072",
+    "cluster": "Блок: Сервисы",
+    "service": "DigitalHealth&Safety"
+  },
+  {
+    "serviceId": "8100859",
+    "cluster": "Блок: Сервисы",
+    "service": "MaterialPayments"
+  },
+  {
+    "serviceId": "8816525",
+    "cluster": "Блок: Сервисы",
+    "service": "Bagration"
+  },
+  {
+    "serviceId": "9821909",
+    "cluster": "Блок: Сервисы",
+    "service": "InternalSecurity"
+  },
+  {
+    "serviceId": "10059580",
+    "cluster": "Блок: Финансы",
+    "service": "Validator"
+  },
+  {
+    "serviceId": "12128577",
+    "cluster": "Блок: Финансы",
+    "service": "Agent PY SFR"
+  },
+  {
+    "serviceId": "12621403",
+    "cluster": "Блок: Финансы",
+    "service": "Agent PY Validator"
+  },
+  {
+    "serviceId": "13121796",
+    "cluster": "Блок: Финансы",
+    "service": "Statements"
+  },
+  {
+    "serviceId": "14936510",
+    "cluster": "Блок: Финансы",
+    "service": "AdapterRequests"
+  },
+  {
+    "serviceId": "15027263",
+    "cluster": "Блок: Финансы",
+    "service": "HCMDataMart.Viewer.Payroll"
+  },
+  {
+    "serviceId": "5160794",
+    "cluster": "Блок: Финансы",
+    "service": "AccountantPlanner"
+  },
+  {
+    "serviceId": "5160795",
+    "cluster": "Блок: Финансы",
+    "service": "AccountantWorkPlace"
+  },
+  {
+    "serviceId": "6171828",
+    "cluster": "Блок: Финансы",
+    "service": "OperatorCalc"
+  },
+  {
+    "serviceId": "6177533",
+    "cluster": "Блок: Финансы",
+    "service": "PrimaryDataForCalculation"
+  },
+  {
+    "serviceId": "6483122",
+    "cluster": "Блок: Финансы",
+    "service": "DirectoryForCalc"
+  },
+  {
+    "serviceId": "6483133",
+    "cluster": "Блок: Финансы",
+    "service": "OrganizationCalc"
+  },
+  {
+    "serviceId": "6483134",
+    "cluster": "Блок: Финансы",
+    "service": "DriverCalc"
+  },
+  {
+    "serviceId": "7660502",
+    "cluster": "Блок: Финансы",
+    "service": "DataMarket"
+  },
+  {
+    "serviceId": "7661122",
+    "cluster": "Блок: Финансы",
+    "service": "ReportsSV"
+  },
+  {
+    "serviceId": "7661129",
+    "cluster": "Блок: Финансы",
+    "service": "ReportsAnalytic"
+  },
+  {
+    "serviceId": "7713220",
+    "cluster": "Блок: Финансы",
+    "service": "MOD"
+  },
+  {
+    "serviceId": "8025010",
+    "cluster": "Блок: Финансы",
+    "service": "ReportsSalary"
+  },
+  {
+    "serviceId": "8244551",
+    "cluster": "Блок: Финансы",
+    "service": "SFR"
+  },
+  {
+    "serviceId": "8449473",
+    "cluster": "Блок: Финансы",
+    "service": "ReportsTax"
+  },
+  {
+    "serviceId": "8449509",
+    "cluster": "Блок: Финансы",
+    "service": "ReportsDebts"
+  },
+  {
+    "serviceId": "9902113",
+    "cluster": "Блок: Финансы",
+    "service": "Agent PY Reports"
+  },
+  {
+    "serviceId": "4938332",
+    "cluster": "Блок: Риски",
+    "service": "HRP.Risk_Control_Management"
+  },
+  {
+    "serviceId": "3540623",
+    "cluster": "Блок: Корпоративно-инвестиционный бизнес",
+    "service": "Адаптер для WorkforceManagement"
+  },
+  {
+    "serviceId": "11971661",
+    "cluster": "Блок: Стратегия и развитие",
+    "service": "OmMgm-Assistant"
+  },
+  {
+    "serviceId": "14787646",
+    "cluster": "Блок: Стратегия и развитие",
+    "service": "OmOrgChart"
+  },
+  {
+    "serviceId": "2581223",
+    "cluster": "Блок: Стратегия и развитие",
+    "service": "SmartCalendar"
+  },
+  {
+    "serviceId": "2750110",
+    "cluster": "Блок: Стратегия и развитие",
+    "service": "SbergileStructure"
+  },
+  {
+    "serviceId": "2831575",
+    "cluster": "Блок: Стратегия и развитие",
+    "service": "PerformanceManagementGoalsFromSAP"
+  },
+  {
+    "serviceId": "2936830",
+    "cluster": "Блок: Стратегия и развитие",
+    "service": "SimpleReports"
+  },
+  {
+    "serviceId": "3017459",
+    "cluster": "Блок: Стратегия и развитие",
+    "service": "SberStructure"
+  },
+  {
+    "serviceId": "3086674",
+    "cluster": "Блок: Стратегия и развитие",
+    "service": "Goals"
+  },
+  {
+    "serviceId": "3447802",
+    "cluster": "Блок: Стратегия и развитие",
+    "service": "Core Product"
+  },
+  {
+    "serviceId": "3925449",
+    "cluster": "Блок: Стратегия и развитие",
+    "service": "Структура"
+  },
+  {
+    "serviceId": "4877436",
+    "cluster": "Блок: Стратегия и развитие",
+    "service": "ЕКОУ"
+  },
+  {
+    "serviceId": "6269427",
+    "cluster": "Блок: Стратегия и развитие",
+    "service": "HRP.Efficiency"
+  },
+  {
+    "serviceId": "7764940",
+    "cluster": "Блок: Стратегия и развитие",
+    "service": "Ведение организационно-штатной структуры (ОШС)"
+  },
+  {
+    "serviceId": "7826919",
+    "cluster": "Блок: Стратегия и развитие",
+    "service": "OmMgm-Regulation"
+  },
+  {
+    "serviceId": "7826920",
+    "cluster": "Блок: Стратегия и развитие",
+    "service": "Управление организационно-штатной структурой ДЗО"
+  },
+  {
+    "serviceId": "7834676",
+    "cluster": "Блок: Стратегия и развитие",
+    "service": "OmService-MainPage"
+  },
+  {
+    "serviceId": "7834697",
+    "cluster": "Блок: Стратегия и развитие",
+    "service": "OmSbergile-Maintenance"
+  },
+  {
+    "serviceId": "7840887",
+    "cluster": "Блок: Стратегия и развитие",
+    "service": "OmFOS-Data"
+  },
+  {
+    "serviceId": "8338404",
+    "cluster": "Блок: Стратегия и развитие",
+    "service": "OmService-PowerSharing"
+  },
+  {
+    "serviceId": "9841512",
+    "cluster": "Блок: Стратегия и развитие",
+    "service": "Metrics Catalog"
+  },
+  {
+    "serviceId": "12211877",
+    "cluster": "Блок: Технологии",
+    "service": "Media.Sbernet"
+  },
+  {
+    "serviceId": "12211899",
+    "cluster": "Блок: Технологии",
+    "service": "Media.Moments"
+  },
+  {
+    "serviceId": "12651913",
+    "cluster": "Блок: Технологии",
+    "service": "Media.Video.Core"
+  },
+  {
+    "serviceId": "15130010",
+    "cluster": "Блок: Технологии",
+    "service": "InTra-SkillManagement"
+  },
+  {
+    "serviceId": "3687172",
+    "cluster": "Блок: Технологии",
+    "service": "InsiderMarkup"
+  },
+  {
+    "serviceId": "4890861",
+    "cluster": "Блок: Технологии",
+    "service": "Инсайдеры"
+  },
+  {
+    "serviceId": "8533435",
+    "cluster": "Блок: Технологии",
+    "service": "InTra-UserUI"
+  },
+  {
+    "serviceId": "8533620",
+    "cluster": "Блок: Технологии",
+    "service": "InTra-TrainingMatrices"
+  },
+  {
+    "serviceId": "9243343",
+    "cluster": "Блок: Технологии",
+    "service": "InTra-TrainingIssues"
+  },
+  {
+    "serviceId": "9504031",
+    "cluster": "Блок: Технологии",
+    "service": "InTra-TrainingAI"
+  },
+  {
+    "serviceId": "14964545",
+    "cluster": "Блок: GR, правовые вопросы, комплаенс и ДЗО",
+    "service": "HCMDataMart.Viewer.InsiderMarkup"
+  },
+  {
+    "serviceId": "15287895",
+    "cluster": "Мотивация / Мотивация и забота",
+    "service": "AI HUB БЛиК.BonusSuggestion"
+  },
+  {
+    "serviceId": "14900378",
+    "cluster": "Обучение / Обучение",
+    "service": "AI HUB БЛиК.LearningHelper"
+  },
+  {
+    "serviceId": "14900382",
+    "cluster": "Обучение / Обучение",
+    "service": "AI HUB БЛиК.LearningTagging"
+  },
+  {
+    "serviceId": "14901430",
+    "cluster": "Подбор и перемещения / Подбор и перемещения",
+    "service": "Screening"
+  },
+  {
+    "serviceId": "10602096",
+    "cluster": "AI продукты БЛиК / Пульс каркас",
+    "service": "AIOpsAgent"
+  },
+  {
+    "serviceId": "11446864",
+    "cluster": "AI продукты БЛиК / Пульс каркас",
+    "service": "AgentContextManager"
+  },
+  {
+    "serviceId": "12320202",
+    "cluster": "AI продукты БЛиК / Пульс каркас",
+    "service": "AIPlaybook"
+  },
+  {
+    "serviceId": "12336662",
+    "cluster": "AI продукты БЛиК / Пульс каркас",
+    "service": "AEF AuditBridge"
+  },
+  {
+    "serviceId": "12781233",
+    "cluster": "AI продукты БЛиК / Пульс каркас",
+    "service": "AgentUtils"
+  },
+  {
+    "serviceId": "14056058",
+    "cluster": "AI продукты БЛиК / Пульс каркас",
+    "service": "AI Playbook"
+  },
+  {
+    "serviceId": "15233019",
+    "cluster": "AI продукты БЛиК / Пульс каркас",
+    "service": "AIHubCloud"
+  },
+  {
+    "serviceId": "9680700",
+    "cluster": "AI продукты БЛиК / Пульс каркас",
+    "service": "AI HUB БЛиК"
+  },
+  {
+    "serviceId": "14545983",
+    "cluster": "Блок: Управление благосостоянием",
+    "service": "AI HUB БЛиК.TeacherSimulator"
+  },
+  {
+    "serviceId": "14546051",
+    "cluster": "Блок: Управление благосостоянием",
+    "service": "AI HUB БЛиК.TeacherAnalyst"
+  }
+]

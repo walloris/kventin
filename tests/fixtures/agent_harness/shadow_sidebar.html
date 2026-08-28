@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="ru">
+  <head><meta charset="utf-8"><title>Shadow sidebar harness</title></head>
+  <body>
+    <main id="app" aria-hidden="true" inert>
+      <button id="background-action">Background Action</button>
+    </main>
+    <x-sidebar></x-sidebar>
+    <script>
+      const host = document.querySelector('x-sidebar');
+      const root = host.attachShadow({ mode: 'open' });
+      root.innerHTML = `
+        <style>aside { position: fixed; inset: 0 0 0 auto; width: 320px; z-index: 200; background: white; }</style>
+        <aside role="dialog" aria-modal="true">
+          <button id="shadow-action">Shadow Action</button>
+          <button aria-label="Закрыть">×</button>
+        </aside>`;
+      root.querySelector('[aria-label="Закрыть"]').addEventListener('click', () => {
+        host.remove();
+        document.querySelector('main').removeAttribute('aria-hidden');
+        document.querySelector('main').removeAttribute('inert');
+      });
+    </script>
+  </body>
+</html>

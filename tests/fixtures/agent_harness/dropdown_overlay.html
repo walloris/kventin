@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <title>Dropdown overlay harness</title>
+    <style>
+      #choices { position: fixed; top: 60px; left: 20px; width: 240px; padding: 8px; background: white; z-index: 100; border: 1px solid #333; }
+      [role="option"] { padding: 8px; cursor: pointer; }
+    </style>
+  </head>
+  <body>
+    <main aria-hidden="true" inert>
+      <button>Background Action</button>
+    </main>
+    <div id="choices" role="listbox">
+      <div role="option" tabindex="0">Option A</div>
+      <div role="option" tabindex="0">Option B</div>
+    </div>
+    <script>
+      document.querySelectorAll('[role="option"]').forEach(option => {
+        option.addEventListener('click', () => {
+          document.querySelector('#choices').remove();
+          document.querySelector('main').removeAttribute('aria-hidden');
+          document.querySelector('main').removeAttribute('inert');
+        });
+      });
+    </script>
+  </body>
+</html>
