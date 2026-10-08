@@ -12,7 +12,9 @@ import requests
 from html.parser import HTMLParser
 from pathlib import Path
 from collections import defaultdict
+from contextlib import contextmanager
 from typing import Optional
+from urllib.parse import quote, urlsplit
 
 script_dir = Path(__file__).resolve().parent
 parent_dir = script_dir.parent
@@ -71,6 +73,7 @@ ALLOWED_TESTERS = {
     "Годунова Дарья Алексеевна", "Гулиев Руслан Иса оглы",
     "Калашников Андрей Романович", "Канаев Леонид Олегович",
     "Меркуленков Дмитрий Игоревич",
+    "Лакутин Роман Денисович",
     "Метляев Игорь Андреевич", "Петрунин Никита Анатольевич",
     "Приколотина Евгения Александровна",
     "Симиник Даниил Григорьевич", "Федоров Никита Андреевич",
@@ -81,6 +84,24 @@ WORKLOG_EXEMPT_COMMENT_AUTHORS = {
     "Никонов Александр Алексеевич",
 }
 WORKLOG_EXEMPT_EXCLUDED_PROJECTS = {"HRC"}
+
+ALLOWED_ARCHITECTURE_CLOSERS = {
+    "Черешнев Антон Олегович", "Абдуллин Нурали Нуриевич",
+    "Базаева Тамара Виталиевна", "Калашникова Екатерина Рашидовна",
+    "Куданов Александр Андреевич", "Куренков Николай Николаевич",
+    "Матвеев Антон Анатольевич", "Махмудов Джамбулат Рамизович",
+    "Абдуллаев Магомед Русланович",
+}
+ARCHITECTURE_CLOSED_STATUSES = {
+    'closed', 'закрыта', 'закрыто', 'done', 'готово', 'выполнено',
+    'resolved', 'решена', 'решено',
+}
+PR_MAX_ATTEMPTS = 2
+PR_RETRY_DELAY_SECONDS = 1
+PR_LOOKUP_TIMEOUT_SECONDS = 20
+PR_REQUEST_TIMEOUT_SECONDS = 3
+PR_RELEASE_TIMEOUT_SECONDS = 120
+PR_ENDPOINT_FAILURE_LIMIT = 3
 
 # Статус ТК, который считается утверждённым (Approved)
 ZEPHYR_APPROVED_STATUS = "Approved"
@@ -418,8 +439,9 @@ class ZephyrScaleClient:
         self.request_timeout_seconds = ZEPHYR_REQUEST_TIMEOUT_SECONDS
         self.max_failed_requests = ZEPHYR_MAX_FAILED_REQUESTS
         self.failed_requests = 0
+        self.fatal_error = None
         self.retry_status_codes = {429, 500, 502, 503, 504}
-        self.session = requests.Session()
+        self.session = ReleaseHttpSession()
         self.session.verify = verify_ssl
         self.session.headers.update({
             'Authorization': f'Bearer {token}',
@@ -428,6 +450,8 @@ class ZephyrScaleClient:
         self.last_test_cycle_search_stats: list[dict] = []
 
     def _raise_if_failed_request_limit_reached(self) -> None:
+        if self.fatal_error:
+            raise RuntimeError(self.fatal_error)
         if self.failed_requests >= self.max_failed_requests:
             raise RuntimeError(
                 "Zephyr API: лимит неуспешных запросов исчерпан "
@@ -436,7 +460,7 @@ class ZephyrScaleClient:
             )
 
     def is_failed_request_limit_reached(self) -> bool:
-        return self.failed_requests >= self.max_failed_requests
+        return bool(self.fatal_error) or self.failed_requests >= self.max_failed_requests
 
     def _mark_failed_request(self, reason: str) -> None:
         self.failed_requests += 1
@@ -452,14 +476,24 @@ class ZephyrScaleClient:
 
         for attempt in range(1, self.max_retries + 1):
             try:
+                started = time.monotonic()
                 response = self.session.get(url, **kwargs)
+                trace_http('Zephyr', url, response.status_code, started, attempt)
+                if response.status_code in {401, 403}:
+                    self.fatal_error = f'Zephyr: HTTP {response.status_code}; проверьте права доступа'
+                    raise RuntimeError(self.fatal_error)
                 if response.status_code not in self.retry_status_codes:
                     return response
                 if attempt == self.max_retries:
                     self._mark_failed_request(f"HTTP {response.status_code}")
                     self._raise_if_failed_request_limit_reached()
                     return response
+            except requests.exceptions.SSLError as e:
+                self.fatal_error = request_failure_kind(e)
+                trace_http('Zephyr', url, self.fatal_error, started, attempt)
+                raise RuntimeError(self.fatal_error) from e
             except requests.RequestException as e:
+                trace_http('Zephyr', url, request_failure_kind(e), started, attempt)
                 last_exception = e
                 if attempt == self.max_retries:
                     self._mark_failed_request(str(e))
@@ -481,12 +515,21 @@ class ZephyrScaleClient:
         """Один быстрый GET без ретраев для диагностических/спекулятивных endpoint'ов."""
         self._raise_if_failed_request_limit_reached()
         kwargs.setdefault('timeout', self.request_timeout_seconds)
+        started = time.monotonic()
         try:
             response = self.session.get(url, **kwargs)
+            trace_http('Zephyr', url, response.status_code, started)
+        except requests.exceptions.SSLError as e:
+            self.fatal_error = request_failure_kind(e)
+            trace_http('Zephyr', url, self.fatal_error, started)
+            raise RuntimeError(self.fatal_error) from e
         except requests.RequestException as e:
             self._mark_failed_request(str(e))
             self._raise_if_failed_request_limit_reached()
             raise
+        if response.status_code in {401, 403}:
+            self.fatal_error = f'Zephyr: HTTP {response.status_code}; проверьте права доступа'
+            raise RuntimeError(self.fatal_error)
         if response.status_code in self.retry_status_codes:
             self._mark_failed_request(f"HTTP {response.status_code}")
             self._raise_if_failed_request_limit_reached()
@@ -1113,12 +1156,79 @@ class ZephyrScaleClient:
         return tc.get('name', tc.get('summary', '—'))
 
 
+def release_tls_policy():
+    """Keep the existing Jira TLS policy unless explicitly configured by the job."""
+    ca_bundle = os.getenv('RELEASE_CHECKER_CA_BUNDLE', '').strip()
+    if ca_bundle:
+        return ca_bundle
+    return os.getenv('RELEASE_CHECKER_VERIFY_SSL', '0').lower() in {'1', 'true', 'yes'}
+
+
+class ReleaseHttpSession(requests.Session):
+    """Pass the chosen verify explicitly: REQUESTS_CA_BUNDLE must not override False."""
+    def request(self, method, url, **kwargs):
+        kwargs.setdefault('verify', self.verify)
+        return super().request(method, url, **kwargs)
+
+
+def request_failure_kind(exc):
+    if isinstance(exc, requests.exceptions.SSLError):
+        return 'TLS: ошибка сертификата; проверьте RELEASE_CHECKER_CA_BUNDLE/VERIFY_SSL'
+    if isinstance(exc, requests.Timeout):
+        return 'timeout'
+    if isinstance(exc, requests.ConnectionError):
+        return 'connection error'
+    if isinstance(exc, ValueError):
+        return 'invalid JSON/API error'
+    return type(exc).__name__
+
+
+def trace_http(source, url, outcome, started, attempt=1, params=None):
+    elapsed = time.monotonic() - started
+    debug = os.getenv('RELEASE_CHECKER_DEBUG_HTTP', '0') == '1'
+    if debug or not str(outcome).startswith('2') or elapsed >= 2:
+        # No headers, tokens, response bodies or arbitrary query strings in CI logs.
+        safe_params = {key: value for key, value in (params or {}).items()
+                       if key in {'issueId', 'applicationType', 'dataType'}}
+        print(f"[HTTP {source}] {urlsplit(url).path} {safe_params or ''} "
+              f"attempt={attempt} result={outcome} elapsed={elapsed:.2f}s", flush=True)
+
+
+class CachedJiraReads:
+    """Reuse identical successful reads within a release; writes always go through."""
+    READ_METHODS = {'issue', 'search_issues', 'comments', 'worklogs', 'fields'}
+
+    def __init__(self, client):
+        self.client = client
+        self.cache = {}
+
+    def clear(self):
+        self.cache.clear()
+
+    def __getattr__(self, name):
+        method = getattr(self.client, name)
+        if name not in self.READ_METHODS:
+            return method
+
+        def read(*args, **kwargs):
+            key = (name, json.dumps([args, kwargs], sort_keys=True, default=str))
+            if key not in self.cache:
+                started = time.monotonic()
+                self.cache[key] = method(*args, **kwargs)
+                if os.getenv('RELEASE_CHECKER_DEBUG_HTTP', '0') == '1':
+                    result = self.cache[key]
+                    size = len(result) if isinstance(result, (list, dict)) else 1
+                    print(f"[JIRA {name}] objects={size} elapsed={time.monotonic()-started:.2f}s", flush=True)
+            return self.cache[key]
+        return read
+
+
 class ReleaseValidator:
     def __init__(self):
-        self.jira_main = JIRA(
-            options={**config['jira']['options'], 'verify': False},
-            token_auth=config['jira']['token']
-        )
+        self.jira_main = CachedJiraReads(JIRA(
+            options={**config['jira']['options'], 'verify': release_tls_policy()},
+            token_auth=config['jira']['token'], timeout=(3, 10), max_retries=1
+        ))
         self.confluence = Confluence(
             url=config['confluence']['url'],
             token=config['confluence']['token'],
@@ -1129,10 +1239,10 @@ class ReleaseValidator:
         self.zephyr = ZephyrScaleClient(
             base_url=config['jira']['url'],
             token=config['jira']['token'],
-            verify_ssl=False
+            verify_ssl=release_tls_policy()
         )
-        self.jira_http = requests.Session()
-        self.jira_http.verify = False
+        self.jira_http = ReleaseHttpSession()
+        self.jira_http.verify = release_tls_policy()
         self.jira_http.headers.update({
             'Authorization': f"Bearer {config['jira']['token']}",
             'Content-Type': 'application/json',
@@ -1156,7 +1266,7 @@ class ReleaseValidator:
         self._zephyr_cycle_approved_checked: set[str] = set()
         self._zephyr_cycle_testing_type_checked: set[tuple[str, str]] = set()
         self._zephyr_cycle_search_debug_logged: set[str] = set()
-        self._dev_status_payload_cache: dict[str, list[tuple[str, str, dict]]] = {}
+        self._dev_status_payload_cache: dict[tuple[str, tuple[str, ...]], list[tuple[str, str, dict]]] = {}
         self._pull_request_evidence_cache: dict[str, Optional[str]] = {}
         self._pull_request_only_evidence_cache: dict[str, Optional[str]] = {}
         self._release_pr_targets_cache: dict[str, list[tuple[object, list[object]]]] = {}
@@ -1172,6 +1282,18 @@ class ReleaseValidator:
             self.my_account_id = None
 
     def _log_issue(self, issue_obj_or_key, status, message):
+        active = getattr(self, '_active_check', None)
+        if active is not None:
+            technical_markers = ('не удалось', 'проверка не выполнена', 'неполную историю',
+                                 'проверка ТЦ пропущена', 'лимит неуспешных', 'недоступна сводка',
+                                 'ошибка получения', 'ошибка поиска', 'ошибка проверки', 'нет токена',
+                                 'пустой ответ от модели', 'не вернул вердикт')
+            if status != 'success' and any(marker in message.casefold() for marker in technical_markers):
+                active['incomplete'] = True
+                if active['required']:
+                    status = 'error'
+            active[status if status in {'error', 'warning'} else 'success'] += 1
+            active['issues'].add(getattr(issue_obj_or_key, 'key', str(issue_obj_or_key)))
         issue_key = "GENERAL"
         assignee = "—"
         summary = "Общие проверки"
@@ -1296,9 +1418,9 @@ class ReleaseValidator:
         """Один кэшированный Zephyr-поиск ТЦ по ключу релиза."""
         if release_key not in self._zephyr_release_cycles_cache:
             raw_cycles = self.zephyr.get_test_cycles_for_issue(release_key)
-            if not raw_cycles:
+            if not raw_cycles and not self.zephyr.is_failed_request_limit_reached():
                 raw_cycles = self._get_test_cycles_from_jira_release_metadata(release_key)
-            if not raw_cycles:
+            if not raw_cycles and not self._zephyr_last_cycle_search_had_technical_failure():
                 raw_cycles = self._get_test_cycles_from_direct_cache_or_scan(release_key)
             cycles = [self._get_cycle_name_from_zephyr_item(cycle) for cycle in raw_cycles]
             self._zephyr_release_cycles_cache[release_key] = [
@@ -1372,6 +1494,8 @@ class ReleaseValidator:
         found = []
 
         for cycle_number in range(high_watermark, min_number - 1, -1):
+            if self.zephyr.is_failed_request_limit_reached():
+                break
             cycle_key = f"{project_key}-C{cycle_number}"
             details = self._get_cached_or_fetch_cycle_details(project_key, cycle_key)
             if not details:
@@ -1665,7 +1789,7 @@ class ReleaseValidator:
         return "; ".join(parts)
 
     def _zephyr_last_cycle_search_had_technical_failure(self) -> bool:
-        technical_statuses = {429, 500, 502, 503, 504}
+        technical_statuses = {401, 403, 429, 500, 502, 503, 504}
         for stat in self.zephyr.last_test_cycle_search_stats:
             status = stat.get('status')
             if status == 'exception':
@@ -1781,10 +1905,10 @@ class ReleaseValidator:
             issues = self.jira_main.search_issues(
                 f'key in ({keys_str})',
                 fields='issuetype',
-                maxResults=500
+                maxResults=False
             )
-        except Exception:
-            return {}
+        except Exception as exc:
+            raise RuntimeError("не удалось получить типы задач") from exc
         return {
             issue.key: issue.fields.issuetype.name.casefold()
             for issue in issues
@@ -1977,7 +2101,7 @@ class ReleaseValidator:
             release_items = self.jira_main.search_issues(
                 f'key in ({keys_str})',
                 fields=f'summary,issuetype,assignee,{service_ke_field_id},customfield_24000',
-                maxResults=500
+                maxResults=False
             )
         except Exception as e:
             self._log_issue(
@@ -2030,8 +2154,71 @@ class ReleaseValidator:
         self._release_service_infos_cache[release_key] = services
         return services
 
-    def check_release(self, release_key):
+    def _run_check(self, check_id, name, callback, *, required=True, skip_reason='', budget=None):
+        record = {'id': check_id, 'name': name, 'required': required, 'status': 'RUNNING',
+                  'seconds': 0.0, 'success': 0, 'error': 0, 'warning': 0,
+                  'issues': set(), 'incomplete': False, 'reason': skip_reason}
+        self.check_results.append(record)
+        if skip_reason:
+            record['status'] = 'SKIP'
+            print(f"[CHECK {check_id}] SKIP {name}: {skip_reason}", flush=True)
+            return
+        started = time.monotonic()
+        self._active_check = record
+        print(f"[CHECK {check_id}] START {name}", flush=True)
+        try:
+            if budget is None:
+                callback()
+            else:
+                with self._pr_lookup_budget(budget):
+                    callback()
+        except Exception as exc:
+            record['incomplete'] = True
+            self._log_issue('GENERAL', 'error' if required else 'warning',
+                            f"{name}: проверка не выполнена ({type(exc).__name__}: {exc})")
+        finally:
+            record['seconds'] = time.monotonic() - started
+            if record['incomplete']:
+                record['status'] = 'INCOMPLETE'
+            elif record['error']:
+                record['status'] = 'FAIL'
+            elif record['warning']:
+                record['status'] = 'WARN'
+            else:
+                record['status'] = 'PASS' if record['success'] else 'NO_FINDINGS'
+            self._active_check = None
+            print(f"[CHECK {check_id}] {record['status']} {record['seconds']:.2f}s "
+                  f"issues={len(record['issues'])} ok={record['success']} "
+                  f"errors={record['error']} warnings={record['warning']}", flush=True)
+
+    def _reset_release_run(self):
         self.report_data.clear()
+        self.check_results = []
+        self._active_check = None
+        self._reset_pr_run_state()
+        if isinstance(self.jira_main, CachedJiraReads):
+            self.jira_main.clear()
+        for name, value in vars(self).items():
+            if name.startswith('_zephyr_') and name != '_zephyr_cycle_cache' and isinstance(value, (dict, set)):
+                value.clear()
+        self._jira_field_name_to_id_cache = None
+        self._consist_of_cache.clear()
+        self._release_service_infos_cache.clear()
+        self.zephyr.failed_requests = 0
+        self.zephyr.fatal_error = None
+        self.zephyr.last_test_cycle_search_stats = []
+
+    def _checks_wiki_table(self):
+        rows = ['|| Проверка || Результат || Время, с || Объекты || Успех / ошибки / предупреждения ||']
+        for result in getattr(self, 'check_results', []):
+            name = result['name']
+            status = result['status'] + (': ' + result['reason'] if result['reason'] else '')
+            rows.append(f"| {name} | {status} | {result['seconds']:.2f} | {len(result['issues'])} | "
+                        f"{result['success']} / {result['error']} / {result['warning']} |")
+        return '\n'.join(rows) + "\nINCOMPLETE — не хватает данных; SKIP — неприменимо; NO_FINDINGS — этап без зарегистрированных результатов."
+
+    def check_release(self, release_key):
+        self._reset_release_run()
         print(f"🔍 Проверка релиза: {release_key}")
         print("⏳ Выполняется анализ...\n")
 
@@ -2042,7 +2229,7 @@ class ReleaseValidator:
             self._log_issue("GENERAL", "error", f"Критическая ошибка: Не удалось получить тикет релиза: {str(e)}")
             return False
 
-        self._check_required_platform_label(release, "Release")
+        self._run_check("release", "Контур релиза", lambda: self._check_required_platform_label(release, "Release"))
 
         # Определяем тип релиза: Hotfix или обычный
         release_type_raw = getattr(release.fields, 'customfield_23500', None)
@@ -2064,25 +2251,32 @@ class ReleaseValidator:
         if release_consist_of is not None:
             self._consist_of_cache[release_key] = release_consist_of
 
-        self._check_test_subtask(release)
-        self._check_artifacts(release_key)
-        self._check_release_coverage(release_key)
-        self._check_zephyr_test_cases(release_key, is_hotfix=is_hotfix)
-        if not is_hotfix:
-            release_labels = self._issue_labels_casefold(release)
-            if 'back' in release_labels:
-                self._check_back_release_service_test_cycles(release_key)
-            if 'web' in release_labels:
-                self._check_web_release_service_test_cycles(release_key)
-        self._check_bugs(release_key, is_hotfix=is_hotfix)
-        self._check_stories(release_key)
-        self._check_required_pull_requests(release_key)
-        self._check_unlinked_release_items_pull_requests(release_key)
-        self._check_gigacode_aifixed_labels(release_key)
-        self._check_cloud_label(release_key, release.fields.summary)
-        self._check_sbrppl_third_party_label(release_key)
-        self._check_sbrppl_story_points(release_key)
-        self._check_summary_description_match(release_key)
+        labels = self._issue_labels_casefold(release)
+        checks = [
+            ('test_subtask', 'Списание времени в тестировании релиза', lambda: self._check_test_subtask(release), True, ''),
+            ('artifacts', 'Комментарии тестировщиков и worklog', lambda: self._check_artifacts(release_key), True, ''),
+            ('coverage', 'Связь задач с тест-кейсами', lambda: self._check_release_coverage(release_key), True, ''),
+            ('zephyr_cases', 'ТК Zephyr: Approved и вид тестирования', lambda: self._check_zephyr_test_cases(release_key, is_hotfix=is_hotfix), True, ''),
+            ('back_cycles', 'Back: обязательные ТЦ по КЭ', lambda: self._check_back_release_service_test_cycles(release_key), True,
+             'Hotfix' if is_hotfix else ('' if 'back' in labels else 'нет лейбла back')),
+            ('web_cycles', 'Web: обязательные ТЦ по КЭ', lambda: self._check_web_release_service_test_cycles(release_key), True,
+             'Hotfix' if is_hotfix else ('' if 'web' in labels else 'нет лейбла web')),
+            ('bugs', 'Баги: поля, статусы, контур, причины пропуска и Confluence', lambda: self._check_bugs(release_key, is_hotfix=is_hotfix), True, ''),
+            ('stories', 'Story: поля, архитектура, сроки тестирования и Task', lambda: self._check_stories(release_key), True, ''),
+            ('required_pr', 'Наличие связи PR', lambda: self._check_required_pull_requests(release_key), True, ''),
+            ('unlinked_pr', 'Merged PR у отлинкованных задач', lambda: self._check_unlinked_release_items_pull_requests(release_key), True, ''),
+            ('gigacode', 'GigaCode и AIFIXED', lambda: self._check_gigacode_aifixed_labels(release_key), False, ''),
+            ('cloud', 'Cloud: лейбл внешнего рынка', lambda: self._check_cloud_label(release_key, release.fields.summary), True,
+             '' if 'cloud' in release.fields.summary.casefold() else 'релиз не Cloud'),
+            ('third_party', 'SBRPPL: лейбл третьих лиц', lambda: self._check_sbrppl_third_party_label(release_key), True, ''),
+            ('story_points', 'SBRPPL: Story Points', lambda: self._check_sbrppl_story_points(release_key), True, ''),
+            ('gigachat', 'GigaChat: соответствие описания', lambda: self._check_summary_description_match(release_key), False, ''),
+        ]
+        for check_id, name, callback, required, reason in checks:
+            # Independent budgets: PR existence cannot starve merged/GigaCode checks.
+            budget = PR_RELEASE_TIMEOUT_SECONDS if check_id in {'required_pr', 'unlinked_pr', 'gigacode'} else None
+            self._run_check(check_id, name, callback, required=required, skip_reason=reason, budget=budget)
+        print("\n[CHECK SUMMARY]\n" + self._checks_wiki_table(), flush=True)
 
         total_errors = sum(len(d['errors']) for d in self.report_data.values())
         return total_errors == 0
@@ -2256,10 +2450,10 @@ class ReleaseValidator:
             issues = self.jira_main.search_issues(
                 f'key in ({keys_str})',
                 fields='summary,issuetype,customfield_24000',
-                maxResults=500
+                maxResults=False
             )
-        except Exception:
-            return result
+        except Exception as exc:
+            raise RuntimeError("не удалось получить вид тестирования задач") from exc
 
         for issue in issues:
             issue_type = issue.fields.issuetype.name.lower() if issue.fields.issuetype else ''
@@ -2329,7 +2523,7 @@ class ReleaseValidator:
             release_items = self.jira_main.search_issues(
                 f'key in ({keys_str})',
                 fields=f'summary,issuetype,assignee,{service_ke_field_id},customfield_24000',
-                maxResults=500
+                maxResults=False
             )
         except Exception as e:
             self._log_issue(
@@ -2812,6 +3006,9 @@ class ReleaseValidator:
               f"IPAD={'✓' if has_ipad_cycle else ('—' if not has_web_cycle else '✗')}")
 
     def _manage_jira_comment(self, release_key, is_success):
+        if getattr(self, 'dry_run', False):
+            print("[DRY RUN] Комментарий Jira не публикуется", flush=True)
+            return
         if not self.my_account_id:
             return
 
@@ -2850,7 +3047,7 @@ class ReleaseValidator:
             table_rows = []
             sorted_items = sorted(self.report_data.items(), key=lambda x: (0 if x[1]['errors'] else 1, x[0]))
             for key, data in sorted_items:
-                if not data['errors']:
+                if not data['errors'] and not data['warnings']:
                     continue
                 assignee = clean_report_text(data['assignee'])
                 summary = trim_report_text(data['summary'], 50) if data['summary'] else "—"
@@ -2873,6 +3070,7 @@ class ReleaseValidator:
                         safe_text = safe_text.replace(raw_char, escaped_char)
                     return safe_text
                 error_lines = [f"• {_escape(e)}" for e in data['errors']]
+                error_lines.extend(f"⚠ {_escape(w)}" for w in data['warnings'])
                 error_text = " \\\\ ".join(error_lines)
                 safe_summary = _escape(summary)
                 safe_assignee = _escape(assignee)
@@ -2884,11 +3082,18 @@ class ReleaseValidator:
                 "{panel:title=Результат проверки: НАЙДЕНЫ ОШИБКИ|borderStyle=solid|borderColor=#de350b|titleBGColor=#de350b|titleColor=#ffffff}\n"
                 "❌ *Релиз не готов к выпуску*\n"
                 "Необходимо исправить следующие замечания:\n\n"
-                "|| Задача || Тема || Ответственный || Ошибки ||\n"
+                "|| Задача || Тема || Ответственный || Ошибки / предупреждения ||\n"
                 f"{table_body}\n\n"
                 "Пожалуйста, исправьте ошибки и перезапустите проверку."
                 "{panel}"
             )
+
+        comment_body += "\n\n*Выполнение проверок*\n" + self._checks_wiki_table()
+        if is_success:
+            warnings = [f"* {key}: {clean_report_text(w).replace('|', '&#124;')}"
+                        for key, data in self.report_data.items() for w in data['warnings']]
+            if warnings:
+                comment_body += "\n\n*Предупреждения*\n" + "\n".join(warnings)
 
         try:
             print("   📝 Публикую новый комментарий...")
@@ -3083,7 +3288,7 @@ class ReleaseValidator:
         jql_covered = f'key in ({keys_str}) AND issue in hasTestCoverage()'
 
         try:
-            covered_issues = self.jira_main.search_issues(jql_covered, fields='key', maxResults=1000)
+            covered_issues = self.jira_main.search_issues(jql_covered, fields='key', maxResults=False)
             covered_keys = {issue.key for issue in covered_issues}
         except Exception as e:
             self._log_issue("GENERAL", "warning", f"Не удалось проверить покрытие (плагин Xray?): {e}")
@@ -3160,8 +3365,7 @@ class ReleaseValidator:
         "PERFREVIEW": 5.2,
         "HRPASSIST": 10.0,
     }
-    STORY_MIN_TESTING_RATIO = 0.90
-    STORY_MAX_TESTING_RATIO = 1.10
+    STORY_MAX_TESTING_RATIO = 1.15
 
     def _extract_story_requirements_rows(self, raw_val: object) -> dict[str, dict]:
         field_value = extract_jira_field_value(raw_val)
@@ -3416,6 +3620,51 @@ class ReleaseValidator:
                 f"({changed_at.strftime('%Y-%m-%d %H:%M')}). Требования и архитектура должны быть привязаны до UAT/Done"
             )
 
+    def _check_story_architecture_subtask(self, story) -> None:
+        """Проверяем именно автора закрытия, а не текущего исполнителя."""
+        try:
+            subtasks = getattr(story.fields, 'subtasks', None)
+            if subtasks is None:
+                subtasks = self.jira_main.issue(story.key, fields='subtasks').fields.subtasks
+            candidates = [task for task in subtasks
+                          if normalize_field_text(task.fields.summary).casefold() == 'анализ архитектуры']
+            if not candidates:
+                self._log_issue(story, "error", "Story: отсутствует sub-task 'Анализ архитектуры'")
+                return
+            failures = []
+            allowed = {normalize_field_text(name).casefold() for name in ALLOWED_ARCHITECTURE_CLOSERS}
+            for task in candidates:
+                try:
+                    full = self.jira_main.issue(task.key, expand='changelog')
+                    status = full.fields.status
+                    current = normalize_status_name(status.name)
+                    if current not in ARCHITECTURE_CLOSED_STATUSES:
+                        failures.append(f"{task.key}: не закрыта (статус '{status.name}')")
+                        continue
+                    changelog = full.changelog
+                    histories = list(getattr(changelog, 'histories', []) or [])
+                    # Не принимаем решение по обрезанной истории: в ней может не быть повторного закрытия.
+                    if getattr(changelog, 'total', len(histories)) > len(histories):
+                        raise ValueError(f"{task.key}: Jira вернула неполную историю закрытия")
+                    transitions = [(history, item) for history in histories for item in history.items
+                                   if getattr(item, 'field', '').casefold() == 'status']
+                    transitions.sort(key=lambda pair: self._parse_jira_datetime(pair[0].created))
+                    if not transitions:
+                        failures.append(f"{task.key}: в истории нет автора закрытия")
+                        continue
+                    history, transition = transitions[-1]
+                    author = self._get_author_name(history.author)
+                    if (normalize_status_name(getattr(transition, 'toString', '')) == current
+                            and normalize_field_text(author).casefold() in allowed):
+                        self._log_issue(story, "success", f"Story: sub-task 'Анализ архитектуры' [{task.key}] закрыта: {author} ✓")
+                        return
+                    failures.append(f"{task.key}: закрытие не подтверждено разрешенным автором (последний переход: {author})")
+                except Exception as exc:
+                    failures.append(f"{task.key}: не удалось проверить закрытие: {exc}")
+            self._log_issue(story, "error", "Story: sub-task 'Анализ архитектуры': " + '; '.join(failures))
+        except Exception as exc:
+            self._log_issue(story, "error", f"Story: не удалось проверить sub-task 'Анализ архитектуры': {exc}")
+
     def _check_stories(self, release_key: str) -> None:
         """Проверка Story: описание + обязательные поля + Epic Link + время в тест-статусах + Task внутри Story"""
         STORY_FIELDS = {
@@ -3435,7 +3684,7 @@ class ReleaseValidator:
 
         keys_str = ",".join(linked_keys)
         fields_req = (
-            f"summary,description,issuetype,status,assignee,labels,issuelinks,"
+            f"summary,description,issuetype,status,assignee,labels,issuelinks,subtasks,"
             f"{','.join(STORY_FIELDS.keys())},{EPIC_LINK_FIELD},"
             f"{REQUIREMENTS_FIELD},{ARCHITECTURE_IMPACT_FIELD}"
         )
@@ -3444,7 +3693,7 @@ class ReleaseValidator:
             story_issues = self.jira_main.search_issues(
                 f'key in ({keys_str}) AND issuetype = Story',
                 fields=fields_req,
-                maxResults=100
+                maxResults=False
             )
         except Exception as e:
             self._log_issue("GENERAL", "error", f"Ошибка поиска Story задач: {e}")
@@ -3458,6 +3707,7 @@ class ReleaseValidator:
 
         for story in story_issues:
             story_project = story.key.split('-')[0]
+            self._check_story_architecture_subtask(story)
 
             # --- 0. Проверка обязательного лейбла контура ---
             self._check_required_platform_label(story, "Story")
@@ -3535,10 +3785,8 @@ class ReleaseValidator:
             # --- 4. Проверка времени в тест-статусах ---
             target_days = self.STORY_MAX_TESTING_DAYS.get(story_project)
             if target_days is not None:
-                min_days = target_days * self.STORY_MIN_TESTING_RATIO
-                max_days = target_days * self.STORY_MAX_TESTING_RATIO
-                min_percent = int(self.STORY_MIN_TESTING_RATIO * 100)
-                max_percent = int(self.STORY_MAX_TESTING_RATIO * 100)
+                max_days = round(target_days * self.STORY_MAX_TESTING_RATIO, 10)
+                max_percent = round(self.STORY_MAX_TESTING_RATIO * 100)
                 try:
                     if story_full is None:
                         story_full = self.jira_main.issue(story.key, expand='changelog')
@@ -3547,7 +3795,6 @@ class ReleaseValidator:
                         self.STORY_MONITORED_STATUSES
                     )
                     actual_days_rounded = round(actual_days, 2)
-                    min_days_rounded = round(min_days, 2)
                     max_days_rounded = round(max_days, 2)
                     target_days_rounded = round(target_days, 2)
                     if actual_days > max_days:
@@ -3558,20 +3805,11 @@ class ReleaseValidator:
                             f"({max_days_rounded} д. из {target_days_rounded} д.) "
                             f"для проектной области {story_project}"
                         )
-                    elif actual_days < min_days:
-                        self._log_issue(
-                            story, "error",
-                            f"Story: суммарное время в тест-статусах "
-                            f"({actual_days_rounded} д.) меньше {min_percent}% норматива "
-                            f"({min_days_rounded} д. из {target_days_rounded} д.) "
-                            f"для проектной области {story_project}"
-                        )
                     else:
                         self._log_issue(
                             story, "success",
                             f"Story: время в тест-статусах {actual_days_rounded} д. "
-                            f"в пределах {min_percent}–{max_percent}% норматива "
-                            f"({min_days_rounded}–{max_days_rounded} д.) ✓"
+                            f"не превышает {max_percent}% норматива ({max_days_rounded} д.) ✓"
                         )
                 except Exception as e:
                     self._log_issue(
@@ -3720,66 +3958,52 @@ class ReleaseValidator:
         return None
 
     def _extract_pull_request_evidence(
-        self,
-        value: object,
-        *,
-        in_pull_request_context: bool = False,
+        self, value: object, *, in_pull_request_context: bool = False,
     ) -> Optional[str]:
-        """Return evidence only for structured Pull Request data, not text mentions."""
-
+        """Recognize PR objects, positive counters, JSON fields and explicit PR URLs."""
+        if isinstance(value, str):
+            text = html.unescape(value).strip()
+            if text.startswith(('{', '[')):
+                try:
+                    return self._extract_pull_request_evidence(
+                        json.loads(text), in_pull_request_context=in_pull_request_context)
+                except ValueError:
+                    pass
+            # Jira Server may serialize Development as a Java map, not JSON.
+            count = re.search(r'\bpullrequests?\s*=\s*\{[^{}]*\b(?:stateCount|count)\s*=\s*([1-9]\d*)\b', text, re.I)
+            if count:
+                return f"PR count={count.group(1)}"
+            match = re.search(r'https?://[^\s<>"\[\]{}]+/(?:pull-requests|pullrequests|pull|merge_requests)/\d+\b[^\s<>"\[\]{}]*', text, re.I)
+            return match.group(0) if match else None
         if isinstance(value, list):
             for item in value:
-                evidence = self._extract_pull_request_evidence(
-                    item,
-                    in_pull_request_context=in_pull_request_context,
-                )
+                evidence = self._extract_pull_request_evidence(item, in_pull_request_context=in_pull_request_context)
                 if evidence:
                     return evidence
-            if in_pull_request_context and value:
-                return "PR list"
-            return None
-
-        if isinstance(value, dict):
-            for key, item in value.items():
-                key_is_pr = self._is_pull_request_key(key)
-                if key_is_pr and item not in (None, '', [], {}):
-                    evidence = self._extract_pull_request_evidence(
-                        item,
-                        in_pull_request_context=True,
-                    )
-                    if evidence:
-                        return evidence
-                    if isinstance(item, str):
-                        if self._is_pull_request_url(item):
-                            return item
-                    return f"PR field {key}"
-                if (
-                    str(key).casefold() in {'url', 'href', 'self', 'link'}
-                    and self._is_pull_request_url(item)
-                ):
-                    return str(item)
-
+        elif isinstance(value, dict):
             if in_pull_request_context:
-                evidence = self._pull_request_evidence_from_mapping(value)
+                for counter in ('count', 'total', 'overall', 'stateCount', 'open', 'merged', 'declined'):
+                    count = value.get(counter)
+                    if isinstance(count, (int, float)) and not isinstance(count, bool) and count > 0:
+                        return f"PR {counter}={count}"
+                # Provider/repository metadata is not a PR object.
+                if not any(key in value for key in ('pullRequests', 'pullrequests', 'repositories', '_instance', 'applicationType')):
+                    if any(value.get(key) for key in ('id', 'number', 'displayId', 'pullRequestId')):
+                        return self._pull_request_evidence_from_mapping(value)
+            for key, item in value.items():
+                compact_key = re.sub(r'[^a-z0-9]', '', str(key).casefold())
+                if compact_key in {'pullrequestid', 'pullrequestcount'} and str(item).isdigit() and int(item) > 0:
+                    return f"PR {key}={item}"
+                if in_pull_request_context and key == 'byInstanceType' and isinstance(item, dict):
+                    for provider_data in item.values():
+                        evidence = self._extract_pull_request_evidence(provider_data, in_pull_request_context=True)
+                        if evidence:
+                            return evidence
+                evidence = self._extract_pull_request_evidence(
+                    item, in_pull_request_context=self._is_pull_request_key(key)
+                    or (in_pull_request_context and key in ('overall', 'byInstanceType', 'stateCount', 'summary')))
                 if evidence:
                     return evidence
-
-            for item in value.values():
-                if isinstance(item, (dict, list)):
-                    evidence = self._extract_pull_request_evidence(
-                        item,
-                        in_pull_request_context=in_pull_request_context,
-                    )
-                    if evidence:
-                        return evidence
-            return None
-
-        if isinstance(value, str) and in_pull_request_context:
-            if self._is_pull_request_url(value):
-                return value
-            match = re.search(r'\bpull\s*request\s*#?\s*(\d+)\b', value, flags=re.IGNORECASE)
-            if match:
-                return f"PR {match.group(1)}"
         return None
 
     def _json_contains_pull_request(self, value: object) -> bool:
@@ -3807,53 +4031,157 @@ class ReleaseValidator:
             return any(self._json_contains_commit(item) for item in value)
         return False
 
-    def _get_dev_status_payloads(self, issue_id: str) -> list[tuple[str, str, dict]]:
-        if issue_id in self._dev_status_payload_cache:
-            return self._dev_status_payload_cache[issue_id]
+    @contextmanager
+    def _pr_lookup_budget(self, seconds=PR_LOOKUP_TIMEOUT_SECONDS):
+        previous = getattr(self, '_pr_request_deadline', None)
+        deadline = time.monotonic() + seconds
+        self._pr_request_deadline = min(previous, deadline) if previous is not None else deadline
+        try:
+            yield
+        finally:
+            self._pr_request_deadline = previous
 
-        base_url = config['jira']['url'].rstrip('/')
-        payloads: list[tuple[str, str, dict]] = []
-        application_types = ('stash', 'bitbucket', 'bitbucket-server')
-        data_types = ('pullrequest', 'repository', 'commit')
+    def _reset_pr_run_state(self):
+        # Snapshots last only for one release run, including failed/empty responses.
+        self._pr_http_cache = {}
+        self._pr_endpoint_failures = {}
+        self._pr_endpoint_last_error = {}
+        self._pr_lookup_failures = set()
+        self._dev_status_payload_cache = {}
+        self._pull_request_only_evidence_cache = {}
+        self._pull_request_evidence_cache = {}
+        self._merged_pull_request_evidence_cache = {}
+        self._release_pr_targets_cache = {}
 
-        for application_type in application_types:
-            for data_type in data_types:
-                url = f"{base_url}/rest/dev-status/latest/issue/detail"
-                try:
-                    response = self.jira_http.get(
-                        url,
-                        params={
-                            'issueId': issue_id,
-                            'applicationType': application_type,
-                            'dataType': data_type,
-                        },
-                        timeout=30,
-                    )
-                    if response.status_code == 200:
-                        payloads.append((application_type, data_type, response.json()))
-                except Exception:
-                    continue
+    def _pr_get_json(self, url: str, **kwargs):
+        """One bounded retry per request; share snapshots and outage protection."""
+        if not hasattr(self, '_pr_http_cache'):
+            self._pr_http_cache = {}
+            self._pr_endpoint_failures = {}
+            self._pr_endpoint_last_error = {}
+        if not hasattr(self, '_pr_lookup_failures'):
+            self._pr_lookup_failures = set()
+        cache_key = (url, json.dumps(kwargs, sort_keys=True))
+        if cache_key in self._pr_http_cache:
+            payload, failure = self._pr_http_cache[cache_key]
+            if failure:
+                self._pr_lookup_failures.add(failure)
+            return payload
+        # Group issue-specific paths, so an outage is not retried for every Story.
+        endpoint = re.sub(r'/issue/[^/]+/(remotelink)$', r'/issue/*/\1', url)
+        if url.endswith('/detail'):
+            params = kwargs.get('params') or {}
+            endpoint += ':' + str(params.get('applicationType', '')) + ':' + str(params.get('dataType', ''))
+        if self._pr_endpoint_failures.get(endpoint, 0) >= PR_ENDPOINT_FAILURE_LIMIT:
+            cause = self._pr_endpoint_last_error.get(endpoint, 'сбой запроса')
+            self._pr_lookup_failures.add(f'источник временно недоступен после повторных сбоев: {cause}')
+            return None
+        failure = 'сбой HTTP/сети или некорректный JSON после повторных запросов'
+        for attempt in range(PR_MAX_ATTEMPTS):
+            deadline = getattr(self, '_pr_request_deadline', None)
+            remaining = deadline - time.monotonic() if deadline is not None else PR_REQUEST_TIMEOUT_SECONDS
+            if remaining <= 0:
+                failure = 'исчерпан лимит времени проверки PR'
+                break
+            started = time.monotonic()
+            try:
+                response = self.jira_http.get(url, timeout=min(PR_REQUEST_TIMEOUT_SECONDS, remaining), **kwargs)
+                trace_http('PR', url, response.status_code, started, attempt + 1, kwargs.get('params'))
+                if response.status_code == 200:
+                    payload = response.json()
+                    if not isinstance(payload, (dict, list)):
+                        raise ValueError('Expected JSON object or list')
+                    if isinstance(payload, dict) and (payload.get('errors') or payload.get('errorMessages')):
+                        raise ValueError('Jira returned application errors')
+                    self._pr_endpoint_failures[endpoint] = 0
+                    self._pr_http_cache[cache_key] = (payload, None)
+                    return payload
+                failure = f'HTTP {response.status_code}'
+                if response.status_code not in {408, 429, 500, 502, 503, 504}:
+                    break
+            except requests.exceptions.SSLError as exc:
+                failure = request_failure_kind(exc)
+                trace_http('PR', url, failure, started, attempt + 1, kwargs.get('params'))
+                self._pr_endpoint_failures[endpoint] = PR_ENDPOINT_FAILURE_LIMIT
+                break
+            except (requests.RequestException, ValueError) as exc:
+                failure = request_failure_kind(exc)
+                trace_http('PR', url, failure, started, attempt + 1, kwargs.get('params'))
+            if attempt + 1 < PR_MAX_ATTEMPTS:
+                delay = PR_RETRY_DELAY_SECONDS
+                if deadline is not None:
+                    delay = min(delay, max(0, deadline - time.monotonic()))
+                if delay:
+                    time.sleep(delay)
+        self._pr_endpoint_failures[endpoint] = self._pr_endpoint_failures.get(endpoint, 0) + 1
+        self._pr_endpoint_last_error[endpoint] = failure
+        self._pr_lookup_failures.add(failure)
+        self._pr_http_cache[cache_key] = (None, failure)
+        return None
 
-        self._dev_status_payload_cache[issue_id] = payloads
+    @staticmethod
+    def _summary_pr_count(payload) -> Optional[int]:
+        if not isinstance(payload, dict) or payload.get('errors') or payload.get('errorMessages'):
+            return None
+        summary = payload.get('summary')
+        section = summary.get('pullrequest') if isinstance(summary, dict) else None
+        overall = section.get('overall') if isinstance(section, dict) else None
+        count = overall.get('count') if isinstance(overall, dict) else None
+        return count if isinstance(count, int) and not isinstance(count, bool) and count >= 0 else None
+
+    def _get_dev_summary(self, issue_id):
+        base = config['jira']['url'].rstrip('/')
+        fallback = (None, None)
+        for version in ('latest', '1.0'):
+            payload = self._pr_get_json(f"{base}/rest/dev-status/{version}/issue/summary",
+                                        params={'issueId': issue_id})
+            if isinstance(payload, dict) and isinstance(payload.get('summary'), dict):
+                fallback = (version, payload)
+                if self._summary_pr_count(payload) is not None:
+                    return version, payload
+        return fallback
+
+    def _get_dev_status_payloads(self, issue_id: str, *, data_types=('pullrequest', 'repository', 'commit')) -> list[tuple[str, str, dict]]:
+        """Details are only needed for merged/GigaCode, never for PR existence."""
+        with self._pr_lookup_budget():
+            return self._get_dev_status_payloads_with_retries(issue_id, data_types)
+
+    def _get_dev_status_payloads_with_retries(self, issue_id: str, data_types) -> list[tuple[str, str, dict]]:
+        cache_key = (issue_id, tuple(data_types))
+        if cache_key in self._dev_status_payload_cache:
+            return self._dev_status_payload_cache[cache_key]
+        version, summary = self._get_dev_summary(issue_id)
+        if summary is None:
+            raise RuntimeError('недоступна сводка development; детали PR/commit не проверены')
+        payloads = []
+        base = config['jira']['url'].rstrip('/')
+        # Only query integrations and data types actually reported by Jira.
+        sections = summary.get('summary', {})
+        for data_type in data_types:
+            section = sections.get(data_type)
+            if not isinstance(section, dict):
+                if data_type == 'pullrequest':
+                    raise RuntimeError('в сводке development нет данных о PR')
+                continue
+            count = (section.get('overall') or {}).get('count')
+            if count == 0:
+                continue
+            providers = section.get('byInstanceType') or {}
+            if not providers:
+                raise RuntimeError(f'Jira не указала интеграцию для {data_type}')
+            for provider in providers:
+                payload = self._pr_get_json(f"{base}/rest/dev-status/{version}/issue/detail", params={
+                    'issueId': issue_id, 'applicationType': provider, 'dataType': data_type})
+                if not isinstance(payload, dict) or not isinstance(payload.get('detail'), list):
+                    raise RuntimeError(f'не удалось проверить {provider}/{data_type}')
+                if count and not payload['detail']:
+                    raise RuntimeError(f'пустой detail при непустой сводке {provider}/{data_type}')
+                payloads.append((provider, data_type, payload))
+        self._dev_status_payload_cache[cache_key] = payloads
         return payloads
 
     def _dev_status_pull_request_evidence(self, data_type: str, payload: dict) -> Optional[str]:
-        evidence = self._extract_pull_request_evidence(payload)
-        if evidence:
-            return evidence
-
-        details = payload.get('detail') if isinstance(payload, dict) else None
-        if data_type == 'pullrequest':
-            evidence = self._extract_pull_request_evidence(
-                details,
-                in_pull_request_context=True,
-            )
-            if evidence:
-                return evidence
-            if details not in (None, '', [], {}):
-                return "dev-status pullrequest detail"
-
-        return None
+        return self._extract_pull_request_evidence(payload)
 
     def _dev_status_payload_has_pull_request(self, data_type: str, payload: dict) -> bool:
         return self._dev_status_pull_request_evidence(data_type, payload) is not None
@@ -3873,11 +4201,11 @@ class ReleaseValidator:
 
         return False
 
-    def _extract_merged_pull_request_evidence_from_payload(self, value: object) -> Optional[str]:
+    def _extract_merged_pull_request_evidence_from_payload(self, value: object, in_pr=False) -> Optional[str]:
         """Найти в dev-status payload PR со статусом merged/merged=true."""
         if isinstance(value, list):
             for item in value:
-                evidence = self._extract_merged_pull_request_evidence_from_payload(item)
+                evidence = self._extract_merged_pull_request_evidence_from_payload(item, in_pr=in_pr)
                 if evidence:
                     return evidence
             return None
@@ -3890,7 +4218,7 @@ class ReleaseValidator:
         raw_casefold = raw_text.casefold()
         raw_compact = re.sub(r'[^a-zа-я0-9/-]+', '', raw_casefold)
         looks_like_pr = (
-            'pullrequest' in re.sub(r'[^a-zа-я0-9]+', '', key_text)
+            in_pr or 'pullrequest' in re.sub(r'[^a-zа-я0-9]+', '', key_text)
             or 'pullrequest' in raw_compact
             or '/pull-requests/' in raw_casefold
             or bool(re.search(r'\bpull\s*request\b', raw_casefold))
@@ -3926,8 +4254,8 @@ class ReleaseValidator:
                 status_display = ", ".join(status_values) if status_values else "merged=true"
                 return f"{pr_id} ({status_display})"
 
-        for item in value.values():
-            evidence = self._extract_merged_pull_request_evidence_from_payload(item)
+        for key, item in value.items():
+            evidence = self._extract_merged_pull_request_evidence_from_payload(item, in_pr=self._is_pull_request_key(key))
             if evidence:
                 return evidence
         return None
@@ -3940,14 +4268,16 @@ class ReleaseValidator:
             return self._merged_pull_request_evidence_cache[cache_key]
 
         evidence = None
+        if not issue_id:
+            raise RuntimeError('нет Jira ID для проверки merged PR')
         if issue_id:
-            for application_type, data_type, payload in self._get_dev_status_payloads(issue_id):
+            for application_type, data_type, payload in self._get_dev_status_payloads(issue_id, data_types=('pullrequest',)):
                 payload_evidence = self._extract_merged_pull_request_evidence_from_payload(payload)
                 if payload_evidence:
                     evidence = f"dev-status {application_type}/{data_type}: {payload_evidence}"
                     break
 
-        if cache_key:
+        if cache_key and evidence:
             self._merged_pull_request_evidence_cache[cache_key] = evidence
         return evidence
 
@@ -3959,7 +4289,7 @@ class ReleaseValidator:
             return self._pull_request_evidence_cache[cache_key]
 
         evidence = self._find_issue_pull_request_evidence_uncached(issue, issue_key, issue_id)
-        if cache_key:
+        if cache_key and evidence:
             self._pull_request_evidence_cache[cache_key] = evidence
         return evidence
 
@@ -3970,113 +4300,46 @@ class ReleaseValidator:
         if cache_key and cache_key in self._pull_request_only_evidence_cache:
             return self._pull_request_only_evidence_cache[cache_key]
 
-        evidence = self._find_issue_pull_request_only_evidence_uncached(issue_key, issue_id)
-        if cache_key:
+        self._pr_lookup_failures = set()
+        with self._pr_lookup_budget():
+            evidence = self._find_issue_pull_request_only_evidence_uncached(issue_key, issue_id)
+        if cache_key and evidence:
             self._pull_request_only_evidence_cache[cache_key] = evidence
         return evidence
 
     def _find_issue_pull_request_only_evidence_uncached(
-        self,
-        issue_key: str,
-        issue_id: str,
+        self, issue_key: str, issue_id: str,
     ) -> Optional[str]:
+        # A positive Jira association counter suffices; do not request PR bodies.
+        count = None
         if issue_id:
-            for application_type, data_type, payload in self._get_dev_status_payloads(issue_id):
-                pr_evidence = self._dev_status_pull_request_evidence(data_type, payload)
-                if pr_evidence:
-                    return f"dev-status {application_type}/{data_type}: {pr_evidence}"
-
+            _, summary = self._get_dev_summary(issue_id)
+            count = self._summary_pr_count(summary)
+            if count is not None and count > 0:
+                return f"Jira development: связанных PR — {count}"
+        # Independent, small fallback: explicit Jira remote links only.
+        links = None
         if issue_key:
-            base_url = config['jira']['url'].rstrip('/')
-
-            try:
-                response = self.jira_http.get(
-                    f"{base_url}/rest/api/2/issue/{issue_key}/remotelink",
-                    timeout=12,
-                )
-                if response.status_code == 200:
-                    pr_evidence = self._extract_pull_request_evidence(response.json())
-                    if pr_evidence:
-                        return f"Jira remote links: {pr_evidence}"
-            except Exception:
-                pass
-
-            try:
-                properties_response = self.jira_http.get(
-                    f"{base_url}/rest/api/2/issue/{issue_key}/properties",
-                    timeout=12,
-                )
-                if properties_response.status_code == 200:
-                    properties_payload = properties_response.json()
-                    for item in properties_payload.get('keys', []) if isinstance(properties_payload, dict) else []:
-                        property_key = item.get('key', '') if isinstance(item, dict) else ''
-                        if not property_key or not self._is_relevant_jira_property_key(property_key):
-                            continue
-                        property_response = self.jira_http.get(
-                            f"{base_url}/rest/api/2/issue/{issue_key}/properties/{property_key}",
-                            timeout=12,
-                        )
-                        if property_response.status_code == 200:
-                            pr_evidence = self._extract_pull_request_evidence(property_response.json())
-                            if pr_evidence:
-                                return f"Jira issue property {property_key}: {pr_evidence}"
-            except Exception:
-                pass
-
+            base = config['jira']['url'].rstrip('/')
+            links = self._pr_get_json(f"{base}/rest/api/2/issue/{quote(issue_key, safe='')}/remotelink")
+            if isinstance(links, list):
+                evidence = self._extract_pull_request_evidence(links)
+                if evidence:
+                    return f"Jira remote links: {evidence}"
+        if count == 0 and isinstance(links, list):
+            # Both sources answered: absence is different from a timeout.
+            self._pr_lookup_failures = set()
+        else:
+            if not hasattr(self, '_pr_lookup_failures'):
+                self._pr_lookup_failures = set()
+            self._pr_lookup_failures.add('не получены полные данные о связях PR')
         return None
 
     def _find_issue_pull_request_evidence_uncached(
-        self,
-        issue,
-        issue_key: str,
-        issue_id: str,
+        self, issue, issue_key: str, issue_id: str,
     ) -> Optional[str]:
-        if issue_id:
-            for application_type, data_type, payload in self._get_dev_status_payloads(issue_id):
-                pr_evidence = self._dev_status_pull_request_evidence(data_type, payload)
-                if pr_evidence:
-                    return f"dev-status {application_type}/{data_type}: {pr_evidence}"
-
-        if issue_key:
-            base_url = config['jira']['url'].rstrip('/')
-
-            try:
-                response = self.jira_http.get(
-                    f"{base_url}/rest/api/2/issue/{issue_key}/remotelink",
-                    timeout=12,
-                )
-                if response.status_code == 200:
-                    remote_links_payload = response.json()
-                    pr_evidence = self._extract_pull_request_evidence(remote_links_payload)
-                    if pr_evidence:
-                        return f"Jira remote links: {pr_evidence}"
-            except Exception:
-                pass
-
-            try:
-                properties_response = self.jira_http.get(
-                    f"{base_url}/rest/api/2/issue/{issue_key}/properties",
-                    timeout=12,
-                )
-                if properties_response.status_code == 200:
-                    properties_payload = properties_response.json()
-                    for item in properties_payload.get('keys', []) if isinstance(properties_payload, dict) else []:
-                        property_key = item.get('key', '') if isinstance(item, dict) else ''
-                        if not property_key or not self._is_relevant_jira_property_key(property_key):
-                            continue
-                        property_response = self.jira_http.get(
-                            f"{base_url}/rest/api/2/issue/{issue_key}/properties/{property_key}",
-                            timeout=12,
-                        )
-                        if property_response.status_code == 200:
-                            property_payload = property_response.json()
-                            pr_evidence = self._extract_pull_request_evidence(property_payload)
-                            if pr_evidence:
-                                return f"Jira issue property {property_key}: {pr_evidence}"
-            except Exception:
-                pass
-
-        return None
+        with self._pr_lookup_budget():
+            return self._find_issue_pull_request_only_evidence_uncached(issue_key, issue_id)
 
     def _issue_has_pull_request(self, issue) -> bool:
         return self._find_issue_pull_request_evidence(issue) is not None
@@ -4084,7 +4347,7 @@ class ReleaseValidator:
     def _issue_has_gigacode_pull_request(self, issue) -> Optional[str]:
         issue_id = str(getattr(issue, 'id', '') or '')
         if not issue_id:
-            return None
+            raise RuntimeError('нет Jira ID для проверки GigaCode')
 
         for _, _, payload in self._get_dev_status_payloads(issue_id):
             gigacode_marker = self._find_gigacode_marker(payload)
@@ -4142,7 +4405,7 @@ class ReleaseValidator:
             release_issues = self.jira_main.search_issues(
                 jql,
                 fields='summary,issuetype,assignee,labels,issuelinks',
-                maxResults=500
+                maxResults=False
             )
         except Exception as e:
             self._log_issue("GENERAL", "error", f"Ошибка получения Story/Bug для проверки PR: {e}")
@@ -4171,7 +4434,7 @@ class ReleaseValidator:
                 task_issues = self.jira_main.search_issues(
                     f'key in ({task_keys_str})',
                     fields='summary,issuetype,assignee,labels',
-                    maxResults=500
+                    maxResults=False
                 )
                 tasks_by_key = {task.key: task for task in task_issues}
             except Exception as e:
@@ -4223,7 +4486,9 @@ class ReleaseValidator:
                 self._log_issue(
                     target_issue,
                     "error",
-                    "Pull Request не найден. Для каждой Story/Bug в составе релиза должен быть PR на самой задаче"
+                    ("Pull Request не удалось подтвердить: " + "; ".join(sorted(self._pr_lookup_failures))
+                     if getattr(self, '_pr_lookup_failures', None) else
+                     "Pull Request не найден. Для каждой Story/Bug в составе релиза должен быть PR на самой задаче")
                 )
 
     @staticmethod
@@ -4244,7 +4509,10 @@ class ReleaseValidator:
         current_linked_keys = set(self._extract_consist_of_issues(release) or [])
         removed_keys = set()
 
-        histories = getattr(getattr(release, 'changelog', None), 'histories', []) or []
+        changelog = getattr(release, 'changelog', None)
+        histories = getattr(changelog, 'histories', []) or []
+        if changelog is None or getattr(changelog, 'total', len(histories)) > len(histories):
+            raise RuntimeError('не удалось получить полную историю связей релиза')
         for history in histories:
             for item in getattr(history, 'items', []) or []:
                 field_name = normalize_field_text(getattr(item, 'field', '')).casefold()
@@ -4273,7 +4541,7 @@ class ReleaseValidator:
             issues = self.jira_main.search_issues(
                 f'key in ({keys_str})',
                 fields='issuetype',
-                maxResults=500,
+                maxResults=False,
             )
         except Exception as e:
             self._log_issue(
@@ -4312,7 +4580,7 @@ class ReleaseValidator:
             issues = self.jira_main.search_issues(
                 f'key in ({keys_str})',
                 fields='summary,issuetype,assignee,labels,issuelinks',
-                maxResults=500
+                maxResults=False
             )
         except Exception as e:
             self._log_issue(
@@ -4359,7 +4627,7 @@ class ReleaseValidator:
             except Exception as e:
                 self._log_issue(
                     issue,
-                    "warning",
+                    "error",
                     f"Отлинкованная задача: не удалось проверить статус PR: {e}"
                 )
                 continue
@@ -4387,15 +4655,21 @@ class ReleaseValidator:
         print(f"   Проверка AIFIXED по GigaCode PR/commit для {len(targets)} Story/Bug...")
 
         for target_issue, issues_to_check in targets:
+            if AIFIXED_LABEL.casefold() in self._issue_labels_casefold(target_issue):
+                self._log_issue(target_issue, 'success', 'AIFIXED: лейбл уже установлен ✓')
+                continue
             matched_issue = None
             matched_marker = None
+            check_failed = False
             for issue_to_check in issues_to_check:
                 try:
                     gigacode_marker = self._issue_has_gigacode_pull_request(issue_to_check)
                     if gigacode_marker and matched_issue is None:
                         matched_issue = issue_to_check
                         matched_marker = gigacode_marker
+                        break
                 except Exception as e:
+                    check_failed = True
                     self._log_issue(
                         target_issue,
                         "warning",
@@ -4403,9 +4677,14 @@ class ReleaseValidator:
                     )
 
             if not matched_issue:
+                if check_failed:
+                    continue
                 self._log_issue(target_issue, "success", "AIFIXED: GigaCode PR/commit не найден — лейбл AIFIXED не требуется ✓")
                 continue
 
+            if getattr(self, 'dry_run', False):
+                self._log_issue(target_issue, "warning", "AIFIXED: найден GigaCode; требуется добавить лейбл (dry-run, запись отключена)")
+                continue
             try:
                 added = self._add_label_if_missing(target_issue, AIFIXED_LABEL)
                 if added:
@@ -4451,7 +4730,7 @@ class ReleaseValidator:
             all_issues = self.jira_main.search_issues(
                 f'key in ({keys_str})',
                 fields='summary,issuetype,assignee,labels',
-                maxResults=200
+                maxResults=False
             )
         except Exception as e:
             self._log_issue("GENERAL", "error", f"Ошибка проверки Cloud-лейбла: {e}")
@@ -4495,7 +4774,7 @@ class ReleaseValidator:
             all_issues = self.jira_main.search_issues(
                 f'key in ({keys_str})',
                 fields='summary,issuetype,assignee,labels',
-                maxResults=200
+                maxResults=False
             )
         except Exception as e:
             self._log_issue("GENERAL", "error", f"Ошибка проверки лейбла #Пульс_3лица для SBRPPL: {e}")
@@ -4546,7 +4825,7 @@ class ReleaseValidator:
             all_issues = self.jira_main.search_issues(
                 f'key in ({keys_str})',
                 fields=f'summary,issuetype,assignee,{story_points_field}',
-                maxResults=200
+                maxResults=False
             )
         except Exception as e:
             self._log_issue(
@@ -4601,7 +4880,7 @@ class ReleaseValidator:
             issues = self.jira_main.search_issues(
                 f'key in ({keys_str})',
                 fields='summary,description,issuetype,assignee',
-                maxResults=500,
+                maxResults=False,
             )
         except Exception as e:
             self._log_issue(
@@ -4781,7 +5060,7 @@ class ReleaseValidator:
                 f"customfield_16901,customfield_11507,{STAND_FIELD_ID},"
                 + ",".join(extra_fields + ["*all"])
             )
-            all_issues = self.jira_main.search_issues(jql, fields=fields_req, maxResults=100)
+            all_issues = self.jira_main.search_issues(jql, fields=fields_req, maxResults=False)
         except Exception as e:
             self._log_issue("GENERAL", "error", f"Ошибка поиска багов: {e}")
             return
@@ -5198,7 +5477,12 @@ def _diag_pr(validator: 'ReleaseValidator', issue_key: str):
 
 
 if __name__ == "__main__":
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
     validator = ReleaseValidator()
+    if len(sys.argv) >= 3 and sys.argv[1] == "--dry-run":
+        validator.dry_run = True
+        sys.exit(0 if validator.generate_report(sys.argv[2]) else 1)
 
     # Диагностика: python scripts/release_checker.py --diag-tc HRPQA-C133028
     if len(sys.argv) >= 3 and sys.argv[1] == '--diag-tc':
