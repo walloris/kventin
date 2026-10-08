@@ -81,17 +81,19 @@ def test_summary_discovers_provider_and_old_api_fallback(validator):
             return {'detail': [{'pullRequests': [{'id': 42}]}]}
         return {'detail': []}
     validator._pr_get_json = Mock(side_effect=fetch)
-    payloads = validator._get_dev_status_payloads('123')
+    payloads = validator._get_dev_status_payloads('123', data_types=('pullrequest',))
     assert any(provider == 'custom-git' and validator._extract_pull_request_evidence(payload)
                for provider, _, payload in payloads)
 
 
-def test_missing_summary_does_not_trigger_detail_scan(validator):
+def test_missing_summary_still_tries_known_integrations(validator):
     validator._pr_get_json = Mock(return_value={})
     with pytest.raises(RuntimeError, match='development'):
-        validator._get_dev_status_payloads('123')
-    assert validator._pr_get_json.call_count == 2
-    assert all(call.args[0].endswith('/summary') for call in validator._pr_get_json.call_args_list)
+        validator._get_dev_status_payloads('123', data_types=('pullrequest',))
+    assert validator._pr_get_json.call_count == 8
+    details = [c for c in validator._pr_get_json.call_args_list if c.args[0].endswith('/detail')]
+    assert {c.kwargs['params']['applicationType'] for c in details} == set(rc.PR_LEGACY_PROVIDERS)
+    assert all(c.kwargs['params']['dataType'] == 'pullrequest' for c in details)
 
 
 def test_lookup_negative_result_not_cached(validator):
@@ -290,8 +292,8 @@ def test_many_issues_during_outage_have_bounded_requests_and_no_success(validato
         for number in range(50):
             assert validator._find_issue_pull_request_only_evidence(NS(key=f'ABC-{number}', id=str(number))) is None
             assert validator._pr_lookup_failures
-    # Two summary versions + remote links, three failed probes per source.
-    assert validator.jira_http.get.call_count <= 3 * rc.PR_ENDPOINT_FAILURE_LIMIT * rc.PR_MAX_ATTEMPTS
+    # Summary, remotelink, direct details and properties still share 120 seconds.
+    assert validator.jira_http.get.call_count <= 50
     assert now[0] <= rc.PR_RELEASE_TIMEOUT_SECONDS
 
 
@@ -324,9 +326,10 @@ def test_detail_queries_only_reported_provider_and_requested_type(validator):
 
 
 def test_empty_detail_with_positive_summary_is_not_success(validator):
-    validator._pr_get_json = Mock(side_effect=[summary_payload(1, {'stash': {'count': 1}}), {'detail': []}])
-    with pytest.raises(RuntimeError, match='пустой detail'):
-        validator._get_dev_status_payloads('123')
+    validator._pr_get_json = Mock(side_effect=lambda url, **kw:
+        summary_payload(1, {'stash': {'count': 1}}) if url.endswith('/summary') else {'detail': []})
+    with pytest.raises(RuntimeError, match='пустой или недоступный detail'):
+        validator._get_dev_status_payloads('123', data_types=('pullrequest',))
 
 
 def test_optional_gigacode_failure_does_not_also_log_success(validator):
@@ -425,12 +428,12 @@ def test_comment_includes_warnings_and_execution_table_on_failure():
     checker._run_check('story', 'Story', lambda: checker._log_issue('ABC-1', 'error', 'Нет описания'))
     checker._manage_jira_comment('REL-1', False)
     body = checker.jira_main.add_comment.call_args.args[1]
-    assert 'AIFIXED: не удалось проверить' in body
+    assert 'Не удалось проверить необходимость лейбла AIFIXED.' in body
     assert 'Нет описания' in body
-    assert 'INCOMPLETE' in body
-    assert body.startswith(rc.CHECK_TABLE_HEADER)
-    assert len(body.splitlines()) == 3
-    assert all(line.startswith('|') and line.endswith('|') for line in body.splitlines())
+    assert 'INCOMPLETE' not in body
+    assert rc.COMMENT_TABLE_HEADER in body
+    assert '#de350b' in body and '#14892c' not in body
+    assert len([line for line in body.splitlines() if line.startswith('| ')]) == 1
 
 
 def test_comment_keeps_optional_warnings_on_success():
@@ -441,10 +444,10 @@ def test_comment_keeps_optional_warnings_on_success():
     checker._run_check('giga', 'GigaCode', lambda: checker._log_issue('ABC-1', 'warning', 'AIFIXED: не удалось проверить'), required=False)
     checker._manage_jira_comment('REL-1', True)
     body = checker.jira_main.add_comment.call_args.args[1]
-    assert 'Предупреждение — AIFIXED: не удалось проверить' in body
-    assert body.startswith(rc.CHECK_TABLE_HEADER)
-    assert len(body.splitlines()) == 2
-    assert 'INCOMPLETE' in body
+    assert 'Не удалось проверить необходимость лейбла AIFIXED.' in body
+    assert rc.COMMENT_TABLE_HEADER in body
+    assert '#14892c' in body and '#de350b' not in body
+    assert 'INCOMPLETE' not in body
 
 
 def test_cached_jira_reads_cache_only_identical_successful_requests():
@@ -616,11 +619,11 @@ def case_payload(key='HRPQA-T1', **overrides):
                  'customFields': {'Вид тестирования': 'Регресс'}, 'issueLinks': ['ABC-1']}, **overrides)
 
 
-def test_zephyr_projects_fields_for_single_full_response(zephyr):
+def test_zephyr_restores_legacy_full_response_without_projection(zephyr):
     zephyr.session.get.return_value = response(200, [case_payload()])
     assert zephyr.get_test_cases_for_issue('ABC-1') == ([case_payload()], None)
     assert zephyr.session.get.call_count == 1
-    assert zephyr.session.get.call_args.kwargs['params']['fields'] == rc.ZEPHYR_CASE_FIELDS
+    assert 'fields' not in zephyr.session.get.call_args.kwargs.get('params', {})
 
 
 def test_zephyr_fallback_uses_documented_search_and_all_pages(zephyr):
@@ -825,3 +828,291 @@ def test_existing_bot_table_comment_is_recognized():
     checker._manage_jira_comment('REL-1', False)
     own.delete.assert_called_once()
     other.delete.assert_not_called()
+
+
+@pytest.mark.parametrize('provider', rc.PR_LEGACY_PROVIDERS)
+def test_pr_presence_survives_missing_summary_through_legacy_detail(validator, provider):
+    def fetch(url, **kwargs):
+        if url.endswith('/summary'):
+            return response(404)
+        if url.endswith('/remotelink'):
+            return response(200, [])
+        if url.endswith('/detail') and kwargs['params']['applicationType'] == provider:
+            return response(200, {'detail': [{'pullRequests': [{'id': 42, 'status': 'OPEN'}]}]})
+        return response(200, {'detail': []})
+    validator.jira_http.get.side_effect = fetch
+    assert 'PR 42' in validator._find_issue_pull_request_only_evidence(NS(key='ABC-1', id='123'))
+    assert not validator._pr_lookup_failures
+    detail_calls = [c for c in validator.jira_http.get.call_args_list if c.args[0].endswith('/detail')]
+    assert all(c.kwargs['params']['dataType'] == 'pullrequest' for c in detail_calls)
+
+
+def test_merged_pr_details_work_when_summary_is_unavailable(validator):
+    validator._merged_pull_request_evidence_cache = {}
+    validator._pr_get_json = Mock(side_effect=lambda url, **kw:
+        None if url.endswith('/summary') else {'detail': [{'pullRequests': [{'id': 42, 'status': 'MERGED'}]}]})
+    assert '42 (merged)' in validator._find_issue_merged_pull_request_evidence(NS(key='ABC-1', id='123'))
+
+
+def test_gigacode_in_repository_survives_summary_outage(validator):
+    def fetch(url, **kwargs):
+        if url.endswith('/summary'):
+            return None
+        data_type = kwargs['params']['dataType']
+        if data_type == 'repository':
+            return {'detail': [{'repositories': [{'commits': [{'message': 'Co-authored-by: GigaCode Assistant'}]}]}]}
+        return {'detail': [{'pullRequests': [], 'commits': []}]}
+    validator._pr_get_json = Mock(side_effect=fetch)
+    assert 'GigaCode Assistant' in validator._issue_has_gigacode_pull_request(NS(key='ABC-1', id='123'))
+
+
+def test_gigacode_marker_in_pr_does_not_require_other_sources(validator):
+    def fetch(url, **kwargs):
+        if url.endswith('/summary'):
+            return summary_payload(1, {'stash': {'count': 1}})
+        assert kwargs['params']['dataType'] == 'pullrequest'
+        return {'detail': [{'pullRequests': [{'id': 42, 'description': 'Co-authored-by: GigaCode Assistant'}]}]}
+    validator._pr_get_json = Mock(side_effect=fetch)
+    assert 'GigaCode Assistant' in validator._issue_has_gigacode_pull_request(NS(key='ABC-1', id='123'))
+    assert validator._pr_get_json.call_count == 2
+
+
+def test_failed_cycle_search_does_not_poison_following_stage(zephyr):
+    checker = zephyr_checker(zephyr)
+    checker._zephyr_release_cycles_cache = {}
+    cycle = {'key': 'HRPQA-C1', 'name': 'REL-1 API Регресс'}
+    zephyr.get_test_cycles_for_issue = Mock(side_effect=[[], [cycle]])
+    checker._get_test_cycles_from_jira_release_metadata = Mock(return_value=[])
+    checker._zephyr_last_cycle_search_had_technical_failure = Mock(return_value=True)
+    checker._log_test_cycle_search_debug = Mock()
+    assert checker._get_release_test_cycles('REL-1') == []
+    assert checker._get_release_test_cycles('REL-1') == [('HRPQA-C1', 'REL-1 API Регресс')]
+    assert zephyr.get_test_cycles_for_issue.call_count == 2
+
+
+def test_properties_source_removed_today_is_restored(validator):
+    def fetch(url, **kwargs):
+        if url.endswith('/properties'):
+            return response(200, {'keys': [{'key': 'unrelated'}, {'key': 'development/pr links'}]})
+        if url.endswith('/properties/development%2Fpr%20links'):
+            return response(200, {'value': {'pullRequests': [{'id': 42, 'status': 'OPEN'}]}})
+        return response(404)
+    validator.jira_http.get.side_effect = fetch
+    evidence = validator._find_issue_pull_request_only_evidence(NS(key='ABC-1', id='123'))
+    assert 'Jira issue property' in evidence and 'PR 42' in evidence
+    assert not any(c.args[0].endswith('/properties/unrelated') for c in validator.jira_http.get.call_args_list)
+
+
+def test_property_fallback_keeps_time_after_slow_summary_and_details(validator, fake_clock):
+    def fetch(url, **kwargs):
+        if url.endswith('/properties'):
+            return response(200, {'keys': [{'key': 'dev'}]})
+        if url.endswith('/properties/dev'):
+            return response(200, {'pullRequests': [{'id': 42}]})
+        fake_clock[0] += kwargs['timeout'].total
+        raise requests.Timeout()
+    validator.jira_http.get.side_effect = fetch
+    assert 'property dev' in validator._find_issue_pull_request_only_evidence(NS(key='ABC-1', id='123'))
+    assert fake_clock[0] < rc.PR_LOOKUP_TIMEOUT_SECONDS
+
+
+def test_slow_detail_longer_than_old_three_second_limit_recovers(validator, fake_clock):
+    def fetch(url, **kwargs):
+        if url.endswith('/summary'):
+            return response(404)
+        if url.endswith('/remotelink'):
+            return response(200, [])
+        assert kwargs['timeout'].total >= 8
+        fake_clock[0] += 8
+        return response(200, {'detail': [{'pullRequests': [{'id': 42}]}]})
+    validator.jira_http.get.side_effect = fetch
+    assert validator._find_issue_pull_request_only_evidence(NS(key='ABC-1', id='123'))
+    assert fake_clock[0] == 8
+
+
+def test_transient_pr_failure_expires_within_run(validator, fake_clock):
+    url = 'https://jira.example/rest/dev-status/latest/issue/detail'
+    validator.jira_http.get.side_effect = requests.Timeout()
+    assert validator._pr_get_json(url) is None
+    fake_clock[0] += rc.PR_FAILURE_COOLDOWN_SECONDS
+    validator.jira_http.get.side_effect = None
+    validator.jira_http.get.return_value = response(200, {'detail': [{'pullRequests': [{'id': 42}]}]})
+    assert validator._pr_get_json(url)['detail']
+
+
+def test_pr_next_stage_can_recover_but_tls_remains_permanent(validator):
+    temporary = 'https://jira.example/temporary'
+    permanent = 'https://jira.example/permanent'
+    validator.jira_http.get.side_effect = lambda url, **kw: response(503 if url == temporary else 403)
+    assert validator._pr_get_json(temporary) is None
+    assert validator._pr_get_json(permanent) is None
+    validator._begin_pr_stage()
+    validator.jira_http.get.side_effect = lambda *a, **kw: response(200, {})
+    assert validator._pr_get_json(temporary) == {}
+    assert validator._pr_get_json(permanent) is None
+
+
+def test_retry_after_applies_to_other_pr_sources_and_stages(validator, fake_clock):
+    validator.jira_http.get.return_value = response(429, headers={'Retry-After': '60'})
+    with validator._pr_lookup_budget(5):
+        assert validator._pr_get_json('https://jira.example/summary') is None
+    validator._begin_pr_stage()
+    with validator._pr_lookup_budget(5):
+        assert validator._pr_get_json('https://jira.example/detail') is None
+    assert validator.jira_http.get.call_count == 1
+    assert fake_clock[0] == 0
+
+
+def test_zephyr_retry_after_cannot_be_bypassed_by_search(zephyr, fake_clock):
+    zephyr.session.get.return_value = response(429, headers={'Retry-After': '90'})
+    cases, error = zephyr.get_test_cases_for_issue('ABC-1')
+    assert error and not cases
+    assert zephyr.session.get.call_count == 1
+    assert fake_clock[0] == 0
+
+
+def test_zephyr_legacy_text_id_and_details_without_key(zephyr):
+    case = {'id': 'HRPQA-T1', 'name': 'Legacy case'}
+    details = {'status': 'Approved', 'customFields': {'Вид тестирования': 'Регресс'}, 'issueLinks': ['ABC-1']}
+    zephyr.session.get.side_effect = [response(200, [case]), response(200, details)]
+    assert zephyr.get_test_cases_for_issue('ABC-1') == ([case], None)
+    assert zephyr.get_test_case_details('HRPQA-T1') == details
+    assert all('params' not in c.kwargs for c in zephyr.session.get.call_args_list)
+
+
+def test_failed_cycle_details_can_recover_in_same_run(zephyr):
+    checker = zephyr_checker(zephyr)
+    checker._zephyr_cycle_details_cache = {}
+    zephyr.get_test_cycle_details = Mock(side_effect=[None, {'key': 'HRPQA-C1', 'name': 'Cycle'}])
+    assert checker._get_test_cycle_details_cached('HRPQA-C1') is None
+    assert checker._get_test_cycle_details_cached('HRPQA-C1')['name'] == 'Cycle'
+
+
+def test_metadata_can_finish_after_ten_seconds(validator, fake_clock):
+    validator._jira_field_name_to_id_cache = None
+    def fetch(url, **kwargs):
+        assert kwargs['timeout'].total > 10
+        fake_clock[0] += 11
+        return response(200, [{'id': 'customfield_1', 'name': 'КЭ сервиса'}])
+    validator.jira_http.get.side_effect = fetch
+    assert validator._get_jira_field_id_by_names(('КЭ сервиса',)) == 'customfield_1'
+    assert validator.jira_http.get.call_count == 1
+
+
+def test_comment_groups_release_objects_and_hides_technical_details():
+    checker = stage_validator()
+    checker._log_issue('ABC-1', 'error', 'Story: отсутствует описание')
+    checker._log_issue('ABC-1', 'error', 'Pull Request не удалось подтвердить: HTTP 429; /rest/dev-status/latest; timeout=3')
+    checker._log_issue('ABC-1', 'error', 'Pull Request не удалось подтвердить: connection error')
+    checker._log_issue('GENERAL', 'warning', 'Zephyr debug: status=404; endpoint=internal')
+    checker._log_issue('GENERAL', 'error', 'Не удалось загрузить metadata полей Jira: HTTPSConnectionPool(token=secret)')
+    body = checker._release_comment('REL-1', False)
+    assert rc.COMMENT_TABLE_HEADER in body
+    assert 'Не удалось проверить ПР.' in body
+    assert 'недоступны данные КЭ' in body
+    assert 'Story: отсутствует описание' in body
+    assert body.count('[ABC-1|') == 1 and body.count('[REL-1|') == 1
+    assert body.count('Не удалось проверить ПР.') == 1
+    for forbidden in ('HTTP', 'timeout', 'endpoint', 'secret', 'INCOMPLETE', '/rest/', 'Время, с', 'debug'):
+        assert forbidden not in body
+    assert '#de350b' in body
+
+
+def test_success_comment_is_green_with_single_release_row():
+    checker = stage_validator()
+    checker._log_issue('ABC-1', 'success', 'Approved; elapsed=2.5')
+    body = checker._release_comment('REL-1', True)
+    assert '#14892c' in body and '#de350b' not in body
+    assert 'Ошибок нет.' in body
+    assert body.count('| [REL-1|') == 1
+    assert 'ABC-1' not in body and 'elapsed' not in body
+
+
+def test_object_comment_escapes_wiki_and_encoded_line_breaks():
+    import re
+    checker = stage_validator()
+    checker._log_issue('ABC-1', 'error', 'Draft | invalid {panel} &#10; || injected ||')
+    body = checker._release_comment('REL-1', False)
+    rows = [line for line in body.splitlines() if line.startswith('| ')]
+    assert len(rows) == 1
+    assert re.sub(r'\[ABC-1\|[^]]+\]', 'ABC-1', rows[0]).count('|') == 3
+    assert body.count('{panel}') == 1
+    assert '|| injected ||' not in body
+
+
+@pytest.mark.parametrize('section', [1, {'overall': 1}, {'byInstanceType': []}])
+def test_invalid_summary_metadata_still_allows_direct_pr(validator, section):
+    validator._pr_get_json = Mock(side_effect=lambda url, **kw:
+        {'summary': {'pullrequest': section}} if url.endswith('/summary') else
+        {'detail': [{'pullRequests': [{'id': 42, 'status': 'OPEN'}]}]})
+    payloads = validator._get_dev_status_payloads('123', data_types=('pullrequest',))
+    assert validator._extract_pull_request_evidence(payloads[0][2]) == 'PR 42'
+
+
+def test_comment_remains_red_if_success_flag_conflicts_with_errors():
+    checker = stage_validator()
+    checker._log_issue('ABC-1', 'error', 'Нет описания')
+    assert '#de350b' in checker._release_comment('REL-1', True)
+
+
+def test_legacy_requests_and_slow_pr_via_real_local_http(validator, monkeypatch):
+    """Transport-level replay; synthetic data, only a local HTTP server is used."""
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import urlsplit
+
+    calls = []
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            calls.append(self.path)
+            path = urlsplit(self.path).path
+            status, payload = 200, {}
+            if path.endswith('/summary'):
+                status = 503
+            elif path.endswith('/remotelink'):
+                payload = []
+            elif path.endswith('/detail'):
+                threading.Event().wait(3.2)  # Earlier 3-second timeout loses this PR.
+                payload = {'detail': [{'pullRequests': [{'id': 42, 'status': 'MERGED'}]}]}
+            elif path.endswith('/testcases'):
+                status = 400 if 'fields=' in self.path else 200
+                payload = [{'id': 'HRPQA-T1', 'name': 'Legacy case'}]
+            elif path.endswith('/testcase/HRPQA-T1'):
+                status = 400 if 'fields=' in self.path else 200
+                payload = {k: v for k, v in case_payload().items() if k != 'key'}
+            else:
+                status = 404
+            body = json.dumps(payload).encode()
+            self.send_response(status)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f'http://127.0.0.1:{server.server_port}'
+    monkeypatch.setitem(rc.config['jira'], 'url', base)
+    validator.jira_http = rc.ReleaseHttpSession()
+    validator.jira_http.trust_env = False
+    zephyr = rc.ZephyrScaleClient(base, 'synthetic-token')
+    zephyr.session.trust_env = False
+    try:
+        assert 'PR 42' in validator._find_issue_pull_request_only_evidence(NS(key='ABC-1', id='123'))
+        checker = zephyr_checker(zephyr)
+        checker._run_check('coverage', 'Покрытие', lambda: checker._check_release_coverage('REL-1'))
+        checker._run_check('cases', 'ТК', lambda: checker._check_zephyr_test_cases('REL-1'))
+        assert [r['status'] for r in checker.check_results] == ['PASS', 'PASS']
+        assert sum('/issue/detail?' in path for path in calls) == 1
+        assert sum(path.endswith('/testcase/HRPQA-T1') for path in calls) == 1
+    finally:
+        validator.jira_http.close()
+        zephyr.session.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
