@@ -13,6 +13,8 @@ from html.parser import HTMLParser
 from pathlib import Path
 from collections import defaultdict
 from contextlib import contextmanager
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Optional
 from urllib.parse import quote, urlsplit
 
@@ -96,8 +98,8 @@ ARCHITECTURE_CLOSED_STATUSES = {
     'closed', 'закрыта', 'закрыто', 'done', 'готово', 'выполнено',
     'resolved', 'решена', 'решено',
 }
-PR_MAX_ATTEMPTS = 2
-PR_RETRY_DELAY_SECONDS = 1
+PR_MAX_ATTEMPTS = 3
+PR_RETRY_DELAY_SECONDS = 0.5
 PR_LOOKUP_TIMEOUT_SECONDS = 20
 PR_REQUEST_TIMEOUT_SECONDS = 3
 PR_RELEASE_TIMEOUT_SECONDS = 120
@@ -142,6 +144,10 @@ ZEPHYR_CYCLE_CACHE_PATH = Path(
 ZEPHYR_REQUEST_TIMEOUT_SECONDS = int(os.getenv("ZEPHYR_REQUEST_TIMEOUT_SECONDS", "10"))
 ZEPHYR_MAX_RETRIES_PER_REQUEST = int(os.getenv("ZEPHYR_MAX_RETRIES_PER_REQUEST", "3"))
 ZEPHYR_MAX_FAILED_REQUESTS = int(os.getenv("ZEPHYR_MAX_FAILED_REQUESTS", "20"))
+ZEPHYR_LOOKUP_TIMEOUT_SECONDS = 20
+ZEPHYR_REQUEST_BUDGET_SECONDS = 12
+ZEPHYR_CASE_FIELDS = 'key,name,status,customFields,issueLinks'
+CHECK_TABLE_HEADER = '|| Проверка || Результат || Время, с || Объекты || Успех / ошибки / предупреждения || Замечания ||'
 
 # Имя кастомного поля "Вид тестирования" в Zephyr Scale ТК/ТЦ.
 # Поле ищется в customFields ответа API GET /rest/atm/1.0/testcase/{key}
@@ -435,12 +441,11 @@ class ZephyrScaleClient:
         self.base_url = base_url.rstrip('/')
         self.verify_ssl = verify_ssl
         self.max_retries = ZEPHYR_MAX_RETRIES_PER_REQUEST
-        self.retry_backoff_seconds = 2
         self.request_timeout_seconds = ZEPHYR_REQUEST_TIMEOUT_SECONDS
         self.max_failed_requests = ZEPHYR_MAX_FAILED_REQUESTS
         self.failed_requests = 0
         self.fatal_error = None
-        self.retry_status_codes = {429, 500, 502, 503, 504}
+        self.retry_status_codes = {408, 429, 500, 502, 503, 504}
         self.session = ReleaseHttpSession()
         self.session.verify = verify_ssl
         self.session.headers.update({
@@ -471,45 +476,26 @@ class ZephyrScaleClient:
 
     def _get_with_retries(self, url: str, **kwargs) -> requests.Response:
         self._raise_if_failed_request_limit_reached()
-        kwargs.setdefault('timeout', self.request_timeout_seconds)
-        last_exception = None
-
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                started = time.monotonic()
-                response = self.session.get(url, **kwargs)
-                trace_http('Zephyr', url, response.status_code, started, attempt)
-                if response.status_code in {401, 403}:
-                    self.fatal_error = f'Zephyr: HTTP {response.status_code}; проверьте права доступа'
-                    raise RuntimeError(self.fatal_error)
-                if response.status_code not in self.retry_status_codes:
-                    return response
-                if attempt == self.max_retries:
-                    self._mark_failed_request(f"HTTP {response.status_code}")
-                    self._raise_if_failed_request_limit_reached()
-                    return response
-            except requests.exceptions.SSLError as e:
-                self.fatal_error = request_failure_kind(e)
-                trace_http('Zephyr', url, self.fatal_error, started, attempt)
-                raise RuntimeError(self.fatal_error) from e
-            except requests.RequestException as e:
-                trace_http('Zephyr', url, request_failure_kind(e), started, attempt)
-                last_exception = e
-                if attempt == self.max_retries:
-                    self._mark_failed_request(str(e))
-                    self._raise_if_failed_request_limit_reached()
-                    raise
-
-            sleep_seconds = self.retry_backoff_seconds * attempt
-            print(
-                f"   ⚠️ Zephyr API: повтор запроса {attempt + 1}/{self.max_retries} "
-                f"через {sleep_seconds} сек."
-            )
-            time.sleep(sleep_seconds)
-
-        if last_exception:
-            raise last_exception
-        raise RuntimeError("Zephyr API: запрос не выполнен")
+        deadline = min(kwargs.pop('deadline', float('inf')),
+                       time.monotonic() + ZEPHYR_REQUEST_BUDGET_SECONDS)
+        validate = kwargs.pop('validate', validate_json_payload)
+        try:
+            response = bounded_get(self.session, url, source='Zephyr',
+                                   attempts=self.max_retries,
+                                   timeout=kwargs.pop('timeout', self.request_timeout_seconds),
+                                   deadline=deadline, validate=validate, **kwargs)
+        except requests.exceptions.SSLError as exc:
+            self.fatal_error = request_failure_kind(exc)
+            raise RuntimeError(self.fatal_error) from exc
+        except (requests.RequestException, ValueError) as exc:
+            self._mark_failed_request(request_failure_kind(exc))
+            raise
+        if response.status_code in {401, 403}:
+            self.fatal_error = f'Zephyr: HTTP {response.status_code}; проверьте права доступа'
+            raise RuntimeError(self.fatal_error)
+        if response.status_code in self.retry_status_codes:
+            self._mark_failed_request(f'HTTP {response.status_code}')
+        return response
 
     def _get_once(self, url: str, **kwargs) -> requests.Response:
         """Один быстрый GET без ретраев для диагностических/спекулятивных endpoint'ов."""
@@ -542,20 +528,73 @@ class ZephyrScaleClient:
           - error_message = str  — АПИ вернул ошибку (статус код / exception)
         Эндпоинт: GET /rest/atm/1.0/issuelink/{issueKey}/testcases
         """
-        url = f"{self.base_url}/rest/atm/1.0/issuelink/{issue_key}/testcases"
+        deadline = time.monotonic() + ZEPHYR_LOOKUP_TIMEOUT_SECONDS
+        errors = []
+        url = f"{self.base_url}/rest/atm/1.0/issuelink/{quote(issue_key, safe='')}/testcases"
         try:
-            response = self._get_with_retries(url)
+            response = self._get_with_retries(url, params={'fields': ZEPHYR_CASE_FIELDS},
+                                             deadline=deadline, validate=self._test_case_page)
             if response.status_code == 200:
-                data = response.json()
-                if isinstance(data, list):
-                    return data, None
-                elif isinstance(data, dict):
-                    return data.get('testCases', data.get('results', [])), None
-                return [], None
+                cases, more = self._test_case_page(response.json())
+                if not more:
+                    return cases, None
+                errors.append('issuelink вернул неполную страницу')
             else:
-                return [], f"HTTP {response.status_code}"
-        except Exception as e:
-            return [], f"{e}"
+                errors.append(f'issuelink HTTP {response.status_code}')
+        except Exception as exc:
+            errors.append(str(exc))
+        if self.is_failed_request_limit_reached():
+            return [], '; '.join(errors)
+        # Documented Server/DC query. Do not scan the whole project or use Xray.
+        query = f'projectKey = "{ZEPHYR_TC_PROJECT_KEY}" AND issueKeys IN ({json.dumps(issue_key)})'
+        url = f'{self.base_url}/rest/atm/1.0/testcase/search'
+        found = {}
+        start = 0
+        try:
+            for _ in range(50):
+                response = self._get_with_retries(url, deadline=deadline, validate=self._test_case_page,
+                    params={'query': query, 'fields': ZEPHYR_CASE_FIELDS, 'startAt': start, 'maxResults': 100})
+                if response.status_code != 200:
+                    raise RuntimeError(f'testcase/search HTTP {response.status_code}')
+                payload = response.json()
+                cases, more = self._test_case_page(payload, start=start)
+                before = len(found)
+                for case in cases:
+                    found[self.get_test_case_key(case)] = case
+                if cases and len(found) - before != len(cases):
+                    raise ValueError('Zephyr: пагинация не продвигается')
+                if more is False or (more is None and len(cases) < 100):
+                    return list(found.values()), None
+                if not cases:
+                    raise ValueError('Zephyr: пустая промежуточная страница ТК')
+                start += len(cases)
+            raise ValueError('Zephyr: превышен лимит страниц ТК')
+        except Exception as exc:
+            errors.append(str(exc))
+            return list(found.values()), '; '.join(errors)
+
+    @staticmethod
+    def _test_case_page(payload, start=0):
+        """Validate instead of treating an unknown JSON envelope as zero coverage."""
+        validate_json_payload(payload)
+        more = None
+        if isinstance(payload, list):
+            cases = payload
+        else:
+            cases = next((payload[k] for k in ('testCases', 'results', 'values', 'items')
+                          if isinstance(payload.get(k), list)), None)
+            if cases is None:
+                raise ValueError('Zephyr: неизвестный формат списка ТК')
+            if isinstance(payload.get('total'), int) and not isinstance(payload['total'], bool):
+                if payload['total'] < start + len(cases):
+                    raise ValueError('Zephyr: противоречивое число ТК в ответе')
+                more = start + len(cases) < payload['total']
+            elif isinstance(payload.get('isLast'), bool):
+                more = not payload['isLast']
+        if any(not isinstance(c, dict) or not re.fullmatch(r'[A-Z][A-Z0-9]*-T\d+',
+                ZephyrScaleClient.get_test_case_key(c)) for c in cases):
+            raise ValueError('Zephyr: ТК без корректного ключа')
+        return cases, more
 
     def get_test_case_details(self, tc_key: str) -> Optional[dict]:
         """
@@ -579,10 +618,17 @@ class ZephyrScaleClient:
         :return: Словарь с данными ТК или None при ошибке.
         """
         url = f"{self.base_url}/rest/atm/1.0/testcase/{tc_key}"
+        def validate_case(data):
+            validate_json_payload(data)
+            if not isinstance(data, dict) or self.get_test_case_key(data) != tc_key:
+                raise ValueError('Zephyr: ответ деталей ТК не соответствует запрошенному ключу')
         try:
-            response = self._get_with_retries(url)
+            response = self._get_with_retries(url, params={'fields': ZEPHYR_CASE_FIELDS},
+                                             validate=validate_case)
             if response.status_code == 200:
-                return response.json()
+                data = response.json()
+                if isinstance(data, dict) and self.get_test_case_key(data) == tc_key:
+                    return data
             return None
         except Exception:
             return None
@@ -594,7 +640,12 @@ class ZephyrScaleClient:
         Ключ — имя поля, значение — строка или объект.
         """
         custom_fields = tc_details.get('customFields', {})
+        if isinstance(custom_fields, list):
+            custom_fields = {str(f.get('name', '')): f.get('value')
+                             for f in custom_fields if isinstance(f, dict)}
         if not custom_fields:
+            return None
+        if not isinstance(custom_fields, dict):
             return None
 
         val = custom_fields.get(field_name)
@@ -608,7 +659,9 @@ class ZephyrScaleClient:
         if val is None:
             return None
         if isinstance(val, dict):
-            return val.get('name', val.get('value', str(val)))
+            return self._extract_zephyr_named_value(val) or None
+        if isinstance(val, list):
+            return ', '.join(self._extract_zephyr_named_value(item) for item in val) or None
         return str(val).strip()
 
     @staticmethod
@@ -1149,8 +1202,10 @@ class ZephyrScaleClient:
 
         return ''
 
-    def get_test_case_key(self, tc: dict) -> str:
-        return tc.get('key', tc.get('id', 'unknown'))
+    @staticmethod
+    def get_test_case_key(tc: dict) -> str:
+        nested = tc.get('testCase') or tc.get('testcase') or {}
+        return str(tc.get('key') or tc.get('testCaseKey') or (nested.get('key') if isinstance(nested, dict) else '') or '')
 
     def get_test_case_name(self, tc: dict) -> str:
         return tc.get('name', tc.get('summary', '—'))
@@ -1192,6 +1247,68 @@ def trace_http(source, url, outcome, started, attempt=1, params=None):
                        if key in {'issueId', 'applicationType', 'dataType'}}
         print(f"[HTTP {source}] {urlsplit(url).path} {safe_params or ''} "
               f"attempt={attempt} result={outcome} elapsed={elapsed:.2f}s", flush=True)
+
+
+def retry_after_seconds(response):
+    """Honor both Retry-After forms; never retry earlier than the server requests."""
+    raw = (getattr(response, 'headers', None) or {}).get('Retry-After')
+    if raw is None:
+        return 0.0
+    try:
+        seconds = float(raw)
+        return max(0.0, seconds) if seconds == seconds else 0.0
+    except (ValueError, TypeError):
+        try:
+            return max(0.0, (parsedate_to_datetime(raw) - datetime.now(timezone.utc)).total_seconds())
+        except (ValueError, TypeError, OverflowError):
+            return 0.0
+
+
+def bounded_get(session, url, *, source, attempts, timeout, deadline, validate=None, **kwargs):
+    """Retry safe reads only, with one shared deadline for requests and backoff.
+
+    Timeout bounds socket waits; the monotonic deadline prevents further requests
+    or sleeps. No retries for TLS/authentication/permanent HTTP failures.
+    """
+    for attempt in range(1, attempts + 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise requests.Timeout(f'{source}: исчерпан лимит времени запроса')
+        started = time.monotonic()
+        response = None
+        try:
+            # A total urllib3 timeout shares time between connect and read.
+            response = session.get(url, timeout=urllib3.util.Timeout(
+                total=min(timeout, remaining), connect=min(2.0, timeout, remaining)), **kwargs)
+            trace_http(source, url, response.status_code, started, attempt, kwargs.get('params'))
+            if response.status_code == 200 and validate is not None:
+                validate(response.json())
+            if response.status_code not in {408, 429, 500, 502, 503, 504} or attempt == attempts:
+                return response
+        except requests.exceptions.SSLError:
+            trace_http(source, url, 'TLS', started, attempt, kwargs.get('params'))
+            raise
+        except (requests.RequestException, ValueError) as exc:
+            trace_http(source, url, request_failure_kind(exc), started, attempt, kwargs.get('params'))
+            if attempt == attempts:
+                raise
+        delay = max(PR_RETRY_DELAY_SECONDS * 2 ** (attempt - 1), retry_after_seconds(response))
+        if delay >= deadline - time.monotonic():
+            raise requests.Timeout(f'{source}: повтор не помещается в лимит времени (Retry-After/backoff)')
+        time.sleep(delay)
+    raise requests.Timeout(f'{source}: не выполнен запрос')
+
+
+def validate_json_payload(payload):
+    if not isinstance(payload, (dict, list)):
+        raise ValueError('Expected JSON object or list')
+    if isinstance(payload, dict) and (payload.get('errors') or payload.get('errorMessages')):
+        raise ValueError('API returned application errors')
+
+
+def wiki_cell(value):
+    text = html.escape(normalize_field_text(clean_report_text(value)), quote=False)
+    return text.translate(str.maketrans({char: f'&#{ord(char)};' for char in '|\\{}[]*_#'}))
 
 
 class CachedJiraReads:
@@ -1294,6 +1411,9 @@ class ReleaseValidator:
                     status = 'error'
             active[status if status in {'error', 'warning'} else 'success'] += 1
             active['issues'].add(getattr(issue_obj_or_key, 'key', str(issue_obj_or_key)))
+            if status in {'error', 'warning'}:
+                active.setdefault('findings', []).append((
+                    getattr(issue_obj_or_key, 'key', str(issue_obj_or_key)), status, message))
         issue_key = "GENERAL"
         assignee = "—"
         summary = "Общие проверки"
@@ -1351,13 +1471,23 @@ class ReleaseValidator:
     def _get_jira_field_id_by_names(self, names: tuple[str, ...]) -> Optional[str]:
         """Найти id Jira-поля по имени через metadata, с кэшем на запуск."""
         if self._jira_field_name_to_id_cache is None:
-            self._jira_field_name_to_id_cache = {}
             try:
-                for field in self.jira_main.fields():
+                # fields() used to time out once and poison this cache for the run.
+                response = bounded_get(self.jira_http,
+                    f"{config['jira']['url'].rstrip('/')}/rest/api/2/field",
+                    source='Jira fields', attempts=3, timeout=4,
+                    deadline=time.monotonic() + 12, validate=validate_json_payload)
+                response.raise_for_status()
+                fields = response.json()
+                if not isinstance(fields, list):
+                    raise ValueError('Jira: неизвестный формат metadata полей')
+                loaded = {}
+                for field in fields:
                     field_name = normalize_field_text(field.get('name', '')).casefold()
                     field_id = field.get('id')
                     if field_name and field_id:
-                        self._jira_field_name_to_id_cache[field_name] = field_id
+                        loaded[field_name] = field_id
+                self._jira_field_name_to_id_cache = loaded
             except Exception as e:
                 self._log_issue("GENERAL", "warning", f"Не удалось загрузить metadata полей Jira: {e}")
 
@@ -1826,12 +1956,22 @@ class ReleaseValidator:
 
     def _get_test_case_details_cached(self, tc_key: str) -> Optional[dict]:
         if tc_key not in self._zephyr_test_case_details_cache:
-            self._zephyr_test_case_details_cache[tc_key] = self.zephyr.get_test_case_details(tc_key)
-        return self._zephyr_test_case_details_cache[tc_key]
+            details = self.zephyr.get_test_case_details(tc_key)
+            if details:
+                self._zephyr_test_case_details_cache[tc_key] = details
+        return self._zephyr_test_case_details_cache.get(tc_key)
 
     def _get_issue_test_cases_cached(self, issue_key: str) -> tuple[list[dict], Optional[str]]:
         if issue_key not in self._zephyr_issue_test_cases_cache:
-            self._zephyr_issue_test_cases_cache[issue_key] = self.zephyr.get_test_cases_for_issue(issue_key)
+            cases, error = self.zephyr.get_test_cases_for_issue(issue_key)
+            if error is not None:
+                return cases, error
+            self._zephyr_issue_test_cases_cache[issue_key] = (cases, None)
+            # The fields projection returns everything needed; detail GET is a
+            # fallback only when a server omits status/customFields/issueLinks.
+            for case in cases:
+                if self.zephyr.get_test_case_status(case) and 'customFields' in case and 'issueLinks' in case:
+                    self._zephyr_test_case_details_cache[self.zephyr.get_test_case_key(case)] = case
         return self._zephyr_issue_test_cases_cache[issue_key]
 
     @staticmethod
@@ -1854,7 +1994,7 @@ class ReleaseValidator:
             payload_text = json.dumps(payload, ensure_ascii=False).casefold()
         except Exception:
             payload_text = str(payload).casefold()
-        return issue_key.casefold() in payload_text
+        return bool(re.search(r'(?<![a-z0-9-])' + re.escape(issue_key.casefold()) + r'(?![a-z0-9-])', payload_text))
 
     @staticmethod
     def _payload_mentions_issue_in_direct_link_fields(payload: dict, issue_key: str) -> bool:
@@ -1953,7 +2093,10 @@ class ReleaseValidator:
         seen_tc_keys = set()
         for test_result in test_results:
             tc_key = self._extract_test_case_key_from_cycle_result(test_result)
-            if not tc_key or tc_key in seen_tc_keys:
+            if not tc_key:
+                unresolved.append('ТК без ключа')
+                continue
+            if tc_key in seen_tc_keys:
                 continue
             seen_tc_keys.add(tc_key)
 
@@ -1963,7 +2106,9 @@ class ReleaseValidator:
                 continue
 
             tc_status = self.zephyr.get_test_case_status(tc_details)
-            if tc_status.casefold() != ZEPHYR_APPROVED_STATUS.casefold():
+            if not tc_status:
+                unresolved.append(tc_key)
+            elif tc_status.casefold() != ZEPHYR_APPROVED_STATUS.casefold():
                 tc_name = self.zephyr.get_test_case_name(tc_details)
                 not_approved.append((tc_key, tc_name, tc_status or '—'))
 
@@ -1983,7 +2128,10 @@ class ReleaseValidator:
                 + ", ".join(sorted(unresolved))
             )
 
-        if not not_approved:
+        if not seen_tc_keys:
+            self._log_issue(release_key, 'error',
+                            f"ТЦ [{cycle_key}] '{cycle_name}': не удалось определить ключи ТК")
+        elif not not_approved and not unresolved:
             self._log_issue(
                 release_key,
                 "success",
@@ -2092,7 +2240,6 @@ class ReleaseValidator:
                 "error",
                 f"{check_label}: не удалось определить Jira field id для поля КЭ/КЭ сервиса"
             )
-            self._release_service_infos_cache[release_key] = None
             return None
 
         keys_str = ",".join(linked_keys)
@@ -2109,7 +2256,6 @@ class ReleaseValidator:
                 "error",
                 f"{check_label}: ошибка получения задач состава релиза для проверки КЭ: {e}"
             )
-            self._release_service_infos_cache[release_key] = None
             return None
 
         services: dict[str, dict[str, object]] = {}
@@ -2157,7 +2303,7 @@ class ReleaseValidator:
     def _run_check(self, check_id, name, callback, *, required=True, skip_reason='', budget=None):
         record = {'id': check_id, 'name': name, 'required': required, 'status': 'RUNNING',
                   'seconds': 0.0, 'success': 0, 'error': 0, 'warning': 0,
-                  'issues': set(), 'incomplete': False, 'reason': skip_reason}
+                  'issues': set(), 'incomplete': False, 'reason': skip_reason, 'findings': []}
         self.check_results.append(record)
         if skip_reason:
             record['status'] = 'SKIP'
@@ -2209,13 +2355,32 @@ class ReleaseValidator:
         self.zephyr.last_test_cycle_search_stats = []
 
     def _checks_wiki_table(self):
-        rows = ['|| Проверка || Результат || Время, с || Объекты || Успех / ошибки / предупреждения ||']
+        rows = [CHECK_TABLE_HEADER]
+        reported = set()
         for result in getattr(self, 'check_results', []):
-            name = result['name']
+            name = wiki_cell(result['name'])
             status = result['status'] + (': ' + result['reason'] if result['reason'] else '')
-            rows.append(f"| {name} | {status} | {result['seconds']:.2f} | {len(result['issues'])} | "
-                        f"{result['success']} / {result['error']} / {result['warning']} |")
-        return '\n'.join(rows) + "\nINCOMPLETE — не хватает данных; SKIP — неприменимо; NO_FINDINGS — этап без зарегистрированных результатов."
+            findings = result.get('findings', [])
+            reported.update(findings)
+            details = ' \\\\ '.join(self._finding_wiki(*finding) for finding in dict.fromkeys(findings)) or '—'
+            rows.append(f"| {name} | {wiki_cell(status)} | {result['seconds']:.2f} | {len(result['issues'])} | "
+                        f"{result['success']} / {result['error']} / {result['warning']} | {details} |")
+        # Keep failures before the first stage (e.g. inaccessible release ticket).
+        for key, data in self.report_data.items():
+            for field, status in (('errors', 'error'), ('warnings', 'warning')):
+                for message in data[field]:
+                    if (key, status, message) not in reported:
+                        rows.append(f"| Общая проверка | {'FAIL' if status == 'error' else 'WARN'} | — | 1 | — | "
+                                    + self._finding_wiki(key, status, message) + ' |')
+        if len(rows) == 1:
+            rows.append('| Проверки не выполнены | INCOMPLETE | — | 0 | 0 / 0 / 0 | Нет результатов проверок |')
+        return '\n'.join(rows)
+
+    def _finding_wiki(self, key, status, message):
+        target = wiki_cell(key)
+        if key != 'GENERAL' and re.fullmatch(r'[A-Z][A-Z0-9_]*-\d+', key):
+            target = f"[{key}|{config['jira']['url'].rstrip('/')}/browse/{key}]"
+        return f"{target}: {'Ошибка' if status == 'error' else 'Предупреждение'} — {wiki_cell(message)}"
 
     def check_release(self, release_key):
         self._reset_release_run()
@@ -2336,13 +2501,13 @@ class ReleaseValidator:
 
             hrpqa_test_cases = [
                 tc for tc in test_cases
-                if self.zephyr.get_test_case_key(tc).startswith(ZEPHYR_TC_PROJECT_KEY)
+                if self.zephyr.get_test_case_key(tc).startswith(ZEPHYR_TC_PROJECT_KEY + '-T')
             ]
 
             if not hrpqa_test_cases:
                 # АПИ ответил успешно, ТК просто нет
                 self._log_issue(
-                    issue_key, "warning",
+                    issue_key, "error",
                     f"Zephyr: задача есть в Jira, но нет прилинкованных ТК в пространстве {ZEPHYR_TC_PROJECT_KEY}"
                 )
                 continue
@@ -2378,7 +2543,10 @@ class ReleaseValidator:
                 total_tc_checked += 1
 
                 # --- Проверка 1: статус Approved ---
-                if tc_status.casefold() != ZEPHYR_APPROVED_STATUS.casefold():
+                if not tc_status:
+                    self._log_issue(issue_key, 'error',
+                                    f"Zephyr ТК [{tc_key}]: не удалось определить статус ТК")
+                elif tc_status.casefold() != ZEPHYR_APPROVED_STATUS.casefold():
                     total_not_approved += 1
                     self._log_issue(
                         issue_key, "error",
@@ -2400,8 +2568,8 @@ class ReleaseValidator:
                         if actual_type is None:
                             self._log_issue(
                                 issue_key, "warning",
-                                f"Zephyr ТК [{tc_key}]: поле '{ZEPHYR_TESTING_TYPE_FIELD}' "
-                                f"не найдено в кастомных полях ТК"
+                                f"Zephyr ТК [{tc_key}]: не удалось проверить поле '{ZEPHYR_TESTING_TYPE_FIELD}' "
+                                f"— не найдено в кастомных полях ТК"
                             )
                         else:
                             if actual_type.strip().lower() != expected_testing_type.strip().lower():
@@ -3023,7 +3191,9 @@ class ReleaseValidator:
                 author = comment.author
                 current_author_id = getattr(author, 'accountId', getattr(author, 'name', ''))
                 if current_author_id == self.my_account_id:
-                    if "Автоматическая проверка релиза" in comment.body or "Результат проверки" in comment.body:
+                    if ("Автоматическая проверка релиза" in comment.body
+                            or "Результат проверки" in comment.body
+                            or comment.body.startswith(CHECK_TABLE_HEADER)):
                         try:
                             comment.delete()
                         except Exception as del_err:
@@ -3035,65 +3205,7 @@ class ReleaseValidator:
         except Exception as e:
             print(f"   ⚠️ Ошибка при попытке удалить комментарии: {e}")
 
-        if is_success:
-            comment_body = (
-                "{panel:title=Автоматическая проверка релиза|borderStyle=solid|borderColor=#14892c|titleBGColor=#14892c|titleColor=#ffffff}\n"
-                "✅ *Релиз готов к выпуску!*\n\n"
-                "Все обязательные проверки качества пройдены успешно.\n"
-                "Анализ выполнен автоматически."
-                "{panel}"
-            )
-        else:
-            table_rows = []
-            sorted_items = sorted(self.report_data.items(), key=lambda x: (0 if x[1]['errors'] else 1, x[0]))
-            for key, data in sorted_items:
-                if not data['errors'] and not data['warnings']:
-                    continue
-                assignee = clean_report_text(data['assignee'])
-                summary = trim_report_text(data['summary'], 50) if data['summary'] else "—"
-                url = data['url']
-                # В Jira wiki-разметке:
-                # • \\ — перенос строки внутри ячейки таблицы
-                # • | внутри текста ячейки ломает таблицу — заменяем на HTML-энтити
-                def _escape(text: str) -> str:
-                    safe_text = clean_report_text(text)
-                    safe_text = html.escape(safe_text, quote=False)
-                    replacements = {
-                        '|': '&#124;',
-                        '{': r'\{',
-                        '}': r'\}',
-                        '*': r'\*',
-                        '_': r'\_',
-                        '#': r'\#',
-                    }
-                    for raw_char, escaped_char in replacements.items():
-                        safe_text = safe_text.replace(raw_char, escaped_char)
-                    return safe_text
-                error_lines = [f"• {_escape(e)}" for e in data['errors']]
-                error_lines.extend(f"⚠ {_escape(w)}" for w in data['warnings'])
-                error_text = " \\\\ ".join(error_lines)
-                safe_summary = _escape(summary)
-                safe_assignee = _escape(assignee)
-                key_cell = "ОБЩЕЕ" if key == "GENERAL" else f"[{key}|{url}]"
-                table_rows.append(f"| {key_cell} | {safe_summary} | {safe_assignee} | {error_text} |")
-
-            table_body = "\n".join(table_rows) if table_rows else "| — | — | — | Проблем не найдено |"
-            comment_body = (
-                "{panel:title=Результат проверки: НАЙДЕНЫ ОШИБКИ|borderStyle=solid|borderColor=#de350b|titleBGColor=#de350b|titleColor=#ffffff}\n"
-                "❌ *Релиз не готов к выпуску*\n"
-                "Необходимо исправить следующие замечания:\n\n"
-                "|| Задача || Тема || Ответственный || Ошибки / предупреждения ||\n"
-                f"{table_body}\n\n"
-                "Пожалуйста, исправьте ошибки и перезапустите проверку."
-                "{panel}"
-            )
-
-        comment_body += "\n\n*Выполнение проверок*\n" + self._checks_wiki_table()
-        if is_success:
-            warnings = [f"* {key}: {clean_report_text(w).replace('|', '&#124;')}"
-                        for key, data in self.report_data.items() for w in data['warnings']]
-            if warnings:
-                comment_body += "\n\n*Предупреждения*\n" + "\n".join(warnings)
+        comment_body = self._checks_wiki_table()
 
         try:
             print("   📝 Публикую новый комментарий...")
@@ -3283,21 +3395,31 @@ class ReleaseValidator:
         linked_keys = self._get_consist_of_issues(release_key)
         if not linked_keys:
             return
-
-        keys_str = ",".join(linked_keys)
-        jql_covered = f'key in ({keys_str}) AND issue in hasTestCoverage()'
-
-        try:
-            covered_issues = self.jira_main.search_issues(jql_covered, fields='key', maxResults=False)
-            covered_keys = {issue.key for issue in covered_issues}
-        except Exception as e:
-            self._log_issue("GENERAL", "warning", f"Не удалось проверить покрытие (плагин Xray?): {e}")
-            return
-
         for key in linked_keys:
             if key == release_key:
                 continue
-            if key not in covered_keys:
+            cases, error = self._get_issue_test_cases_cached(key)
+            if error is not None:
+                self._log_issue(key, 'error', f'Zephyr: не удалось проверить покрытие ({error})')
+                continue
+            confirmed = []
+            unresolved = []
+            for case in cases:
+                tc_key = self.zephyr.get_test_case_key(case)
+                if not tc_key.startswith(ZEPHYR_TC_PROJECT_KEY + '-T'):
+                    continue
+                details = None
+                if not self._is_directly_linked_test_case_for_issue(key, case, None):
+                    details = self._get_test_case_details_cached(tc_key)
+                if self._is_directly_linked_test_case_for_issue(key, case, details):
+                    confirmed.append(tc_key)
+                elif not details or not any(f in details or f in case for f in ('issueLinks', 'links', 'issues')):
+                    unresolved.append(tc_key)
+            if confirmed:
+                self._log_issue(key, 'success', 'Покрытие Zephyr: ' + ', '.join(sorted(set(confirmed))))
+            elif unresolved:
+                self._log_issue(key, 'error', 'Zephyr: не удалось подтвердить прямую связь с ТК: ' + ', '.join(unresolved))
+            else:
                 self._log_issue(key, "error", "Отсутствует тестовое покрытие (нет прилинкованных ТК)")
 
     @staticmethod
@@ -4054,7 +4176,7 @@ class ReleaseValidator:
         self._release_pr_targets_cache = {}
 
     def _pr_get_json(self, url: str, **kwargs):
-        """One bounded retry per request; share snapshots and outage protection."""
+        """At most three bounded attempts; share snapshots and outage protection."""
         if not hasattr(self, '_pr_http_cache'):
             self._pr_http_cache = {}
             self._pr_endpoint_failures = {}
@@ -4076,43 +4198,28 @@ class ReleaseValidator:
             cause = self._pr_endpoint_last_error.get(endpoint, 'сбой запроса')
             self._pr_lookup_failures.add(f'источник временно недоступен после повторных сбоев: {cause}')
             return None
-        failure = 'сбой HTTP/сети или некорректный JSON после повторных запросов'
-        for attempt in range(PR_MAX_ATTEMPTS):
-            deadline = getattr(self, '_pr_request_deadline', None)
-            remaining = deadline - time.monotonic() if deadline is not None else PR_REQUEST_TIMEOUT_SECONDS
-            if remaining <= 0:
-                failure = 'исчерпан лимит времени проверки PR'
-                break
-            started = time.monotonic()
-            try:
-                response = self.jira_http.get(url, timeout=min(PR_REQUEST_TIMEOUT_SECONDS, remaining), **kwargs)
-                trace_http('PR', url, response.status_code, started, attempt + 1, kwargs.get('params'))
-                if response.status_code == 200:
-                    payload = response.json()
-                    if not isinstance(payload, (dict, list)):
-                        raise ValueError('Expected JSON object or list')
-                    if isinstance(payload, dict) and (payload.get('errors') or payload.get('errorMessages')):
-                        raise ValueError('Jira returned application errors')
-                    self._pr_endpoint_failures[endpoint] = 0
-                    self._pr_http_cache[cache_key] = (payload, None)
-                    return payload
-                failure = f'HTTP {response.status_code}'
-                if response.status_code not in {408, 429, 500, 502, 503, 504}:
-                    break
-            except requests.exceptions.SSLError as exc:
-                failure = request_failure_kind(exc)
-                trace_http('PR', url, failure, started, attempt + 1, kwargs.get('params'))
+        outer_deadline = getattr(self, '_pr_request_deadline', None)
+        deadline = min(outer_deadline if outer_deadline is not None else float('inf'),
+                       time.monotonic() + 12)
+        try:
+            response = bounded_get(self.jira_http, url, source='PR', attempts=PR_MAX_ATTEMPTS,
+                                   timeout=PR_REQUEST_TIMEOUT_SECONDS, deadline=deadline,
+                                   validate=validate_json_payload, **kwargs)
+            if response.status_code == 200:
+                payload = response.json()
+                self._pr_endpoint_failures[endpoint] = 0
+                self._pr_http_cache[cache_key] = (payload, None)
+                return payload
+            failure = f'HTTP {response.status_code}'
+            if response.status_code in {401, 403}:
                 self._pr_endpoint_failures[endpoint] = PR_ENDPOINT_FAILURE_LIMIT
-                break
-            except (requests.RequestException, ValueError) as exc:
-                failure = request_failure_kind(exc)
-                trace_http('PR', url, failure, started, attempt + 1, kwargs.get('params'))
-            if attempt + 1 < PR_MAX_ATTEMPTS:
-                delay = PR_RETRY_DELAY_SECONDS
-                if deadline is not None:
-                    delay = min(delay, max(0, deadline - time.monotonic()))
-                if delay:
-                    time.sleep(delay)
+        except requests.exceptions.SSLError as exc:
+            failure = request_failure_kind(exc)
+            self._pr_endpoint_failures[endpoint] = PR_ENDPOINT_FAILURE_LIMIT
+        except (requests.RequestException, ValueError) as exc:
+            failure = request_failure_kind(exc)
+            if isinstance(exc, requests.Timeout) and 'лимит' in str(exc):
+                failure += ': исчерпан лимит времени проверки PR'
         self._pr_endpoint_failures[endpoint] = self._pr_endpoint_failures.get(endpoint, 0) + 1
         self._pr_endpoint_last_error[endpoint] = failure
         self._pr_lookup_failures.add(failure)

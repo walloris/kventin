@@ -45,8 +45,12 @@ def test_supported_pr_sources(validator, payload):
     assert validator._extract_pull_request_evidence(payload)
 
 
-def response(status, payload=None):
-    return NS(status_code=status, json=lambda: payload)
+def response(status, payload=None, headers=None):
+    def raise_for_status():
+        if status >= 400:
+            raise requests.HTTPError(f'HTTP {status}')
+    return NS(status_code=status, json=lambda: payload, headers=headers or {},
+              raise_for_status=raise_for_status)
 
 
 def test_http_retries_timeout_throttle_and_success(validator):
@@ -247,7 +251,7 @@ def test_failed_request_snapshot_reused_with_failure_reason(validator):
     assert validator._pr_get_json('https://jira.example/summary', params={'issueId': '1'}) is None
     validator._pr_lookup_failures = set()
     assert validator._pr_get_json('https://jira.example/summary', params={'issueId': '1'}) is None
-    assert validator.jira_http.get.call_count == 2
+    assert validator.jira_http.get.call_count == rc.PR_MAX_ATTEMPTS
     assert validator._pr_lookup_failures
 
 
@@ -262,7 +266,7 @@ def test_empty_responses_reused_only_within_current_run(validator):
     assert validator.jira_http.get.call_count == 2
 
 
-def test_throttle_has_one_retry(validator):
+def test_throttle_stops_retrying_after_recovery(validator):
     validator.jira_http.get.side_effect = [response(429), response(200, {})]
     assert validator._pr_get_json('https://jira.example') == {}
     assert validator.jira_http.get.call_count == 2
@@ -279,15 +283,15 @@ def test_many_issues_during_outage_have_bounded_requests_and_no_success(validato
     monkeypatch.setattr(rc.time, 'monotonic', lambda: now[0])
     monkeypatch.setattr(rc.time, 'sleep', lambda delay: now.__setitem__(0, now[0] + delay))
     def timeout(url, **kwargs):
-        now[0] += kwargs['timeout']
+        now[0] += kwargs['timeout'].total
         raise requests.Timeout()
     validator.jira_http.get.side_effect = timeout
     with validator._pr_lookup_budget(rc.PR_RELEASE_TIMEOUT_SECONDS):
         for number in range(50):
             assert validator._find_issue_pull_request_only_evidence(NS(key=f'ABC-{number}', id=str(number))) is None
             assert validator._pr_lookup_failures
-    # Two summary versions + remote links, three failed probes with two attempts each.
-    assert validator.jira_http.get.call_count <= 18
+    # Two summary versions + remote links, three failed probes per source.
+    assert validator.jira_http.get.call_count <= 3 * rc.PR_ENDPOINT_FAILURE_LIMIT * rc.PR_MAX_ATTEMPTS
     assert now[0] <= rc.PR_RELEASE_TIMEOUT_SECONDS
 
 
@@ -295,7 +299,7 @@ def test_global_deadline_stops_even_healthy_but_slow_sources(validator, monkeypa
     now = [0.0]
     monkeypatch.setattr(rc.time, 'monotonic', lambda: now[0])
     def slow(url, **kwargs):
-        now[0] += min(1.0, kwargs['timeout'])
+        now[0] += min(1.0, kwargs['timeout'].total)
         return response(200, summary_payload(1))
     validator.jira_http.get.side_effect = slow
     with validator._pr_lookup_budget(5):
@@ -424,7 +428,9 @@ def test_comment_includes_warnings_and_execution_table_on_failure():
     assert 'AIFIXED: не удалось проверить' in body
     assert 'Нет описания' in body
     assert 'INCOMPLETE' in body
-    assert 'Выполнение проверок' in body
+    assert body.startswith(rc.CHECK_TABLE_HEADER)
+    assert len(body.splitlines()) == 3
+    assert all(line.startswith('|') and line.endswith('|') for line in body.splitlines())
 
 
 def test_comment_keeps_optional_warnings_on_success():
@@ -435,7 +441,9 @@ def test_comment_keeps_optional_warnings_on_success():
     checker._run_check('giga', 'GigaCode', lambda: checker._log_issue('ABC-1', 'warning', 'AIFIXED: не удалось проверить'), required=False)
     checker._manage_jira_comment('REL-1', True)
     body = checker.jira_main.add_comment.call_args.args[1]
-    assert 'Предупреждения' in body
+    assert 'Предупреждение — AIFIXED: не удалось проверить' in body
+    assert body.startswith(rc.CHECK_TABLE_HEADER)
+    assert len(body.splitlines()) == 2
     assert 'INCOMPLETE' in body
 
 
@@ -544,3 +552,276 @@ def test_http_trace_does_not_expose_query_headers_or_arbitrary_params(monkeypatc
     assert 'secret' not in output
     assert 'token' not in output
 
+
+@pytest.fixture
+def fake_clock(monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr(rc.time, 'monotonic', lambda: now[0])
+    monkeypatch.setattr(rc.time, 'sleep', lambda delay: now.__setitem__(0, now[0] + delay))
+    return now
+
+
+def test_pr_recovers_on_third_attempt_with_short_backoff(validator, fake_clock):
+    validator.jira_http.get.side_effect = [requests.Timeout(), response(503), response(200, summary_payload(1))]
+    assert validator._pr_get_json('https://jira.example/summary') == summary_payload(1)
+    assert validator.jira_http.get.call_count == 3
+    assert fake_clock[0] == 1.5
+    assert not validator._pr_lookup_failures
+
+
+def test_retry_after_honored_inside_budget(validator, fake_clock):
+    validator.jira_http.get.side_effect = [response(429, headers={'Retry-After': '2'}), response(200, {})]
+    with validator._pr_lookup_budget(5):
+        assert validator._pr_get_json('https://jira.example/summary') == {}
+    assert fake_clock[0] == 2
+
+
+def test_retry_after_cannot_extend_budget(validator, fake_clock):
+    validator.jira_http.get.return_value = response(429, headers={'Retry-After': '60'})
+    with validator._pr_lookup_budget(5):
+        assert validator._pr_get_json('https://jira.example/summary') is None
+    assert validator.jira_http.get.call_count == 1
+    assert fake_clock[0] == 0
+    assert any('лимит' in reason for reason in validator._pr_lookup_failures)
+
+
+@pytest.mark.parametrize('header,expected', [('3', 3), ('-1', 0), ('NaN', 0), ('invalid', 0)])
+def test_retry_after_numeric_and_invalid(header, expected):
+    assert rc.retry_after_seconds(response(429, headers={'Retry-After': header})) == expected
+
+
+def test_retry_after_http_date():
+    from datetime import datetime, timezone, timedelta
+    from email.utils import format_datetime
+    date = format_datetime(datetime.now(timezone.utc) + timedelta(seconds=5), usegmt=True)
+    assert 3 < rc.retry_after_seconds(response(429, headers={'Retry-After': date})) <= 5
+
+
+def test_zero_deadline_prevents_request(validator, fake_clock):
+    with validator._pr_lookup_budget(0):
+        assert validator._pr_get_json('https://jira.example/summary') is None
+    validator.jira_http.get.assert_not_called()
+
+
+@pytest.fixture
+def zephyr(monkeypatch):
+    monkeypatch.setattr(rc.time, 'sleep', lambda _: None)
+    client = rc.ZephyrScaleClient('https://jira.example', 'synthetic-test-token')
+    client.session.get = Mock()
+    return client
+
+
+def case_payload(key='HRPQA-T1', **overrides):
+    return dict({'key': key, 'name': 'Synthetic case', 'status': 'Approved',
+                 'customFields': {'Вид тестирования': 'Регресс'}, 'issueLinks': ['ABC-1']}, **overrides)
+
+
+def test_zephyr_projects_fields_for_single_full_response(zephyr):
+    zephyr.session.get.return_value = response(200, [case_payload()])
+    assert zephyr.get_test_cases_for_issue('ABC-1') == ([case_payload()], None)
+    assert zephyr.session.get.call_count == 1
+    assert zephyr.session.get.call_args.kwargs['params']['fields'] == rc.ZEPHYR_CASE_FIELDS
+
+
+def test_zephyr_fallback_uses_documented_search_and_all_pages(zephyr):
+    first = [case_payload(f'HRPQA-T{i}') for i in range(1, 101)]
+    zephyr.session.get.side_effect = [response(404), response(200, first), response(200, [case_payload('HRPQA-T101')])]
+    cases, error = zephyr.get_test_cases_for_issue('ABC-1')
+    assert error is None and len(cases) == 101
+    calls = zephyr.session.get.call_args_list
+    assert calls[1].args[0].endswith('/testcase/search')
+    assert calls[1].kwargs['params']['query'] == 'projectKey = "HRPQA" AND issueKeys IN ("ABC-1")'
+    assert [c.kwargs['params']['startAt'] for c in calls[1:]] == [0, 100]
+
+
+def test_zephyr_explicit_pagination_overrides_short_page(zephyr):
+    zephyr.session.get.side_effect = [response(404),
+        response(200, {'values': [case_payload()], 'total': 2}),
+        response(200, {'values': [case_payload('HRPQA-T2')], 'total': 2})]
+    cases, error = zephyr.get_test_cases_for_issue('ABC-1')
+    assert error is None and len(cases) == 2
+
+
+def test_zephyr_unknown_schema_is_retried_then_searched(zephyr):
+    zephyr.session.get.side_effect = [response(200, {'unexpected': []})] * 3 + [response(200, [case_payload()])]
+    cases, error = zephyr.get_test_cases_for_issue('ABC-1')
+    assert error is None and cases == [case_payload()]
+    assert zephyr.session.get.call_count == 4
+
+
+@pytest.mark.parametrize('payload', [{}, {'unexpected': []}, {'errors': ['unavailable']}, [{'name': 'no key'}]])
+def test_zephyr_bad_schema_is_never_zero_coverage(zephyr, payload):
+    zephyr.session.get.return_value = response(200, payload)
+    cases, error = zephyr.get_test_cases_for_issue('ABC-1')
+    assert error and cases == []
+    assert zephyr.session.get.call_count <= 6
+
+
+def test_zephyr_repeated_final_page_is_incomplete(zephyr):
+    zephyr.session.get.side_effect = [response(404),
+        response(200, {'values': [case_payload()], 'total': 2}),
+        response(200, {'values': [case_payload()], 'total': 2})]
+    cases, error = zephyr.get_test_cases_for_issue('ABC-1')
+    assert cases == [case_payload()]
+    assert 'пагинация' in error
+
+
+def test_zephyr_primary_and_fallback_share_deadline(zephyr, fake_clock):
+    def timeout(url, **kwargs):
+        fake_clock[0] += kwargs['timeout'].total
+        raise requests.Timeout('synthetic outage')
+    zephyr.session.get.side_effect = timeout
+    cases, error = zephyr.get_test_cases_for_issue('ABC-1')
+    assert error and cases == []
+    assert fake_clock[0] <= rc.ZEPHYR_LOOKUP_TIMEOUT_SECONDS
+    assert zephyr.session.get.call_count <= 6
+
+
+@pytest.mark.parametrize('status', [401, 403])
+def test_zephyr_auth_failure_stops_without_fallback(zephyr, status):
+    zephyr.session.get.return_value = response(status)
+    for key in ['ABC-1', 'ABC-2']:
+        cases, error = zephyr.get_test_cases_for_issue(key)
+        assert not cases and str(status) in error
+    assert zephyr.session.get.call_count == 1
+
+
+def test_zephyr_detail_key_mismatch_is_retried(zephyr):
+    zephyr.session.get.side_effect = [response(200, case_payload('HRPQA-T2')), response(200, case_payload())]
+    assert zephyr.get_test_case_details('HRPQA-T1') == case_payload()
+    assert zephyr.session.get.call_count == 2
+
+
+def zephyr_checker(zephyr):
+    checker = stage_validator()
+    checker.zephyr = zephyr
+    checker.jira_main = Mock()
+    checker._zephyr_issue_test_cases_cache = {}
+    checker._zephyr_test_case_details_cache = {}
+    checker._get_consist_of_issues = Mock(return_value=['ABC-1'])
+    checker._build_expected_testing_type_map = Mock(return_value={'ABC-1': 'Регресс'})
+    checker._get_issue_type_map = Mock(return_value={'ABC-1': 'story'})
+    return checker
+
+
+def test_coverage_and_case_policy_reuse_full_zephyr_response_without_xray(zephyr):
+    checker = zephyr_checker(zephyr)
+    zephyr.session.get.return_value = response(200, [case_payload()])
+    checker._run_check('coverage', 'Покрытие', lambda: checker._check_release_coverage('REL-1'))
+    checker._run_check('cases', 'ТК', lambda: checker._check_zephyr_test_cases('REL-1'))
+    assert [r['status'] for r in checker.check_results] == ['PASS', 'PASS']
+    assert zephyr.session.get.call_count == 1
+    checker.jira_main.search_issues.assert_not_called()
+
+
+@pytest.mark.parametrize('overrides,expected', [
+    ({'status': 'Draft'}, 'FAIL'),
+    ({'customFields': {'Вид тестирования': 'Новый функционал'}}, 'FAIL'),
+    ({'customFields': {}}, 'INCOMPLETE'),
+    ({'status': ''}, 'INCOMPLETE'),
+])
+def test_zephyr_actual_policy_errors_and_missing_data_block_release(zephyr, overrides, expected):
+    checker = zephyr_checker(zephyr)
+    case = case_payload(**overrides)
+    zephyr.session.get.side_effect = lambda url, **kw: response(200, [case] if url.endswith('/testcases') else case)
+    checker._run_check('cases', 'ТК', lambda: checker._check_zephyr_test_cases('REL-1'))
+    assert checker.check_results[0]['status'] == expected
+    assert checker.report_data['ABC-1']['errors']
+
+
+@pytest.mark.parametrize('payload', [[], [case_payload(issueLinks=['ABC-10'])]])
+def test_no_direct_coverage_is_a_failure(zephyr, payload):
+    checker = zephyr_checker(zephyr)
+    zephyr.session.get.return_value = response(200, payload)
+    checker._run_check('coverage', 'Покрытие', lambda: checker._check_release_coverage('REL-1'))
+    assert checker.check_results[0]['status'] == 'FAIL'
+    assert not checker.report_data['ABC-1']['success']
+
+
+def test_zephyr_failed_list_not_cached_and_can_recover_next_stage(zephyr):
+    checker = zephyr_checker(zephyr)
+    zephyr.get_test_cases_for_issue = Mock(side_effect=[([], 'timeout'), ([case_payload()], None)])
+    checker._run_check('coverage', 'Покрытие', lambda: checker._check_release_coverage('REL-1'))
+    checker._run_check('cases', 'ТК', lambda: checker._check_zephyr_test_cases('REL-1'))
+    assert [r['status'] for r in checker.check_results] == ['INCOMPLETE', 'PASS']
+    assert zephyr.get_test_cases_for_issue.call_count == 2
+    zephyr.session.get.assert_not_called()
+
+
+def test_zephyr_failed_detail_not_cached(zephyr):
+    checker = zephyr_checker(zephyr)
+    zephyr.get_test_case_details = Mock(side_effect=[None, case_payload()])
+    assert checker._get_test_case_details_cached('HRPQA-T1') is None
+    assert checker._get_test_case_details_cached('HRPQA-T1') == case_payload()
+
+
+@pytest.mark.parametrize('custom_fields', [
+    {'Вид тестирования': {'name': 'Регресс'}},
+    [{'name': 'Вид тестирования', 'value': {'name': 'Регресс'}}],
+])
+def test_zephyr_testing_type_supports_structured_fields(zephyr, custom_fields):
+    assert zephyr.get_test_case_custom_field({'customFields': custom_fields}, 'Вид тестирования') == 'Регресс'
+
+
+@pytest.mark.parametrize('detail', [None, case_payload(status='')])
+def test_cycle_missing_case_data_never_logs_all_approved(zephyr, detail):
+    checker = zephyr_checker(zephyr)
+    checker._get_test_cycle_details_cached = Mock(return_value={'items': [{'testCaseKey': 'HRPQA-T1'}]})
+    checker._get_test_case_details_cached = Mock(return_value=detail)
+    checker._run_check('cycle', 'ТЦ', lambda: checker._check_test_cycle_cases_approved('REL-1', 'HRPQA-R1', 'Cycle'))
+    assert checker.check_results[0]['status'] == 'INCOMPLETE'
+    assert not checker.report_data['REL-1']['success']
+
+
+def test_field_metadata_retried_and_failed_load_not_cached(validator):
+    validator._jira_field_name_to_id_cache = None
+    fields = [{'id': 'customfield_1', 'name': 'КЭ сервиса'}]
+    validator.jira_http.get.side_effect = [requests.Timeout()] * 3 + [response(200, fields)]
+    assert validator._get_jira_field_id_by_names(('КЭ сервиса',)) is None
+    assert validator._jira_field_name_to_id_cache is None
+    assert validator._get_jira_field_id_by_names(('КЭ сервиса',)) == 'customfield_1'
+    assert validator._get_jira_field_id_by_names(('КЭ сервиса',)) == 'customfield_1'
+    assert validator.jira_http.get.call_count == 4
+
+
+def test_field_metadata_failure_does_not_poison_service_cache(validator):
+    validator._release_service_infos_cache = {}
+    validator._get_consist_of_issues = Mock(return_value=['ABC-1'])
+    validator._get_jira_field_id_by_names = Mock(return_value=None)
+    for check in ('Back', 'Web'):
+        assert validator._collect_release_service_infos('REL-1', check) is None
+    assert validator._get_jira_field_id_by_names.call_count == 2
+
+
+def test_comment_escapes_markup_and_encoded_newlines_without_extra_rows():
+    import re
+    checker = stage_validator()
+    checker._run_check('case', 'Zephyr | ТК', lambda: checker._log_issue('ABC-1', 'error',
+        'Draft | wrong\n{panel} &#10;|| injected || [text|url]'))
+    checker._log_issue('GENERAL', 'warning', 'Внешнее предупреждение')
+    body = checker._checks_wiki_table()
+    assert len(body.splitlines()) == 3
+    assert '{panel}' not in body and '|| injected ||' not in body
+    assert '&#124;' in body
+    for row in body.splitlines()[1:]:
+        assert re.sub(r'\[ABC-1\|[^]]+\]', 'ABC-1', row).count('|') == 7
+    assert 'Внешнее предупреждение' in body
+
+
+def test_empty_checks_comment_is_explicit_incomplete_table():
+    body = stage_validator()._checks_wiki_table()
+    assert body.startswith(rc.CHECK_TABLE_HEADER)
+    assert len(body.splitlines()) == 2
+    assert 'INCOMPLETE' in body
+
+
+def test_existing_bot_table_comment_is_recognized():
+    checker = stage_validator()
+    checker.my_account_id = 'bot'
+    checker.jira_main = Mock()
+    own = Mock(author=NS(accountId='bot'), body=rc.CHECK_TABLE_HEADER + '\n| old |')
+    other = Mock(author=NS(accountId='human'), body=rc.CHECK_TABLE_HEADER + '\n| other |')
+    checker.jira_main.comments.return_value = [own, other]
+    checker._manage_jira_comment('REL-1', False)
+    own.delete.assert_called_once()
+    other.delete.assert_not_called()
