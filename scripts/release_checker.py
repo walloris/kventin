@@ -151,7 +151,7 @@ ZEPHYR_LOOKUP_TIMEOUT_SECONDS = 45
 ZEPHYR_REQUEST_BUDGET_SECONDS = 32
 ZEPHYR_CASE_FIELDS = 'key,name,status,customFields,issueLinks'
 CHECK_TABLE_HEADER = '|| Проверка || Результат || Время, с || Объекты || Успех / ошибки / предупреждения || Замечания ||'
-COMMENT_TABLE_HEADER = '|| Объект релиза || Ошибки ||'
+COMMENT_TABLE_HEADER = '|| Объект релиза || Замечания ||'
 
 # Имя кастомного поля "Вид тестирования" в Zephyr Scale ТК/ТЦ.
 # Поле ищется в customFields ответа API GET /rest/atm/1.0/testcase/{key}
@@ -479,9 +479,24 @@ class ZephyrScaleClient:
             f" ({reason})"
         )
 
+    @contextmanager
+    def lookup_budget(self, seconds):
+        previous = getattr(self, '_lookup_deadline', None)
+        deadline = time.monotonic() + seconds
+        self._lookup_deadline = min(previous, deadline) if previous is not None else deadline
+        try:
+            yield
+        finally:
+            self._lookup_deadline = previous
+
+    def lookup_budget_exhausted(self):
+        deadline = getattr(self, '_lookup_deadline', None)
+        return deadline is not None and time.monotonic() >= deadline
+
     def _get_with_retries(self, url: str, **kwargs) -> requests.Response:
         self._raise_if_failed_request_limit_reached()
         deadline = min(kwargs.pop('deadline', float('inf')),
+                       getattr(self, '_lookup_deadline', None) or float('inf'),
                        time.monotonic() + ZEPHYR_REQUEST_BUDGET_SECONDS)
         validate = kwargs.pop('validate', validate_json_payload)
         try:
@@ -509,7 +524,8 @@ class ZephyrScaleClient:
         started = time.monotonic()
         try:
             response = bounded_get(self.session, url, source='Zephyr', attempts=1,
-                timeout=kwargs.pop('timeout'), deadline=time.monotonic() + self.request_timeout_seconds,
+                timeout=kwargs.pop('timeout'), deadline=min(time.monotonic() + self.request_timeout_seconds,
+                    getattr(self, '_lookup_deadline', None) or float('inf')),
                 retry_state=self.retry_state, **kwargs)
             trace_http('Zephyr', url, response.status_code, started)
         except requests.exceptions.SSLError as e:
@@ -806,7 +822,7 @@ class ZephyrScaleClient:
             + list(ZEPHYR_TEST_CYCLE_PROJECT_KEYS)
         )
 
-        for item in self._get_test_cycles_by_issue_query_params(issue_key, project_keys_to_try):
+        for item in self._get_test_cycles_by_issue_link(issue_key):
             key = self.get_test_cycle_key(item)
             dedupe_key = key or f"name:{self.get_test_cycle_name(item)}"
             if dedupe_key and dedupe_key not in seen_keys:
@@ -816,7 +832,7 @@ class ZephyrScaleClient:
         if result:
             return result
 
-        for item in self._get_test_cycles_by_issue_link(issue_key):
+        for item in self._get_test_cycles_by_issue_query_params(issue_key, project_keys_to_try):
             key = self.get_test_cycle_key(item)
             dedupe_key = key or f"name:{self.get_test_cycle_name(item)}"
             if dedupe_key and dedupe_key not in seen_keys:
@@ -1054,56 +1070,47 @@ class ZephyrScaleClient:
         return matched
 
     def _search_test_cycles_by_name_query(self, project_key: str, issue_key: str) -> list[dict]:
-        """
-        Быстрый targeted-поиск по имени. На части инсталляций Zephyr Scale это
-        работает, на части возвращает 400 — тогда ниже остается полный fallback
-        по projectKey.
-        """
         url = f"{self.base_url}/rest/atm/1.0/testrun/search"
         query = f'projectKey = "{project_key}" AND name ~ "{issue_key}"'
-        try:
-            response = self._get_with_retries(
-                url,
-                params={'query': query, 'maxResults': 50, 'startAt': 0},
-            )
-        except Exception as e:
-            self.last_test_cycle_search_stats.append({
-                'mode': 'search-name',
-                'project_key': project_key,
-                'query': query,
-                'status': 'exception',
-                'count': 0,
-                'error': str(e),
-            })
-            return []
-
-        body_snippet = ''
-        if response.status_code == 200:
+        matched, seen_pages, seen_keys = [], set(), set()
+        start_at, total_seen, status, error = 0, 0, None, ''
+        with self.lookup_budget(ZEPHYR_LOOKUP_TIMEOUT_SECONDS):
             try:
-                items = self._extract_zephyr_collection(response.json())
-            except Exception:
-                items = []
-                body_snippet = response.text[:300]
-        else:
-            items = []
-            body_snippet = response.text[:300]
-
-        issue_key_lower = issue_key.lower()
-        matched = []
-        for item in items:
-            name = self.get_test_cycle_name(item)
-            if not name or issue_key_lower in name.casefold():
-                matched.append(item)
-
+                while True:
+                    response = self._get_with_retries(url, params={
+                        'query': query, 'maxResults': 50, 'startAt': start_at})
+                    status = response.status_code
+                    if status != 200:
+                        break
+                    payload = response.json()
+                    items = self._extract_zephyr_collection(payload)
+                    fingerprint = json.dumps(items, sort_keys=True)
+                    if items and fingerprint in seen_pages:
+                        raise ValueError('Zephyr повторил страницу ТЦ; полнота списка не подтверждена')
+                    seen_pages.add(fingerprint)
+                    total_seen += len(items)
+                    for item in items:
+                        name = self.get_test_cycle_name(item)
+                        key = self.get_test_cycle_key(item) or name
+                        if key not in seen_keys and (not name or issue_key.casefold() in name.casefold()):
+                            matched.append(item)
+                            seen_keys.add(key)
+                    if isinstance(payload, dict) and payload.get('isLast') is True:
+                        break
+                    total = payload.get('total') if isinstance(payload, dict) else None
+                    if type(total) is int and start_at + len(items) >= total:
+                        break
+                    if not items or (len(items) < 50 and total is None):
+                        break
+                    start_at += len(items)
+            except (requests.RequestException, ValueError, RuntimeError) as exc:
+                status, error = 'exception', str(exc)
         self.last_test_cycle_search_stats.append({
-            'mode': 'search-name',
-            'project_key': project_key,
-            'query': query,
-            'status': response.status_code,
-            'seen': len(items),
-            'count': len(matched),
-            'body': body_snippet,
-        })
+            'mode': 'search-name', 'project_key': project_key, 'query': query,
+            'status': status, 'seen': total_seen, 'count': len(matched), 'error': error})
+        if error or (status != 200 and matched):
+            # A partially read list must not become a successful cached lookup.
+            return []
         return matched
 
     def _print_test_cycle_search_debug(self, issue_key: str, project_keys_to_try: list[str]) -> None:
@@ -1566,7 +1573,7 @@ class ReleaseValidator:
             raw_cycles = self.zephyr.get_test_cycles_for_issue(release_key)
             if not raw_cycles and not self.zephyr.is_failed_request_limit_reached():
                 raw_cycles = self._get_test_cycles_from_jira_release_metadata(release_key)
-            if not raw_cycles and not self._zephyr_last_cycle_search_had_technical_failure():
+            if not raw_cycles and not self.zephyr.is_failed_request_limit_reached():
                 raw_cycles = self._get_test_cycles_from_direct_cache_or_scan(release_key)
             cycles = [self._get_cycle_name_from_zephyr_item(cycle) for cycle in raw_cycles]
             resolved = [(key, name) for key, name in cycles if key or name]
@@ -1601,6 +1608,10 @@ class ReleaseValidator:
         return result
 
     def _get_test_cycles_from_direct_cache_or_scan(self, release_key: str) -> list[dict]:
+        with self.zephyr.lookup_budget(30):
+            return self._get_test_cycles_from_direct_cache_or_scan_bounded(release_key)
+
+    def _get_test_cycles_from_direct_cache_or_scan_bounded(self, release_key: str) -> list[dict]:
         """Найти ТЦ через локальный кэш или bounded direct scan по ключам HRPQA-C..."""
         cached_cycles = self._get_cached_test_cycles_for_release(release_key)
         if not ZEPHYR_DIRECT_CYCLE_SCAN_ENABLED:
@@ -1641,7 +1652,7 @@ class ReleaseValidator:
         found = []
 
         for cycle_number in range(high_watermark, min_number - 1, -1):
-            if self.zephyr.is_failed_request_limit_reached():
+            if self.zephyr.is_failed_request_limit_reached() or self.zephyr.lookup_budget_exhausted():
                 break
             cycle_key = f"{project_key}-C{cycle_number}"
             details = self._get_cached_or_fetch_cycle_details(project_key, cycle_key)
@@ -1709,6 +1720,8 @@ class ReleaseValidator:
         current = high_watermark
         misses = 0
         for cycle_number in range(high_watermark + 1, high_watermark + ZEPHYR_DIRECT_CYCLE_SCAN_FORWARD_LIMIT + 1):
+            if self.zephyr.is_failed_request_limit_reached() or self.zephyr.lookup_budget_exhausted():
+                break
             cycle_key = f"{project_key}-C{cycle_number}"
             details = self.zephyr.get_test_cycle_details(cycle_key)
             if details:
@@ -2440,6 +2453,11 @@ class ReleaseValidator:
         grouped = {}
         has_errors = any(data['errors'] for data in self.report_data.values())
         success = is_success and not has_errors
+        # PR lookup observations are the explicit exception: they keep a green result.
+        other_remarks = any(self._comment_message(message) and not (
+            'pull request' in message.casefold() or re.search(r'\bpr\b', message, re.I))
+            for data in self.report_data.values() for message in data['warnings'])
+        green = success and not other_remarks
         for key, data in self.report_data.items():
             messages = [self._comment_message(message) for message in data['errors'] + data['warnings']]
             messages = list(dict.fromkeys(message for message in messages if message))
@@ -2447,11 +2465,13 @@ class ReleaseValidator:
                 continue
             object_key = release_key if key == 'GENERAL' else key
             entry = grouped.setdefault(object_key, {'summary': data['summary'], 'messages': []})
+            if key == release_key and data['summary']:
+                entry['summary'] = data['summary']
             entry['messages'].extend(message for message in messages if message not in entry['messages'])
         if not grouped:
             grouped[release_key] = {'summary': '', 'messages': [
                 'Ошибок нет.' if success else 'Проверка не завершена. Повторите запуск.']}
-        color, background = ('#14892c', '#e3fcef') if success else ('#de350b', '#ffebe6')
+        color, background = ('#14892c', '#e3fcef') if green else ('#de350b', '#ffebe6')
         rows = [f'{{panel:borderColor={color}|bgColor={background}}}', COMMENT_TABLE_HEADER]
         for key, entry in sorted(grouped.items()):
             target = wiki_cell(key)
@@ -2510,8 +2530,8 @@ class ReleaseValidator:
              'Hotfix' if is_hotfix else ('' if 'web' in labels else 'нет лейбла web')),
             ('bugs', 'Баги: поля, статусы, контур, причины пропуска и Confluence', lambda: self._check_bugs(release_key, is_hotfix=is_hotfix), True, ''),
             ('stories', 'Story: поля, архитектура, сроки тестирования и Task', lambda: self._check_stories(release_key), True, ''),
-            ('required_pr', 'Наличие связи PR', lambda: self._check_required_pull_requests(release_key), True, ''),
-            ('unlinked_pr', 'Merged PR у отлинкованных задач', lambda: self._check_unlinked_release_items_pull_requests(release_key), True, ''),
+            ('required_pr', 'Наличие связи PR', lambda: self._check_required_pull_requests(release_key), False, ''),
+            ('unlinked_pr', 'Merged PR у отлинкованных задач', lambda: self._check_unlinked_release_items_pull_requests(release_key), False, ''),
             ('gigacode', 'GigaCode и AIFIXED', lambda: self._check_gigacode_aifixed_labels(release_key), False, ''),
             ('cloud', 'Cloud: лейбл внешнего рынка', lambda: self._check_cloud_label(release_key, release.fields.summary), True,
              '' if 'cloud' in release.fields.summary.casefold() else 'релиз не Cloud'),
@@ -4577,7 +4597,7 @@ class ReleaseValidator:
             try:
                 with self._pr_lookup_budget(16):
                     for provider, data_type, payload in self._get_dev_status_payloads(
-                            issue_id, data_types=('pullrequest',), find_evidence=self._extract_pull_request_evidence):
+                            issue_id, data_types=('pullrequest', 'repository'), find_evidence=self._extract_pull_request_evidence):
                         evidence = self._dev_status_pull_request_evidence(data_type, payload)
                         if evidence:
                             self._pr_lookup_failures = set()
@@ -4671,7 +4691,7 @@ class ReleaseValidator:
                 maxResults=False
             )
         except Exception as e:
-            self._log_issue("GENERAL", "error", f"Ошибка получения Story/Bug для проверки PR: {e}")
+            self._log_issue("GENERAL", "warning", f"Ошибка получения Story/Bug для проверки PR: {e}")
             self._release_pr_targets_cache[release_key] = []
             return []
 
@@ -4738,6 +4758,7 @@ class ReleaseValidator:
                     "warning",
                     f"Pull Request: не удалось проверить {target_issue.key}: {e}"
                 )
+                continue
 
             if pr_evidence:
                 self._log_issue(
@@ -4748,7 +4769,7 @@ class ReleaseValidator:
             else:
                 self._log_issue(
                     target_issue,
-                    "error",
+                    "warning",
                     ("Pull Request не удалось подтвердить: " + "; ".join(sorted(self._pr_lookup_failures))
                      if getattr(self, '_pr_lookup_failures', None) else
                      "Pull Request не найден. Для каждой Story/Bug в составе релиза должен быть PR на самой задаче")
@@ -4890,7 +4911,7 @@ class ReleaseValidator:
             except Exception as e:
                 self._log_issue(
                     issue,
-                    "error",
+                    "warning",
                     f"Отлинкованная задача: не удалось проверить статус PR: {e}"
                 )
                 continue

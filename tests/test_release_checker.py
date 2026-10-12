@@ -446,7 +446,7 @@ def test_comment_keeps_optional_warnings_on_success():
     body = checker.jira_main.add_comment.call_args.args[1]
     assert 'Не удалось проверить необходимость лейбла AIFIXED.' in body
     assert rc.COMMENT_TABLE_HEADER in body
-    assert '#14892c' in body and '#de350b' not in body
+    assert '#de350b' in body  # Non-PR remarks are red even when advisory.
     assert 'INCOMPLETE' not in body
 
 
@@ -472,7 +472,12 @@ def test_merged_pr_in_structured_array_without_url_is_detected(validator):
     assert validator._extract_merged_pull_request_evidence_from_payload(payload) == '42 (merged)'
 
 
-def test_all_applicable_release_stages_execute_despite_one_crash():
+@pytest.mark.parametrize('failed_method,ready', [
+    ('_check_artifacts', False),
+    ('_check_required_pull_requests', True),
+    ('_check_unlinked_release_items_pull_requests', True),
+])
+def test_all_applicable_release_stages_execute_despite_one_crash(failed_method, ready):
     checker = stage_validator()
     release = NS(key='REL-1', fields=NS(summary='Cloud release', labels=['back', 'web'],
                                       assignee=None, issuelinks=[]))
@@ -491,8 +496,8 @@ def test_all_applicable_release_stages_execute_despite_one_crash():
         '_check_summary_description_match']
     for name in methods:
         setattr(checker, name, Mock())
-    checker._check_artifacts.side_effect = RuntimeError('synthetic outage')
-    assert checker.check_release('REL-1') is False
+    getattr(checker, failed_method).side_effect = RuntimeError('synthetic outage')
+    assert checker.check_release('REL-1') is ready
     for name in methods:
         getattr(checker, name).assert_called_once()
     assert len(checker.check_results) == 16
@@ -882,6 +887,7 @@ def test_failed_cycle_search_does_not_poison_following_stage(zephyr):
     checker._zephyr_release_cycles_cache = {}
     cycle = {'key': 'HRPQA-C1', 'name': 'REL-1 API Регресс'}
     zephyr.get_test_cycles_for_issue = Mock(side_effect=[[], [cycle]])
+    checker._get_test_cycles_from_direct_cache_or_scan = Mock(return_value=[])
     checker._get_test_cycles_from_jira_release_metadata = Mock(return_value=[])
     checker._zephyr_last_cycle_search_had_technical_failure = Mock(return_value=True)
     checker._log_test_cycle_search_debug = Mock()
@@ -1116,3 +1122,113 @@ def test_legacy_requests_and_slow_pr_via_real_local_http(validator, monkeypatch)
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+@pytest.mark.parametrize('lookup', [None, requests.Timeout('unavailable')])
+def test_missing_or_unavailable_pr_is_green_with_object_remark(lookup):
+    checker = stage_validator()
+    issue = NS(key='ABC-1', fields=NS(summary='Release item', assignee=None))
+    checker._get_release_pr_targets = Mock(return_value=[(issue, [issue])])
+    checker._find_issue_pull_request_only_evidence = Mock()
+    if isinstance(lookup, Exception):
+        checker._find_issue_pull_request_only_evidence.side_effect = lookup
+    else:
+        checker._find_issue_pull_request_only_evidence.return_value = lookup
+    checker._run_check('required_pr', 'Наличие связи PR',
+                       lambda: checker._check_required_pull_requests('REL-1'), required=False)
+    assert not any(data['errors'] for data in checker.report_data.values())
+    assert len(checker.report_data['ABC-1']['warnings']) == 1
+    body = checker._release_comment('REL-1', True)
+    assert '#14892c' in body and '#de350b' not in body
+    assert '[ABC-1|' in body and 'ПР' in body
+    assert rc.COMMENT_TABLE_HEADER == '|| Объект релиза || Замечания ||'
+
+
+def test_real_violation_stays_red_alongside_missing_pr():
+    checker = stage_validator()
+    checker._log_issue('ABC-1', 'warning', 'Pull Request не найден.')
+    checker._log_issue('ABC-2', 'error', 'Story: отсутствует описание')
+    checker._log_issue('GENERAL', 'error', 'Не удалось проверить тест-циклы')
+    body = checker._release_comment('REL-1', False)
+    assert '#de350b' in body
+    assert '[ABC-1|' in body and '[ABC-2|' in body and '[REL-1|' in body
+    assert 'GENERAL' not in body
+    assert 'INCOMPLETE' not in body and 'Время, с' not in body
+
+
+def test_zephyr_direct_links_precede_broad_project_search(zephyr):
+    cycle = {'key': 'HRPQA-C1', 'name': 'REL-1 API Регресс'}
+    zephyr._get_test_cycles_by_issue_link = Mock(return_value=[cycle])
+    zephyr._get_test_cycles_by_issue_query_params = Mock(side_effect=AssertionError('Unnecessary search'))
+    assert zephyr.get_test_cycles_for_issue('REL-1') == [cycle]
+
+
+def test_transient_search_failure_does_not_disable_direct_lookup(zephyr):
+    checker = zephyr_checker(zephyr)
+    checker._zephyr_release_cycles_cache = {}
+    cycle = {'key': 'HRPQA-C1', 'name': 'REL-1 API Регресс'}
+    zephyr.get_test_cycles_for_issue = Mock(return_value=[])
+    checker._get_test_cycles_from_jira_release_metadata = Mock(return_value=[])
+    checker._zephyr_last_cycle_search_had_technical_failure = Mock(return_value=True)
+    checker._get_test_cycles_from_direct_cache_or_scan = Mock(return_value=[cycle])
+    assert checker._get_release_test_cycles('REL-1') == [('HRPQA-C1', 'REL-1 API Регресс')]
+    checker._get_test_cycles_from_direct_cache_or_scan.assert_called_once()
+
+
+def test_zephyr_name_search_reads_second_page(zephyr):
+    first = [{'key': f'HRPQA-C{i}', 'name': f'REL-1 Cycle {i}'} for i in range(50)]
+    last = {'key': 'HRPQA-C50', 'name': 'REL-1 API Регресс'}
+    zephyr._get_with_retries = Mock(side_effect=[response(200, first), response(200, [last])])
+    cycles = zephyr._search_test_cycles_by_name_query('HRPQA', 'REL-1')
+    assert len(cycles) == 51 and cycles[-1] == last
+    assert [c.kwargs['params']['startAt'] for c in zephyr._get_with_retries.call_args_list] == [0, 50]
+
+
+def test_zephyr_repeated_page_not_cached_as_complete(zephyr):
+    page = [{'key': f'HRPQA-C{i}', 'name': f'REL-1 Cycle {i}'} for i in range(50)]
+    zephyr._get_with_retries = Mock(return_value=response(200, page))
+    assert zephyr._search_test_cycles_by_name_query('HRPQA', 'REL-1') == []
+    assert zephyr._get_with_retries.call_count == 2
+    assert zephyr.last_test_cycle_search_stats[-1]['status'] == 'exception'
+
+
+def test_pr_from_repository_survives_missing_summary_and_pullrequest_endpoint(validator):
+    def fetch(url, **kwargs):
+        if url.endswith('/detail') and kwargs['params']['dataType'] == 'repository':
+            return {'detail': [{'repositories': [{'pullRequests': [{'id': 42}]}]}]}
+        return None
+    validator._pr_get_json = Mock(side_effect=fetch)
+    assert 'PR 42' in validator._find_issue_pull_request_only_evidence(NS(key='ABC-1', id='123'))
+
+
+def test_direct_cycle_scan_stops_at_its_budget(zephyr, fake_clock):
+    checker = zephyr_checker(zephyr)
+    def get(key):
+        fake_clock[0] += 5
+        return None
+    zephyr.get_test_cycle_details = Mock(side_effect=get)
+    with zephyr.lookup_budget(10):
+        assert checker._refresh_direct_scan_high_watermark('HRPQA', 100) == 100
+    assert zephyr.get_test_cycle_details.call_count == 2
+
+
+@pytest.mark.parametrize('merged_result,blocking', [('PR 42 (merged)', True), (requests.Timeout(), False)])
+def test_unlinked_merged_violation_blocks_but_unavailable_pr_does_not(merged_result, blocking):
+    checker = stage_validator()
+    issue = NS(key='ABC-2', id='2', fields=NS(summary='Removed task', assignee=None,
+               issuetype=NS(name='Story'), labels=[], issuelinks=[]))
+    checker._get_unlinked_release_issue_keys = Mock(return_value={'ABC-2'})
+    checker._get_release_story_bug_keys = Mock(return_value={'ABC-1'})
+    checker.jira_main = Mock()
+    checker.jira_main.search_issues.return_value = [issue]
+    checker._find_issue_merged_pull_request_evidence = Mock()
+    if isinstance(merged_result, Exception):
+        checker._find_issue_merged_pull_request_evidence.side_effect = merged_result
+    else:
+        checker._find_issue_merged_pull_request_evidence.return_value = merged_result
+    checker._run_check('unlinked_pr', 'Merged PR',
+                       lambda: checker._check_unlinked_release_items_pull_requests('REL-1'), required=False)
+    assert bool(checker.report_data['ABC-2']['errors']) is blocking
+    body = checker._release_comment('REL-1', not blocking)
+    assert ('#de350b' if blocking else '#14892c') in body
+    assert '[ABC-2|' in body
