@@ -1,6 +1,7 @@
 """Release policy regressions; never connect to Jira or publish comments."""
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
+from contextlib import nullcontext
 
 import pytest
 import requests
@@ -153,6 +154,12 @@ def architecture_story(validator, histories=None, status='Closed', total=None):
 @pytest.mark.parametrize('author', sorted(rc.ALLOWED_ARCHITECTURE_CLOSERS))
 def test_architecture_closed_by_allowed_author(validator, author):
     story = architecture_story(validator, [history(author)])
+    validator._check_story_architecture_subtask(story)
+    assert validator._log_issue.call_args.args[1] == 'success'
+
+
+def test_pokhotnyuk_is_an_allowed_architecture_closer(validator):
+    story = architecture_story(validator, [history('Плохотнюк Анна Дмитриевна')])
     validator._check_story_architecture_subtask(story)
     assert validator._log_issue.call_args.args[1] == 'success'
 
@@ -523,7 +530,8 @@ def test_dry_run_does_not_write_comment_or_aifixed_label(validator):
 
 def test_failed_zephyr_service_does_not_trigger_direct_cycle_scan(validator):
     validator._zephyr_release_cycles_cache = {}
-    validator.zephyr = Mock()
+    validator.zephyr = Mock(last_test_cycle_search_stats=[])
+    validator.zephyr.lookup_budget.return_value = nullcontext()
     validator.zephyr.get_test_cycles_for_issue.return_value = []
     validator.zephyr.is_failed_request_limit_reached.return_value = True
     validator._get_test_cycles_from_jira_release_metadata = Mock()
@@ -1016,7 +1024,7 @@ def test_comment_groups_release_objects_and_hides_technical_details():
     assert rc.COMMENT_TABLE_HEADER in body
     assert 'Не удалось проверить ПР.' in body
     assert 'недоступны данные КЭ' in body
-    assert 'Story: отсутствует описание' in body
+    assert 'отсутствует описание' in body
     assert body.count('[ABC-1|') == 1 and body.count('[REL-1|') == 1
     assert body.count('Не удалось проверить ПР.') == 1
     for forbidden in ('HTTP', 'timeout', 'endpoint', 'secret', 'INCOMPLETE', '/rest/', 'Время, с', 'debug'):
@@ -1232,3 +1240,148 @@ def test_unlinked_merged_violation_blocks_but_unavailable_pr_does_not(merged_res
     body = checker._release_comment('REL-1', not blocking)
     assert ('#de350b' if blocking else '#14892c') in body
     assert '[ABC-2|' in body
+
+
+def test_no_bugs_is_a_success_without_a_comment_remark():
+    checker = stage_validator()
+    checker.jira_main = Mock()
+    checker.jira_main.search_issues.return_value = []
+    checker._get_consist_of_issues = Mock(return_value=[])
+    checker._run_check('bugs', 'Баги', lambda: checker._check_bugs('REL-1'))
+    assert checker.check_results[0]['status'] == 'PASS'
+    body = checker._release_comment('REL-1', True)
+    assert '#14892c' in body and 'Баги не найдены' not in body
+
+
+def test_job_1468_comment_has_numbered_facts_and_no_diagnostics():
+    checker = stage_validator()
+    checker._log_issue('REL-1', 'error',
+        'Web release: Zephyr временно не отдал ТЦ по ключу релиза REL-1; '
+        'проверка ТЦ пропущена, отсутствие ТЦ не зафиксировано как ошибка. '
+        'Диагностика: issuelink/testruns status=404 found=0; '
+        'testrun/search issueKey status=exception; search-name status=400')
+    checker._log_issue('ABC-1', 'error', 'Отсутствует тестовое покрытие (нет прилинкованных ТК)')
+    checker._log_issue('ABC-1', 'error', 'Zephyr: задача есть в Jira, но нет прилинкованных ТК в пространстве HRPQA')
+    checker._log_issue('ABC-1', 'error', 'Нет комментариев от тестировщика')
+    checker._log_issue('ABC-2', 'error', 'Нет затреканного времени')
+    body = checker._release_comment('REL-1', False)
+    rows = [line for line in body.splitlines() if line.startswith('| ')]
+    assert len(rows) == 3 and '[REL-1|' in rows[0]
+    assert '*1.* Не удалось проверить тест-циклы в Zephyr.' in rows[0]
+    assert '*1.* Нет связанных тест-кейсов.' in rows[1]
+    assert '*2.* Нет комментариев от тестировщика' in rows[1]
+    assert '*1.* Нет затреканного времени' in rows[2]
+    assert body.count('Нет связанных тест-кейсов.') == 1
+    for forbidden in ('Диагностика', 'status=', 'exception', 'testruns', '{color:'):
+        assert forbidden not in body
+    # Detailed evidence is still available to the console report.
+    assert 'status=404' in checker.report_data['REL-1']['errors'][0]
+
+
+def test_cycle_index_uses_supported_query_and_finds_links_on_server_capped_pages(zephyr):
+    pages = [
+        [{'key': 'HRPQA-C1', 'name': 'REL-10 regression'}],
+        [{'key': 'HRPQA-C2', 'name': 'Regression', 'issueLinks': [{'issueKey': 'REL-1'}]}],
+        [{'key': 'HRPQA-C3', 'name': 'Other', 'issueKey': 'REL-1'}],
+        [],
+    ]
+    def fetch(url, **kwargs):
+        if '/issuelink/' in url:
+            return response(404)
+        params = kwargs['params']
+        assert params['query'] == 'projectKey = "HRPQA"'
+        assert params['fields'] == 'key,name,issueKey,issueLinks'
+        assert 'issueKey' not in params and params['maxResults'] == rc.ZEPHYR_CYCLE_INDEX_PAGE_SIZE
+        return response(200, pages[params['startAt']])
+    zephyr.session.get.side_effect = fetch
+    found = zephyr.get_test_cycles_for_issue('REL-1')
+    assert [c['key'] for c in found] == ['HRPQA-C2', 'HRPQA-C3']
+    assert zephyr.last_test_cycle_search_stats[-1]['complete'] is True
+    assert zephyr.session.get.call_count == 5
+
+
+@pytest.mark.parametrize('payload', [
+    {'results': [], 'total': 10}, {'results': [], 'isLast': False},
+    {'unknown': []}, [{'name': 'REL-1 without a key'}],
+])
+def test_invalid_cycle_index_is_not_proof_of_absence(zephyr, payload):
+    zephyr.session.get.return_value = response(200, payload)
+    assert zephyr._search_test_cycles_by_name('HRPQA', 'REL-1') == []
+    assert zephyr.last_test_cycle_search_stats[-1]['complete'] is False
+    assert zephyr.last_test_cycle_search_stats[-1]['status'] == 'exception'
+
+
+@pytest.mark.parametrize('termination', ['repeat', 'timeout'])
+def test_partial_cycle_index_keeps_matches_but_marks_check_incomplete(zephyr, termination):
+    checker = zephyr_checker(zephyr)
+    checker._zephyr_release_cycles_cache = {}
+    page = [{'key': 'HRPQA-C1', 'name': 'REL-1 regression'}]
+    zephyr._get_test_cycles_by_issue_link = Mock(return_value=[])
+    zephyr._get_with_retries = Mock(side_effect=[response(200, page),
+        response(200, page) if termination == 'repeat' else requests.Timeout()])
+    result = []
+    checker._run_check('web', 'ТЦ', lambda: result.extend(checker._get_release_test_cycles('REL-1')))
+    assert result == [('HRPQA-C1', 'REL-1 regression')]
+    assert checker.check_results[0]['status'] == 'INCOMPLETE'
+    assert 'REL-1' not in checker._zephyr_release_cycles_cache
+    assert 'Не удалось проверить все тест-циклы релиза.' in checker._release_comment('REL-1', False)
+
+
+def test_cycle_index_obeys_shared_budget(zephyr, fake_clock):
+    def fetch(url, **kwargs):
+        fake_clock[0] += kwargs['timeout'].total
+        raise requests.Timeout()
+    zephyr.session.get.side_effect = fetch
+    assert zephyr._search_test_cycles_by_name('HRPQA', 'REL-1') == []
+    assert fake_clock[0] <= 30
+    assert zephyr.session.get.call_count <= 3
+
+
+def test_cycle_index_retries_transient_errors(zephyr):
+    cycle = {'key': 'HRPQA-C1', 'name': 'REL-1 regression'}
+    zephyr.session.get.side_effect = [requests.Timeout(),
+        response(200, {'results': [cycle], 'total': 1})]
+    assert zephyr._search_test_cycles_by_name('HRPQA', 'REL-1') == [cycle]
+    assert zephyr.last_test_cycle_search_stats[-1]['complete'] is True
+    assert zephyr.session.get.call_count == 2
+
+
+def test_direct_scan_checks_known_cycles_before_slow_forward_reads(zephyr, fake_clock, monkeypatch):
+    checker = zephyr_checker(zephyr)
+    checker._zephyr_cycle_cache = {'projects': {}, 'release_map': {}}
+    checker._save_zephyr_cycle_cache = Mock()
+    monkeypatch.setattr(rc, 'ZEPHYR_DIRECT_CYCLE_SCAN_START', '100')
+    monkeypatch.setattr(rc, 'ZEPHYR_DIRECT_CYCLE_SCAN_LIMIT', 1)
+    def fetch(key):
+        fake_clock[0] += 1 if key == 'HRPQA-C100' else 10
+        return {'key': key, 'name': 'REL-1 regression'} if key == 'HRPQA-C100' else None
+    zephyr.get_test_cycle_details = Mock(side_effect=fetch)
+    found = checker._get_test_cycles_from_direct_cache_or_scan('REL-1')
+    assert [c['key'] for c in found] == ['HRPQA-C100']
+    assert zephyr.get_test_cycle_details.call_args_list[0].args == ('HRPQA-C100',)
+
+
+def test_direct_scan_progress_and_new_issue_links_survive_cache(zephyr, monkeypatch, tmp_path):
+    checker = zephyr_checker(zephyr)
+    checker._zephyr_cycle_cache = {'projects': {}, 'release_map': {}}
+    monkeypatch.setattr(rc, 'ZEPHYR_CYCLE_CACHE_PATH', tmp_path / 'cache' / 'cycles.json')
+    monkeypatch.setattr(rc, 'ZEPHYR_DIRECT_CYCLE_SCAN_START', '100')
+    cycle = {'key': 'HRPQA-C110', 'name': 'Regression', 'issueLinks': [{'issueKey': 'REL-1'}]}
+    checker._cache_cycle_details('HRPQA', cycle)
+    checker._save_zephyr_cycle_cache()
+    checker._zephyr_cycle_cache = checker._load_zephyr_cycle_cache()
+    assert checker._get_direct_scan_high_watermark('HRPQA') == 110
+    assert checker._get_cached_test_cycles_for_release('REL-1') == [cycle]
+    zephyr.session.get.assert_not_called()
+
+
+def test_unwritable_cycle_cache_is_console_only(zephyr, monkeypatch, tmp_path, capsys):
+    checker = zephyr_checker(zephyr)
+    checker._zephyr_cycle_cache = {'projects': {}, 'release_map': {}}
+    not_directory = tmp_path / 'file'
+    not_directory.write_text('not a directory')
+    monkeypatch.setattr(rc, 'ZEPHYR_CYCLE_CACHE_PATH', not_directory / 'cycles.json')
+    checker._run_check('cache', 'Cache', checker._save_zephyr_cycle_cache)
+    assert checker.check_results[0]['status'] == 'NO_FINDINGS'
+    assert 'не удалось сохранить' in capsys.readouterr().out
+    assert '#14892c' in checker._release_comment('REL-1', True)

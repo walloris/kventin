@@ -9,6 +9,7 @@ import json
 import urllib3
 import logging
 import requests
+import tempfile
 from html.parser import HTMLParser
 from pathlib import Path
 from collections import defaultdict
@@ -92,7 +93,7 @@ ALLOWED_ARCHITECTURE_CLOSERS = {
     "Базаева Тамара Виталиевна", "Калашникова Екатерина Рашидовна",
     "Куданов Александр Андреевич", "Куренков Николай Николаевич",
     "Матвеев Антон Анатольевич", "Махмудов Джамбулат Рамизович",
-    "Абдуллаев Магомед Русланович",
+    "Абдуллаев Магомед Русланович", "Плохотнюк Анна Дмитриевна",
 }
 ARCHITECTURE_CLOSED_STATUSES = {
     'closed', 'закрыта', 'закрыто', 'done', 'готово', 'выполнено',
@@ -122,7 +123,7 @@ ZEPHYR_TEST_CYCLE_PROJECT_KEYS = tuple(
         if project_key.strip()
     )
 )
-ZEPHYR_ENABLE_FULL_CYCLE_SCAN = os.getenv("ZEPHYR_ENABLE_FULL_CYCLE_SCAN", "0").lower() in (
+ZEPHYR_ENABLE_FULL_CYCLE_SCAN = os.getenv("ZEPHYR_ENABLE_FULL_CYCLE_SCAN", "1").lower() in (
     "1",
     "true",
     "yes",
@@ -142,13 +143,15 @@ ZEPHYR_DIRECT_CYCLE_SCAN_FORWARD_LIMIT = int(os.getenv("ZEPHYR_DIRECT_CYCLE_SCAN
 ZEPHYR_DIRECT_CYCLE_SCAN_FORWARD_MISS_LIMIT = int(os.getenv("ZEPHYR_DIRECT_CYCLE_SCAN_FORWARD_MISS_LIMIT", "20"))
 ZEPHYR_DIRECT_CYCLE_SCAN_START = os.getenv("ZEPHYR_DIRECT_CYCLE_SCAN_START", "133028").strip()
 ZEPHYR_CYCLE_CACHE_PATH = Path(
-    os.getenv("ZEPHYR_CYCLE_CACHE_PATH", str(parent_dir / "trash" / "zephyr_cycle_cache.json"))
+    os.getenv("ZEPHYR_CYCLE_CACHE_PATH", str(
+        Path(tempfile.gettempdir()) / f"kventin-release-checker-{os.getuid()}" / "zephyr_cycle_cache.json"))
 )
 ZEPHYR_REQUEST_TIMEOUT_SECONDS = int(os.getenv("ZEPHYR_REQUEST_TIMEOUT_SECONDS", "10"))
 ZEPHYR_MAX_RETRIES_PER_REQUEST = int(os.getenv("ZEPHYR_MAX_RETRIES_PER_REQUEST", "3"))
 ZEPHYR_MAX_FAILED_REQUESTS = int(os.getenv("ZEPHYR_MAX_FAILED_REQUESTS", "20"))
 ZEPHYR_LOOKUP_TIMEOUT_SECONDS = 45
 ZEPHYR_REQUEST_BUDGET_SECONDS = 32
+ZEPHYR_CYCLE_INDEX_PAGE_SIZE = int(os.getenv("ZEPHYR_CYCLE_INDEX_PAGE_SIZE", "200"))
 ZEPHYR_CASE_FIELDS = 'key,name,status,customFields,issueLinks'
 CHECK_TABLE_HEADER = '|| Проверка || Результат || Время, с || Объекты || Успех / ошибки / предупреждения || Замечания ||'
 COMMENT_TABLE_HEADER = '|| Объект релиза || Замечания ||'
@@ -768,17 +771,10 @@ class ZephyrScaleClient:
 
     @staticmethod
     def _cycle_mentions_issue(cycle: dict, issue_key: str) -> bool:
-        issue_key_lower = issue_key.casefold()
-        direct_issue_key = str(cycle.get('issueKey') or cycle.get('jiraIssueKey') or '').casefold()
-        if direct_issue_key == issue_key_lower:
-            return True
-        cycle_name = ZephyrScaleClient.get_test_cycle_name(cycle).casefold()
-        if issue_key_lower in cycle_name:
-            return True
-        try:
-            return issue_key_lower in json.dumps(cycle, ensure_ascii=False).casefold()
-        except Exception:
-            return False
+        # REL-1 must not match REL-10; names and both legacy/new link fields count.
+        text = json.dumps(cycle, ensure_ascii=False).casefold()
+        return bool(re.search(r'(?<![a-z0-9-])' + re.escape(issue_key.casefold())
+                              + r'(?![a-z0-9-])', text))
 
     @staticmethod
     def _issue_link_endpoint_paths(issue_key: str) -> list[tuple[str, str]]:
@@ -832,7 +828,11 @@ class ZephyrScaleClient:
         if result:
             return result
 
-        for item in self._get_test_cycles_by_issue_query_params(issue_key, project_keys_to_try):
+        # issueKey is not a documented testrun/search filter. Servers may ignore
+        # it and serialize the entire project, including all execution results.
+        legacy_items = (self._get_test_cycles_by_issue_query_params(issue_key, project_keys_to_try)
+                        if ZEPHYR_EXTENDED_CYCLE_DIAG else [])
+        for item in legacy_items:
             key = self.get_test_cycle_key(item)
             dedupe_key = key or f"name:{self.get_test_cycle_name(item)}"
             if dedupe_key and dedupe_key not in seen_keys:
@@ -994,79 +994,78 @@ class ZephyrScaleClient:
         ]
 
     def _search_test_cycles_by_name(self, project_key: str, issue_key: str) -> list[dict]:
+        """Read a bounded, lightweight index using the documented Server API.
+
+        Server only supports projectKey/folder filters for cycles, not name or
+        issueKey. Projecting out execution items avoids the expensive full payload.
         """
-        GET /rest/atm/1.0/testrun/search?query=projectKey = "{project_key}"
-        Пагинация по 50, фильтруем на стороне клиента по issue_key в name.
-        API поддерживает только поля projectKey и folder в query.
-        """
-        targeted = self._search_test_cycles_by_name_query(project_key, issue_key)
-        if targeted:
-            return targeted
+        if ZEPHYR_EXTENDED_CYCLE_DIAG:
+            targeted = self._search_test_cycles_by_name_query(project_key, issue_key)
+            if targeted:
+                return targeted
         if not ZEPHYR_ENABLE_FULL_CYCLE_SCAN:
             self.last_test_cycle_search_stats.append({
-                'mode': 'search',
-                'project_key': project_key,
-                'status': 'skipped',
-                'pages': 0,
-                'total_seen': 0,
-                'count': 0,
-                'error': 'full project scan disabled',
-            })
+                'mode': 'search', 'project_key': project_key, 'status': 'exception',
+                'pages': 0, 'total_seen': 0, 'count': 0, 'error': 'project index disabled'})
             return []
 
         url = f"{self.base_url}/rest/atm/1.0/testrun/search"
-        query = f'projectKey = "{project_key}"'
-        page_size = 50
-        start_at = 0
-        matched: list[dict] = []
-        issue_key_lower = issue_key.lower()
-        pages = 0
-        total_seen = 0
-        status = None
-
-        while True:
+        matched, seen_keys = [], set()
+        start_at, pages, status, error = 0, 0, None, ''
+        complete = False
+        with self.lookup_budget(30):
             try:
-                response = self._get_with_retries(
-                    url,
-                    params={'query': query, 'maxResults': page_size, 'startAt': start_at},
-                )
-            except Exception as e:
-                status = 'exception'
-                search_error = str(e)
-                break
-
-            status = response.status_code
-            if response.status_code != 200:
-                break
-
-            data = response.json()
-            items = self._extract_zephyr_collection(data)
-
-            if not items:
-                break
-
-            pages += 1
-            total_seen += len(items)
-            for item in items:
-                name = self.get_test_cycle_name(item)
-                if issue_key_lower in name.casefold():
-                    matched.append(item)
-
-            # Если вернулось меньше page_size — достигли конца
-            if len(items) < page_size:
-                break
-
-            start_at += page_size
-
-        self.last_test_cycle_search_stats.append({
-            'mode': 'search',
-            'project_key': project_key,
-            'status': status,
-            'pages': pages,
-            'total_seen': total_seen,
-            'count': len(matched),
-            'error': locals().get('search_error', ''),
-        })
+                for _ in range(500):
+                    response = self._get_with_retries(url, params={
+                        'query': f'projectKey = "{project_key}"',
+                        'fields': 'key,name,issueKey,issueLinks',
+                        'maxResults': ZEPHYR_CYCLE_INDEX_PAGE_SIZE, 'startAt': start_at})
+                    status = response.status_code
+                    if status != 200:
+                        raise ValueError(f'cycle index HTTP {status}')
+                    payload = response.json()
+                    if isinstance(payload, list):
+                        items = payload
+                    elif isinstance(payload, dict):
+                        items = next((payload[k] for k in ('results', 'testRuns', 'testCycles', 'values', 'items')
+                                      if isinstance(payload.get(k), list)), None)
+                    else:
+                        items = None
+                    if items is None:
+                        raise ValueError('Unknown cycle index response')
+                    pages += 1
+                    for item in items:
+                        key = self.get_test_cycle_key(item) if isinstance(item, dict) else ''
+                        if not re.fullmatch(r'[A-Z][A-Z0-9_]*-C\d+', key) or key in seen_keys:
+                            raise ValueError('Invalid cycle key or repeated index page')
+                        seen_keys.add(key)
+                        if self._cycle_mentions_issue(item, issue_key):
+                            matched.append(item)
+                    start_at += len(items)
+                    total = payload.get('total') if isinstance(payload, dict) else None
+                    is_last = payload.get('isLast') if isinstance(payload, dict) else None
+                    if type(total) is int and (total < start_at or (not items and start_at < total)):
+                        raise ValueError('Inconsistent cycle index total')
+                    if not items and is_last is False:
+                        raise ValueError('Empty intermediate cycle index page')
+                    if is_last is True or (type(total) is int and start_at >= total) or not items:
+                        complete = True
+                        break
+                    # A plain list may be capped by the server. Continue until
+                    # an empty page instead of assuming a short page is final.
+                if not complete:
+                    raise ValueError('Cycle index page limit reached')
+            except (requests.RequestException, ValueError, RuntimeError) as exc:
+                status, error = 'exception', str(exc)
+        stat = {'mode': 'search', 'project_key': project_key, 'status': status,
+                'pages': pages, 'total_seen': start_at, 'count': len(matched),
+                'complete': complete, 'error': error}
+        self.last_test_cycle_search_stats.append(stat)
+        print(f"   Zephyr cycle index: project={project_key} pages={pages} "
+              f"seen={start_at} matched={len(matched)} complete={complete}"
+              + (f" error={error}" if error else ''))
+        # Positive matches remain useful even if a later page failed. The caller
+        # must report incomplete discovery and never cache this as a full list.
         return matched
 
     def _search_test_cycles_by_name_query(self, project_key: str, issue_key: str) -> list[dict]:
@@ -1569,6 +1568,10 @@ class ReleaseValidator:
 
     def _get_release_test_cycles(self, release_key: str) -> list[tuple[str, str]]:
         """Один кэшированный Zephyr-поиск ТЦ по ключу релиза."""
+        with self.zephyr.lookup_budget(ZEPHYR_LOOKUP_TIMEOUT_SECONDS):
+            return self._get_release_test_cycles_bounded(release_key)
+
+    def _get_release_test_cycles_bounded(self, release_key: str) -> list[tuple[str, str]]:
         if release_key not in self._zephyr_release_cycles_cache:
             raw_cycles = self.zephyr.get_test_cycles_for_issue(release_key)
             if not raw_cycles and not self.zephyr.is_failed_request_limit_reached():
@@ -1577,6 +1580,12 @@ class ReleaseValidator:
                 raw_cycles = self._get_test_cycles_from_direct_cache_or_scan(release_key)
             cycles = [self._get_cycle_name_from_zephyr_item(cycle) for cycle in raw_cycles]
             resolved = [(key, name) for key, name in cycles if key or name]
+            incomplete = any(stat.get('complete') is False
+                             for stat in self.zephyr.last_test_cycle_search_stats)
+            if resolved and incomplete:
+                self._log_issue(release_key, 'warning',
+                                'Zephyr: не удалось проверить полный список ТЦ релиза')
+                return resolved
             if not resolved:
                 self._log_test_cycle_search_debug(release_key)
                 if self._zephyr_last_cycle_search_had_technical_failure():
@@ -1647,19 +1656,26 @@ class ReleaseValidator:
             )
             return []
 
-        high_watermark = self._refresh_direct_scan_high_watermark(project_key, high_watermark)
+        # Search the known window before advancing it. Previously forward lookup
+        # consumed the entire budget, so even the configured start was never read.
         min_number = max(1, high_watermark - ZEPHYR_DIRECT_CYCLE_SCAN_LIMIT + 1)
         found = []
 
-        for cycle_number in range(high_watermark, min_number - 1, -1):
-            if self.zephyr.is_failed_request_limit_reached() or self.zephyr.lookup_budget_exhausted():
-                break
-            cycle_key = f"{project_key}-C{cycle_number}"
-            details = self._get_cached_or_fetch_cycle_details(project_key, cycle_key)
-            if not details:
-                continue
-            if self._test_cycle_belongs_to_release(details, release_key):
-                found.append(details)
+        with self.zephyr.lookup_budget(20):
+            for cycle_number in range(high_watermark, min_number - 1, -1):
+                if self.zephyr.is_failed_request_limit_reached() or self.zephyr.lookup_budget_exhausted():
+                    break
+                cycle_key = f"{project_key}-C{cycle_number}"
+                details = self._get_cached_or_fetch_cycle_details(project_key, cycle_key)
+                if details and self._test_cycle_belongs_to_release(details, release_key):
+                    found.append(details)
+        high_watermark = self._refresh_direct_scan_high_watermark(project_key, high_watermark)
+        # Forward reads already populate release_map. Keep those matches even
+        # when the final read exhausts the remaining budget.
+        found.extend(self._get_cached_test_cycles_for_release(release_key))
+        self.zephyr.last_test_cycle_search_stats.append({
+            'mode': 'direct-scan', 'status': 'exception', 'complete': False,
+            'error': 'bounded numeric window does not prove a complete release cycle list'})
 
         combined_by_key = {}
         for cycle in cached_cycles + found:
@@ -1710,11 +1726,10 @@ class ReleaseValidator:
         return not allowed_prefixes or any(str(cycle_key).casefold().startswith(prefix) for prefix in allowed_prefixes)
 
     def _get_direct_scan_high_watermark(self, project_key: str) -> int:
-        if ZEPHYR_DIRECT_CYCLE_SCAN_START.isdigit():
-            return int(ZEPHYR_DIRECT_CYCLE_SCAN_START)
         project_cache = self._zephyr_cycle_cache.get('projects', {}).get(project_key, {})
         cached_max = project_cache.get('max_seen')
-        return int(cached_max) if str(cached_max).isdigit() else 0
+        return max(int(cached_max) if str(cached_max).isdigit() else 0,
+                   int(ZEPHYR_DIRECT_CYCLE_SCAN_START) if ZEPHYR_DIRECT_CYCLE_SCAN_START.isdigit() else 0)
 
     def _refresh_direct_scan_high_watermark(self, project_key: str, high_watermark: int) -> int:
         current = high_watermark
@@ -1770,8 +1785,11 @@ class ReleaseValidator:
         match = re.search(r'-C(\d+)$', cycle_key)
         if match:
             project_cache['max_seen'] = max(int(project_cache.get('max_seen') or 0), int(match.group(1)))
-        issue_key = str(cycle_details.get('issueKey') or '')
-        if issue_key:
+        issue_keys = re.findall(r'\b[A-Z][A-Z0-9_]*-\d+\b', json.dumps({
+            'issueKey': cycle_details.get('issueKey'),
+            'issueLinks': cycle_details.get('issueLinks'),
+            'name': self.zephyr.get_test_cycle_name(cycle_details)}, ensure_ascii=False))
+        for issue_key in set(issue_keys):
             release_map = self._zephyr_cycle_cache.setdefault('release_map', {})
             current = set(release_map.get(issue_key, []))
             current.add(cycle_key)
@@ -1797,7 +1815,8 @@ class ReleaseValidator:
                 encoding='utf-8',
             )
         except Exception as e:
-            self._log_issue("GENERAL", "warning", f"Не удалось сохранить кэш Zephyr ТЦ: {e}")
+            # Cache persistence is an optimization, never a release defect.
+            print(f"   Zephyr cache: не удалось сохранить {ZEPHYR_CYCLE_CACHE_PATH}: {e}")
 
     def _collect_test_cycle_keys_from_jira_metadata(self, release_key: str) -> set[str]:
         cycle_keys: set[str] = set()
@@ -1818,10 +1837,16 @@ class ReleaseValidator:
             'issue_html': self._collect_test_cycle_keys_from_issue_html(release_key),
         }
 
+    def _get_cycle_metadata(self, url, **kwargs):
+        """Jira fallbacks share the cycle discovery deadline, including properties."""
+        deadline = getattr(self.zephyr, '_lookup_deadline', None) or time.monotonic() + 12
+        return bounded_get(self.jira_http, url, source='Jira cycle metadata',
+                           attempts=1, timeout=12, deadline=deadline, **kwargs)
+
     def _collect_test_cycle_keys_from_remote_links(self, release_key: str) -> set[str]:
         url = f"{config['jira']['url'].rstrip('/')}/rest/api/2/issue/{release_key}/remotelink"
         try:
-            response = self.jira_http.get(url, timeout=12)
+            response = self._get_cycle_metadata(url)
             if response.status_code != 200:
                 return set()
             return self._extract_test_cycle_keys(response.json())
@@ -1832,7 +1857,7 @@ class ReleaseValidator:
         base_url = config['jira']['url'].rstrip('/')
         url = f"{base_url}/rest/api/2/issue/{release_key}/properties"
         try:
-            response = self.jira_http.get(url, timeout=12)
+            response = self._get_cycle_metadata(url)
             if response.status_code != 200:
                 return set()
             data = response.json()
@@ -1847,9 +1872,11 @@ class ReleaseValidator:
                 property_keys.append(property_key)
 
         for property_key in property_keys[:30]:
+            if self.zephyr.lookup_budget_exhausted():
+                break
             property_url = f"{url}/{property_key}"
             try:
-                property_response = self.jira_http.get(property_url, timeout=12)
+                property_response = self._get_cycle_metadata(property_url)
                 if property_response.status_code == 200:
                     cycle_keys.update(self._extract_test_cycle_keys(property_response.json()))
             except Exception:
@@ -1858,22 +1885,19 @@ class ReleaseValidator:
 
     def _collect_test_cycle_keys_from_issue_raw(self, release_key: str) -> set[str]:
         try:
-            issue = self.jira_main.issue(
-                release_key,
-                fields='*all',
-                expand='renderedFields,names,schema',
-            )
-            return self._extract_test_cycle_keys(issue.raw)
+            url = f"{config['jira']['url'].rstrip('/')}/rest/api/2/issue/{release_key}"
+            response = self._get_cycle_metadata(url, params={
+                'fields': '*all', 'expand': 'renderedFields,names,schema'})
+            return self._extract_test_cycle_keys(response.json()) if response.status_code == 200 else set()
         except Exception:
             return set()
 
     def _collect_test_cycle_keys_from_issue_html(self, release_key: str) -> set[str]:
         url = f"{config['jira']['url'].rstrip('/')}/browse/{release_key}"
         try:
-            response = self.jira_http.get(
+            response = self._get_cycle_metadata(
                 url,
                 headers={'Accept': 'text/html,application/xhtml+xml'},
-                timeout=12,
             )
             if response.status_code != 200:
                 return set()
@@ -1902,12 +1926,7 @@ class ReleaseValidator:
 
     @staticmethod
     def _test_cycle_belongs_to_release(cycle_details: dict, release_key: str) -> bool:
-        if str(cycle_details.get('issueKey', '')).casefold() == release_key.casefold():
-            return True
-        try:
-            return release_key.casefold() in json.dumps(cycle_details, ensure_ascii=False).casefold()
-        except Exception:
-            return False
+        return ZephyrScaleClient._cycle_mentions_issue(cycle_details, release_key)
 
     def _log_test_cycle_search_debug(self, release_key: str) -> None:
         if release_key in self._zephyr_cycle_search_debug_logged:
@@ -2420,17 +2439,23 @@ class ReleaseValidator:
         """Keep the action needed by the release owner; diagnostics stay in logs."""
         text = clean_report_text(message)
         lower = text.casefold()
-        if any(marker in lower for marker in ('zephyr debug:', 'zephyr direct scan:', 'gigachat')):
+        if any(marker in lower for marker in ('zephyr debug:', 'zephyr direct scan:', 'gigachat',
+                                              'сохранить кэш zephyr', 'баги не найдены в составе')):
             return ''
+        if 'нет прилинкованных тк' in lower:
+            return 'Нет связанных тест-кейсов.'
+        if 'не удалось проверить полный список тц' in lower:
+            return 'Не удалось проверить все тест-циклы релиза.'
         technical = any(marker in lower for marker in (
             'не удалось', 'проверка не выполнена', 'лимит неуспешных',
-            'ошибка получения', 'ошибка поиска', 'ошибка проверки', 'timeout', 'httppool', 'httpsconnectionpool'))
+            'ошибка получения', 'ошибка поиска', 'ошибка проверки', 'timeout', 'httppool', 'httpsconnectionpool',
+            'временно не отдал', 'проверка тц пропущена', 'диагностика:', '/rest/', 'status=', 'traceback'))
         if technical:
             if 'aifixed' in lower or 'gigacode' in lower:
                 return 'Не удалось проверить необходимость лейбла AIFIXED.'
             if 'pull request' in lower or re.search(r'\bpr\b', lower):
                 return 'Не удалось проверить ПР. Повторите проверку.'
-            if 'metadata' in lower or 'кэ' in lower:
+            if 'metadata' in lower or re.search(r'\bкэ\b', lower):
                 return 'Не удалось проверить тест-циклы: недоступны данные КЭ.'
             if 'тц' in lower or 'тест-цикл' in lower:
                 return 'Не удалось проверить тест-циклы в Zephyr.'
@@ -2440,7 +2465,11 @@ class ReleaseValidator:
                 return 'Не удалось проверить баги релиза.'
             if 'истори' in lower:
                 return 'Не удалось проверить историю изменений задачи.'
+            if 'анализ архитектуры' in lower:
+                return 'Не удалось проверить закрытие задачи «Анализ архитектуры».'
             return 'Не удалось завершить проверку. Повторите запуск.'
+        text = re.sub(r'^(?:Story|Bug|Web release|Back release):\s*', '', text)
+        text = re.sub(r"sub-task 'Анализ архитектуры':\s*", 'Анализ архитектуры — ', text)
         text = re.sub(r'^Zephyr\s+(ТК|ТЦ)', r'\1', text)
         text = re.sub(r'«[^»]+»\s*', '', text)
         text = re.sub(r'\s*\(customfield_\d+\)', '', text)
@@ -2472,15 +2501,19 @@ class ReleaseValidator:
             grouped[release_key] = {'summary': '', 'messages': [
                 'Ошибок нет.' if success else 'Проверка не завершена. Повторите запуск.']}
         color, background = ('#14892c', '#e3fcef') if green else ('#de350b', '#ffebe6')
-        rows = [f'{{panel:borderColor={color}|bgColor={background}}}', COMMENT_TABLE_HEADER]
-        for key, entry in sorted(grouped.items()):
+        title = 'Проверка релиза — успешно' if green else 'Проверка релиза — есть замечания'
+        rows = [f'{{panel:title={title}|titleBGColor={background}|titleColor={color}'
+                f'|borderColor={color}|bgColor=#ffffff}}', COMMENT_TABLE_HEADER]
+        for key, entry in sorted(grouped.items(), key=lambda item: (item[0] != release_key, item[0])):
             target = wiki_cell(key)
             if re.fullmatch(r'[A-Z][A-Z0-9_]*-\d+', key):
                 target = f"[{key}|{config['jira']['url'].rstrip('/')}/browse/{key}]"
             if entry['summary'] and entry['summary'] != 'Общие проверки':
-                target += ' — ' + wiki_cell(trim_report_text(entry['summary'], 75))
-            messages = ' \\\\ '.join(wiki_cell(message) for message in entry['messages'])
-            rows.append(f'| {target} | {{color:{color}}}{messages}{{color}} |')
+                target += ' \\\\ ' + wiki_cell(trim_report_text(entry['summary'], 100))
+            messages = ' \\\\ \\\\ '.join(
+                f'*{number}.* {wiki_cell(message)}'
+                for number, message in enumerate(entry['messages'], 1))
+            rows.append(f'| {target} | {messages} |')
         rows.append('{panel}')
         return '\n'.join(rows)
 
@@ -5352,7 +5385,7 @@ class ReleaseValidator:
         bugs = [i for i in all_issues if i.fields.issuetype.name in ['Bug', 'Defect', 'Ошибка']]
 
         if not bugs:
-            self._log_issue("GENERAL", "warning", "Баги не найдены в составе релиза")
+            self._log_issue(release_key, "success", "Баги не найдены в составе релиза")
             return
 
         print(f"   Проверка {len(bugs)} багов...")
