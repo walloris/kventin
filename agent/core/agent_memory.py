@@ -1,0 +1,953 @@
+"""
+AgentMemory: память агента за сессию.
+
+Хранит всё, что агент делал: действия, дедупликацию по url_pattern + stable_key,
+покрытие, навигационный граф, метрики, тест-план, дефекты, и т.п.
+
+Раньше класс жил в agent/agent.py. Вынесен сюда — он не зависит ни от Page, ни от
+LLM-клиента, ни от run_agent. Это «чистая» структура данных + методы над ней.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+from concurrent.futures import Future
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+from config import (
+    LOOP_GUARD_DIVERSIFY_AFTER,
+    LOOP_GUARD_GOTO_START_AFTER,
+    LOOP_GUARD_HARD_STOP_AFTER,
+    MAX_ACTIONS_IN_MEMORY,
+    MAX_SCROLLS_IN_ROW,
+    PHASE_STEPS_TO_ADVANCE,
+    SELF_HEAL_AFTER_FAILURES,
+    URL_BUDGET_NO_PROGRESS,
+)
+from agent.actions.element_resolver import norm_key as _norm_key
+from agent.actions.locators import detect_repeating_pattern, url_pattern as _url_pattern
+from agent.browser.page_objects import PageObjectRegistry
+
+LOG = logging.getLogger("kventin.memory")
+
+
+class AgentMemory:
+    """
+    Хранит всё, что агент уже делал, чтобы не ходить по циклу.
+    Учитываются: клики, ховеры, ввод в поля, закрытие модалок, выбор опций, прокрутки.
+    """
+
+    def __init__(self, max_actions: Optional[int] = None):
+        self.actions: List[Dict[str, Any]] = []
+        self.max_actions = max_actions or MAX_ACTIONS_IN_MEMORY
+        self.defects_reported: List[str] = []
+        self.iteration = 0
+        # Ключи (normalized) уже выполненных действий — НЕ ПОВТОРЯТЬ
+        self.done_click: set = set()
+        self.done_hover: set = set()
+        self.done_type: set = set()
+        self.done_close_modal: int = 0
+        self.done_select_option: set = set()
+        self.done_scroll_down: int = 0
+        self.done_scroll_up: int = 0
+        # Лимиты, чтобы не зациклиться на одном типе действия
+        self.max_scrolls_in_row = MAX_SCROLLS_IN_ROW
+        self.last_actions_sequence: List[str] = []
+        self.last_screenshot_hash: str = ""
+        self.defects_on_current_step: int = 0
+        self.coverage_zones: List[str] = []
+        self.test_plan: List[str] = []
+        self.structured_test_plan: List[Dict[str, Any]] = []
+        self.critical_flow_done: set = set()
+        self.defects_created: List[Dict[str, Any]] = []
+        self.session_start: Optional[datetime] = None
+        # Фаза тестирования: orient → smoke → critical_path → exploratory
+        self.tester_phase: str = "orient"
+        self.steps_in_phase: int = 0
+        self.console_len_before_action: int = 0
+        self.network_len_before_action: int = 0
+        self.test_plan_completed: List[bool] = []
+        self.consecutive_failures: int = 0
+        self.form_strategy_iteration: int = 0
+        self.reported_a11y_rules: set = set()
+        self.reported_perf_rules: set = set()
+        self.responsive_done: set = set()
+        self.screenshot_before_action: Optional[str] = None
+        self._pending_analyses: List[Dict[str, Any]] = []
+        self._scenario_queue: List[Dict[str, Any]] = []
+        self._consecutive_repeats: int = 0
+        self._recent_action_keys: List[str] = []
+        self._page_elements_cache: Dict[str, List[Dict[str, Any]]] = {}
+        self._important_pages: Dict[str, str] = {}
+        self._page_coverage: Dict[str, set] = {}
+        self._page_checklists: Dict[str, Dict[str, Any]] = {}
+        # Модули страницы
+        self.page_modules: List[Dict[str, Any]] = []
+        self.current_module_index: int = 0
+        self.steps_in_current_module: int = 0
+        self._modules_page_url: str = ""
+        # Структурированный лог шагов (для отчёта)
+        self._step_log: List[Dict[str, Any]] = []
+        # Граф навигации
+        self._nav_graph: List[Dict[str, Any]] = []
+        self._url_depths: Dict[str, int] = {}
+        self._start_url_nav: str = ""
+        # Ссылки/доп. проверки
+        self._broken_links: List[Dict[str, Any]] = []
+        self._checked_link_urls: set = set()
+        self._websocket_issues: List[Dict[str, Any]] = []
+        self._mixed_content: List[Dict[str, Any]] = []
+        self._api_log: List[Dict[str, Any]] = []
+        self._visual_regressions: List[Dict[str, Any]] = []
+        self._visual_baseline_checked: set = set()
+        self._selector_heal_cache: Dict[str, Dict[str, Any]] = {}
+        self._browser_metrics_latest: Dict[str, Any] = {}
+        self._browser_metrics_history: List[Dict[str, Any]] = []
+        # --- Память по стабильным ключам (этап 2) ---
+        self.done_by_url: Dict[str, Dict[str, set]] = {}
+        self.steps_on_url_no_progress: Dict[str, int] = {}
+        self.current_url_pattern: str = ""
+        self.touched_keys_on_url: Dict[str, set] = {}
+        # Future-ы фоновой отправки дефектов в Jira: дожидаемся в финале сессии.
+        self.pending_defect_futures: List[Future] = []
+        # --- Anti-Loop Guard на уровне сессии ---
+        # Сколько шагов прошло БЕЗ полезного прогресса (новый stable_key / новый URL /
+        # новый дефект). Сбрасывается на каждом «полезном» шаге.
+        self.steps_without_progress: int = 0
+        self._all_touched_keys: set = set()
+        self._all_visited_url_patterns: set = set()
+        self._defects_count_at_last_progress: int = 0
+        self._last_session_diversify_step: int = -1
+        self._last_session_goto_start_step: int = -1
+        self.session_should_stop: bool = False
+        self.session_stop_reason: str = ""
+        self.page_objects = PageObjectRegistry()
+        self._external_tabs: List[Dict[str, Any]] = []
+
+    # ------------------------------------------------------------------ navigation
+
+    def set_start_url_for_nav(self, url: str) -> None:
+        self._start_url_nav = url or ""
+        if self._start_url_nav:
+            self._url_depths[self._start_url_nav] = 0
+
+    def record_navigation(self, from_url: str, to_url: str, step: int, selector: str = "") -> None:
+        from_url = (from_url or "").strip()
+        to_url = (to_url or "").strip()
+        if not to_url or from_url == to_url:
+            return
+        self._nav_graph.append(
+            {"from_url": from_url, "to_url": to_url, "step": step, "selector": selector[:80]}
+        )
+        prev_depth = self._url_depths.get(from_url, 0)
+        if to_url not in self._url_depths:
+            self._url_depths[to_url] = prev_depth + 1
+
+    def get_navigation_depth(self, url: str) -> int:
+        return self._url_depths.get((url or "").strip(), 0)
+
+    def append_step_log(self, entry: Dict[str, Any]) -> None:
+        self._step_log.append(entry)
+
+    # ------------------------------------------------------------------ modules
+
+    def set_page_modules(self, modules: List[Dict[str, Any]], page_url: str) -> None:
+        self.page_modules = list(modules) if modules else []
+        self.current_module_index = 0
+        self.steps_in_current_module = 0
+        self._modules_page_url = page_url or ""
+
+    def get_current_module(self) -> Optional[Dict[str, Any]]:
+        if not self.page_modules or self.current_module_index >= len(self.page_modules):
+            return None
+        return self.page_modules[self.current_module_index]
+
+    def advance_module(self) -> bool:
+        if not self.page_modules or self.current_module_index >= len(self.page_modules) - 1:
+            return False
+        self.current_module_index += 1
+        self.steps_in_current_module = 0
+        return True
+
+    def tick_module_step(self) -> None:
+        self.steps_in_current_module += 1
+
+    def get_module_context_text(self) -> str:
+        if not self.page_modules:
+            return ""
+        lines = ["МОДУЛИ СТРАНИЦЫ (тестируй по очереди):"]
+        for i, m in enumerate(self.page_modules):
+            name = m.get("name", "Модуль")
+            mark = " ← ТЕКУЩИЙ" if i == self.current_module_index else ""
+            lines.append(f"  {i + 1}) {name}{mark}")
+        cur = self.get_current_module()
+        if cur:
+            lines.append("")
+            lines.append(
+                f"Сейчас тестируй только модуль: «{cur.get('name', '')}». "
+                f"Выбери действие внутри этого модуля (selector ref:N из элементов этого блока)."
+            )
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------ actions
+
+    def begin_step(self) -> int:
+        """Advance the orchestration step exactly once."""
+        self.iteration += 1
+        return self.iteration
+
+    def add_action(self, action: Dict[str, Any], result: str = "") -> None:
+        act = (action.get("action") or "").lower()
+        sel = _norm_key(action.get("selector", ""))
+        val = _norm_key(action.get("value", ""))
+        stable_key = (action.get("_stable_key") or "").strip()
+        url_pat = (action.get("_url_pattern") or self.current_url_pattern or "").strip()
+        loop_key = stable_key or sel
+        self.record_action_key(act, loop_key)
+
+        if self.iteration <= 0:
+            self.begin_step()
+        step_ctx = action.get("_step_context") or {}
+        entry = {
+            "step": int(action.get("_step_number") or self.iteration),
+            "time": datetime.now().strftime("%H:%M:%S"),
+            "action": act,
+            "selector": action.get("selector", ""),
+            "stable_key": stable_key,
+            "canonical_locator": (action.get("_canonical_locator") or "").strip(),
+            "url_pattern": url_pat,
+            "value": action.get("value", ""),
+            "reason": action.get("reason", ""),
+            "test_goal": action.get("test_goal", ""),
+            "expected_outcome": action.get("expected_outcome", ""),
+            "result": result[:200],
+            "url_before": step_ctx.get("url_before", ""),
+            "element_desc": step_ctx.get("element_desc", ""),
+        }
+        self.actions.append(entry)
+        if len(self.actions) > self.max_actions:
+            self.actions = self.actions[-self.max_actions:]
+
+        # Дедупликация по url_pattern + stable_key (главный механизм).
+        progress_made = False
+        if url_pat:
+            if url_pat not in self._all_visited_url_patterns:
+                self._all_visited_url_patterns.add(url_pat)
+                progress_made = True
+        if url_pat and stable_key and act in (
+            "click", "hover", "type", "select_option", "fill_form", "upload_file",
+        ):
+            self.done_by_url.setdefault(url_pat, {}).setdefault(act, set()).add(stable_key)
+            touched = self.touched_keys_on_url.setdefault(url_pat, set())
+            is_new_key = stable_key not in touched
+            touched.add(stable_key)
+            global_key = f"{url_pat}#{stable_key}"
+            if global_key not in self._all_touched_keys:
+                self._all_touched_keys.add(global_key)
+                progress_made = True
+            if is_new_key:
+                self.steps_on_url_no_progress[url_pat] = 0
+            else:
+                self.steps_on_url_no_progress[url_pat] = (
+                    self.steps_on_url_no_progress.get(url_pat, 0) + 1
+                )
+
+        # Глобальный счётчик прогресса для anti-loop guard. Новый дефект тоже считается
+        # прогрессом — даже если позже окажется дублем, на шаге создания мы видим, что
+        # «что-то нашлось», и не глушим агента.
+        if not progress_made and len(self.defects_created) > self._defects_count_at_last_progress:
+            progress_made = True
+        if progress_made:
+            self._defects_count_at_last_progress = len(self.defects_created)
+            self.steps_without_progress = 0
+        else:
+            # scroll/close_modal сами по себе не прогресс, но и не «окончательный простой» —
+            # учитываем чуть мягче: один scroll = 0.5 шага, чтобы скроллинг не выдавил
+            # агент в hard-stop за пару экранов.
+            if act in ("scroll", "close_modal"):
+                self.steps_without_progress += 1 if (self.iteration % 2 == 0) else 0
+            else:
+                self.steps_without_progress += 1
+
+        # Старый механизм (fallback на случай отсутствия stable_key).
+        def _safe_key(x):
+            return x if isinstance(x, str) else str(x) if x is not None else ""
+
+        if act == "click" and sel:
+            self.done_click.add(_safe_key(sel))
+        elif act == "hover" and sel:
+            self.done_hover.add(_safe_key(sel))
+        elif act == "type" and (sel or val):
+            self.done_type.add(_safe_key(sel or val))
+        elif act == "close_modal":
+            self.done_close_modal += 1
+        elif act == "select_option" and (sel or val):
+            t = (_safe_key(sel), _safe_key(val)) if sel and val else (_safe_key(sel or val),)
+            self.done_select_option.add(t)
+        elif act == "scroll":
+            if sel in ("down", "вниз", ""):
+                self.done_scroll_down += 1
+            elif sel in ("up", "вверх"):
+                self.done_scroll_up += 1
+
+        self.last_actions_sequence.append(act)
+        if len(self.last_actions_sequence) > 10:
+            self.last_actions_sequence = self.last_actions_sequence[-10:]
+
+    def is_already_done(
+        self,
+        action: str,
+        selector: str = "",
+        value: str = "",
+        stable_key: str = "",
+        url_pattern: str = "",
+    ) -> bool:
+        """
+        Проверить, не делали ли мы уже это действие.
+
+        Приоритет: (url_pattern, action, stable_key). Иначе fallback на
+        глобальные множества по selector.
+        """
+        act = (action or "").lower()
+        sel = _norm_key(selector)
+        val = _norm_key(value)
+
+        if stable_key:
+            url_pat = (url_pattern or self.current_url_pattern or "").strip()
+            if url_pat:
+                bucket = self.done_by_url.get(url_pat, {}).get(act)
+                if bucket and stable_key in bucket:
+                    return True
+
+        if act == "click" and sel and sel in self.done_click:
+            return True
+        if act == "hover" and sel and sel in self.done_hover:
+            return True
+        if act == "type" and (sel or val) and (sel in self.done_type or val in self.done_type):
+            return True
+        if act == "select_option" and (sel or val):
+            if (sel, val) in self.done_select_option:
+                return True
+            if val and (val,) in self.done_select_option:
+                return True
+            if sel and (sel,) in self.done_select_option:
+                return True
+        return False
+
+    def is_already_done_action(self, action: Dict[str, Any]) -> bool:
+        if not isinstance(action, dict):
+            return False
+        return self.is_already_done(
+            (action.get("action") or "").lower(),
+            (action.get("selector") or "").strip(),
+            (action.get("value") or "").strip(),
+            stable_key=(action.get("_stable_key") or "").strip(),
+            url_pattern=(action.get("_url_pattern") or "").strip(),
+        )
+
+    # ------------------------------------------------------------------ url budget
+
+    def set_current_url_pattern(self, url: str) -> None:
+        self.current_url_pattern = _url_pattern(url) if url else ""
+
+    def should_force_back_to_start(self) -> bool:
+        url_pat = self.current_url_pattern
+        if not url_pat:
+            return False
+        return self.steps_on_url_no_progress.get(url_pat, 0) >= URL_BUDGET_NO_PROGRESS
+
+    def reset_url_budget(self, url_pattern: str = "") -> None:
+        url_pat = url_pattern or self.current_url_pattern
+        if url_pat:
+            self.steps_on_url_no_progress[url_pat] = 0
+
+    def should_avoid_scroll(self) -> bool:
+        recent = self.last_actions_sequence[-5:] if self.last_actions_sequence else []
+        scroll_count = sum(1 for a in recent if a == "scroll")
+        return scroll_count >= self.max_scrolls_in_row
+
+    # ------------------------------------------------------------------ history / loops
+
+    def get_history_text(self, last_n: int = 20) -> str:
+        lines = [
+            "⚠️⚠️⚠️ КРИТИЧНО: УЖЕ СДЕЛАНО (НЕ ПОВТОРЯТЬ, выбирай ДРУГОЕ действие!) ⚠️⚠️⚠️",
+            "",
+        ]
+        if self.done_click:
+            items = sorted(self.done_click, key=str)[-30:]
+            lines.append(
+                f"❌ Кликнуто ({len(self.done_click)}): "
+                + ", ".join(f'"{str(x)[:40]}"' for x in items)
+            )
+        if self.done_hover:
+            items = sorted(self.done_hover, key=str)[-20:]
+            lines.append(
+                f"❌ Наведено (hover) ({len(self.done_hover)}): "
+                + ", ".join(f'"{str(x)[:40]}"' for x in items)
+            )
+        if self.done_type:
+            items = sorted(self.done_type, key=str)[-20:]
+            lines.append(
+                f"❌ Ввод в поля ({len(self.done_type)}): "
+                + ", ".join(f'"{str(x)[:40]}"' for x in items)
+            )
+        if self.done_close_modal:
+            lines.append(f"❌ Закрыто модалок: {self.done_close_modal}")
+        if self.done_select_option:
+            items = list(self.done_select_option)[:20]
+            lines.append("❌ Выбрано опций: " + ", ".join(str(x)[:50] for x in items))
+        if self.done_scroll_down or self.done_scroll_up:
+            lines.append(
+                f"❌ Прокручено: вниз {self.done_scroll_down}, вверх {self.done_scroll_up}"
+            )
+        if self.should_avoid_scroll():
+            lines.append(
+                "⚠️ Внимание: недавно много прокруток — выбери клик/hover/type/close_modal, а не scroll."
+            )
+        if self._consecutive_repeats >= 2:
+            lines.append(
+                f"🚨 ЗАЦИКЛИВАНИЕ: {self._consecutive_repeats} повтора подряд! "
+                f"СРОЧНО выбери ДРУГОЕ действие, которого НЕТ выше!"
+            )
+        lines.append("")
+        lines.append("✅ Выбери действие, которого ещё НЕТ в списке выше (❌).")
+        lines.append("")
+        lines.append("Последние выполненные шаги:")
+        for a in self.actions[-last_n:]:
+            act = a.get("action", "?")
+            sel = a.get("selector", "")[:45]
+            res = a.get("result", "")[:50]
+            lines.append(f"  #{a.get('step', '?')} {act} -> {sel} | {res}")
+        return "\n".join(lines)
+
+    def record_repeat(self) -> None:
+        self._consecutive_repeats += 1
+
+    def reset_repeats(self) -> None:
+        self._consecutive_repeats = 0
+
+    def is_stuck(self) -> bool:
+        return self._consecutive_repeats >= 3
+
+    # --- Anti-Loop Guard на уровне сессии ----------------------------------
+
+    def loop_guard_action(self) -> str:
+        """
+        Решить, какую эскалацию запустить из-за «застоя» сессии.
+
+        Возвращает один из строковых статусов:
+          ""             — всё нормально, продолжаем
+          "diversify"    — пора разнообразить (scroll/back/смена модуля)
+          "goto_start"   — пора вернуться на стартовую страницу
+          "hard_stop"    — пора аккуратно завершить сессию
+
+        Каждая эскалация выдаётся НЕ чаще одного раза на серию: если агент уже
+        получил «diversify» на шаге 14, повторно «diversify» придёт только после
+        того, как счётчик ещё раз вырастет на LOOP_GUARD_DIVERSIFY_AFTER. Так
+        мы не залипнем, давая одну и ту же команду каждый шаг.
+        """
+        n = self.steps_without_progress
+        step = self.iteration
+
+        if LOOP_GUARD_HARD_STOP_AFTER and n >= LOOP_GUARD_HARD_STOP_AFTER:
+            self.session_should_stop = True
+            self.session_stop_reason = (
+                f"loop-guard: {n} шагов без прогресса (порог HARD_STOP={LOOP_GUARD_HARD_STOP_AFTER})"
+            )
+            return "hard_stop"
+
+        if LOOP_GUARD_GOTO_START_AFTER and n >= LOOP_GUARD_GOTO_START_AFTER:
+            if step - self._last_session_goto_start_step >= LOOP_GUARD_DIVERSIFY_AFTER:
+                self._last_session_goto_start_step = step
+                return "goto_start"
+
+        if LOOP_GUARD_DIVERSIFY_AFTER and n >= LOOP_GUARD_DIVERSIFY_AFTER:
+            if step - self._last_session_diversify_step >= max(3, LOOP_GUARD_DIVERSIFY_AFTER // 2):
+                self._last_session_diversify_step = step
+                return "diversify"
+        return ""
+
+    def reset_session_progress(self) -> None:
+        """Сбросить счётчик «без прогресса» (например, после смены URL/модуля)."""
+        self.steps_without_progress = 0
+        self._defects_count_at_last_progress = len(self.defects_created)
+
+    # ------------------------------------------------------------------ persistence
+
+    @staticmethod
+    def _set_to_list(value: Any) -> Any:
+        if isinstance(value, set):
+            return sorted(value, key=str)
+        if isinstance(value, dict):
+            return {str(k): AgentMemory._set_to_list(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [AgentMemory._set_to_list(v) for v in value]
+        return value
+
+    @staticmethod
+    def _list_to_set(value: Any) -> set:
+        if isinstance(value, list):
+            return set(value)
+        return set()
+
+    def to_persistent_dict(self) -> Dict[str, Any]:
+        return {
+            "version": 1,
+            "saved_at": datetime.now().isoformat(),
+            "actions": self.actions[-self.max_actions:],
+            "defects_created": self.defects_created[-200:],
+            "done_click": self._set_to_list(self.done_click),
+            "done_hover": self._set_to_list(self.done_hover),
+            "done_type": self._set_to_list(self.done_type),
+            "done_select_option": [list(x) for x in self.done_select_option],
+            "done_by_url": self._set_to_list(self.done_by_url),
+            "steps_on_url_no_progress": dict(self.steps_on_url_no_progress),
+            "touched_keys_on_url": self._set_to_list(self.touched_keys_on_url),
+            "all_touched_keys": self._set_to_list(self._all_touched_keys),
+            "all_visited_url_patterns": self._set_to_list(self._all_visited_url_patterns),
+            "page_coverage": self._set_to_list(self._page_coverage),
+            "nav_graph": self._nav_graph[-500:],
+            "url_depths": dict(self._url_depths),
+            "start_url": self._start_url_nav,
+            "external_tabs": self._external_tabs[-500:],
+        }
+
+    def restore_persistent_dict(self, data: Dict[str, Any]) -> None:
+        if not isinstance(data, dict):
+            return
+        self.actions = list(data.get("actions") or [])[-self.max_actions:]
+        self.defects_created = list(data.get("defects_created") or [])[-200:]
+        self.done_click = self._list_to_set(data.get("done_click"))
+        self.done_hover = self._list_to_set(data.get("done_hover"))
+        self.done_type = self._list_to_set(data.get("done_type"))
+        self.done_select_option = {tuple(x) for x in (data.get("done_select_option") or []) if isinstance(x, list)}
+        self.done_by_url = {
+            url: {act: set(vals or []) for act, vals in (bucket or {}).items()}
+            for url, bucket in (data.get("done_by_url") or {}).items()
+            if isinstance(bucket, dict)
+        }
+        self.steps_on_url_no_progress = {
+            str(k): int(v or 0) for k, v in (data.get("steps_on_url_no_progress") or {}).items()
+        }
+        self.touched_keys_on_url = {
+            str(k): set(v or []) for k, v in (data.get("touched_keys_on_url") or {}).items()
+        }
+        self._all_touched_keys = self._list_to_set(data.get("all_touched_keys"))
+        self._all_visited_url_patterns = self._list_to_set(data.get("all_visited_url_patterns"))
+        self._page_coverage = {
+            str(k): set(v or []) for k, v in (data.get("page_coverage") or {}).items()
+        }
+        self._nav_graph = list(data.get("nav_graph") or [])[-500:]
+        self._url_depths = {str(k): int(v or 0) for k, v in (data.get("url_depths") or {}).items()}
+        self._start_url_nav = str(data.get("start_url") or "")
+        self._external_tabs = list(data.get("external_tabs") or [])[-500:]
+        self.iteration = len(self.actions)
+
+    def save_to_file(self, path: str) -> bool:
+        if not path:
+            return False
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            tmp_path = f"{path}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(self.to_persistent_dict(), f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, path)
+            return True
+        except Exception:
+            LOG.debug("save memory failed: %s", path, exc_info=True)
+            return False
+
+    def load_from_file(self, path: str) -> bool:
+        if not path or not os.path.isfile(path):
+            return False
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.restore_persistent_dict(data)
+            return True
+        except Exception:
+            LOG.debug("load memory failed: %s", path, exc_info=True)
+            return False
+
+    def record_external_tab(self, url: str, status: str, title: str = "", detail: str = "") -> None:
+        self._external_tabs.append({
+            "time": datetime.now().isoformat(),
+            "url": (url or "")[:500],
+            "status": status,
+            "title": (title or "")[:200],
+            "detail": (detail or "")[:300],
+        })
+        if len(self._external_tabs) > 500:
+            self._external_tabs = self._external_tabs[-500:]
+
+    def record_action_key(self, action: str, selector: str) -> None:
+        key = f"{action}:{_norm_key(selector)}"
+        self._recent_action_keys.append(key)
+        if len(self._recent_action_keys) > 12:
+            self._recent_action_keys.pop(0)
+        # 1) Старая эвристика: 3 одинаковых ключа подряд.
+        if len(self._recent_action_keys) >= 3 and len(set(self._recent_action_keys[-3:])) == 1:
+            self._consecutive_repeats += 1
+            return
+        # 2) Новый детектор: цикл периода 2..4 (A,B,A,B / A,B,C,A,B,C / ...).
+        period = detect_repeating_pattern(self._recent_action_keys, max_period=4)
+        if period >= 2:
+            self._consecutive_repeats += 1
+
+    # ------------------------------------------------------------------ coverage
+
+    def record_page_element(self, url: str, element_key: str) -> None:
+        if url not in self._page_coverage:
+            self._page_coverage[url] = set()
+        self._page_coverage[url].add(element_key)
+
+    def is_element_tested(self, url: str, element_key: str) -> bool:
+        return element_key in self._page_coverage.get(url, set())
+
+    def cache_page_elements(self, url: str, elements: List[Dict[str, Any]]) -> None:
+        self._page_elements_cache[url] = elements[:50]
+
+    def get_cached_elements(self, url: str) -> List[Dict[str, Any]]:
+        return self._page_elements_cache.get(url, [])
+
+    def remember_important_page(self, url: str, description: str) -> None:
+        self._important_pages[url] = description[:200]
+
+    def record_coverage_zone(self, zone: str) -> None:
+        if zone and zone not in self.coverage_zones:
+            self.coverage_zones.append(zone)
+            if len(self.coverage_zones) > 20:
+                self.coverage_zones = self.coverage_zones[-20:]
+
+    # ------------------------------------------------------------------ test plan
+
+    def set_test_plan(self, steps: List[str]) -> None:
+        self.test_plan = list(steps)[:15]
+
+    # --- Структурированный тест-план ----------------------------------------
+    # Каждый пункт = dict со схемой, которую возвращает get_structured_test_plan.
+    # Храним рядом со старым плоским test_plan, чтобы постепенно мигрировать UI.
+
+    def set_structured_test_plan(self, items: List[Dict[str, Any]]) -> None:
+        """Сохранить структурированный план и синхронизировать плоский test_plan."""
+        clean: List[Dict[str, Any]] = []
+        for raw in items[:15]:
+            if not isinstance(raw, dict):
+                continue
+            title = str(raw.get("title") or "").strip()
+            if not title:
+                continue
+            clean.append({
+                "id": str(raw.get("id") or f"plan-{len(clean)+1}")[:40],
+                "area": str(raw.get("area") or "")[:30],
+                "module": str(raw.get("module") or "")[:60],
+                "title": title[:200],
+                "intent": str(raw.get("intent") or "")[:200],
+                "expected": str(raw.get("expected") or "")[:300],
+                "priority": str(raw.get("priority") or "exploratory").lower()[:20],
+                "done": False,
+                "result": "",
+            })
+        # Стабильный порядок: smoke → critical → exploratory → остальные.
+        prio_rank = {"smoke": 0, "critical": 1, "exploratory": 2}
+        clean.sort(key=lambda x: prio_rank.get(x.get("priority", ""), 9))
+        self.structured_test_plan: List[Dict[str, Any]] = clean
+        self.test_plan = [item["title"] for item in clean]
+        self.test_plan_completed = [False] * len(clean)
+
+    def get_structured_test_plan(self) -> List[Dict[str, Any]]:
+        return list(getattr(self, "structured_test_plan", []) or [])
+
+    def mark_structured_test_plan_step(
+        self, step_index: int, *, result: str = ""
+    ) -> None:
+        plan = getattr(self, "structured_test_plan", None) or []
+        if 0 <= step_index < len(plan):
+            plan[step_index]["done"] = True
+            if result:
+                plan[step_index]["result"] = result[:300]
+        if 0 <= step_index < len(self.test_plan_completed):
+            self.test_plan_completed[step_index] = True
+
+    def get_structured_plan_progress_text(self) -> str:
+        plan = getattr(self, "structured_test_plan", None) or []
+        if not plan:
+            return ""
+        done = sum(1 for it in plan if it.get("done"))
+        lines = [f"Тест-план (структ.): {done}/{len(plan)}"]
+        for it in plan:
+            mark = "[x]" if it.get("done") else "[ ]"
+            prio = it.get("priority", "")
+            mod = it.get("module") or it.get("area") or ""
+            mod_part = f" «{mod[:30]}»" if mod else ""
+            title = (it.get("title") or "")[:90]
+            line = f"  {mark} [{prio}]{mod_part} {title}"
+            if it.get("done") and it.get("result"):
+                line += f" → {it['result'][:60]}"
+            lines.append(line)
+        return "\n".join(lines)
+
+    def get_next_plan_focus(self) -> Dict[str, Any]:
+        """Вернуть следующий невыполненный пункт плана (или {}).
+
+        Используется в промпте LLM, чтобы направлять выбор действий: «двигайся к
+        этой цели». Приоритет уже отражён в порядке списка (smoke → critical →
+        exploratory).
+        """
+        plan = getattr(self, "structured_test_plan", None) or []
+        for item in plan:
+            if not item.get("done"):
+                return dict(item)
+        return {}
+
+    def get_steps_to_reproduce(self, max_steps: int = 15) -> List[str]:
+        steps: List[str] = []
+        prev_url = ""
+        for a in self.actions[-max_steps:]:
+            act = (a.get("action") or "").strip()
+            sel = (a.get("selector") or "").strip()
+            value = (a.get("value") or "").strip()
+            reason = (a.get("reason") or "").strip()
+            elem = (a.get("element_desc") or "").strip()
+            url_before = (a.get("url_before") or "").strip()
+            result = (a.get("result") or "").strip()
+
+            if url_before and url_before != prev_url:
+                steps.append(f"Открыть URL: {url_before}")
+                prev_url = url_before
+
+            locator_part = elem if elem else (sel or "—")
+            verb_map = {
+                "click": "Кликнуть по",
+                "hover": "Навести курсор на",
+                "type": "Ввести в поле",
+                "select_option": "Выбрать опцию в",
+                "press_key": "Нажать клавишу",
+                "close_modal": "Закрыть модальное окно",
+                "scroll": "Прокрутить страницу",
+                "upload_file": "Загрузить файл в",
+                "fill_form": "Заполнить форму",
+                "explore": "Осмотреть страницу",
+            }
+            verb = verb_map.get(act, act or "Действие")
+
+            if act == "scroll":
+                direction = sel or "down"
+                steps.append(f"Прокрутить страницу ({direction})")
+            elif act == "close_modal":
+                steps.append("Закрыть модальное окно" + (f" — {locator_part}" if elem else ""))
+            elif act == "press_key":
+                key = value or sel or "Enter"
+                steps.append(f"Нажать клавишу «{key}»")
+            elif act == "fill_form":
+                steps.append("Заполнить форму тестовыми данными")
+            elif act == "type" and (sel or elem):
+                masked_value = value[:80] + ("…" if len(value) > 80 else "") if value else ""
+                tail = f" значение: «{masked_value}»" if masked_value else ""
+                reason_tail = f" (цель: {reason[:80]})" if reason else ""
+                steps.append(f"Ввести в поле {locator_part}.{tail}{reason_tail}")
+            elif act == "select_option" and (sel or elem):
+                tail = f" (значение: «{value[:60]}»)" if value else ""
+                steps.append(f"Выбрать опцию в {locator_part}{tail}")
+            elif act in ("click", "hover", "upload_file") and (sel or elem):
+                reason_tail = f" (цель: {reason[:80]})" if reason else ""
+                steps.append(f"{verb} {locator_part}{reason_tail}")
+            else:
+                if sel or elem:
+                    steps.append(f"{verb} {locator_part}")
+                else:
+                    steps.append(verb)
+
+            low_res = result.lower()
+            if low_res and any(
+                x in low_res
+                for x in ("error", "not_found", "not found", "5xx", "404", "timeout", "dead_click")
+            ):
+                steps.append(f"  └─ результат: {result[:120]}")
+        return steps
+
+    # ------------------------------------------------------------------ defects
+
+    def record_defect_created(self, key: str, summary: str, severity: str = "major") -> None:
+        self.defects_created.append(
+            {"key": key, "summary": summary[:200], "severity": severity}
+        )
+
+    def last_canonical_locator(self) -> str:
+        for a in reversed(self.actions):
+            loc = (a.get("canonical_locator") or "").strip()
+            if loc:
+                return loc
+        return ""
+
+    def last_action_summary(self) -> str:
+        if not self.actions:
+            return ""
+        a = self.actions[-1]
+        act = (a.get("action") or "").strip() or "—"
+        loc = (a.get("canonical_locator") or a.get("selector") or "").strip()
+        val = (a.get("value") or "").strip()
+        parts = [act]
+        if loc:
+            parts.append(loc)
+        if val:
+            v = val[:60] + ("…" if len(val) > 60 else "")
+            parts.append(f"value={v!r}")
+        return " | ".join(parts)
+
+    # ------------------------------------------------------------------ phases
+
+    def advance_tester_phase(self, force: bool = False) -> str:
+        if not force and self.steps_in_phase < PHASE_STEPS_TO_ADVANCE:
+            return self.tester_phase
+        next_phase = {
+            "orient": "smoke",
+            "smoke": "critical_path",
+            "critical_path": "exploratory",
+            "exploratory": "exploratory",
+        }
+        old = self.tester_phase
+        self.tester_phase = next_phase.get(self.tester_phase, "exploratory")
+        self.steps_in_phase = 0
+        if old != self.tester_phase:
+            LOG.info("Фаза: %s → %s", old, self.tester_phase)
+        return self.tester_phase
+
+    def tick_phase_step(self) -> None:
+        self.steps_in_phase += 1
+
+    def get_phase_instruction(self) -> str:
+        d = {
+            "orient": "Фаза: ОРИЕНТАЦИЯ. Определи тип страницы. Выбери одно действие для понимания контекста (клик по главному CTA или ключевому элементу).",
+            "smoke": "Фаза: SMOKE. Проверь ключевые кнопки/ссылки. Выбери один важный элемент и проверь его (клик или hover).",
+            "critical_path": "Фаза: ОСНОВНОЙ СЦЕНАРИЙ. Тестируй главный сценарий: кнопка, форма, навигация. Одно целенаправленное действие.",
+            "exploratory": "Фаза: ИССЛЕДОВАНИЕ. Проверь меню, футер, формы. Не повторяй уже сделанное. Осмысленная проверка.",
+        }
+        return d.get(self.tester_phase, d["exploratory"])
+
+    # ------------------------------------------------------------------ session report
+
+    def get_session_report_text(self) -> str:
+        if not self.session_start:
+            self.session_start = datetime.now()
+        duration = (datetime.now() - self.session_start).total_seconds() if self.session_start else 0
+        lines = [
+            "=== Отчёт сессии AI-тестировщика Kventin ===",
+            f"Шагов выполнено: {len(self.actions)}",
+            f"Фаза: {self.tester_phase}",
+            f"Время: {duration:.0f} с",
+            f"Зоны покрытия: {', '.join(str(z) for z in self.coverage_zones) if self.coverage_zones else '—'}",
+            f"Кликнуто: {len(self.done_click)}, наведено: {len(self.done_hover)}, ввод: {len(self.done_type)}",
+        ]
+        struct_progress = self.get_structured_plan_progress_text()
+        if struct_progress:
+            lines.append(struct_progress)
+        elif self.test_plan:
+            lines.append("Тест-план: " + "; ".join(self.test_plan[:5]))
+        if self.defects_created:
+            lines.append(f"Создано дефектов: {len(self.defects_created)}")
+            for d in self.defects_created[-10:]:
+                lines.append(f"  - {d.get('key', '')}: {d.get('summary', '')[:60]}")
+        else:
+            lines.append("Дефектов не обнаружено.")
+        if self._external_tabs:
+            lines.append(f"Внешние/новые вкладки проверены: {len(self._external_tabs)}")
+            for tab in self._external_tabs[-5:]:
+                lines.append(
+                    f"  - {tab.get('status', '')}: {(tab.get('url') or '')[:80]}"
+                )
+        m = getattr(self, "_browser_metrics_latest", None) or {}
+        if m:
+            lines.append("--- Метрики браузера (последний сбор) ---")
+            lines.append(f"  Шаг: {m.get('step', '—')}, URL: {(m.get('url') or '')[:80]}")
+            page = m.get("page") or {}
+            for key, label in [
+                ("ttfb", "TTFB"),
+                ("domContentLoaded", "DCL"),
+                ("loadComplete", "Load"),
+                ("firstContentfulPaint", "FCP"),
+                ("lcp", "LCP"),
+            ]:
+                if page.get(key) is not None:
+                    lines.append(f"  {label}: {page[key]} мс")
+            res = m.get("resources") or {}
+            for rtype, data in sorted(res.items())[:6]:
+                count = data.get("count", 0)
+                avg = data.get("avgDuration")
+                mx = data.get("durationMax")
+                lines.append(f"  [{rtype}] n={count}, avg={avg or '—'} мс, max={mx or '—'} мс")
+            resp = m.get("response") or {}
+            if resp.get("avgMs") is not None:
+                lines.append(f"  XHR/fetch отклик: avg={resp['avgMs']} мс, max={resp.get('maxMs', '—')} мс")
+            if m.get("scrollHeight") is not None:
+                lines.append(f"  scrollHeight/scrollWidth: {m.get('scrollHeight')} / {m.get('scrollWidth', '—')}")
+            if m.get("usedJSHeapSize") is not None:
+                used_mb = round(m["usedJSHeapSize"] / 1024 / 1024, 2)
+                lines.append(f"  JS heap: {used_mb} МБ")
+        lines.append("=== Конец отчёта ===")
+        return "\n".join(lines)
+
+    def set_test_plan_tracking(self) -> None:
+        self.test_plan_completed = [False] * len(self.test_plan)
+
+    def mark_test_plan_step(self, step_index: int) -> None:
+        if 0 <= step_index < len(self.test_plan_completed):
+            self.test_plan_completed[step_index] = True
+
+    def get_test_plan_progress(self) -> str:
+        # Если есть структурированный план — выводим его (богаче, с приоритетом и модулями).
+        struct_text = self.get_structured_plan_progress_text()
+        if struct_text:
+            return struct_text
+        if not self.test_plan:
+            return ""
+        done = sum(self.test_plan_completed)
+        total = len(self.test_plan)
+        lines = [f"Тест-план: {done}/{total} выполнено"]
+        for i, (step, completed) in enumerate(zip(self.test_plan, self.test_plan_completed)):
+            mark = "[x]" if completed else "[ ]"
+            lines.append(f"  {mark} {i+1}. {step[:60]}")
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------ failures / self-heal
+
+    def record_action_success(self) -> None:
+        self.consecutive_failures = 0
+
+    def record_action_failure(self) -> None:
+        self.consecutive_failures += 1
+
+    def needs_self_healing(self) -> bool:
+        return self.consecutive_failures >= SELF_HEAL_AFTER_FAILURES
+
+    # ------------------------------------------------------------------ logs / screenshot
+
+    def snapshot_logs_before_action(self, console_log: list, network_failures: list) -> None:
+        self.console_len_before_action = len(console_log)
+        self.network_len_before_action = len(network_failures)
+
+    def get_new_errors_after_action(
+        self, console_log: list, network_failures: list
+    ) -> Dict[str, Any]:
+        new_console = [
+            c for c in console_log[self.console_len_before_action:] if c.get("type") == "error"
+        ]
+        new_network = [
+            n for n in network_failures[self.network_len_before_action:]
+            if n.get("status") and n.get("status") >= 400
+        ]
+        return {"console_errors": new_console, "network_errors": new_network}
+
+    def is_screenshot_changed(self, screenshot_b64: str) -> bool:
+        if not screenshot_b64:
+            return True
+        h = hashlib.md5(screenshot_b64[:10000].encode()).hexdigest()
+        changed = h != self.last_screenshot_hash
+        self.last_screenshot_hash = h
+        return changed
+
+
+__all__ = ["AgentMemory"]

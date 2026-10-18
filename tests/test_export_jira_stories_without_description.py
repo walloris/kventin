@@ -1,4 +1,4 @@
-from export_jira_stories_without_description import (
+from scripts.export_jira_stories_without_description import (
     build_jql,
     is_empty_description,
     issue_to_row,

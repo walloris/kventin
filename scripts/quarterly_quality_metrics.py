@@ -1,0 +1,4966 @@
+#!/usr/bin/env python3
+"""90-day and quarterly Story/Bug quality metrics for Jira/Confluence.
+
+The script finds Story issues from Release 2.0 tickets installed to production,
+collects bugs created in each team's Jira projects, checks their complete
+detection-stage history, calculates independent rolling-90-day and quarter
+ratios, and publishes both Confluence tables.
+
+Run locally without publishing:
+    python scripts/quarterly_quality_metrics.py --no-publish
+
+Publish to the page embedded in DEFAULT_CONFLUENCE_PAGE_ID, using config.py:
+    python scripts/quarterly_quality_metrics.py
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import html
+import json
+import os
+import re
+import sys
+import time
+import zipfile
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
+from pathlib import Path
+from threading import local
+from typing import Any, Iterable, Iterator, Mapping, Optional, Sequence
+from xml.etree import ElementTree
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+DEFAULT_JIRA_URL = "https://jira.sberbank.ru"
+DEFAULT_CONFLUENCE_URL = "https://confluence.sberbank.ru"
+HTTP_TIMEOUT_SECONDS = 60
+JIRA_KEY_BATCH_SIZE = 200
+# Jira ограничивает частоту одиночных GET /issue. Одна переиспользуемая
+# Session работает стабильнее нескольких параллельных сессий и соответствует
+# способу загрузки issuelinks в release_checker.py.
+JIRA_LINK_WORKERS = 1
+JIRA_ISSUE_REQUEST_INTERVAL_SECONDS = 0.35
+JIRA_RATE_LIMIT_RECOVERY_SECONDS = 30
+# Корпоративные Jira/Confluence используют self-signed CA. release_checker.py
+# также принудительно отключает verify для этих подключений.
+VERIFY_SSL = False
+DEFAULT_RELEASE_PROJECT = "HRPRELEASE"
+# Релизы Ассистента HR с КЭ HRApp (5366436) также создаются в SDTR
+# (например, SDTR-2215) и должны участвовать в том же consist-of сборе.
+DEFAULT_ADDITIONAL_RELEASE_PROJECTS = ("SDTR",)
+DEFAULT_RELEASE_ISSUE_TYPE = "Release 2.0"
+DEFAULT_RELEASE_CREATED_SINCE = "2025-09-01"
+DEFAULT_RELEASE_KE_FIELD_NAME = "КЭ"
+# КЭ используются как справочник команд, но не ограничивают поиск релизов:
+# источником Story являются все установленные Release 2.0 за период, после
+# чего consist-of задачи фильтруются по Jira project настроенных команд.
+DEFAULT_FILTER_RELEASES_BY_KE = False
+# Фактическое имя customfield_19400 в Jira. Несмотря на суффикс «(план)»,
+# именно это поле отображается в карточке Release 2.0 и содержит дату,
+# по которой dpm2 относит установленный релиз к отчётному периоду.
+DEFAULT_RELEASE_DATE_FIELD_NAME = "Дата завершения установки в ПРОМ (план)"
+DEFAULT_RELEASE_DATE_FIELD_ID = "customfield_19400"
+DEFAULT_RELEASE_TYPE_FIELD_ID = "customfield_23500"
+DEFAULT_DETECTION_STAGE_FIELD_ID = "customfield_11507"
+DEFAULT_TEAM_ASSIGNMENT_FIELD_IDS = tuple(
+    field_id.strip()
+    for field_id in re.split(r"[,;\s]+", os.environ.get("QUALITY_METRIC_TEAM_FIELD_IDS", ""))
+    if field_id.strip()
+)
+DEFAULT_TEAM_ASSIGNMENT_FIELD_NAME_TOKENS = (
+    "команд",
+    "squad",
+    "сквад",
+    "team",
+)
+METRIC_INITIAL_DETECTION_STAGE_FIELD = "_metric_initial_detection_stage"
+METRIC_CURRENT_DETECTION_STAGE_FIELD = "_metric_current_detection_stage"
+METRIC_DETECTION_STAGE_HISTORY_FIELD = "_metric_detection_stage_history"
+DEFAULT_CONFLUENCE_PAGE_ID = "24517214638"
+
+DEFAULT_STORY_TYPES = ("Story",)
+DEFAULT_STORY_STATUSES = ("Done", "Сделано", "Готово")
+DEFAULT_BUG_TYPES = ("Bug", "Defect", "Ошибка")
+DEFAULT_EXCLUDED_BUG_STATUSES = ("Отклонен исполнителем",)
+DEFAULT_BUG_PRIORITIES = (
+    "Critical",
+    "Crytical",
+    "Blocker",
+    "Высокий",
+    "Блокирующий",
+)
+DEFAULT_PSI_DETECTION_STAGES = ("PSI", "ПСИ")
+DEFAULT_PROM_DETECTION_STAGES = ("PROM", "ПРОМ")
+DEFAULT_RELEASE_LINK_KEYWORDS = ("consist", "part")
+DEFAULT_HOTFIX_VALUES = ("Hotfix",)
+DEFAULT_INSTALLED_RELEASE_STATUSES = (
+    "Установлен на ПРОМ",
+)
+# Корпоративная Q3-выгрузка относит к кварталу ночной batch релизов с датой
+# установки в последний календарный день предыдущего квартала (например,
+# релиз 30.06 со Story, закрытой 01.07). Сдвиг применяется только к источнику
+# Story квартального среза; релизные итоги и последние 90 дней остаются
+# строго календарными.
+QUARTER_STORY_LOOKBACK_DAYS = 1
+EXCLUDED_METRIC_KE_IDS = frozenset((9362600, 9535069))
+RELEASE_KE_IDS = tuple(
+    dict.fromkeys(
+        (
+            2298599,
+            8553253,
+            3589425,
+            3304476,
+            3303802,
+            3191860,
+            2288712,
+            2257858,
+            2935717,
+            3521872,
+            6355438,
+            5452084,
+            5452083,
+            5452082,
+            5452085,
+            3303802,
+            3304476,
+            7993288,
+            2435236,
+            5374387,
+            2257817,
+            2644268,
+            2298078,
+            5366436,
+            2503797,
+            3930742,
+            2836020,
+            3173847,
+            2295205,
+            2288712,
+            9643400,
+            9643401,
+            9644023,
+            9644025,
+            8553253,
+            9644020,
+            10743713,
+            15112079,
+        )
+    )
+)
+
+RETRYABLE_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504}
+AS_IS_FLOOR_MULTIPLIER = Decimal("0.8")
+
+# target_ratio — актуальная «Цель 2026» из целевой таблицы (результат
+# A × AS IS + B). Итоговый коэффициент дополнительно ограничивается снизу
+# значением as_is_ratio × AS_IS_FLOOR_MULTIPLIER по заданной бизнес-формуле.
+TEAM_SETTINGS_JSON = r"""
+[
+  {
+    "team": "HRP Core UI",
+    "squad_code": "00HC0031",
+    "project_keys": ["HRM"],
+    "ke_ids": [
+      2298599, 3589425, 3304476, 3303802, 3191860, 2288712, 2257858,
+      2935717, 3521872, 6355438, 5452084, 5452083, 5452082, 5452085
+    ],
+    "as_is_ratio": 0.11,
+    "target_ratio": 0.12
+  },
+  {
+    "team": "HRP Core Tech",
+    "squad_code": "00HC0072",
+    "project_keys": ["HRC"],
+    "ke_ids": [7993288, 2435236, 5374387, 2257817, 2644268, 2298078],
+    "as_is_ratio": 0.13,
+    "target_ratio": 0.13
+  },
+  {
+    "team": "Core UI 2.0 / Neuro UI",
+    "squad_code": "00QV0004",
+    "project_keys": ["NEUROUI"],
+    "ke_ids": [9643400, 9643401, 9644023, 9644025, 9644020],
+    "as_is_ratio": 0.29,
+    "target_ratio": 0.35
+  },
+  {
+    "team": "Профиль сотрудника",
+    "squad_code": "00HC0050",
+    "project_keys": ["SFILE"],
+    "ke_ids": [2295205, 8553253],
+    "as_is_ratio": 0.21,
+    "target_ratio": 0.35
+  },
+  {
+    "team": "Продуктовая аналитика",
+    "squad_code": "",
+    "project_keys": ["HRPPA"],
+    "ke_ids": [],
+    "as_is_ratio": 0.80,
+    "target_ratio": 0.65
+  },
+  {
+    "team": "Люди Сбера",
+    "squad_code": "00QV0017",
+    "project_keys": ["SBRPPL"],
+    "ke_ids": [15112079],
+    "as_is_ratio": null,
+    "target_ratio": 0.10
+  },
+  {
+    "team": "Задачи и уведомления",
+    "squad_code": "00HC0042",
+    "project_keys": ["PERFREVIEW"],
+    "ke_ids": [],
+    "as_is_ratio": 0.34,
+    "target_ratio": 0.20
+  },
+  {
+    "team": "Ассистент HR",
+    "squad_code": "00QV0001",
+    "project_keys": ["HRPASSIST"],
+    "ke_ids": [5366436, 2503797, 3930742, 2836020, 3173847, 10743713],
+    "as_is_ratio": 0.09,
+    "target_ratio": 0.20
+  }
+]
+"""
+TEAM_SETTINGS: tuple[dict[str, Any], ...] = tuple(json.loads(TEAM_SETTINGS_JSON))
+
+
+def execution_log(message: str, *, error: bool = False) -> None:
+    """Print a timestamped job log line immediately."""
+
+    timestamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    stream = sys.stderr if error else sys.stdout
+    print(f"[{timestamp}] {message}", file=stream, flush=True)
+
+
+def elapsed_seconds(started_at: float) -> str:
+    return f"{time.perf_counter() - started_at:.1f} с"
+
+
+def normalized(value: Any) -> str:
+    text = str(value or "").strip().casefold().replace("ё", "е")
+    return re.sub(r"\s+", " ", text)
+
+
+def normalized_set(values: Iterable[str]) -> frozenset[str]:
+    return frozenset(normalized(value) for value in values if str(value).strip())
+
+
+def jql_value(value: str) -> str:
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", value):
+        return value
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def issue_keys_jql(keys: Iterable[str]) -> str:
+    cleaned = sorted({str(key).strip().upper() for key in keys if str(key).strip()})
+    return ",".join(
+        key if re.fullmatch(r"[A-Z][A-Z0-9_]*-\d+", key) else jql_value(key)
+        for key in cleaned
+    )
+
+
+def batches(values: Sequence[str], size: int = 100) -> Iterator[Sequence[str]]:
+    for start in range(0, len(values), size):
+        yield values[start : start + size]
+
+
+def quarter_bounds(day: date) -> tuple[date, date, int]:
+    quarter = (day.month - 1) // 3 + 1
+    start_month = (quarter - 1) * 3 + 1
+    start = date(day.year, start_month, 1)
+    if quarter == 4:
+        end = date(day.year + 1, 1, 1)
+    else:
+        end = date(day.year, start_month + 3, 1)
+    return start, end, quarter
+
+
+def parse_quarter(value: str) -> tuple[date, date, int]:
+    match = re.fullmatch(r"(\d{4})-?[QqКк]([1-4])", value.strip())
+    if not match:
+        raise ValueError("Квартал должен быть в формате YYYY-QN, например 2026-Q3.")
+    year = int(match.group(1))
+    quarter = int(match.group(2))
+    month = (quarter - 1) * 3 + 1
+    start = date(year, month, 1)
+    end = date(year + 1, 1, 1) if quarter == 4 else date(year, month + 3, 1)
+    return start, end, quarter
+
+
+def parse_jira_date(value: Any) -> Optional[date]:
+    if value is None:
+        return None
+    if isinstance(value, Mapping):
+        for key in ("value", "date", "name"):
+            parsed = parse_jira_date(value.get(key))
+            if parsed is not None:
+                return parsed
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError:
+        return None
+
+
+def named_values(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        result: list[str] = []
+        for item in value:
+            result.extend(named_values(item))
+        return result
+    if isinstance(value, Mapping):
+        for key in ("value", "name", "displayName", "key"):
+            nested = value.get(key)
+            if nested not in (None, ""):
+                return named_values(nested)
+        return []
+    text = str(value).strip()
+    return [text] if text else []
+
+
+def named_value(value: Any) -> str:
+    values = named_values(value)
+    return values[0] if values else ""
+
+
+@dataclass(frozen=True)
+class TeamSpec:
+    team: str
+    squad_code: str
+    project_keys: tuple[str, ...]
+    ke_ids: tuple[int, ...]
+    as_is_ratio: Optional[Decimal]
+    target_ratio: Decimal
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "TeamSpec":
+        team = str(raw.get("team") or "").strip()
+        squad_code = str(raw.get("squad_code") or "").strip().upper()
+        projects_raw = raw.get("project_keys")
+        if not isinstance(projects_raw, list):
+            raise ValueError(f"{team or 'Команда'}: project_keys должен быть массивом.")
+        project_keys = tuple(
+            dict.fromkeys(str(key).strip().upper() for key in projects_raw if str(key).strip())
+        )
+        ke_ids_raw = raw.get("ke_ids")
+        if not isinstance(ke_ids_raw, list):
+            raise ValueError(f"{team or 'Команда'}: ke_ids должен быть массивом.")
+        try:
+            ke_ids = tuple(dict.fromkeys(int(value) for value in ke_ids_raw))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{team or 'Команда'}: неверный ke_ids.") from exc
+        try:
+            target_ratio = Decimal(str(raw.get("target_ratio")))
+        except Exception as exc:
+            raise ValueError(f"{team or 'Команда'}: неверный target_ratio.") from exc
+        as_is_raw = raw.get("as_is_ratio")
+        try:
+            as_is_ratio = (
+                None if as_is_raw in (None, "") else Decimal(str(as_is_raw))
+            )
+        except Exception as exc:
+            raise ValueError(f"{team or 'Команда'}: неверный as_is_ratio.") from exc
+        if not team:
+            raise ValueError("У команды не задано имя.")
+        if not project_keys:
+            raise ValueError(f"{team}: не задан ни один Jira project key.")
+        if target_ratio <= 0 or target_ratio >= 1:
+            raise ValueError(f"{team}: target_ratio должен быть больше 0 и меньше 1.")
+        if as_is_ratio is not None and as_is_ratio < 0:
+            raise ValueError(f"{team}: as_is_ratio не может быть отрицательным.")
+        return cls(
+            team=team,
+            squad_code=squad_code,
+            project_keys=project_keys,
+            ke_ids=ke_ids,
+            as_is_ratio=as_is_ratio,
+            target_ratio=target_ratio,
+        )
+
+
+def load_team_specs() -> list[TeamSpec]:
+    raw = TEAM_SETTINGS
+    specs = [TeamSpec.from_dict(item) for item in raw if isinstance(item, Mapping)]
+    if len(specs) != len(raw):
+        raise ValueError("Каждый элемент TEAM_SETTINGS должен быть словарём.")
+
+    seen_projects: dict[str, str] = {}
+    seen_ke_ids: dict[int, str] = {}
+    for spec in specs:
+        for project_key in spec.project_keys:
+            previous = seen_projects.get(project_key)
+            if previous:
+                raise ValueError(
+                    f"Jira project {project_key} одновременно назначен командам "
+                    f"'{previous}' и '{spec.team}'."
+                )
+            seen_projects[project_key] = spec.team
+        for ke_id in spec.ke_ids:
+            if ke_id <= 0:
+                raise ValueError(f"{spec.team}: КЭ должен быть положительным числом.")
+            if ke_id in EXCLUDED_METRIC_KE_IDS:
+                raise ValueError(f"{spec.team}: КЭ {ke_id} исключён из метрики.")
+            previous = seen_ke_ids.get(ke_id)
+            if previous:
+                raise ValueError(
+                    f"КЭ {ke_id} одновременно назначен командам "
+                    f"'{previous}' и '{spec.team}'."
+                )
+            seen_ke_ids[ke_id] = spec.team
+    configured_ke_ids = set(seen_ke_ids)
+    release_ke_ids = set(RELEASE_KE_IDS)
+    if configured_ke_ids != release_ke_ids:
+        missing = sorted(configured_ke_ids - release_ke_ids)
+        unassigned = sorted(release_ke_ids - configured_ke_ids)
+        raise ValueError(
+            "Список КЭ релизов не совпадает с распределением по командам: "
+            f"нет в RELEASE_KE_IDS={missing or '—'}; "
+            f"не назначены команде={unassigned or '—'}."
+        )
+    return specs
+
+
+@dataclass(frozen=True)
+class MetricRules:
+    story_types: frozenset[str]
+    story_statuses: frozenset[str]
+    bug_types: frozenset[str]
+    excluded_bug_statuses: frozenset[str]
+    bug_priorities: frozenset[str]
+    psi_detection_stages: frozenset[str]
+    prom_detection_stages: frozenset[str]
+
+    @classmethod
+    def defaults(cls) -> "MetricRules":
+        return cls(
+            story_types=normalized_set(DEFAULT_STORY_TYPES),
+            story_statuses=normalized_set(DEFAULT_STORY_STATUSES),
+            bug_types=normalized_set(DEFAULT_BUG_TYPES),
+            excluded_bug_statuses=normalized_set(DEFAULT_EXCLUDED_BUG_STATUSES),
+            bug_priorities=normalized_set(DEFAULT_BUG_PRIORITIES),
+            psi_detection_stages=normalized_set(DEFAULT_PSI_DETECTION_STAGES),
+            prom_detection_stages=normalized_set(DEFAULT_PROM_DETECTION_STAGES),
+        )
+
+
+@dataclass
+class TeamCounts:
+    stories: int = 0
+    bugs: int = 0
+    psi_bugs: int = 0
+    prom_bugs: int = 0
+    story_keys: list[str] = field(default_factory=list)
+    bug_keys: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class TeamMetric:
+    team: str
+    project_keys: tuple[str, ...]
+    as_is_ratio: Optional[Decimal]
+    calculated_target_ratio: Decimal
+    minimum_target_ratio: Optional[Decimal]
+    target_ratio: Decimal
+    defect_limit_ratio: Decimal
+    stories: int
+    bugs: int
+    psi_bugs: int
+    prom_bugs: int
+    actual_ratio: Optional[Decimal]
+    target_attainment_percent: Optional[Decimal]
+    infinite_attainment: bool
+    additional_bugs_allowed: int
+    additional_stories_required: int
+    state: str
+    story_keys: tuple[str, ...]
+    bug_keys: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class MetricForecast:
+    projected_stories: int
+    projected_bugs: int
+    projected_ratio: Optional[Decimal]
+    projected_attainment_percent: Optional[Decimal]
+    teams_on_target: int
+    team_count: int
+    factor: Decimal
+
+
+def calculate_metric(spec: TeamSpec, counts: TeamCounts) -> TeamMetric:
+    calculated_target = spec.target_ratio
+    minimum_target = (
+        spec.as_is_ratio * AS_IS_FLOOR_MULTIPLIER
+        if spec.as_is_ratio is not None
+        else None
+    )
+    defect_limit = (
+        max(calculated_target, minimum_target)
+        if minimum_target is not None
+        else calculated_target
+    )
+    target = calculated_target
+    stories = counts.stories
+    bugs = counts.bugs
+
+    if stories > 0:
+        # В эталонной таблице сначала округляется факт до сотых, а уже затем
+        # считается выполнение цели: target / rounded_fact * 100.
+        actual_ratio: Optional[Decimal] = (
+            Decimal(bugs) / Decimal(stories)
+        ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    else:
+        actual_ratio = None
+
+    if stories == 0:
+        # Business rule: absence of released Story means the metric is met,
+        # even if bugs were created in the team's Jira space in the period.
+        attainment = Decimal(100)
+        infinite_attainment = False
+        state = "Цель выполнена"
+    elif bugs == 0 or actual_ratio == 0:
+        attainment = Decimal(100)
+        infinite_attainment = False
+        state = "Цель выполнена"
+    else:
+        attainment = (target / actual_ratio) * Decimal(100) if actual_ratio else None
+        infinite_attainment = False
+        state = "Цель выполнена" if actual_ratio <= target else "Ниже цели"
+
+    # Запас багов использует коэффициент лимита с нижней границей 80% AS IS.
+    # Story до цели и выполнение используют актуальную «Цель 2026» напрямую.
+    bug_budget = int(
+        (Decimal(stories) * defect_limit).to_integral_value(rounding=ROUND_FLOOR)
+    )
+    additional_bugs_allowed = max(0, bug_budget - bugs)
+
+    if stories == 0:
+        stories_needed_total = 0
+    elif bugs > 0:
+        stories_needed_total = int(
+            (Decimal(bugs) / target).to_integral_value(rounding=ROUND_CEILING)
+        )
+    else:
+        stories_needed_total = 0
+    additional_stories_required = max(0, stories_needed_total - stories)
+
+    return TeamMetric(
+        team=spec.team,
+        project_keys=spec.project_keys,
+        as_is_ratio=spec.as_is_ratio,
+        calculated_target_ratio=calculated_target,
+        minimum_target_ratio=minimum_target,
+        target_ratio=target,
+        defect_limit_ratio=defect_limit,
+        stories=stories,
+        bugs=bugs,
+        psi_bugs=counts.psi_bugs,
+        prom_bugs=counts.prom_bugs,
+        actual_ratio=actual_ratio,
+        target_attainment_percent=attainment,
+        infinite_attainment=infinite_attainment,
+        additional_bugs_allowed=additional_bugs_allowed,
+        additional_stories_required=additional_stories_required,
+        state=state,
+        story_keys=tuple(sorted(counts.story_keys)),
+        bug_keys=tuple(sorted(counts.bug_keys)),
+    )
+
+
+def issue_field(issue: Mapping[str, Any], key: str) -> Any:
+    fields = issue.get("fields")
+    if not isinstance(fields, Mapping):
+        return None
+    return fields.get(key)
+
+
+def issue_project_key(issue: Mapping[str, Any]) -> str:
+    project = issue_field(issue, "project")
+    if isinstance(project, Mapping):
+        key = str(project.get("key") or "").strip()
+        if key:
+            return key.upper()
+    return named_value(project).upper()
+
+
+def story_has_done_status(raw_status: Any, rules: MetricRules) -> bool:
+    if normalized(named_value(raw_status)) in rules.story_statuses:
+        return True
+    if not isinstance(raw_status, Mapping):
+        return False
+    status_category = raw_status.get("statusCategory")
+    category_values = {
+        normalized(value)
+        for value in named_values(status_category)
+    }
+    if isinstance(status_category, Mapping):
+        category_values.update(
+            normalized(status_category.get(key))
+            for key in ("key", "name")
+            if status_category.get(key)
+        )
+    return "done" in category_values
+
+
+def bug_has_eligible_status(raw_status: Any, rules: MetricRules) -> bool:
+    """All Bug statuses are eligible except the explicit rejection status."""
+
+    return (
+        normalized(named_value(raw_status))
+        not in rules.excluded_bug_statuses
+    )
+
+
+def classify_eligible_detection_stage(
+    raw_value: Any,
+    rules: MetricRules,
+) -> Optional[str]:
+    stages = {normalized(value) for value in named_values(raw_value)}
+    if stages & rules.prom_detection_stages:
+        return "prom"
+    if stages & rules.psi_detection_stages:
+        return "psi"
+    return None
+
+
+def initial_detection_stage_value(
+    issue: Mapping[str, Any],
+    detection_stage_field_id: str,
+) -> Any:
+    """Restore the detection stage that was set when the bug was created."""
+
+    events = changelog_field_events(
+        issue,
+        detection_stage_field_id,
+        ("Этап обнаружения", "Detection Stage"),
+    )
+    if events:
+        # The first `from` value is what was set before the earliest edit.
+        return events[0]["from"]
+
+    return issue_field(issue, detection_stage_field_id)
+
+
+def changelog_field_events(
+    issue: Mapping[str, Any],
+    field_id: str,
+    field_names: Sequence[str],
+) -> list[dict[str, str]]:
+    changelog = issue.get("changelog")
+    histories = changelog.get("histories") if isinstance(changelog, Mapping) else None
+    if not isinstance(histories, list):
+        return []
+
+    normalized_names = normalized_set(field_names)
+    result: list[dict[str, str]] = []
+    ordered_histories = sorted(
+        (history for history in histories if isinstance(history, Mapping)),
+        key=lambda history: str(history.get("created") or ""),
+    )
+    for history in ordered_histories:
+        items = history.get("items")
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, Mapping):
+                continue
+            item_field_id = str(item.get("fieldId") or "").strip()
+            item_field_name = normalized(item.get("field"))
+            field_name_matches = (
+                item_field_name in normalized_names
+                or (
+                    "этап" in item_field_name
+                    and "обнаруж" in item_field_name
+                    and any(
+                        "этап" in name and "обнаруж" in name
+                        for name in normalized_names
+                    )
+                )
+                or (
+                    "detection" in item_field_name
+                    and "stage" in item_field_name
+                    and any(
+                        "detection" in name and "stage" in name
+                        for name in normalized_names
+                    )
+                )
+            )
+            if item_field_id != field_id and not field_name_matches:
+                continue
+            from_value = item.get("fromString")
+            if from_value is None:
+                from_value = item.get("from")
+            to_value = item.get("toString")
+            if to_value is None:
+                to_value = item.get("to")
+            result.append(
+                {
+                    "changed_at": str(history.get("created") or ""),
+                    "from": str(from_value or ""),
+                    "to": str(to_value or ""),
+                }
+            )
+    return result
+
+
+def field_values_over_history(
+    issue: Mapping[str, Any],
+    field_id: str,
+    field_names: Sequence[str],
+) -> list[str]:
+    """Return distinct historical and current display values of a Jira field."""
+
+    values: list[str] = []
+    for event in changelog_field_events(issue, field_id, field_names):
+        values.extend((event["from"], event["to"]))
+    values.extend(named_values(issue_field(issue, field_id)))
+    return list(dict.fromkeys(value.strip() for value in values if value.strip()))
+
+
+def detection_stage_values_from_history_html(
+    document: str,
+    rules: MetricRules,
+) -> list[str]:
+    """Extract PSI/PROM values from the Server/DC change-history HTML tab."""
+
+    normalized_document = normalized(document)
+    if (
+        "login-form" in normalized_document
+        or "id=\"login\"" in normalized_document
+        or "name=\"os_username\"" in normalized_document
+    ):
+        raise RuntimeError("Jira вернула страницу входа вместо истории задачи.")
+
+    blocks = re.findall(r"<tr\b[^>]*>.*?</tr\s*>", document, flags=re.I | re.S)
+    if not blocks:
+        blocks = re.findall(r"<li\b[^>]*>.*?</li\s*>", document, flags=re.I | re.S)
+    if not blocks:
+        blocks = [document]
+
+    result: list[str] = []
+    for block in blocks:
+        without_markup = re.sub(r"<[^>]+>", " ", block)
+        text = normalized(html.unescape(without_markup))
+        field_matches = (
+            "этап обнаруж" in text
+            or ("detection" in text and "stage" in text)
+        )
+        if not field_matches:
+            continue
+        if any(
+            re.search(rf"(?<!\w){re.escape(value)}(?!\w)", text)
+            for value in rules.prom_detection_stages
+        ):
+            result.append("ПРОМ")
+        if any(
+            re.search(rf"(?<!\w){re.escape(value)}(?!\w)", text)
+            for value in rules.psi_detection_stages
+        ):
+            result.append("ПСИ")
+    return list(dict.fromkeys(result))
+
+
+def with_detection_stage_history(
+    issue: Mapping[str, Any],
+    detection_stage_field_id: str,
+    additional_values: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Copy an issue and expose every detection stage seen in its changelog."""
+
+    result = dict(issue)
+    raw_fields = issue.get("fields")
+    fields = dict(raw_fields) if isinstance(raw_fields, Mapping) else {}
+    current_value = fields.get(detection_stage_field_id)
+    initial_value = initial_detection_stage_value(
+        issue,
+        detection_stage_field_id,
+    )
+    history_values = field_values_over_history(
+        issue,
+        detection_stage_field_id,
+        ("Этап обнаружения", "Detection Stage"),
+    )
+    history_values.extend(
+        value
+        for value in additional_values
+        if value and value not in history_values
+    )
+    if not history_values:
+        history_values = named_values(current_value)
+    fields[METRIC_INITIAL_DETECTION_STAGE_FIELD] = initial_value
+    fields[METRIC_CURRENT_DETECTION_STAGE_FIELD] = fields.get(
+        detection_stage_field_id
+    )
+    fields[METRIC_DETECTION_STAGE_HISTORY_FIELD] = history_values
+    # aggregate_issues reads the configured Jira field. Replacing it with all
+    # historical values makes PROM precedence deterministic and also preserves
+    # bugs that were created as PROM and later changed to another stage.
+    fields[detection_stage_field_id] = history_values
+    result["fields"] = fields
+    return result
+
+
+def team_aliases(spec: TeamSpec) -> frozenset[str]:
+    aliases = {normalized(spec.team)}
+    if spec.squad_code:
+        aliases.add(spec.squad_code.casefold())
+    if spec.team == "Core UI 2.0 / Neuro UI":
+        aliases.add(normalized("CoreUI 2.0"))
+        aliases.add(normalized("Core UI 2.0"))
+    return frozenset(alias for alias in aliases if alias)
+
+
+def issue_assignment_team(
+    issue: Mapping[str, Any],
+    team_specs: Sequence[TeamSpec],
+    team_assignment_field_ids: Sequence[str],
+) -> Optional[str]:
+    if not team_assignment_field_ids:
+        return None
+
+    field_values = [
+        issue_field(issue, field_id)
+        for field_id in team_assignment_field_ids
+        if issue_field(issue, field_id) not in (None, "", [], {})
+    ]
+    if not field_values:
+        return None
+
+    text_parts = []
+    for value in field_values:
+        text_parts.extend(named_values(value))
+        try:
+            text_parts.append(json.dumps(value, ensure_ascii=False, default=str))
+        except Exception:
+            text_parts.append(str(value))
+    raw_joined_text = " ".join(text_parts)
+    joined_text = normalized(raw_joined_text)
+
+    matched = [
+        spec.team
+        for spec in team_specs
+        if any(alias and alias in joined_text for alias in team_aliases(spec))
+    ]
+    unique = list(dict.fromkeys(matched))
+    if len(unique) == 1:
+        return unique[0]
+    if re.search(r"\b\d{2}[A-ZА-Я]{2}\d{4}\b", raw_joined_text.upper()):
+        return ""
+    return None
+
+
+def issue_assignment_debug(
+    issue: Mapping[str, Any],
+    team_specs: Sequence[TeamSpec],
+    team_assignment_field_ids: Sequence[str],
+) -> dict[str, Any]:
+    """Explain whether a team came from a Jira field or project fallback."""
+
+    candidate_fields = [
+        {
+            "id": field_id,
+            "values": flattened_debug_values(issue_field(issue, field_id)),
+        }
+        for field_id in team_assignment_field_ids
+        if issue_field(issue, field_id) not in (None, "", [], {})
+    ]
+    explicit_team = issue_assignment_team(
+        issue,
+        team_specs,
+        team_assignment_field_ids,
+    )
+    project_key = issue_project_key(issue)
+    project_team = next(
+        (
+            spec.team
+            for spec in team_specs
+            if project_key in spec.project_keys
+        ),
+        None,
+    )
+    if explicit_team == "":
+        source = "другое значение команды/сквада"
+        final_team = None
+    elif explicit_team is not None:
+        source = "явное поле команды/сквада"
+        final_team = explicit_team
+    elif candidate_fields:
+        source = "fallback по Jira project после нераспознанных полей"
+        final_team = project_team
+    else:
+        source = "fallback по Jira project; поля команды/сквада пусты"
+        final_team = project_team
+    return {
+        "source": source,
+        "explicit_team": explicit_team or None,
+        "project_fallback_team": project_team,
+        "final_team": final_team,
+        "candidate_fields": candidate_fields,
+    }
+
+
+def aggregate_issues(
+    team_specs: Sequence[TeamSpec],
+    issues: Iterable[Mapping[str, Any]],
+    rules: MetricRules,
+    detection_stage_field_id: str,
+    team_assignment_field_ids: Sequence[str] = (),
+) -> dict[str, TeamCounts]:
+    counts = {spec.team: TeamCounts() for spec in team_specs}
+    project_to_team = {
+        project_key: spec.team for spec in team_specs for project_key in spec.project_keys
+    }
+    seen_keys: set[str] = set()
+
+    for issue in issues:
+        key = str(issue.get("key") or "").strip().upper()
+        if not key or key in seen_keys:
+            continue
+        seen_keys.add(key)
+
+        project_key = issue_project_key(issue)
+        team = issue_assignment_team(issue, team_specs, team_assignment_field_ids)
+        if team == "":
+            continue
+        if team is None:
+            team = project_to_team.get(project_key)
+        if team is None:
+            continue
+
+        issue_type = normalized(named_value(issue_field(issue, "issuetype")))
+        raw_status = issue_field(issue, "status")
+
+        if issue_type in rules.story_types and story_has_done_status(raw_status, rules):
+            counts[team].stories += 1
+            counts[team].story_keys.append(key)
+            continue
+
+        if (
+            issue_type not in rules.bug_types
+            or not bug_has_eligible_status(raw_status, rules)
+        ):
+            continue
+
+        priority = normalized(named_value(issue_field(issue, "priority")))
+        if priority not in rules.bug_priorities:
+            continue
+
+        detection_stage = classify_eligible_detection_stage(
+            issue_field(issue, detection_stage_field_id),
+            rules,
+        )
+        if detection_stage is None:
+            continue
+
+        counts[team].bugs += 1
+        counts[team].bug_keys.append(key)
+        if detection_stage == "prom":
+            counts[team].prom_bugs += 1
+        else:
+            counts[team].psi_bugs += 1
+
+    return counts
+
+
+@dataclass(frozen=True)
+class ConnectionSettings:
+    url: str
+    token: str
+    username: str
+    auth_mode: str
+    verify_ssl: bool
+    timeout_seconds: int = 60
+
+    def auth(self) -> tuple[dict[str, str], Optional[tuple[str, str]]]:
+        headers = {"Accept": "application/json", "Content-Type": "application/json"}
+        if self.auth_mode == "basic":
+            return headers, (self.username, self.token)
+        headers["Authorization"] = f"Bearer {self.token}"
+        return headers, None
+
+
+class HttpRequestError(RuntimeError):
+    def __init__(self, service: str, status_code: int, response_text: str):
+        self.service = service
+        self.status_code = status_code
+        self.response_text = response_text
+        super().__init__(
+            f"{service}: HTTP {status_code}; ответ: {response_text[:700]}"
+        )
+
+
+class RestClient:
+    def __init__(self, service: str, settings: ConnectionSettings):
+        try:
+            import requests
+            import urllib3
+        except ImportError as exc:
+            raise RuntimeError(
+                "Не установлены requests/urllib3. Выполните: pip install -r requirements.txt"
+            ) from exc
+        if not settings.verify_ssl:
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        self.service = service
+        self.settings = settings
+        self.session = requests.Session()
+        headers, auth = settings.auth()
+        self.session.headers.update(headers)
+        self.session.auth = auth
+
+    def request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[Mapping[str, Any]] = None,
+        payload: Optional[Mapping[str, Any]] = None,
+        safe_to_retry: bool = False,
+    ) -> Any:
+        url = f"{self.settings.url.rstrip('/')}/{path.lstrip('/')}"
+        attempts = 4 if method.upper() == "GET" or safe_to_retry else 1
+        for attempt in range(1, attempts + 1):
+            try:
+                response = self.session.request(
+                    method=method,
+                    url=url,
+                    params=params,
+                    json=payload,
+                    timeout=self.settings.timeout_seconds,
+                    verify=self.settings.verify_ssl,
+                )
+            except Exception as exc:
+                if attempt >= attempts:
+                    raise RuntimeError(f"{self.service}: ошибка запроса {url}: {exc}") from exc
+                delay = min(2 ** (attempt - 1), 8)
+                execution_log(
+                    f"{self.service}: ошибка сети, повтор "
+                    f"{attempt + 1}/{attempts} через {delay} с: {exc}",
+                    error=True,
+                )
+                time.sleep(delay)
+                continue
+
+            if 200 <= response.status_code < 300:
+                if not response.content:
+                    return {}
+                try:
+                    return response.json()
+                except ValueError as exc:
+                    raise RuntimeError(
+                        f"{self.service}: сервер вернул не JSON для {url}."
+                    ) from exc
+
+            if (
+                response.status_code in RETRYABLE_HTTP_STATUSES
+                and attempt < attempts
+            ):
+                retry_after = response.headers.get("Retry-After", "").strip()
+                try:
+                    delay = float(retry_after)
+                except ValueError:
+                    delay = min(2 ** (attempt - 1), 8)
+                if response.status_code == 429:
+                    # SynGX/Jira иногда присылает Retry-After: 0. Немедленный
+                    # повтор только добивает лимит и расходует все попытки.
+                    delay = max(delay, min(2 ** (attempt - 1), 8))
+                delay = max(0, min(delay, 30))
+                execution_log(
+                    f"{self.service}: HTTP {response.status_code}, повтор "
+                    f"{attempt + 1}/{attempts} через {delay:g} с",
+                    error=True,
+                )
+                time.sleep(delay)
+                continue
+            raise HttpRequestError(self.service, response.status_code, response.text)
+        raise AssertionError("unreachable")
+
+    def request_text(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[Mapping[str, Any]] = None,
+    ) -> str:
+        """Request an authenticated HTML page with the same retry policy."""
+
+        url = f"{self.settings.url.rstrip('/')}/{path.lstrip('/')}"
+        attempts = 4 if method.upper() == "GET" else 1
+        for attempt in range(1, attempts + 1):
+            try:
+                response = self.session.request(
+                    method=method,
+                    url=url,
+                    params=params,
+                    headers={"Accept": "text/html,application/xhtml+xml"},
+                    timeout=self.settings.timeout_seconds,
+                    verify=self.settings.verify_ssl,
+                )
+            except Exception as exc:
+                if attempt >= attempts:
+                    raise RuntimeError(
+                        f"{self.service}: ошибка запроса {url}: {exc}"
+                    ) from exc
+                delay = min(2 ** (attempt - 1), 8)
+                time.sleep(delay)
+                continue
+
+            if 200 <= response.status_code < 300:
+                return response.text
+            if (
+                response.status_code in RETRYABLE_HTTP_STATUSES
+                and attempt < attempts
+            ):
+                delay = min(2 ** (attempt - 1), 8)
+                time.sleep(delay)
+                continue
+            raise HttpRequestError(self.service, response.status_code, response.text)
+        raise AssertionError("unreachable")
+
+
+class JiraClient:
+    def __init__(self, settings: ConnectionSettings):
+        self.settings = settings
+        self.rest = RestClient("Jira", settings)
+
+    def search(
+        self,
+        jql: str,
+        fields: Sequence[str],
+        *,
+        page_size: int = 100,
+    ) -> list[dict[str, Any]]:
+        start_at = 0
+        result: list[dict[str, Any]] = []
+        while True:
+            data = self.rest.request_json(
+                "POST",
+                "/rest/api/2/search",
+                payload={
+                    "jql": jql,
+                    "startAt": start_at,
+                    "maxResults": page_size,
+                    "fields": list(dict.fromkeys(fields)),
+                },
+                safe_to_retry=True,
+            )
+            if not isinstance(data, Mapping):
+                raise RuntimeError("Jira search вернул неожиданный ответ.")
+            issues = data.get("issues") or []
+            if not isinstance(issues, list):
+                raise RuntimeError("Jira search: поле issues не является массивом.")
+            result.extend(issue for issue in issues if isinstance(issue, dict))
+            start_at += len(issues)
+            total = int(data.get("total") or 0)
+            if not issues or start_at >= total:
+                break
+        return result
+
+    def fields(self) -> list[dict[str, Any]]:
+        data = self.rest.request_json("GET", "/rest/api/2/field")
+        if not isinstance(data, list):
+            raise RuntimeError("Jira /field вернул неожиданный ответ.")
+        return [item for item in data if isinstance(item, dict)]
+
+    def issue(
+        self,
+        issue_key: str,
+        fields: Sequence[str],
+        *,
+        expand: str = "",
+    ) -> dict[str, Any]:
+        params = {"fields": ",".join(dict.fromkeys(fields))}
+        if expand:
+            params["expand"] = expand
+        data = self.rest.request_json(
+            "GET",
+            f"/rest/api/2/issue/{issue_key}",
+            params=params,
+        )
+        if not isinstance(data, dict):
+            raise RuntimeError(f"Jira issue {issue_key} вернул неожиданный ответ.")
+        return data
+
+    def issues_individually(
+        self,
+        issue_keys: Iterable[str],
+        fields: Sequence[str],
+        *,
+        max_workers: int = JIRA_LINK_WORKERS,
+        progress_label: str = "",
+        expand: str = "",
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+        keys = sorted(
+            {
+                str(issue_key).strip().upper()
+                for issue_key in issue_keys
+                if str(issue_key).strip()
+            }
+        )
+        if not keys:
+            return {}, {}
+
+        if max_workers <= 1:
+            result: dict[str, dict[str, Any]] = {}
+            errors: dict[str, str] = {}
+            previous_request_started = 0.0
+            for index, key in enumerate(keys, start=1):
+                since_previous_start = (
+                    time.perf_counter() - previous_request_started
+                    if previous_request_started
+                    else JIRA_ISSUE_REQUEST_INTERVAL_SECONDS
+                )
+                pacing_delay = max(
+                    0.0,
+                    JIRA_ISSUE_REQUEST_INTERVAL_SECONDS - since_previous_start,
+                )
+                if pacing_delay:
+                    time.sleep(pacing_delay)
+                previous_request_started = time.perf_counter()
+                try:
+                    result[key] = self.issue(key, fields, expand=expand)
+                except Exception as exc:
+                    errors[key] = str(exc)
+                if progress_label and (index % 10 == 0 or index == len(keys)):
+                    execution_log(
+                        f"{progress_label}: {index}/{len(keys)}, "
+                        f"ошибок={len(errors)}"
+                    )
+            return result, errors
+
+        worker_state = local()
+
+        def load_issue(key: str) -> tuple[str, dict[str, Any]]:
+            worker_client = getattr(worker_state, "jira_client", None)
+            if worker_client is None:
+                worker_client = JiraClient(self.settings)
+                worker_state.jira_client = worker_client
+            return key, worker_client.issue(key, fields, expand=expand)
+
+        result = {}
+        errors = {}
+        worker_count = min(max_workers, len(keys))
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="jira-links",
+        ) as executor:
+            futures = {
+                executor.submit(load_issue, key): key
+                for key in keys
+            }
+            completed = 0
+            for future in as_completed(futures):
+                key = futures[future]
+                try:
+                    loaded_key, issue = future.result()
+                except Exception as exc:
+                    errors[key] = str(exc)
+                else:
+                    result[loaded_key] = issue
+                completed += 1
+                if progress_label and (
+                    completed % 10 == 0 or completed == len(keys)
+                ):
+                    execution_log(
+                        f"{progress_label}: {completed}/{len(keys)}, "
+                        f"ошибок={len(errors)}"
+                    )
+        return result, errors
+
+    def issues_by_keys(
+        self,
+        issue_keys: Iterable[str],
+        fields: Sequence[str],
+        *,
+        batch_size: int = JIRA_KEY_BATCH_SIZE,
+        progress_label: str = "",
+    ) -> dict[str, dict[str, Any]]:
+        if batch_size <= 0:
+            raise ValueError("Jira batch_size должен быть больше нуля.")
+        keys = sorted(
+            {
+                str(issue_key).strip().upper()
+                for issue_key in issue_keys
+                if str(issue_key).strip()
+            }
+        )
+        result: dict[str, dict[str, Any]] = {}
+        batch_count = (len(keys) + batch_size - 1) // batch_size
+        for batch_index, key_batch in enumerate(
+            batches(keys, size=batch_size),
+            start=1,
+        ):
+            batch_started = time.perf_counter()
+            jql = f"key in ({issue_keys_jql(key_batch)})"
+            batch_issues = self.search(
+                jql,
+                fields,
+                page_size=min(max(len(key_batch), 100), 1000),
+            )
+            for issue in batch_issues:
+                key = str(issue.get("key") or "").strip().upper()
+                if key:
+                    result[key] = issue
+            if progress_label:
+                execution_log(
+                    f"{progress_label}: пакет {batch_index}/{batch_count}, "
+                    f"ключей={len(key_batch)}, Jira вернула={len(batch_issues)}, "
+                    f"всего загружено={len(result)} ({elapsed_seconds(batch_started)})"
+                )
+        return result
+
+    def issue_history_html(self, issue_key: str) -> str:
+        """Load the full Server/DC history tab when REST changelog is limited."""
+
+        return self.rest.request_text(
+            "GET",
+            f"/browse/{issue_key}",
+            params={
+                "page": (
+                    "com.atlassian.jira.plugin.system.issuetabpanels:"
+                    "changehistory-tabpanel"
+                )
+            },
+        )
+
+
+def find_jira_field_id(
+    jira: JiraClient,
+    explicit_id: str,
+    requested_name: str,
+    candidates: Sequence[str],
+) -> str:
+    explicit_id = explicit_id.strip()
+    wanted = normalized_set((requested_name, *candidates))
+    fields = jira.fields()
+
+    explicit_field = next(
+        (
+            item
+            for item in fields
+            if str(item.get("id") or "").strip() == explicit_id
+        ),
+        None,
+    )
+
+    default_field = next(
+        (
+            item
+            for item in fields
+            if str(item.get("id") or "").strip() == DEFAULT_RELEASE_DATE_FIELD_ID
+            and normalized(item.get("name")) in wanted
+        ),
+        None,
+    )
+    if default_field is not None:
+        if explicit_id and explicit_id != DEFAULT_RELEASE_DATE_FIELD_ID:
+            configured_name = (
+                str(explicit_field.get("name") or "").strip()
+                if explicit_field is not None
+                else "поле с таким ID не найдено"
+            )
+            execution_log(
+                f"Jira: настроенный ID даты {explicit_id} указывает на "
+                f"«{configured_name}»; использую проверенный "
+                f"{DEFAULT_RELEASE_DATE_FIELD_ID} "
+                f"«{default_field.get('name')}»",
+                error=True,
+            )
+        return DEFAULT_RELEASE_DATE_FIELD_ID
+
+    if explicit_field is not None:
+        explicit_name = str(explicit_field.get("name") or "").strip()
+        if normalized(explicit_name) in wanted:
+            return explicit_id
+
+    exact = [
+        item
+        for item in fields
+        if normalized(item.get("name")) in wanted
+        and str(item.get("id") or "").strip()
+    ]
+    if len(exact) == 1:
+        resolved_id = str(exact[0].get("id") or "").strip()
+        if explicit_id and resolved_id != explicit_id:
+            configured_name = (
+                str(explicit_field.get("name") or "").strip()
+                if explicit_field is not None
+                else "поле с таким ID не найдено"
+            )
+            execution_log(
+                f"Jira: настроенный ID даты {explicit_id} указывает на "
+                f"«{configured_name}»; использую {resolved_id} "
+                f"«{exact[0].get('name')}»",
+                error=True,
+            )
+        return resolved_id
+    if len(exact) > 1:
+        available = ", ".join(
+            f"{item.get('name')} ({item.get('id')})" for item in exact
+        )
+        raise RuntimeError(
+            f"Для Jira-поля '{requested_name}' найдено несколько точных "
+            f"совпадений: {available}. Укажите правильный id в "
+            "config['jira']['fields']['prod_installed_date_id']."
+        )
+
+    partial = [
+        item
+        for item in fields
+        if any(candidate in normalized(item.get("name")) for candidate in wanted)
+    ]
+    if len(partial) == 1:
+        resolved_id = str(partial[0].get("id") or "").strip()
+        if resolved_id:
+            return resolved_id
+    available = ", ".join(
+        sorted(
+            f"{item.get('name')} ({item.get('id')})"
+            for item in partial
+            if item.get("name")
+        )
+    )
+    suffix = f" Похожие поля: {available}." if available else ""
+    explicit_suffix = (
+        f" Настроенный ID {explicit_id} не соответствует этому имени."
+        if explicit_id
+        else ""
+    )
+    raise RuntimeError(
+        f"Не найдено Jira-поле '{requested_name}'. "
+        "Укажите его id в config['jira']['fields']['prod_installed_date_id'] "
+        "или DEFAULT_RELEASE_DATE_FIELD_ID внутри скрипта."
+        + explicit_suffix
+        + suffix
+    )
+
+
+def find_team_assignment_field_ids(jira: "JiraClient") -> tuple[str, ...]:
+    explicit_ids = tuple(dict.fromkeys(DEFAULT_TEAM_ASSIGNMENT_FIELD_IDS))
+    fields = jira.fields()
+    token_matches = []
+    for item in fields:
+        field_id = str(item.get("id") or "").strip()
+        field_name = normalized(item.get("name"))
+        if not field_id:
+            continue
+        if any(token in field_name for token in DEFAULT_TEAM_ASSIGNMENT_FIELD_NAME_TOKENS):
+            token_matches.append(field_id)
+    return tuple(dict.fromkeys((*explicit_ids, *token_matches)))
+
+
+def build_release_jql(
+    *,
+    project: str,
+    additional_projects: Sequence[str] = (),
+    issue_type: str,
+    ke_field_name: str,
+    ke_ids: Sequence[int],
+    created_since: str,
+) -> str:
+    projects = tuple(
+        dict.fromkeys(
+            value.strip().upper()
+            for value in (project, *additional_projects)
+            if value.strip()
+        )
+    )
+    if len(projects) == 1:
+        project_clause = f"project={jql_value(projects[0])}"
+    else:
+        project_values = ", ".join(jql_value(value) for value in projects)
+        project_clause = f"project in ({project_values})"
+    ke_ids_jql = ", ".join(str(value) for value in dict.fromkeys(ke_ids))
+    clauses = [
+        f"{project_clause} "
+        f"AND type = {jql_value(issue_type)} "
+        f'AND created >= "{created_since}"'
+    ]
+    if ke_ids_jql:
+        clauses.append(f" AND {ke_field_name} in ({ke_ids_jql})")
+    return "".join(clauses)
+
+
+def build_created_bugs_jql(
+    team_specs: Sequence[TeamSpec],
+    *,
+    start: date,
+    end: date,
+) -> str:
+    projects = tuple(
+        dict.fromkeys(
+            project_key
+            for spec in team_specs
+            for project_key in spec.project_keys
+        )
+    )
+    project_values = ", ".join(jql_value(value) for value in projects)
+    return (
+        f"project in ({project_values}) "
+        "AND issuetype = Bug "
+        f'AND created >= "{start.isoformat()}" '
+        f'AND created < "{end.isoformat()}"'
+    )
+
+
+def collect_created_bugs(
+    jira: JiraClient,
+    team_specs: Sequence[TeamSpec],
+    rules: MetricRules,
+    *,
+    start: date,
+    end: date,
+    detection_stage_field_id: str,
+    team_assignment_field_ids: Sequence[str] = (),
+    verbose: bool = False,
+) -> tuple[list[dict[str, Any]], str]:
+    """Collect bugs created in team projects and load eligible stage history."""
+
+    started = time.perf_counter()
+    jql = build_created_bugs_jql(team_specs, start=start, end=end)
+    fields = (
+        "summary",
+        "project",
+        "issuetype",
+        "status",
+        "priority",
+        "created",
+        "resolutiondate",
+        detection_stage_field_id,
+        *team_assignment_field_ids,
+    )
+    execution_log(
+        "Jira: ищу заведённые баги в пространствах команд "
+        f"за {start.isoformat()} — {(end - timedelta(days=1)).isoformat()}"
+    )
+    if verbose:
+        print(f"JQL заведённых багов: {jql}")
+    candidates = jira.search(jql, fields, page_size=1000)
+
+    # Changelog is only needed for bugs that pass the inexpensive current
+    # status/priority checks. Metric eligibility uses every historical
+    # detection-stage value, not only the initial or current value.
+    history_keys: list[str] = []
+    for issue in candidates:
+        issue_type = normalized(named_value(issue_field(issue, "issuetype")))
+        raw_status = issue_field(issue, "status")
+        priority = normalized(named_value(issue_field(issue, "priority")))
+        key = str(issue.get("key") or "").strip().upper()
+        if (
+            key
+            and issue_type in rules.bug_types
+            and bug_has_eligible_status(raw_status, rules)
+            and priority in rules.bug_priorities
+        ):
+            history_keys.append(key)
+
+    execution_log(
+        f"Jira: заведённых Bug/Defect найдено={len(candidates)}; "
+        "High+ без статуса «Отклонен исполнителем» для проверки "
+        f"истории этапа={len(history_keys)}"
+    )
+    detailed, errors = jira.issues_individually(
+        history_keys,
+        fields,
+        max_workers=JIRA_LINK_WORKERS,
+        progress_label="Jira: changelog багов",
+        expand="changelog",
+    )
+    if errors or len(detailed) != len(set(history_keys)):
+        missing = sorted(set(history_keys) - set(detailed))
+        details = "; ".join(
+            f"{key}: {errors.get(key, 'пустой ответ Jira')}"
+            for key in missing[:5]
+        )
+        raise RuntimeError(
+            "Jira не вернула changelog всех допустимых High+ багов; "
+            f"публикация остановлена. {details}"
+        )
+
+    detailed_with_stage_history = {
+        key: with_detection_stage_history(issue, detection_stage_field_id)
+        for key, issue in detailed.items()
+    }
+
+    # Old Jira Server/DC versions expose only a limited changelog window in
+    # REST and do not implement /issue/{key}/changelog at all. For unresolved
+    # bugs with a truncated REST history, the standard full History tab is the
+    # only API-accessible source for older custom-field values.
+    html_history_keys: list[str] = []
+    for key, issue in detailed.items():
+        metric_issue = detailed_with_stage_history[key]
+        if classify_eligible_detection_stage(
+            issue_field(metric_issue, detection_stage_field_id),
+            rules,
+        ) is not None:
+            continue
+        changelog = issue.get("changelog")
+        histories = changelog.get("histories") if isinstance(changelog, Mapping) else None
+        if not isinstance(histories, list):
+            html_history_keys.append(key)
+            continue
+        total = int(changelog.get("total") or len(histories))
+        if "total" not in changelog or total > len(histories):
+            html_history_keys.append(key)
+
+    execution_log(
+        "Jira: REST-история не содержит ПСИ/ПРОМ и обрезана для "
+        f"{len(html_history_keys)} багов; проверяю полную вкладку History"
+    )
+    html_history_errors: dict[str, str] = {}
+    html_history_found = 0
+    previous_request_started = 0.0
+    for index, key in enumerate(html_history_keys, start=1):
+        since_previous_start = (
+            time.perf_counter() - previous_request_started
+            if previous_request_started
+            else JIRA_ISSUE_REQUEST_INTERVAL_SECONDS
+        )
+        pacing_delay = max(
+            0.0,
+            JIRA_ISSUE_REQUEST_INTERVAL_SECONDS - since_previous_start,
+        )
+        if pacing_delay:
+            time.sleep(pacing_delay)
+        previous_request_started = time.perf_counter()
+        try:
+            history_html = jira.issue_history_html(key)
+            additional_values = detection_stage_values_from_history_html(
+                history_html,
+                rules,
+            )
+        except Exception as exc:
+            html_history_errors[key] = str(exc)
+        else:
+            if additional_values:
+                html_history_found += 1
+                detailed_with_stage_history[key] = with_detection_stage_history(
+                    detailed[key],
+                    detection_stage_field_id,
+                    additional_values,
+                )
+        if index % 10 == 0 or index == len(html_history_keys):
+            execution_log(
+                f"Jira: полная History: {index}/{len(html_history_keys)}, "
+                f"с найденным ПСИ/ПРОМ={html_history_found}, "
+                f"ошибок={len(html_history_errors)}"
+            )
+    if html_history_errors:
+        example_key = sorted(html_history_errors)[0]
+        execution_log(
+            "Jira: не удалось прочитать HTML History для "
+            f"{len(html_history_errors)} багов; продолжаю по доступной REST-истории. "
+            f"Пример {example_key}: {html_history_errors[example_key]}",
+            error=True,
+        )
+
+    result: list[dict[str, Any]] = []
+    for issue in candidates:
+        key = str(issue.get("key") or "").strip().upper()
+        result.append(detailed_with_stage_history.get(key, issue))
+
+    execution_log(
+        f"Jira: баги команд загружены={len(result)}, "
+        f"REST/HTML-история этапа обработана для="
+        f"{len(detailed_with_stage_history)} "
+        f"({elapsed_seconds(started)})"
+    )
+    return result, jql
+
+
+def issue_link_type_text(link: Mapping[str, Any]) -> str:
+    link_type = link.get("type")
+    if isinstance(link_type, Mapping):
+        # У разных Jira название связи встречается в name либо только в
+        # направлении inward/outward. Для consist-of учитываем все варианты.
+        values: list[str] = []
+        for key in ("name", "inward", "outward"):
+            values.extend(named_values(link_type.get(key)))
+        return " / ".join(dict.fromkeys(values))
+    return " / ".join(named_values(link_type))
+
+
+def release_linked_keys(
+    release: Mapping[str, Any],
+    link_keywords: Sequence[str],
+) -> set[str]:
+    keywords = normalized_set(link_keywords)
+    fields = release.get("fields")
+    if not isinstance(fields, Mapping):
+        return set()
+    links = fields.get("issuelinks") or []
+    result: set[str] = set()
+    if not isinstance(links, list):
+        return result
+    for link in links:
+        if not isinstance(link, Mapping):
+            continue
+        link_type_text = issue_link_type_text(link)
+        normalized_type = normalized(link_type_text)
+        if not any(keyword in normalized_type for keyword in keywords):
+            continue
+        for direction in ("outwardIssue", "inwardIssue"):
+            linked = link.get(direction)
+            if isinstance(linked, Mapping):
+                key = str(linked.get("key") or "").strip().upper()
+                if key:
+                    result.add(key)
+    return result
+
+
+def is_hotfix_release(
+    release: Mapping[str, Any],
+    release_type_field_id: str,
+    hotfix_values: Sequence[str],
+) -> bool:
+    """Return whether a Release 2.0 ticket represents a Hotfix."""
+
+    expected = normalized_set(hotfix_values)
+    actual_values = {
+        normalized(value)
+        for value in named_values(issue_field(release, release_type_field_id))
+    }
+    if actual_values & expected:
+        return True
+
+    # Старые Hotfix-релизы в HRPRELEASE встречаются без заполненного типа, но с
+    # маркером Hotfix в summary. Такой fallback уже использует dpm2.py.
+    summary = normalized(issue_field(release, "summary"))
+    return any(value and value in summary for value in expected)
+
+
+def release_is_installed_on_prom(
+    release: Mapping[str, Any],
+    allowed_statuses: Sequence[str] = DEFAULT_INSTALLED_RELEASE_STATUSES,
+) -> bool:
+    status = normalized(named_value(issue_field(release, "status")))
+    # Только точный allowlist: substring-проверка ошибочно принимала статусы
+    # вроде «Не установлен на ПРОМ» и «Будет установлен на ПРОМ».
+    return status in normalized_set(allowed_statuses)
+
+
+def collect_released_issues(
+    jira: JiraClient,
+    *,
+    start: date,
+    end: date,
+    release_project: str,
+    release_issue_type: str,
+    release_ke_field_name: str,
+    release_ke_ids: Sequence[int],
+    release_created_since: str,
+    release_date_field_id: str,
+    release_type_field_id: str,
+    detection_stage_field_id: str,
+    link_keywords: Sequence[str],
+    team_assignment_field_ids: Sequence[str] = (),
+    verbose: bool = False,
+    team_project_keys: Sequence[str] = (),
+    additional_release_projects: Sequence[str] = (),
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    str,
+    dict[str, set[str]],
+]:
+    collection_started = time.perf_counter()
+    configured_projects = {
+        str(project_key).strip().upper()
+        for project_key in team_project_keys
+        if str(project_key).strip()
+    }
+    release_fields = (
+        "summary",
+        "status",
+        release_date_field_id,
+        release_type_field_id,
+    )
+    release_jql = build_release_jql(
+        project=release_project,
+        additional_projects=additional_release_projects,
+        issue_type=release_issue_type,
+        ke_field_name=release_ke_field_name,
+        ke_ids=release_ke_ids,
+        created_since=release_created_since,
+    )
+    if verbose:
+        print(f"JQL релизов Release 2.0: {release_jql}")
+    release_search_started = time.perf_counter()
+    execution_log(
+        "Jira: поиск всех Release 2.0 в проектах "
+        f"{', '.join((release_project, *additional_release_projects))} "
+        f"для диапазона {start.isoformat()} — "
+        f"{(end - timedelta(days=1)).isoformat()}"
+    )
+    release_candidates = jira.search(
+        release_jql,
+        release_fields,
+        page_size=1000,
+    )
+    execution_log(
+        f"Jira: найдено кандидатов релизов={len(release_candidates)} "
+        f"({elapsed_seconds(release_search_started)})"
+    )
+
+    releases_with_install_date = [
+        release
+        for release in release_candidates
+        if parse_jira_date(issue_field(release, release_date_field_id)) is not None
+    ]
+    if release_candidates and not releases_with_install_date:
+        raise RuntimeError(
+            f"Jira вернула {len(release_candidates)} кандидатов релизов, "
+            f"но поле даты {release_date_field_id} пусто у всех. "
+            "Проверьте config['jira']['fields']['prod_installed_date_id']; "
+            f"для текущей Jira ожидается {DEFAULT_RELEASE_DATE_FIELD_ID}."
+        )
+
+    range_releases = [
+        release
+        for release in releases_with_install_date
+        if (
+            (installed := parse_jira_date(issue_field(release, release_date_field_id)))
+            is not None
+            and start <= installed < end
+        )
+    ]
+    releases = [
+        release
+        for release in range_releases
+        if release_is_installed_on_prom(release)
+    ]
+    execution_log(
+        f"Jira: в диапазоне={len(range_releases)}, "
+        f"в статусе «Установлен на ПРОМ»={len(releases)}"
+    )
+    if verbose:
+        print(
+            f"Jira вернула релизов: {len(release_candidates)}; "
+            f"с датой установки: {len(releases_with_install_date)}; "
+            f"в объединённом диапазоне: {len(range_releases)}; "
+            f"в статусе «Установлен на ПРОМ»: {len(releases)}"
+        )
+        status_counts = Counter(
+            named_value(issue_field(release, "status")) or "Без статуса"
+            for release in range_releases
+        )
+        if status_counts:
+            print("Статусы релизов объединённого диапазона:")
+            for status_name, count in status_counts.most_common():
+                print(f"  {status_name}: {count}")
+
+    issue_fields = (
+        "summary",
+        "project",
+        "issuetype",
+        "status",
+        "created",
+        "resolutiondate",
+        "priority",
+        detection_stage_field_id,
+        *team_assignment_field_ids,
+    )
+    issues_by_key: dict[str, dict[str, Any]] = {}
+    all_linked_keys: set[str] = set()
+    failed_releases: list[str] = []
+    link_types: Counter[str] = Counter()
+    issue_keys_by_release: dict[str, set[str]] = {}
+    release_keys = sorted(
+        {
+            str(release.get("key") or "").strip().upper()
+            for release in releases
+            if str(release.get("key") or "").strip()
+        }
+    )
+    # Jira Search на практике может вернуть урезанный issuelinks даже при
+    # явном fields=issuelinks. Как и release_checker.py, источником истины
+    # оставляем последовательный GET /issue/{key} через одну Session.
+    release_links_started = time.perf_counter()
+    execution_log(
+        f"Jira: загружаю точный consist-of для {len(release_keys)} релизов, "
+        f"параллельность={JIRA_LINK_WORKERS}, "
+        f"интервал GET≥{JIRA_ISSUE_REQUEST_INTERVAL_SECONDS:.2f} с"
+    )
+    release_details_by_key, release_errors = jira.issues_individually(
+        release_keys,
+        ("issuelinks",),
+        max_workers=JIRA_LINK_WORKERS,
+        progress_label="Jira: связи релизов",
+    )
+    incomplete_release_keys = [
+        key
+        for key, release in release_details_by_key.items()
+        if (
+            not isinstance(release.get("fields"), Mapping)
+            or "issuelinks" not in release["fields"]
+        )
+    ]
+    for key in incomplete_release_keys:
+        release_details_by_key.pop(key, None)
+        release_errors[key] = "в ответе отсутствует fields.issuelinks"
+
+    retry_release_keys = sorted(
+        set(release_keys) - set(release_details_by_key)
+    )
+    if retry_release_keys:
+        rate_limited = any(
+            "429" in release_errors.get(key, "")
+            for key in retry_release_keys
+        )
+        if rate_limited:
+            execution_log(
+                f"Jira: rate limit затронул {len(retry_release_keys)} релизов; "
+                f"жду {JIRA_RATE_LIMIT_RECOVERY_SECONDS} с перед recovery",
+                error=True,
+            )
+            time.sleep(JIRA_RATE_LIMIT_RECOVERY_SECONDS)
+        else:
+            execution_log(
+                f"Jira: повторно загружаю связи {len(retry_release_keys)} релизов "
+                "через последовательный recovery"
+            )
+
+        recovered_releases, recovery_errors = jira.issues_individually(
+            retry_release_keys,
+            ("issuelinks",),
+            max_workers=1,
+            progress_label="Jira: recovery связей",
+        )
+        incomplete_recovery_keys = [
+            key
+            for key, release in recovered_releases.items()
+            if (
+                not isinstance(release.get("fields"), Mapping)
+                or "issuelinks" not in release["fields"]
+            )
+        ]
+        for key in incomplete_recovery_keys:
+            recovered_releases.pop(key, None)
+            recovery_errors[key] = "в ответе отсутствует fields.issuelinks"
+        release_details_by_key.update(recovered_releases)
+        for key in recovered_releases:
+            release_errors.pop(key, None)
+        for key, error in recovery_errors.items():
+            release_errors[key] = error
+
+    failed_releases.extend(
+        sorted(set(release_keys) - set(release_details_by_key))
+    )
+
+    for index, release in enumerate(releases, start=1):
+        release_key = str(release.get("key") or "").strip().upper()
+        if not release_key:
+            continue
+        full_release = release_details_by_key.get(release_key)
+        if full_release is None:
+            issue_keys_by_release[release_key] = set()
+            if verbose:
+                print(
+                    f"Не удалось получить связи {release_key}: "
+                    f"{release_errors.get(release_key, 'пустой ответ Jira')}",
+                    file=sys.stderr,
+                )
+            continue
+
+        linked_keys = release_linked_keys(full_release, link_keywords)
+        if configured_projects:
+            linked_keys = {
+                key
+                for key in linked_keys
+                if key.partition("-")[0] in configured_projects
+            }
+        issue_keys_by_release[release_key] = set(linked_keys)
+        all_linked_keys.update(linked_keys)
+
+        if verbose:
+            links = issue_field(full_release, "issuelinks") or []
+            if isinstance(links, list):
+                for link in links:
+                    if isinstance(link, Mapping):
+                        link_types[issue_link_type_text(link) or "без названия"] += 1
+
+        if verbose and (index % 10 == 0 or index == len(releases)):
+            print(
+                f"Обработано релизов: {index}/{len(releases)}; "
+                f"последний {release_key}: consist-of задач={len(linked_keys)}"
+            )
+
+    if failed_releases:
+        details = "; ".join(
+            f"{key}: {release_errors.get(key, 'пустой ответ Jira')}"
+            for key in failed_releases[:5]
+        )
+        suffix = (
+            f"; ещё {len(failed_releases) - 5}"
+            if len(failed_releases) > 5
+            else ""
+        )
+        raise RuntimeError(
+            "Jira не вернула полный состав установленных релизов; "
+            "публикация остановлена. "
+            f"{details}{suffix}"
+        )
+    relevant_release_keys = {
+        release_key
+        for release_key, linked_keys in issue_keys_by_release.items()
+        if linked_keys
+    }
+    releases = [
+        release
+        for release in releases
+        if str(release.get("key") or "").strip().upper()
+        in relevant_release_keys
+    ]
+    execution_log(
+        f"Jira: связи релизов загружены, релизов с задачами команд="
+        f"{len(releases)}, "
+        f"уникальных consist-of ключей={len(all_linked_keys)} "
+        f"({elapsed_seconds(release_links_started)})"
+    )
+
+    # Сначала загружаем абсолютно весь состав consist of без фильтра типа,
+    # проекта, статуса, приоритета или этапа обнаружения. Все
+    # бизнес-фильтры применяются только позже в aggregate_issues().
+    issue_load_started = time.perf_counter()
+    execution_log(
+        f"Jira: загружаю {len(all_linked_keys)} уникальных задач состава "
+        f"пакетами по {JIRA_KEY_BATCH_SIZE}"
+    )
+    issues_by_key = jira.issues_by_keys(
+        all_linked_keys,
+        issue_fields,
+        progress_label="Jira: задачи состава",
+    )
+    initially_missing_keys = sorted(all_linked_keys - set(issues_by_key))
+    if initially_missing_keys:
+        execution_log(
+            f"Jira: пакетный поиск не вернул {len(initially_missing_keys)} задач; "
+            "запускаю точный GET fallback"
+        )
+    fallback_issues, issue_errors = jira.issues_individually(
+        initially_missing_keys,
+        issue_fields,
+        max_workers=JIRA_LINK_WORKERS,
+        progress_label="Jira: fallback задач",
+    )
+    issues_by_key.update(fallback_issues)
+    inaccessible_keys = sorted(
+        set(initially_missing_keys) - set(fallback_issues)
+    )
+
+    if inaccessible_keys:
+        details = "; ".join(
+            f"{key}: {issue_errors.get(key, 'пустой ответ Jira')}"
+            for key in inaccessible_keys[:5]
+        )
+        suffix = (
+            f"; ещё {len(inaccessible_keys) - 5}"
+            if len(inaccessible_keys) > 5
+            else ""
+        )
+        raise RuntimeError(
+            "Jira не вернула все задачи из consist of; "
+            "публикация остановлена. "
+            f"{details}{suffix}"
+        )
+    execution_log(
+        f"Jira: задачи состава загружены={len(issues_by_key)} "
+        f"({elapsed_seconds(issue_load_started)}); "
+        f"весь сбор={elapsed_seconds(collection_started)}"
+    )
+
+    if verbose:
+        issue_batch_requests = (
+            (len(all_linked_keys) + JIRA_KEY_BATCH_SIZE - 1)
+            // JIRA_KEY_BATCH_SIZE
+            if all_linked_keys
+            else 0
+        )
+        print(
+            f"Полный состав consist of: релизов={len(releases)}, "
+            f"ошибок={len(failed_releases)}, "
+            f"уникальных ключей={len(all_linked_keys)}, "
+            f"загружено задач без фильтров={len(issues_by_key)}, "
+            f"недоступно в Jira={len(inaccessible_keys)}"
+        )
+        print(
+            "Jira-запросы состава: "
+            f"точные GET релизов={len(release_keys)} "
+            f"(параллельность≤{JIRA_LINK_WORKERS}), "
+            f"пакеты задач≈{issue_batch_requests}, "
+            f"GET fallback задач={len(initially_missing_keys)}"
+        )
+        if link_types:
+            print("Типы связей релизов:")
+            for label, count in link_types.most_common():
+                print(f"  {label}: {count}")
+
+    return releases, list(issues_by_key.values()), release_jql, issue_keys_by_release
+
+
+def select_period_data(
+    releases: Sequence[Mapping[str, Any]],
+    issues: Sequence[Mapping[str, Any]],
+    issue_keys_by_release: Mapping[str, set[str]],
+    *,
+    start: date,
+    end: date,
+    release_date_field_id: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    period_releases: list[dict[str, Any]] = []
+    period_issue_keys: set[str] = set()
+
+    for release in releases:
+        installed = parse_jira_date(issue_field(release, release_date_field_id))
+        if installed is None or not (start <= installed < end):
+            continue
+        if not isinstance(release, dict):
+            continue
+        period_releases.append(release)
+        release_key = str(release.get("key") or "").strip().upper()
+        period_issue_keys.update(issue_keys_by_release.get(release_key, set()))
+
+    period_issues = [
+        issue
+        for issue in issues
+        if str(issue.get("key") or "").strip().upper() in period_issue_keys
+    ]
+    return period_releases, period_issues
+
+
+def select_released_stories(
+    issues: Sequence[Mapping[str, Any]],
+    rules: MetricRules,
+) -> list[dict[str, Any]]:
+    """Select Story candidates; the linked release date defines the period."""
+
+    return [
+        issue
+        for issue in issues
+        if isinstance(issue, dict)
+        and normalized(named_value(issue_field(issue, "issuetype")))
+        in rules.story_types
+    ]
+
+
+def select_created_issues(
+    issues: Sequence[Mapping[str, Any]],
+    *,
+    start: date,
+    end: date,
+) -> list[dict[str, Any]]:
+    return [
+        issue
+        for issue in issues
+        if isinstance(issue, dict)
+        and (
+            (created := parse_jira_date(issue_field(issue, "created")))
+            is not None
+            and start <= created < end
+        )
+    ]
+
+
+def print_issue_inventory(issues: Sequence[Mapping[str, Any]]) -> None:
+    """Print raw Story/Bug distribution before metric filters."""
+
+    inventory: dict[str, Counter[tuple[str, str]]] = defaultdict(Counter)
+    for issue in issues:
+        project_key = issue_project_key(issue) or "БЕЗ ПРОЕКТА"
+        issue_type = named_value(issue_field(issue, "issuetype")) or "Без типа"
+        status = named_value(issue_field(issue, "status")) or "Без статуса"
+        inventory[project_key][(issue_type, status)] += 1
+
+    print("Состав релизов до фильтров метрики:")
+    if not inventory:
+        print("  задач не загружено")
+        return
+    for project_key in sorted(inventory):
+        total = sum(inventory[project_key].values())
+        details = "; ".join(
+            f"{issue_type}/{status}={count}"
+            for (issue_type, status), count in inventory[project_key].most_common()
+        )
+        print(f"  {project_key}: всего={total}; {details}")
+
+
+def print_filter_audit(
+    team_specs: Sequence[TeamSpec],
+    issues: Sequence[Mapping[str, Any]],
+    rules: MetricRules,
+    detection_stage_field_id: str,
+    team_assignment_field_ids: Sequence[str] = (),
+) -> None:
+    """Explain how Story/Bug candidates pass through metric filters."""
+
+    project_to_team = {
+        project_key: spec.team for spec in team_specs for project_key in spec.project_keys
+    }
+    audit: dict[str, Counter[str]] = {
+        spec.team: Counter() for spec in team_specs
+    }
+    rejected_values: dict[str, dict[str, Counter[str]]] = {
+        spec.team: {
+            "story_status": Counter(),
+            "bug_status": Counter(),
+            "bug_priority": Counter(),
+            "bug_detection_stage": Counter(),
+        }
+        for spec in team_specs
+    }
+    outside_projects: Counter[str] = Counter()
+    outside_assignment: Counter[str] = Counter()
+
+    for issue in issues:
+        project_key = issue_project_key(issue) or "БЕЗ ПРОЕКТА"
+        team = issue_assignment_team(issue, team_specs, team_assignment_field_ids)
+        if team == "":
+            outside_assignment[project_key] += 1
+            continue
+        if team is None:
+            team = project_to_team.get(project_key)
+        if team is None:
+            outside_projects[project_key] += 1
+            continue
+
+        issue_type = normalized(named_value(issue_field(issue, "issuetype")))
+        raw_status = issue_field(issue, "status")
+        status_name = named_value(raw_status) or "Без статуса"
+        if issue_type in rules.story_types:
+            audit[team]["story_total"] += 1
+            if story_has_done_status(raw_status, rules):
+                audit[team]["story_done"] += 1
+            else:
+                rejected_values[team]["story_status"][status_name] += 1
+            continue
+
+        if issue_type not in rules.bug_types:
+            continue
+        audit[team]["bug_total"] += 1
+        if not bug_has_eligible_status(raw_status, rules):
+            rejected_values[team]["bug_status"][status_name] += 1
+            continue
+        audit[team]["bug_status_eligible"] += 1
+
+        priority_name = named_value(issue_field(issue, "priority")) or "Без приоритета"
+        if normalized(priority_name) not in rules.bug_priorities:
+            rejected_values[team]["bug_priority"][priority_name] += 1
+            continue
+        audit[team]["bug_high_plus"] += 1
+
+        stage_values = named_values(issue_field(issue, detection_stage_field_id))
+        stage_name = ", ".join(stage_values) or "Без этапа обнаружения в истории"
+        initial_stage_values = named_values(
+            issue_field(issue, METRIC_INITIAL_DETECTION_STAGE_FIELD)
+        )
+        current_stage_values = named_values(
+            issue_field(issue, METRIC_CURRENT_DETECTION_STAGE_FIELD)
+        )
+        if initial_stage_values and current_stage_values:
+            initial_stage_name = ", ".join(initial_stage_values)
+            current_stage_name = ", ".join(current_stage_values)
+            if normalized(initial_stage_name) != normalized(current_stage_name):
+                audit[team]["bug_stage_changed"] += 1
+                stage_name = (
+                    f"история: {stage_name}; "
+                    f"первый={initial_stage_name}; сейчас={current_stage_name}"
+                )
+        if classify_eligible_detection_stage(
+            issue_field(issue, detection_stage_field_id),
+            rules,
+        ) is None:
+            rejected_values[team]["bug_detection_stage"][stage_name] += 1
+            continue
+        audit[team]["bug_eligible"] += 1
+
+    print("Аудит фильтров метрики:")
+    for spec in team_specs:
+        values = audit[spec.team]
+        print(
+            f"  {spec.team}: "
+            f"Story всего={values['story_total']}, Done={values['story_done']}; "
+            f"Bug всего={values['bug_total']}, "
+            f"статус допустим={values['bug_status_eligible']}, "
+            f"High+={values['bug_high_plus']}, PSI/ПРОМ={values['bug_eligible']}; "
+            f"этап менялся={values['bug_stage_changed']}"
+        )
+        details: list[str] = []
+        for field_name, label in (
+            ("story_status", "Story-статусы"),
+            ("bug_status", "исключённые Bug-статусы"),
+            ("bug_priority", "приоритеты"),
+            ("bug_detection_stage", "этапы обнаружения"),
+        ):
+            counter = rejected_values[spec.team][field_name]
+            if counter:
+                rendered = ", ".join(
+                    f"{value}={count}" for value, count in counter.most_common()
+                )
+                details.append(f"{label}: {rendered}")
+        if details:
+            print("    Отсев — " + "; ".join(details))
+
+    if outside_projects:
+        rendered = ", ".join(
+            f"{project_key}={count}"
+            for project_key, count in outside_projects.most_common()
+        )
+        print("  Вне настроенных команд: " + rendered)
+    if outside_assignment:
+        rendered = ", ".join(
+            f"{project_key}={count}"
+            for project_key, count in outside_assignment.most_common()
+        )
+        print("  Вне выбранной команды по полю команды/сквада: " + rendered)
+
+
+def decimal_text(value: Decimal, places: int = 3) -> str:
+    quantizer = Decimal(1).scaleb(-places)
+    return format(value.quantize(quantizer), "f").replace(".", ",")
+
+
+def ratio_text(value: Optional[Decimal], bugs: int, stories: int) -> str:
+    if value is None:
+        return "—"
+    return f"{decimal_text(value, 2)} ({decimal_text(value * 100, 1)}%)"
+
+
+def target_text(value: Decimal) -> str:
+    return f"{decimal_text(value, 2)} ({decimal_text(value * 100, 0)}%)"
+
+
+def target_formula_text(metric: TeamMetric) -> str:
+    if metric.as_is_ratio is None or metric.minimum_target_ratio is None:
+        return (
+            f"AS IS — · цель {decimal_text(metric.calculated_target_ratio, 3)}"
+        )
+    return (
+        f"AS IS {decimal_text(metric.as_is_ratio, 3)} · "
+        f"цель {decimal_text(metric.calculated_target_ratio, 3)} · "
+        f"80% AS IS {decimal_text(metric.minimum_target_ratio, 3)}"
+    )
+
+
+def as_is_floor_applied(metric: TeamMetric) -> bool:
+    return (
+        metric.minimum_target_ratio is not None
+        and metric.calculated_target_ratio < metric.minimum_target_ratio
+    )
+
+
+def attainment_text(metric: TeamMetric) -> str:
+    if metric.infinite_attainment:
+        return "∞"
+    if metric.target_attainment_percent is None:
+        return "—"
+    return f"{decimal_text(metric.target_attainment_percent, 1)}%"
+
+
+def period_forecast_factor(start: date, end: date, as_of: date) -> Decimal:
+    total_days = max(1, (end - start).days)
+    if as_of < start:
+        return Decimal(0)
+    elapsed_days = min(total_days, (as_of - start).days + 1)
+    return Decimal(total_days) / Decimal(max(1, elapsed_days))
+
+
+def projected_count(value: int, factor: Decimal) -> int:
+    if factor <= 0:
+        return 0
+    return int((Decimal(value) * factor).to_integral_value(rounding=ROUND_HALF_UP))
+
+
+def forecast_metric(metrics: Sequence[TeamMetric], start: date, end: date, as_of: date) -> MetricForecast:
+    factor = period_forecast_factor(start, end, as_of)
+    projected_stories = sum(projected_count(metric.stories, factor) for metric in metrics)
+    projected_bugs = sum(projected_count(metric.bugs, factor) for metric in metrics)
+
+    if projected_stories > 0:
+        projected_ratio = (Decimal(projected_bugs) / Decimal(projected_stories)).quantize(
+            Decimal("0.01"),
+            rounding=ROUND_HALF_UP,
+        )
+    else:
+        projected_ratio = None
+
+    weighted_target_numerator = sum(
+        Decimal(projected_count(metric.stories, factor)) * metric.target_ratio
+        for metric in metrics
+    )
+    projected_target = (
+        weighted_target_numerator / Decimal(projected_stories)
+        if projected_stories > 0
+        else None
+    )
+
+    if projected_ratio is None or projected_ratio == 0:
+        projected_attainment = Decimal(100)
+    elif projected_target is None:
+        projected_attainment = None
+    else:
+        projected_attainment = (projected_target / projected_ratio) * Decimal(100)
+
+    forecasted_team_states = 0
+    for metric in metrics:
+        team_stories = projected_count(metric.stories, factor)
+        team_bugs = projected_count(metric.bugs, factor)
+        if team_stories == 0 or team_bugs == 0:
+            forecasted_team_states += 1
+            continue
+        team_ratio = (Decimal(team_bugs) / Decimal(team_stories)).quantize(
+            Decimal("0.01"),
+            rounding=ROUND_HALF_UP,
+        )
+        if team_ratio <= metric.target_ratio:
+            forecasted_team_states += 1
+
+    return MetricForecast(
+        projected_stories=projected_stories,
+        projected_bugs=projected_bugs,
+        projected_ratio=projected_ratio,
+        projected_attainment_percent=projected_attainment,
+        teams_on_target=forecasted_team_states,
+        team_count=len(metrics),
+        factor=factor,
+    )
+
+
+def forecast_text(forecast: MetricForecast) -> str:
+    return (
+        f"Прогноз метрики качества: Story≈{forecast.projected_stories}; "
+        f"баги≈{forecast.projected_bugs}; "
+        f"факт≈{ratio_text(forecast.projected_ratio, forecast.projected_bugs, forecast.projected_stories)}; "
+        f"выполнение≈{decimal_text(forecast.projected_attainment_percent, 1) if forecast.projected_attainment_percent is not None else '—'}%; "
+        f"цель выполнят {forecast.teams_on_target} из {forecast.team_count} команд"
+    )
+
+
+def render_console(metrics: Sequence[TeamMetric]) -> str:
+    headers = (
+        "Команда",
+        "Jira",
+        "AS IS",
+        "Цель 2026",
+        "Коэф. лимита",
+        "Story",
+        "Баги",
+        "PSI",
+        "ПРОМ",
+        "Факт",
+        "Цель, %",
+        "Ещё ПРОМ-багов",
+        "Story до цели",
+    )
+    rows = [
+        (
+            metric.team,
+            ",".join(metric.project_keys),
+            (
+                decimal_text(metric.as_is_ratio, 2)
+                if metric.as_is_ratio is not None
+                else "—"
+            ),
+            decimal_text(metric.calculated_target_ratio, 2),
+            decimal_text(metric.defect_limit_ratio, 2),
+            str(metric.stories),
+            str(metric.bugs),
+            str(metric.psi_bugs),
+            str(metric.prom_bugs),
+            ratio_text(metric.actual_ratio, metric.bugs, metric.stories),
+            attainment_text(metric),
+            str(metric.additional_bugs_allowed),
+            str(metric.additional_stories_required),
+        )
+        for metric in metrics
+    ]
+    widths = [
+        max(len(headers[index]), *(len(row[index]) for row in rows))
+        for index in range(len(headers))
+    ]
+
+    def render_row(row: Sequence[str]) -> str:
+        return " | ".join(value.ljust(widths[index]) for index, value in enumerate(row))
+
+    separator = "-+-".join("-" * width for width in widths)
+    return "\n".join((render_row(headers), separator, *(render_row(row) for row in rows)))
+
+
+def state_cell_style(metric: TeamMetric) -> str:
+    if metric.state == "Цель выполнена":
+        return "background-color:#E3FCEF;color:#006644;"
+    if metric.state == "Ниже цели":
+        return "background-color:#FFEBE6;color:#BF2600;"
+    return "background-color:#F4F5F7;color:#5E6C84;"
+
+
+def state_badge(metric: TeamMetric) -> str:
+    if metric.state == "Цель выполнена":
+        icon = "✓"
+    elif metric.state == "Ниже цели":
+        icon = "!"
+    else:
+        icon = "·"
+    return (
+        f'<span style="{state_cell_style(metric)}border-radius:12px;display:inline-block;'
+        f'font-weight:bold;padding:4px 9px;">{icon} {html.escape(metric.state)}</span>'
+    )
+
+
+def attainment_visual(metric: TeamMetric) -> str:
+    if metric.infinite_attainment:
+        percent_for_bar = 100
+        color = "#00A3BF"
+    elif metric.target_attainment_percent is None:
+        percent_for_bar = 0
+        color = "#B3BAC5"
+    else:
+        percent_for_bar = max(
+            0,
+            min(100, int(metric.target_attainment_percent)),
+        )
+        color = "#36B37E" if metric.target_attainment_percent >= 100 else "#FF5630"
+    return (
+        f'<div style="font-weight:bold;color:#172B4D;">{html.escape(attainment_text(metric))}</div>'
+        '<div style="background-color:#DFE1E6;border-radius:4px;height:6px;'
+        'margin-top:5px;min-width:78px;">'
+        f'<div style="background-color:{color};border-radius:4px;height:6px;'
+        f'width:{percent_for_bar}%;">&#160;</div></div>'
+    )
+
+
+def summary_card(
+    label: str,
+    value: str,
+    subtitle: str,
+    accent: str,
+) -> str:
+    return (
+        '<td style="background-color:#FFFFFF;border:6px solid #F4F5F7;'
+        f'border-top:4px solid {accent};padding:12px 14px;text-align:left;'
+        'vertical-align:top;width:25%;">'
+        f'<div style="color:{accent};font-size:10px;font-weight:bold;'
+        f'letter-spacing:.04em;text-transform:uppercase;">{html.escape(label)}</div>'
+        '<div style="color:#172B4D;font-size:22px;font-weight:bold;'
+        f'margin-top:3px;">{html.escape(value)}</div>'
+        '<div style="color:#6B778C;font-size:10px;margin-top:2px;">'
+        f'{html.escape(subtitle)}</div></td>'
+    )
+
+
+def bug_count_text(count: int) -> str:
+    last_two = count % 100
+    last = count % 10
+    if 11 <= last_two <= 14:
+        noun = "багов"
+    elif last == 1:
+        noun = "баг"
+    elif 2 <= last <= 4:
+        noun = "бага"
+    else:
+        noun = "багов"
+    return f"{count} {noun}"
+
+
+def metric_action_html(metric: TeamMetric) -> str:
+    if metric.additional_stories_required > 0:
+        return (
+            '<div style="color:#BF2600;font-size:14px;font-weight:bold;">'
+            f'+{metric.additional_stories_required} Story</div>'
+            '<div style="color:#6B778C;font-size:10px;margin-top:2px;">'
+            'нужно до цели</div>'
+        )
+    if metric.additional_bugs_allowed > 0:
+        return (
+            '<div style="color:#006644;font-size:14px;font-weight:bold;">'
+            f'Ещё {bug_count_text(metric.additional_bugs_allowed)}</div>'
+            '<div style="color:#6B778C;font-size:10px;margin-top:2px;">'
+            'до лимита</div>'
+        )
+    if metric.stories == 0:
+        return (
+            '<div style="color:#006644;font-weight:bold;">✓ Цель выполнена</div>'
+            '<div style="color:#6B778C;font-size:10px;margin-top:2px;">нет Story</div>'
+        )
+    return (
+        '<div style="color:#006644;font-weight:bold;">✓ Цель выполнена</div>'
+        '<div style="color:#6B778C;font-size:10px;margin-top:2px;">запас исчерпан</div>'
+    )
+
+
+def render_metric_section_html(
+    metrics: Sequence[TeamMetric],
+    *,
+    title: str,
+    start: date,
+    end: date,
+    release_count: int,
+    hotfix_count: int,
+    accent: str,
+) -> str:
+    planned_release_count = max(0, release_count - hotfix_count)
+    story_count = sum(metric.stories for metric in metrics)
+    bug_count = sum(metric.bugs for metric in metrics)
+    psi_bug_count = sum(metric.psi_bugs for metric in metrics)
+    prom_bug_count = sum(metric.prom_bugs for metric in metrics)
+    teams_on_target = sum(metric.state == "Цель выполнена" for metric in metrics)
+    period = (
+        f"{start.strftime('%d.%m')}–"
+        f"{(end - timedelta(days=1)).strftime('%d.%m.%Y')}"
+    )
+
+    parts = [
+        '<div style="border-bottom:2px solid #DFE1E6;margin:22px 0 10px;'
+        'padding:0 2px 10px;">',
+        f'<span style="color:{accent};font-size:20px;font-weight:bold;">'
+        f'{html.escape(title)}</span>',
+        '<span style="color:#6B778C;font-size:12px;margin-left:10px;">'
+        f'{html.escape(period)}</span>',
+        f'<span style="background-color:{"#E3FCEF" if teams_on_target == len(metrics) else "#FFF0B3"};'
+        'border-radius:12px;color:#172B4D;float:right;font-size:11px;'
+        f'font-weight:bold;padding:4px 9px;">В цели {teams_on_target}/{len(metrics)}</span>',
+        "</div>",
+        '<table style="background-color:#F4F5F7;border-collapse:separate;'
+        'border-spacing:0;margin:0 0 10px 0;'
+        'table-layout:fixed;width:100%;"><tbody><tr>',
+        summary_card(
+            "Релизы",
+            str(release_count),
+            f"плановые {planned_release_count} · hotfix {hotfix_count}",
+            "#6554C0",
+        ),
+        summary_card("Story", str(story_count), "Done из consist of", "#00875A"),
+        summary_card(
+            "Баги",
+            str(bug_count),
+            f"PSI {psi_bug_count} · ПРОМ {prom_bug_count}",
+            "#DE350B",
+        ),
+        summary_card(
+            "Команды в цели",
+            f"{teams_on_target}/{len(metrics)}",
+            "выполнение 100% и выше",
+            "#0052CC",
+        ),
+        "</tr></tbody></table>",
+        '<div style="background-color:#F4F5F7;border-radius:6px;color:#5E6C84;'
+        'font-size:11px;margin-bottom:10px;padding:8px 11px;">'
+        '<strong style="color:#172B4D;">Как читать:</strong> факт = баги / Story. '
+        'Чем меньше факт и выше выполнение, тем лучше. Зелёный — цель выполнена; '
+        'красный — нужны дополнительные Story.',
+        "</div>",
+        '<table class="confluenceTable" style="border-collapse:collapse;'
+        'border:1px solid #C1C7D0;font-size:12px;table-layout:fixed;'
+        'width:100%;"><thead><tr>',
+    ]
+    headers = (
+        "Команда",
+        "Цель 2026",
+        "Story",
+        "Баги",
+        "Факт",
+        "Выполнение",
+        "Что дальше",
+    )
+    for header in headers:
+        parts.append(
+            '<th style="background-color:#172B4D;border:1px solid #344563;'
+            'color:#FFFFFF;font-size:11px;font-weight:bold;padding:9px 8px;'
+            'text-align:center;vertical-align:middle;">'
+            f'<span style="color:#FFFFFF;font-weight:bold;">'
+            f"{html.escape(header)}</span></th>"
+        )
+    parts.append("</tr></thead><tbody>")
+
+    for index, metric in enumerate(metrics):
+        row_background = "#FFFFFF" if index % 2 == 0 else "#F7F9FC"
+        base_cell = (
+            f"background-color:{row_background};border:1px solid #DFE1E6;"
+            "padding:10px 8px;text-align:center;vertical-align:middle;"
+        )
+        state_accent = "#36B37E" if metric.state == "Цель выполнена" else "#FF5630"
+        parts.append(
+            f'<tr><td style="{base_cell}border-left:4px solid {state_accent};'
+            f'color:#172B4D;font-weight:bold;text-align:left;">{html.escape(metric.team)}'
+            '<div style="color:#6B778C;font-size:10px;font-weight:normal;margin-top:3px;">'
+            f'{html.escape(", ".join(metric.project_keys))}</div></td>'
+        )
+        parts.append(
+            f'<td style="{base_cell}color:#403294;font-size:14px;font-weight:bold;">'
+            f'{html.escape(decimal_text(metric.target_ratio * 100, 0))}%</td>'
+        )
+        parts.append(
+            f'<td style="{base_cell}color:#172B4D;font-size:16px;'
+            f'font-weight:bold;">{metric.stories}</td>'
+        )
+        parts.append(
+            f'<td style="{base_cell}color:#BF2600;font-size:16px;'
+            f'font-weight:bold;">{metric.bugs}'
+            '<div style="color:#6B778C;font-size:10px;font-weight:normal;margin-top:3px;">'
+            f'PSI {metric.psi_bugs} · ПРОМ {metric.prom_bugs}</div></td>'
+        )
+        ratio_background = "#E3FCEF" if metric.state == "Цель выполнена" else "#FFEBE6"
+        ratio_color = "#006644" if metric.state == "Цель выполнена" else "#BF2600"
+        parts.append(
+            f'<td style="{base_cell}background-color:{ratio_background};'
+            f'color:{ratio_color};font-size:14px;font-weight:bold;">'
+            f'{html.escape(decimal_text(metric.actual_ratio * 100, 1) + "%" if metric.actual_ratio is not None else "—")}'
+            '<div style="font-size:10px;font-weight:normal;margin-top:3px;">'
+            f'{html.escape(decimal_text(metric.actual_ratio, 2) if metric.actual_ratio is not None else "")}</div></td>'
+        )
+        parts.append(f'<td style="{base_cell}">{attainment_visual(metric)}</td>')
+        parts.append(
+            f'<td style="{base_cell}">{metric_action_html(metric)}</td>'
+        )
+        parts.append("</tr>")
+
+    parts.append("</tbody></table>")
+    return "".join(parts)
+
+
+def render_hidden_issue_details(
+    *,
+    rolling_metrics: Sequence[TeamMetric],
+    quarter_metrics: Sequence[TeamMetric],
+    rolling_start: date,
+    rolling_end: date,
+    quarter_start: date,
+    quarter_end: date,
+    quarter: int,
+    generated_at: datetime,
+) -> str:
+    """Render a collapsed, copy-friendly audit of every counted issue key."""
+
+    lines = [
+        "ТЕХНИЧЕСКАЯ ДЕТАЛИЗАЦИЯ МЕТРИКИ",
+        f"Сформировано: {generated_at.isoformat(timespec='seconds')}",
+        "",
+        "Правила:",
+        "- Story: текущий статус Done, связь consist of с релизом, "
+        "установленным на ПРОМ в периоде.",
+        "- Bug: создан в периоде в пространстве команды, любой статус, кроме "
+        "«Отклонен исполнителем», приоритет High+ и этап обнаружения PSI/ПРОМ "
+        "в текущем значении или истории.",
+        "- Причина пропуска «Ошибка была известна в релизе» не исключает Bug.",
+        "- Факт = Bug / Story; выполнение = Цель 2026 / Факт.",
+        "",
+    ]
+
+    periods = (
+        (
+            f"{quarter_start.year} Q{quarter}",
+            quarter_start,
+            quarter_end,
+            quarter_metrics,
+        ),
+        ("Последние 90 дней", rolling_start, rolling_end, rolling_metrics),
+    )
+    for period_title, period_start, period_end, metrics in periods:
+        lines.extend(
+            (
+                "=" * 72,
+                f"ПЕРИОД: {period_title} | "
+                f"{period_start.strftime('%d.%m.%Y')}–"
+                f"{(period_end - timedelta(days=1)).strftime('%d.%m.%Y')}",
+                "=" * 72,
+            )
+        )
+        for metric in metrics:
+            actual = (
+                decimal_text(metric.actual_ratio, 2)
+                if metric.actual_ratio is not None
+                else "—"
+            )
+            lines.extend(
+                (
+                    "",
+                    f"[{metric.team}] Jira: {', '.join(metric.project_keys)}",
+                    f"Итог: Story={metric.stories}; Bug={metric.bugs}; "
+                    f"PSI={metric.psi_bugs}; ПРОМ={metric.prom_bugs}; "
+                    f"Факт={actual}; Цель={decimal_text(metric.target_ratio, 2)}",
+                    f"Story ({len(metric.story_keys)}): "
+                    f"{', '.join(metric.story_keys) or '—'}",
+                    f"Bug ({len(metric.bug_keys)}): "
+                    f"{', '.join(metric.bug_keys) or '—'}",
+                )
+            )
+        lines.append("")
+
+    details = html.escape("\n".join(lines))
+    return (
+        '<div style="border-top:1px solid #DFE1E6;margin-top:18px;padding-top:12px;">'
+        '<ac:structured-macro ac:name="expand">'
+        '<ac:parameter ac:name="title">Техническая детализация для сверки '
+        '— все учтённые Story и Bug</ac:parameter>'
+        '<ac:rich-text-body>'
+        '<div style="background-color:#F4F5F7;border-left:4px solid #0052CC;'
+        'color:#42526E;margin-bottom:10px;padding:10px 12px;">'
+        'Если цифры расходятся с дашбордом, раскройте блок, скопируйте его '
+        'целиком и пришлите для сравнения.</div>'
+        '<pre style="background-color:#FFFFFF;border:1px solid #C1C7D0;'
+        'color:#172B4D;font-size:11px;line-height:1.45;overflow-wrap:anywhere;'
+        'padding:12px;white-space:pre-wrap;word-break:break-word;">'
+        f'{details}</pre>'
+        '</ac:rich-text-body>'
+        '</ac:structured-macro>'
+        '</div>'
+    )
+
+
+def render_confluence_html(
+    *,
+    rolling_metrics: Sequence[TeamMetric],
+    quarter_metrics: Sequence[TeamMetric],
+    rolling_start: date,
+    rolling_end: date,
+    quarter_start: date,
+    quarter_end: date,
+    quarter: int,
+    rolling_release_count: int,
+    rolling_hotfix_count: int,
+    quarter_release_count: int,
+    quarter_hotfix_count: int,
+    generated_at: datetime,
+) -> str:
+    parts = [
+        '<div style="background-color:#172B4D;border-left:7px solid #36B37E;'
+        'border-radius:10px;color:#FFFFFF;margin-bottom:16px;padding:18px 20px;">',
+        '<div style="color:#FFFFFF;font-size:25px;font-weight:bold;">'
+        "Качество релизов</div>",
+        '<div style="color:#B3D4FF;font-size:13px;margin-top:5px;">'
+        "Коротко о главном: текущий квартал и последние 90 дней</div>",
+        '<div style="color:#79F2C0;font-size:11px;margin-top:9px;">'
+        'Факт = баги / Story &nbsp;·&nbsp; 100% и выше — цель выполнена '
+        '&nbsp;·&nbsp; Обновлено '
+        f"{html.escape(generated_at.strftime('%d.%m.%Y %H:%M'))}</div>",
+        "</div>",
+        render_metric_section_html(
+            quarter_metrics,
+            title=f"Текущий квартал · {quarter_start.year} Q{quarter}",
+            start=quarter_start,
+            end=quarter_end,
+            release_count=quarter_release_count,
+            hotfix_count=quarter_hotfix_count,
+            accent="#6554C0",
+        ),
+        render_metric_section_html(
+            rolling_metrics,
+            title="Последние 90 дней",
+            start=rolling_start,
+            end=rolling_end,
+            release_count=rolling_release_count,
+            hotfix_count=rolling_hotfix_count,
+            accent="#0052CC",
+        ),
+        render_hidden_issue_details(
+            rolling_metrics=rolling_metrics,
+            quarter_metrics=quarter_metrics,
+            rolling_start=rolling_start,
+            rolling_end=rolling_end,
+            quarter_start=quarter_start,
+            quarter_end=quarter_end,
+            quarter=quarter,
+            generated_at=generated_at,
+        ),
+    ]
+    return "".join(parts)
+
+
+class ConfluencePublisher:
+    def __init__(self, settings: ConnectionSettings):
+        self.rest = RestClient("Confluence", settings)
+        self.base_url = settings.url.rstrip("/")
+
+    def get_page(self, page_id: str) -> dict[str, Any]:
+        page = self.rest.request_json(
+            "GET",
+            f"/rest/api/content/{page_id}",
+            params={"expand": "version,space,title"},
+        )
+        if not isinstance(page, dict):
+            raise RuntimeError("Confluence вернул неожиданные данные страницы.")
+        return page
+
+    def update_page(self, page: Mapping[str, Any], title: str, body: str) -> dict[str, Any]:
+        page_id = str(page.get("id") or "").strip()
+        version = page.get("version")
+        version_number = int(version.get("number") or 0) if isinstance(version, Mapping) else 0
+        if not page_id or version_number <= 0:
+            fresh = self.get_page(page_id)
+            page_id = str(fresh.get("id") or "").strip()
+            fresh_version = fresh.get("version")
+            version_number = (
+                int(fresh_version.get("number") or 0)
+                if isinstance(fresh_version, Mapping)
+                else 0
+            )
+        if not page_id or version_number <= 0:
+            raise RuntimeError("Confluence: не удалось определить id/version страницы.")
+        result = self.rest.request_json(
+            "PUT",
+            f"/rest/api/content/{page_id}",
+            payload={
+                "id": page_id,
+                "type": "page",
+                "title": title,
+                "version": {
+                    "number": version_number + 1,
+                    "message": "Quarterly quality metrics refresh",
+                },
+                "body": {
+                    "storage": {
+                        "value": body,
+                        "representation": "storage",
+                    }
+                },
+            },
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError("Confluence update page вернул неожиданный ответ.")
+        return result
+
+    def publish(
+        self,
+        *,
+        body: str,
+        page_id: str = DEFAULT_CONFLUENCE_PAGE_ID,
+    ) -> str:
+        page = self.get_page(page_id)
+        actual_title = str(page.get("title") or "").strip()
+        if not actual_title:
+            raise RuntimeError(
+                f"Confluence: у страницы {page_id} не удалось прочитать текущее название."
+            )
+        try:
+            result = self.update_page(page, actual_title, body)
+        except HttpRequestError as exc:
+            if exc.status_code != 403:
+                raise
+            space = page.get("space")
+            space_key = (
+                str(space.get("key") or "").strip()
+                if isinstance(space, Mapping)
+                else ""
+            )
+            space_suffix = f", space={space_key}" if space_key else ""
+            raise RuntimeError(
+                "Confluence: токен успешно читает страницу, но не имеет права "
+                f"редактировать pageId={page_id}{space_suffix}. "
+                "Выдайте пользователю токена право Add/Edit Page и снимите "
+                "ограничение редактирования именно с этой страницы или её "
+                "родителя. Доступ к соседней странице dpm2 этого права не даёт."
+            ) from exc
+        result_id = str(result.get("id") or page_id).strip()
+        if not result_id:
+            raise RuntimeError("Confluence не вернул id опубликованной страницы.")
+        return f"{self.base_url}/pages/viewpage.action?pageId={result_id}"
+
+
+def load_repository_config() -> tuple[Any, Mapping[str, Any]]:
+    """Load the same config.py sources that release_checker.py uses."""
+
+    try:
+        import config as config_module
+    except ImportError as exc:
+        raise RuntimeError(
+            f"Не найден {PROJECT_ROOT / 'config.py'} с настройками Jira/Confluence."
+        ) from exc
+    nested = getattr(config_module, "config", {})
+    return config_module, nested if isinstance(nested, Mapping) else {}
+
+
+def configured_jira_field_id(field_name: str, default: str = "") -> str:
+    """Read config['jira']['fields'][field_name] exactly like dpm2.py."""
+
+    _, nested = load_repository_config()
+    jira_config = nested.get("jira") if isinstance(nested.get("jira"), Mapping) else {}
+    fields = (
+        jira_config.get("fields")
+        if isinstance(jira_config.get("fields"), Mapping)
+        else {}
+    )
+    return first_text(fields.get(field_name), default=default)
+
+
+def first_text(*values: Any, default: str = "") -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return default
+
+
+def load_jira_settings() -> ConnectionSettings:
+    config_module, nested = load_repository_config()
+    jira_config = nested.get("jira") if isinstance(nested.get("jira"), Mapping) else {}
+    options = (
+        jira_config.get("options")
+        if isinstance(jira_config.get("options"), Mapping)
+        else {}
+    )
+    url = first_text(
+        jira_config.get("url"),
+        options.get("server"),
+        getattr(config_module, "JIRA_URL", ""),
+        default=DEFAULT_JIRA_URL,
+    ).rstrip("/")
+    token = first_text(
+        jira_config.get("token"),
+        getattr(config_module, "JIRA_API_TOKEN", ""),
+    )
+    username = first_text(
+        jira_config.get("username"),
+        jira_config.get("email"),
+        getattr(config_module, "JIRA_USERNAME", ""),
+        getattr(config_module, "JIRA_EMAIL", ""),
+    )
+    auth_mode = first_text(
+        jira_config.get("auth_mode"),
+        getattr(config_module, "JIRA_AUTH_MODE", ""),
+        default="token",
+    ).casefold()
+    missing: list[str] = []
+    if not token:
+        missing.append("config['jira']['token'] или config.JIRA_API_TOKEN")
+    if auth_mode == "basic" and not username:
+        missing.append("Jira username/email в config.py")
+    if missing:
+        raise RuntimeError(f"Не заданы настройки Jira в config.py: {', '.join(missing)}.")
+    if auth_mode not in {"token", "basic"}:
+        raise RuntimeError("Jira auth_mode в config.py должен быть token или basic.")
+    return ConnectionSettings(
+        url=url,
+        token=token,
+        username=username,
+        auth_mode=auth_mode,
+        verify_ssl=VERIFY_SSL,
+        timeout_seconds=HTTP_TIMEOUT_SECONDS,
+    )
+
+
+def load_confluence_settings() -> ConnectionSettings:
+    config_module, nested = load_repository_config()
+    confluence_config = (
+        nested.get("confluence")
+        if isinstance(nested.get("confluence"), Mapping)
+        else {}
+    )
+    jira_config = nested.get("jira") if isinstance(nested.get("jira"), Mapping) else {}
+    url = first_text(
+        confluence_config.get("url"),
+        getattr(config_module, "CONFLUENCE_URL", ""),
+        default=DEFAULT_CONFLUENCE_URL,
+    ).rstrip("/")
+    token = first_text(
+        confluence_config.get("token"),
+        getattr(config_module, "CONFLUENCE_TOKEN", ""),
+    )
+    username = first_text(
+        confluence_config.get("username"),
+        getattr(config_module, "CONFLUENCE_USERNAME", ""),
+        jira_config.get("username"),
+        jira_config.get("email"),
+        getattr(config_module, "JIRA_USERNAME", ""),
+        getattr(config_module, "JIRA_EMAIL", ""),
+    )
+    auth_mode = first_text(
+        confluence_config.get("auth_mode"),
+        getattr(config_module, "CONFLUENCE_AUTH_MODE", ""),
+        default="token",
+    ).casefold()
+    missing: list[str] = []
+    if not token:
+        missing.append("config['confluence']['token'] или config.CONFLUENCE_TOKEN")
+    if auth_mode == "basic" and not username:
+        missing.append("Confluence username в config.py")
+    if missing:
+        raise RuntimeError(
+            f"Не заданы настройки Confluence в config.py: {', '.join(missing)}."
+        )
+    if auth_mode not in {"token", "basic"}:
+        raise RuntimeError("Confluence auth_mode в config.py должен быть token или basic.")
+    return ConnectionSettings(
+        url=url,
+        token=token,
+        username=username,
+        auth_mode=auth_mode,
+        verify_ssl=VERIFY_SSL,
+        timeout_seconds=HTTP_TIMEOUT_SECONDS,
+    )
+
+
+def excel_column_index(reference: str) -> int:
+    match = re.match(r"[A-Za-z]+", reference)
+    if not match:
+        return 0
+    result = 0
+    for char in match.group(0).upper():
+        result = result * 26 + ord(char) - ord("A") + 1
+    return result - 1
+
+
+def xml_node_text(node: Optional[ElementTree.Element]) -> str:
+    return "".join(node.itertext()) if node is not None else ""
+
+
+def read_jira_metric_xlsx(path: Path) -> list[list[Any]]:
+    """Read Jira's minimal XLSX export, including its case-mismatched sheet path."""
+
+    namespace = {
+        "x": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    }
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = archive.namelist()
+            names_by_lower = {name.lower(): name for name in names}
+            shared_strings: list[str] = []
+            shared_name = names_by_lower.get("xl/sharedstrings.xml")
+            if shared_name:
+                shared_root = ElementTree.fromstring(archive.read(shared_name))
+                shared_strings = [
+                    xml_node_text(node)
+                    for node in shared_root.findall("x:si", namespace)
+                ]
+            sheet_names = sorted(
+                name
+                for name in names
+                if name.lower().startswith("xl/worksheets/")
+                and name.lower().endswith(".xml")
+            )
+            if not sheet_names:
+                raise RuntimeError("в XLSX нет worksheet XML")
+            root = ElementTree.fromstring(archive.read(sheet_names[0]))
+    except Exception as exc:
+        raise RuntimeError(f"Не удалось прочитать debug XLSX {path}: {exc}") from exc
+
+    rows: list[list[Any]] = []
+    for row_node in root.findall(".//x:sheetData/x:row", namespace):
+        values_by_column: dict[int, Any] = {}
+        for cell in row_node.findall("x:c", namespace):
+            column = excel_column_index(str(cell.get("r") or "A1"))
+            cell_type = str(cell.get("t") or "")
+            value_node = cell.find("x:v", namespace)
+            if cell_type == "inlineStr":
+                value: Any = xml_node_text(cell.find("x:is", namespace))
+            elif value_node is None:
+                value = ""
+            elif cell_type == "s":
+                index = int(value_node.text or "0")
+                value = (
+                    shared_strings[index]
+                    if 0 <= index < len(shared_strings)
+                    else ""
+                )
+            else:
+                value = value_node.text or ""
+            values_by_column[column] = value
+        width = max(values_by_column, default=-1) + 1
+        rows.append([values_by_column.get(index, "") for index in range(width)])
+    return rows
+
+
+def expand_debug_reference_paths(values: Sequence[str]) -> list[Path]:
+    result: list[Path] = []
+    for raw_value in values:
+        expanded_value = str(Path(raw_value).expanduser())
+        candidate = Path(expanded_value)
+        if candidate.is_dir():
+            matches = sorted(candidate.glob("*.xlsx"))
+        else:
+            matches = [Path(value) for value in glob.glob(expanded_value)]
+            if not matches and candidate.is_file():
+                matches = [candidate]
+        result.extend(matches)
+    unique = {
+        str(path.resolve()): path.resolve()
+        for path in result
+        if path.suffix.casefold() == ".xlsx"
+    }
+    return list(unique.values())
+
+
+def reference_team_name(raw_name: str, team_specs: Sequence[TeamSpec]) -> str:
+    without_code = re.sub(r"\s*\([^)]*\)\s*$", "", raw_name).strip()
+    aliases = {
+        normalized("CoreUI 2.0"): "Core UI 2.0 / Neuro UI",
+    }
+    alias = aliases.get(normalized(without_code))
+    if alias:
+        return alias
+    by_normalized = {normalized(spec.team): spec.team for spec in team_specs}
+    return by_normalized.get(normalized(without_code), without_code)
+
+
+def load_reference_tasks(
+    paths: Sequence[Path],
+    team_specs: Sequence[TeamSpec],
+) -> dict[str, dict[str, dict[str, set[str]]]]:
+    result: dict[str, dict[str, dict[str, set[str]]]] = {
+        "quarter": defaultdict(lambda: {"Story": set(), "Bug": set()}),
+        "rolling_90_days": defaultdict(lambda: {"Story": set(), "Bug": set()}),
+    }
+    configured_teams = {spec.team for spec in team_specs}
+    for path in paths:
+        rows = read_jira_metric_xlsx(path)
+        selection = " ".join(
+            str(value or "")
+            for value in (rows[0] if rows else [])
+        ).casefold()
+        if "90 дней" in selection:
+            period_name = "rolling_90_days"
+        elif re.search(r"\bq[1-4]\s+\d{4}\b", selection):
+            period_name = "quarter"
+        else:
+            # Summary exports do not contain issue keys and are not a task
+            # reference for either reporting period.
+            continue
+        for row in rows[2:]:
+            if len(row) < 4:
+                continue
+            issue_key = str(row[0] or "").strip().upper()
+            issue_type = str(row[2] or "").strip()
+            team = reference_team_name(str(row[3] or ""), team_specs)
+            if issue_key.startswith("S-"):
+                issue_key = issue_key[2:]
+            if team not in configured_teams or issue_type not in {"Story", "Bug"}:
+                continue
+            if issue_key:
+                result[period_name][team][issue_type].add(issue_key)
+    return {
+        period_name: dict(team_values)
+        for period_name, team_values in result.items()
+        if team_values
+    }
+
+
+def flattened_debug_values(value: Any, *, limit: int = 50) -> list[str]:
+    """Flatten a Jira field value into a compact list for the debug JSON."""
+
+    result: list[str] = []
+    stack = [value]
+    while stack and len(result) < limit:
+        current = stack.pop()
+        if current in (None, ""):
+            continue
+        if isinstance(current, Mapping):
+            stack.extend(reversed(list(current.values())))
+            continue
+        if isinstance(current, (list, tuple, set)):
+            stack.extend(reversed(list(current)))
+            continue
+        text = str(current).strip()
+        if text:
+            result.append(text)
+    return list(dict.fromkeys(result))
+
+
+def issue_link_debug_rows(issue: Mapping[str, Any]) -> list[dict[str, str]]:
+    links = issue_field(issue, "issuelinks")
+    if not isinstance(links, list):
+        return []
+    result: list[dict[str, str]] = []
+    for link in links:
+        if not isinstance(link, Mapping):
+            continue
+        for direction in ("outwardIssue", "inwardIssue"):
+            linked = link.get(direction)
+            if not isinstance(linked, Mapping):
+                continue
+            key = str(linked.get("key") or "").strip().upper()
+            if key:
+                result.append(
+                    {
+                        "direction": direction,
+                        "type": issue_link_type_text(link),
+                        "key": key,
+                    }
+                )
+    return result
+
+
+def issue_team_field_candidates(
+    issue: Mapping[str, Any],
+    jira_field_names: Mapping[str, str],
+    team_specs: Sequence[TeamSpec],
+) -> list[dict[str, Any]]:
+    fields = issue.get("fields")
+    if not isinstance(fields, Mapping):
+        return []
+    squad_codes = {spec.squad_code for spec in team_specs if spec.squad_code}
+    name_tokens = (
+        "команд",
+        "squad",
+        "подраздел",
+        "юнит",
+        "team",
+        "кэ",
+        "конфигурац",
+        "service",
+        "сервис",
+        "продукт",
+        "кластер",
+        "трайб",
+        "дит",
+        "причин",
+        "исключ",
+    )
+    result: list[dict[str, Any]] = []
+    for field_id, raw_value in fields.items():
+        if raw_value in (None, "", [], {}):
+            continue
+        field_name = jira_field_names.get(str(field_id), str(field_id))
+        values = flattened_debug_values(raw_value)
+        normalized_name = normalized(field_name)
+        joined_values = " ".join(values).upper()
+        if (
+            not any(token in normalized_name for token in name_tokens)
+            and not any(code in joined_values for code in squad_codes)
+        ):
+            continue
+        result.append(
+            {
+                "id": str(field_id),
+                "name": field_name,
+                "values": values,
+            }
+        )
+    return result
+
+
+def issue_debug_snapshot(
+    issue: Optional[Mapping[str, Any]],
+    *,
+    detection_stage_field_id: str,
+    jira_field_names: Mapping[str, str],
+    team_specs: Sequence[TeamSpec],
+) -> dict[str, Any]:
+    if issue is None:
+        return {"loaded": False}
+
+    raw_fields = issue.get("fields")
+    fields = raw_fields if isinstance(raw_fields, Mapping) else {}
+    if METRIC_INITIAL_DETECTION_STAGE_FIELD in fields:
+        initial_stage = fields.get(METRIC_INITIAL_DETECTION_STAGE_FIELD)
+    else:
+        initial_stage = initial_detection_stage_value(
+            issue,
+            detection_stage_field_id,
+        )
+    if METRIC_CURRENT_DETECTION_STAGE_FIELD in fields:
+        current_stage = fields.get(METRIC_CURRENT_DETECTION_STAGE_FIELD)
+    else:
+        current_stage = issue_field(issue, detection_stage_field_id)
+    if METRIC_DETECTION_STAGE_HISTORY_FIELD in fields:
+        stage_history = fields.get(METRIC_DETECTION_STAGE_HISTORY_FIELD)
+    else:
+        stage_history = field_values_over_history(
+            issue,
+            detection_stage_field_id,
+            ("Этап обнаружения", "Detection Stage"),
+        )
+
+    return {
+        "loaded": True,
+        "summary": str(issue_field(issue, "summary") or ""),
+        "project": issue_project_key(issue),
+        "type": named_value(issue_field(issue, "issuetype")),
+        "status": named_value(issue_field(issue, "status")),
+        "priority": named_value(issue_field(issue, "priority")),
+        "created": str(issue_field(issue, "created") or ""),
+        "resolutiondate": str(issue_field(issue, "resolutiondate") or ""),
+        "initial_detection_stage": named_values(initial_stage),
+        "current_detection_stage": named_values(current_stage),
+        "detection_stage_history": named_values(stage_history),
+        "history": {
+            "status": changelog_field_events(
+                issue,
+                "status",
+                ("Status", "Статус"),
+            ),
+            "priority": changelog_field_events(
+                issue,
+                "priority",
+                ("Priority", "Приоритет"),
+            ),
+            "detection_stage": changelog_field_events(
+                issue,
+                detection_stage_field_id,
+                ("Этап обнаружения", "Detection Stage"),
+            ),
+        },
+        "team_field_candidates": issue_team_field_candidates(
+            issue,
+            jira_field_names,
+            team_specs,
+        ),
+        "issue_links": issue_link_debug_rows(issue),
+        "fix_versions": named_values(issue_field(issue, "fixVersions")),
+        "components": named_values(issue_field(issue, "components")),
+        "labels": flattened_debug_values(issue_field(issue, "labels")),
+        "parent": flattened_debug_values(issue_field(issue, "parent")),
+    }
+
+
+def debug_decimal(value: Optional[Decimal]) -> Optional[str]:
+    """Serialize Decimal values without losing the exact metric arithmetic."""
+
+    return None if value is None else format(value, "f")
+
+
+def metric_calculation_debug(metric: TeamMetric) -> dict[str, Any]:
+    """Expose every input and intermediate value used by calculate_metric()."""
+
+    exact_ratio = (
+        Decimal(metric.bugs) / Decimal(metric.stories)
+        if metric.stories
+        else None
+    )
+    bug_budget = int(
+        (Decimal(metric.stories) * metric.defect_limit_ratio).to_integral_value(
+            rounding=ROUND_FLOOR
+        )
+    )
+    stories_needed_total = (
+        int(
+            (Decimal(metric.bugs) / metric.target_ratio).to_integral_value(
+                rounding=ROUND_CEILING
+            )
+        )
+        if metric.stories and metric.bugs
+        else 0
+    )
+    return {
+        "inputs": {
+            "stories": metric.stories,
+            "bugs_total": metric.bugs,
+            "bugs_psi": metric.psi_bugs,
+            "bugs_prom": metric.prom_bugs,
+            "as_is_ratio": debug_decimal(metric.as_is_ratio),
+            "target_2026": debug_decimal(
+                metric.calculated_target_ratio
+            ),
+            "as_is_times_0_8": debug_decimal(metric.minimum_target_ratio),
+        },
+        "formulas": {
+            "defect_limit_ratio": (
+                "max(A × AS IS + B; AS IS × 0.8)"
+                if metric.as_is_ratio is not None
+                else "A × AS IS + B (AS IS отсутствует)"
+            ),
+            "actual_exact": "bugs_total / stories",
+            "actual_display": "round_half_up(actual_exact, 2)",
+            "attainment_percent": (
+                "target_2026 / actual_display × 100; "
+                "при 0 Story или 0 багов = 100"
+            ),
+            "bug_budget": "floor(stories × defect_limit_ratio)",
+            "additional_bugs_allowed": "max(0; bug_budget - bugs_total)",
+            "stories_needed_total": "ceil(bugs_total / target_2026)",
+            "additional_stories_required": (
+                "max(0; stories_needed_total - stories)"
+            ),
+        },
+        "intermediate": {
+            "target_2026": debug_decimal(metric.target_ratio),
+            "defect_limit_ratio": debug_decimal(metric.defect_limit_ratio),
+            "actual_exact": debug_decimal(exact_ratio),
+            "actual_display": debug_decimal(metric.actual_ratio),
+            "bug_budget": bug_budget,
+            "stories_needed_total": stories_needed_total,
+        },
+        "result": {
+            "state": metric.state,
+            "target_attainment_percent": debug_decimal(
+                metric.target_attainment_percent
+            ),
+            "additional_bugs_allowed": metric.additional_bugs_allowed,
+            "additional_stories_required": metric.additional_stories_required,
+            "counted_story_keys": list(metric.story_keys),
+            "counted_bug_keys": list(metric.bug_keys),
+        },
+    }
+
+
+def issue_filter_result(
+    checks: Sequence[tuple[str, bool]],
+) -> dict[str, Any]:
+    """Return an ordered PASS/FAIL trace and human-readable reject reasons."""
+
+    failed = [name for name, passed in checks if not passed]
+    return {
+        "checks": [
+            {"name": name, "passed": passed}
+            for name, passed in checks
+        ],
+        "passed": not failed,
+        "failed_checks": failed,
+    }
+
+
+def write_project_debug_report(
+    *,
+    output_path: Path,
+    project_key: str,
+    team_spec: TeamSpec,
+    rules: MetricRules,
+    rolling_start: date,
+    rolling_end: date,
+    quarter_start: date,
+    quarter_end: date,
+    quarter_story_start: date,
+    quarter: int,
+    releases: Sequence[Mapping[str, Any]],
+    released_issues: Sequence[Mapping[str, Any]],
+    created_bugs: Sequence[Mapping[str, Any]],
+    issue_keys_by_release: Mapping[str, set[str]],
+    release_jql: str,
+    bugs_jql: str,
+    release_date_field_id: str,
+    release_type_field_id: str,
+    detection_stage_field_id: str,
+    team_assignment_field_ids: Sequence[str] = (),
+) -> None:
+    """Write a self-contained, read-only audit for one Jira project."""
+
+    project_key = project_key.strip().upper()
+    project_spec = TeamSpec(
+        team=team_spec.team,
+        squad_code=team_spec.squad_code,
+        project_keys=(project_key,),
+        ke_ids=team_spec.ke_ids,
+        as_is_ratio=team_spec.as_is_ratio,
+        target_ratio=team_spec.target_ratio,
+    )
+    project_release_items = sorted(
+        (
+            issue
+            for issue in released_issues
+            if issue_project_key(issue) == project_key
+        ),
+        key=lambda issue: str(issue.get("key") or ""),
+    )
+    project_bugs = sorted(
+        (
+            issue
+            for issue in created_bugs
+            if issue_project_key(issue) == project_key
+        ),
+        key=lambda issue: str(issue.get("key") or ""),
+    )
+    project_item_keys = {
+        str(issue.get("key") or "").strip().upper()
+        for issue in project_release_items
+        if str(issue.get("key") or "").strip()
+    }
+
+    releases_by_issue: dict[str, list[str]] = defaultdict(list)
+    for release_key, issue_keys in issue_keys_by_release.items():
+        for issue_key in issue_keys:
+            normalized_key = str(issue_key).strip().upper()
+            if normalized_key in project_item_keys:
+                releases_by_issue[normalized_key].append(release_key)
+
+    release_by_key = {
+        str(release.get("key") or "").strip().upper(): release
+        for release in releases
+        if str(release.get("key") or "").strip()
+    }
+
+    def linked_release_dates(issue_key: str) -> list[tuple[str, Optional[date]]]:
+        return [
+            (
+                release_key,
+                parse_jira_date(
+                    issue_field(
+                        release_by_key.get(release_key, {}),
+                        release_date_field_id,
+                    )
+                ),
+            )
+            for release_key in sorted(releases_by_issue.get(issue_key, []))
+        ]
+
+    def has_linked_release_in_period(
+        issue_key: str,
+        start: date,
+        end: date,
+    ) -> bool:
+        return any(
+            installed is not None and start <= installed < end
+            for _, installed in linked_release_dates(issue_key)
+        )
+
+    relevant_release_keys = sorted(
+        {
+            release_key
+            for release_key, issue_keys in issue_keys_by_release.items()
+            if project_item_keys.intersection(issue_keys)
+        }
+    )
+    release_rows: list[dict[str, Any]] = []
+    for release_key in relevant_release_keys:
+        release = release_by_key.get(release_key)
+        if release is None:
+            continue
+        installed = parse_jira_date(issue_field(release, release_date_field_id))
+        linked_project_keys = sorted(
+            project_item_keys.intersection(
+                issue_keys_by_release.get(release_key, set())
+            )
+        )
+        release_rows.append(
+            {
+                "key": release_key,
+                "summary": str(issue_field(release, "summary") or ""),
+                "status": named_value(issue_field(release, "status")),
+                "installed_date": installed.isoformat() if installed else "",
+                "release_type": named_values(
+                    issue_field(release, release_type_field_id)
+                ),
+                "is_hotfix": is_hotfix_release(
+                    release,
+                    release_type_field_id,
+                    DEFAULT_HOTFIX_VALUES,
+                ),
+                "in_rolling_90_days": bool(
+                    installed and rolling_start <= installed < rolling_end
+                ),
+                "in_quarter": bool(
+                    installed and quarter_start <= installed < quarter_end
+                ),
+                "consist_of_total": len(
+                    issue_keys_by_release.get(release_key, set())
+                ),
+                "consist_of_project_count": len(linked_project_keys),
+                "consist_of_project_keys": linked_project_keys,
+            }
+        )
+
+    story_rows: list[dict[str, Any]] = []
+    for issue in project_release_items:
+        key = str(issue.get("key") or "").strip().upper()
+        issue_type = normalized(named_value(issue_field(issue, "issuetype")))
+        raw_status = issue_field(issue, "status")
+        type_ok = issue_type in rules.story_types
+        status_ok = story_has_done_status(raw_status, rules)
+        rolling_release_ok = has_linked_release_in_period(
+            key,
+            rolling_start,
+            rolling_end,
+        )
+        quarter_release_ok = has_linked_release_in_period(
+            key,
+            quarter_story_start,
+            quarter_end,
+        )
+        common_checks = (
+            ("project совпадает", issue_project_key(issue) == project_key),
+            (
+                "команда/сквад совпадает",
+                issue_assignment_team(
+                    issue,
+                    (project_spec,),
+                    team_assignment_field_ids,
+                )
+                != "",
+            ),
+            ("тип Story", type_ok),
+            ("статус/категория Done", status_ok),
+        )
+        rolling_filter = issue_filter_result(
+            (
+                *common_checks,
+                ("релиз установлен в пределах 90 дней", rolling_release_ok),
+            )
+        )
+        quarter_filter = issue_filter_result(
+            (
+                *common_checks,
+                (
+                    "релиз установлен в квартале с ночной границей",
+                    quarter_release_ok,
+                ),
+            )
+        )
+        raw_status_category = (
+            raw_status.get("statusCategory")
+            if isinstance(raw_status, Mapping)
+            else None
+        )
+        story_rows.append(
+            {
+                "key": key,
+                "summary": str(issue_field(issue, "summary") or ""),
+                "type": named_value(issue_field(issue, "issuetype")),
+                "status": named_value(raw_status),
+                "status_category": named_value(raw_status_category),
+                "created": str(issue_field(issue, "created") or ""),
+                "resolutiondate": str(issue_field(issue, "resolutiondate") or ""),
+                "team_assignment": issue_assignment_debug(
+                    issue,
+                    (project_spec,),
+                    team_assignment_field_ids,
+                ),
+                "linked_installed_releases": sorted(
+                    releases_by_issue.get(key, [])
+                ),
+                "linked_release_dates": [
+                    {
+                        "key": release_key,
+                        "installed_date": (
+                            installed.isoformat() if installed else ""
+                        ),
+                    }
+                    for release_key, installed in linked_release_dates(key)
+                ],
+                "rolling_90_days": rolling_filter,
+                "quarter": quarter_filter,
+            }
+        )
+
+    bug_rows: list[dict[str, Any]] = []
+    for issue in project_bugs:
+        key = str(issue.get("key") or "").strip().upper()
+        raw_status = issue_field(issue, "status")
+        issue_type = normalized(named_value(issue_field(issue, "issuetype")))
+        priority = normalized(named_value(issue_field(issue, "priority")))
+        created = parse_jira_date(issue_field(issue, "created"))
+        stage = classify_eligible_detection_stage(
+            issue_field(issue, detection_stage_field_id),
+            rules,
+        )
+        type_ok = issue_type in rules.bug_types
+        status_ok = bug_has_eligible_status(raw_status, rules)
+        priority_ok = priority in rules.bug_priorities
+        rolling_date_ok = bool(
+            created and rolling_start <= created < rolling_end
+        )
+        quarter_date_ok = bool(
+            created and quarter_start <= created < quarter_end
+        )
+        common_checks = (
+            ("project совпадает", issue_project_key(issue) == project_key),
+            (
+                "команда/сквад совпадает",
+                issue_assignment_team(
+                    issue,
+                    (project_spec,),
+                    team_assignment_field_ids,
+                )
+                != "",
+            ),
+            ("тип Bug", type_ok),
+            ("статус не Отклонен исполнителем", status_ok),
+            ("приоритет High+", priority_ok),
+            ("в истории этапа есть PSI/ПРОМ", stage is not None),
+        )
+        snapshot = issue_debug_snapshot(
+            issue,
+            detection_stage_field_id=detection_stage_field_id,
+            jira_field_names={},
+            team_specs=(project_spec,),
+        )
+        snapshot.update(
+            {
+                "key": key,
+                "classified_detection_stage": (
+                    stage.upper() if stage else None
+                ),
+                "full_changelog_loaded": (
+                    "changelog" in issue
+                    or METRIC_DETECTION_STAGE_HISTORY_FIELD
+                    in (
+                        issue.get("fields")
+                        if isinstance(issue.get("fields"), Mapping)
+                        else {}
+                    )
+                ),
+                "team_assignment": issue_assignment_debug(
+                    issue,
+                    (project_spec,),
+                    team_assignment_field_ids,
+                ),
+                "rolling_90_days": issue_filter_result(
+                    (*common_checks, ("created входит в 90 дней", rolling_date_ok))
+                ),
+                "quarter": issue_filter_result(
+                    (*common_checks, ("created входит в квартал", quarter_date_ok))
+                ),
+            }
+        )
+        bug_rows.append(snapshot)
+
+    rolling_story_issues = [
+        issue
+        for issue, row in zip(project_release_items, story_rows)
+        if row["rolling_90_days"]["passed"]
+    ]
+    quarter_story_issues = [
+        issue
+        for issue, row in zip(project_release_items, story_rows)
+        if row["quarter"]["passed"]
+    ]
+    rolling_bug_issues = [
+        issue
+        for issue, row in zip(project_bugs, bug_rows)
+        if row["rolling_90_days"]["passed"]
+    ]
+    quarter_bug_issues = [
+        issue
+        for issue, row in zip(project_bugs, bug_rows)
+        if row["quarter"]["passed"]
+    ]
+    rolling_counts = aggregate_issues(
+        (project_spec,),
+        [*rolling_story_issues, *rolling_bug_issues],
+        rules,
+        detection_stage_field_id,
+        team_assignment_field_ids,
+    )[project_spec.team]
+    quarter_counts = aggregate_issues(
+        (project_spec,),
+        [*quarter_story_issues, *quarter_bug_issues],
+        rules,
+        detection_stage_field_id,
+        team_assignment_field_ids,
+    )[project_spec.team]
+    rolling_metric = calculate_metric(project_spec, rolling_counts)
+    quarter_metric = calculate_metric(project_spec, quarter_counts)
+
+    def decision_summary(
+        rows: Sequence[Mapping[str, Any]],
+        period_name: str,
+    ) -> dict[str, Any]:
+        failed_checks: Counter[str] = Counter()
+        counted = 0
+        for row in rows:
+            decision = row.get(period_name)
+            if not isinstance(decision, Mapping):
+                continue
+            if decision.get("passed") is True:
+                counted += 1
+            for check in decision.get("failed_checks") or []:
+                failed_checks[str(check)] += 1
+        return {
+            "found": len(rows),
+            "counted": counted,
+            "excluded": len(rows) - counted,
+            "failed_checks": dict(failed_checks.most_common()),
+        }
+
+    payload = {
+        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "read_only": True,
+        "project": project_key,
+        "team": team_spec.team,
+        "squad_code": team_spec.squad_code,
+        "periods": {
+            "rolling_90_days": {
+                "start_inclusive": rolling_start.isoformat(),
+                "end_exclusive": rolling_end.isoformat(),
+                "display_end": (rolling_end - timedelta(days=1)).isoformat(),
+            },
+            "quarter": {
+                "name": f"{quarter_start.year} Q{quarter}",
+                "start_inclusive": quarter_start.isoformat(),
+                "story_start_inclusive": quarter_story_start.isoformat(),
+                "end_exclusive": quarter_end.isoformat(),
+                "display_end": (quarter_end - timedelta(days=1)).isoformat(),
+            },
+        },
+        "rules": {
+            "story_types": sorted(rules.story_types),
+            "story_done_statuses": sorted(rules.story_statuses),
+            "bug_types": sorted(rules.bug_types),
+            "excluded_bug_statuses": sorted(rules.excluded_bug_statuses),
+            "bug_high_plus_priorities": sorted(rules.bug_priorities),
+            "psi_detection_stages": sorted(rules.psi_detection_stages),
+            "prom_detection_stages": sorted(rules.prom_detection_stages),
+            "detection_stage_field_id": detection_stage_field_id,
+            "story_period_field": "дата установки связанного Release 2.0",
+            "bug_period_field": "created",
+            "story_source": "consist of установленных Release 2.0",
+            "bug_source": "JQL по Jira project",
+        },
+        "queries": {
+            "release_jql": release_jql,
+            "created_bugs_jql": bugs_jql,
+        },
+        "source_counts": {
+            "installed_releases_global": len(releases),
+            "installed_releases_with_project_items": len(release_rows),
+            "consist_of_items_global": len(released_issues),
+            "consist_of_items_project": len(project_release_items),
+            "created_bug_candidates_project": len(project_bugs),
+        },
+        "decision_summary": {
+            "rolling_90_days": {
+                "release_consist_of_items": decision_summary(
+                    story_rows,
+                    "rolling_90_days",
+                ),
+                "created_bug_candidates": decision_summary(
+                    bug_rows,
+                    "rolling_90_days",
+                ),
+            },
+            "quarter": {
+                "release_consist_of_items": decision_summary(
+                    story_rows,
+                    "quarter",
+                ),
+                "created_bug_candidates": decision_summary(
+                    bug_rows,
+                    "quarter",
+                ),
+            },
+        },
+        "releases_with_project_items": release_rows,
+        "release_consist_of_items": story_rows,
+        "created_bug_candidates": bug_rows,
+        "calculations": {
+            "rolling_90_days": metric_calculation_debug(rolling_metric),
+            "quarter": metric_calculation_debug(quarter_metric),
+        },
+    }
+    output_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(f"DEBUG_PROJECT_JSON={output_path.resolve()}")
+
+
+def write_issue_debug_report(
+    *,
+    jira: JiraClient,
+    issue_key: str,
+    output_path: Path,
+    team_specs: Sequence[TeamSpec],
+    rules: MetricRules,
+    detection_stage_field_id: str,
+) -> None:
+    """Download every field of one issue for a focused metric diagnosis."""
+
+    issue_key = issue_key.strip().upper()
+    jira_fields = jira.fields()
+    jira_field_names = {
+        str(item.get("id") or ""): str(item.get("name") or item.get("id") or "")
+        for item in jira_fields
+        if item.get("id")
+    }
+    issue = jira.issue(
+        issue_key,
+        ("*all", "issuelinks"),
+        expand="changelog",
+    )
+    history_html_error = ""
+    html_stage_values: list[str] = []
+    try:
+        html_stage_values = detection_stage_values_from_history_html(
+            jira.issue_history_html(issue_key),
+            rules,
+        )
+    except Exception as exc:
+        history_html_error = str(exc)
+    metric_issue = with_detection_stage_history(
+        issue,
+        detection_stage_field_id,
+        html_stage_values,
+    )
+    snapshot = issue_debug_snapshot(
+        metric_issue,
+        detection_stage_field_id=detection_stage_field_id,
+        jira_field_names=jira_field_names,
+        team_specs=team_specs,
+    )
+    project_key = issue_project_key(metric_issue)
+    configured_team = next(
+        (
+            spec
+            for spec in team_specs
+            if project_key in spec.project_keys
+        ),
+        None,
+    )
+    priority = normalized(named_value(issue_field(metric_issue, "priority")))
+    stage = classify_eligible_detection_stage(
+        issue_field(metric_issue, detection_stage_field_id),
+        rules,
+    )
+    raw_fields = metric_issue.get("fields")
+    all_fields = raw_fields if isinstance(raw_fields, Mapping) else {}
+    assignment_field_ids = {
+        str(row.get("id") or "")
+        for row in snapshot.get("team_field_candidates", [])
+        if isinstance(row, Mapping)
+    }
+    assignment_fields = [
+        {
+            "id": field_id,
+            "name": jira_field_names.get(field_id, field_id),
+            "values": flattened_debug_values(value),
+        }
+        for field_id, value in all_fields.items()
+        if str(field_id) in assignment_field_ids
+    ]
+    all_nonempty_fields = [
+        {
+            "id": str(field_id),
+            "name": jira_field_names.get(str(field_id), str(field_id)),
+            "values": flattened_debug_values(value),
+        }
+        for field_id, value in all_fields.items()
+        if value not in (None, "", [], {})
+    ]
+    all_nonempty_fields.sort(
+        key=lambda row: (
+            normalized(str(row["name"])),
+            str(row["id"]),
+        )
+    )
+    payload = {
+        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "read_only": True,
+        "issue_key": issue_key,
+        "project_mapped_team": (
+            {
+                "team": configured_team.team,
+                "squad_code": configured_team.squad_code,
+                "project_keys": list(configured_team.project_keys),
+                "ke_ids": list(configured_team.ke_ids),
+            }
+            if configured_team is not None
+            else None
+        ),
+        "metric_filters": issue_filter_result(
+            (
+                (
+                    "тип Bug",
+                    normalized(named_value(issue_field(metric_issue, "issuetype")))
+                    in rules.bug_types,
+                ),
+                (
+                    "статус не Отклонен исполнителем",
+                    bug_has_eligible_status(issue_field(metric_issue, "status"), rules),
+                ),
+                ("приоритет High+", priority in rules.bug_priorities),
+                ("в истории этапа есть PSI/ПРОМ", stage is not None),
+            )
+        ),
+        "classified_detection_stage": stage.upper() if stage else None,
+        "html_history_stage_values": html_stage_values,
+        "html_history_error": history_html_error,
+        "issue": snapshot,
+        "assignment_field_candidates": assignment_fields,
+        "all_nonempty_fields": all_nonempty_fields,
+    }
+    output_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(f"DEBUG_ISSUE_JSON={output_path.resolve()}")
+
+
+def write_reference_debug_report(
+    *,
+    jira: JiraClient,
+    reference_paths: Sequence[Path],
+    output_path: Path,
+    team_specs: Sequence[TeamSpec],
+    rules: MetricRules,
+    rolling_metrics: Sequence[TeamMetric],
+    quarter_metrics: Sequence[TeamMetric],
+    rolling_start: date,
+    rolling_end: date,
+    quarter_start: date,
+    quarter_end: date,
+    quarter_story_start: date,
+    released_issues: Sequence[Mapping[str, Any]],
+    created_bugs: Sequence[Mapping[str, Any]],
+    releases: Sequence[Mapping[str, Any]],
+    issue_keys_by_release: Mapping[str, set[str]],
+    release_date_field_id: str,
+    detection_stage_field_id: str,
+    team_assignment_field_ids: Sequence[str] = (),
+) -> None:
+    reference = load_reference_tasks(reference_paths, team_specs)
+    period_configs = {
+        "quarter": {
+            "label": f"{quarter_start.year} Q{quarter_bounds(quarter_start)[2]}",
+            "metrics": {metric.team: metric for metric in quarter_metrics},
+            "issue_start": quarter_start,
+            "story_start": quarter_story_start,
+            "end": quarter_end,
+        },
+        "rolling_90_days": {
+            "label": "90 дней",
+            "metrics": {metric.team: metric for metric in rolling_metrics},
+            "issue_start": rolling_start,
+            "story_start": rolling_start,
+            "end": rolling_end,
+        },
+    }
+    comparison_key_sets: dict[
+        str,
+        dict[str, dict[str, tuple[set[str], set[str]]]],
+    ] = {}
+    disputed_keys: set[str] = set()
+    for period_name, reference_by_team in reference.items():
+        config = period_configs[period_name]
+        metrics_by_team = config["metrics"]
+        period_sets: dict[str, dict[str, tuple[set[str], set[str]]]] = {}
+        for spec in team_specs:
+            if spec.team not in reference_by_team:
+                continue
+            metric = metrics_by_team[spec.team]
+            team_sets: dict[str, tuple[set[str], set[str]]] = {}
+            for issue_type, actual_keys in (
+                ("Story", set(metric.story_keys)),
+                ("Bug", set(metric.bug_keys)),
+            ):
+                expected_keys = reference_by_team[spec.team][issue_type]
+                missing = expected_keys - actual_keys
+                extra = actual_keys - expected_keys
+                team_sets[issue_type] = (missing, extra)
+                disputed_keys.update(missing)
+                disputed_keys.update(extra)
+            period_sets[spec.team] = team_sets
+        comparison_key_sets[period_name] = period_sets
+
+    execution_log(
+        "Debug XLSX: загружаю полные поля и changelog "
+        f"для спорных задач={len(disputed_keys)}"
+    )
+    exact_debug_issues, debug_issue_errors = jira.issues_individually(
+        disputed_keys,
+        ("*all", "issuelinks"),
+        max_workers=JIRA_LINK_WORKERS,
+        progress_label="Jira: debug спорных задач",
+        expand="changelog",
+    )
+    exact_debug_issues = {
+        key: with_detection_stage_history(issue, detection_stage_field_id)
+        for key, issue in exact_debug_issues.items()
+    }
+    jira_field_names = {
+        str(item.get("id") or ""): str(item.get("name") or item.get("id") or "")
+        for item in jira.fields()
+        if item.get("id")
+    }
+    if debug_issue_errors:
+        execution_log(
+            f"Debug XLSX: не удалось загрузить спорных задач="
+            f"{len(debug_issue_errors)}",
+            error=True,
+        )
+
+    released_by_key = {
+        str(issue.get("key") or "").strip().upper(): issue
+        for issue in released_issues
+        if str(issue.get("key") or "").strip()
+    }
+    bugs_by_key = {
+        str(issue.get("key") or "").strip().upper(): issue
+        for issue in created_bugs
+        if str(issue.get("key") or "").strip()
+    }
+    release_dates = {
+        str(release.get("key") or "").strip().upper(): (
+            parse_jira_date(issue_field(release, release_date_field_id))
+        )
+        for release in releases
+        if str(release.get("key") or "").strip()
+    }
+    releases_by_issue: dict[str, list[str]] = defaultdict(list)
+    for release_key, issue_keys in issue_keys_by_release.items():
+        for issue_key in issue_keys:
+            releases_by_issue[issue_key].append(release_key)
+
+    def task_details(
+        issue_key: str,
+        issue_type: str,
+        period_name: str,
+        expected_team: str,
+    ) -> dict[str, Any]:
+        config = period_configs[period_name]
+        issue_start = config["issue_start"]
+        story_start = config["story_start"]
+        period_end = config["end"]
+        period_label = str(config["label"])
+        source = released_by_key if issue_type == "Story" else bugs_by_key
+        issue = exact_debug_issues.get(issue_key) or source.get(issue_key)
+        snapshot = issue_debug_snapshot(
+            issue,
+            detection_stage_field_id=detection_stage_field_id,
+            jira_field_names=jira_field_names,
+            team_specs=team_specs,
+        )
+        if issue is not None:
+            snapshot["team_assignment"] = issue_assignment_debug(
+                issue,
+                team_specs,
+                team_assignment_field_ids,
+            )
+        assigned_team = (
+            issue_assignment_team(
+                issue,
+                team_specs,
+                team_assignment_field_ids,
+            )
+            if issue is not None
+            else None
+        )
+        wrong_assignment = (
+            assigned_team == ""
+            or assigned_team not in (None, expected_team)
+        )
+        if issue_type == "Story":
+            linked_releases = sorted(releases_by_issue.get(issue_key, []))
+            linked_period_release = any(
+                installed is not None
+                and story_start <= installed < period_end
+                for installed in (
+                    release_dates.get(release_key)
+                    for release_key in linked_releases
+                )
+            )
+            snapshot["installed_releases"] = [
+                {
+                    "key": release_key,
+                    "date": (
+                        release_dates[release_key].isoformat()
+                        if release_dates.get(release_key)
+                        else ""
+                    ),
+                }
+                for release_key in linked_releases
+            ]
+            if issue is None:
+                snapshot["reason"] = (
+                    "нет в consist of установленных релизов объединённой выборки"
+                )
+            elif wrong_assignment:
+                snapshot["reason"] = (
+                    "КЭ/команда задачи относится к другой или ненастроенной "
+                    "проектной области"
+                )
+            elif not linked_period_release:
+                snapshot["reason"] = (
+                    f"нет consist-of релиза, установленного за {period_label}"
+                )
+            elif not story_has_done_status(issue_field(issue, "status"), rules):
+                snapshot["reason"] = "Story не в Done"
+            else:
+                snapshot["reason"] = "должна учитываться"
+        else:
+            created = parse_jira_date(issue_field(issue, "created")) if issue else None
+            priority = normalized(named_value(issue_field(issue, "priority"))) if issue else ""
+            stage = (
+                classify_eligible_detection_stage(
+                    issue_field(issue, detection_stage_field_id),
+                    rules,
+                )
+                if issue
+                else None
+            )
+            if issue is None:
+                snapshot["reason"] = "нет в JQL заведённых Bug объединённого периода"
+            elif wrong_assignment:
+                snapshot["reason"] = (
+                    "КЭ/команда задачи относится к другой или ненастроенной "
+                    "проектной области"
+                )
+            elif created is None or not (issue_start <= created < period_end):
+                snapshot["reason"] = f"created вне периода {period_label}"
+            elif not bug_has_eligible_status(issue_field(issue, "status"), rules):
+                snapshot["reason"] = "статус «Отклонен исполнителем»"
+            elif priority not in rules.bug_priorities:
+                snapshot["reason"] = "приоритет не High+"
+            elif stage is None:
+                snapshot["reason"] = "в истории этапа нет PSI/ПРОМ"
+            else:
+                snapshot["reason"] = (
+                    f"должен учитываться по истории как {stage.upper()}"
+                )
+        return snapshot
+
+    comparisons: dict[str, Any] = {}
+    for period_name in ("quarter", "rolling_90_days"):
+        reference_by_team = reference.get(period_name, {})
+        if not reference_by_team:
+            continue
+        config = period_configs[period_name]
+        metrics_by_team = config["metrics"]
+        period_result: dict[str, Any] = {}
+        for spec in team_specs:
+            if spec.team not in reference_by_team:
+                continue
+            metric = metrics_by_team[spec.team]
+            team_result: dict[str, Any] = {}
+            for issue_type, actual_keys in (
+                ("Story", set(metric.story_keys)),
+                ("Bug", set(metric.bug_keys)),
+            ):
+                expected_keys = reference_by_team[spec.team][issue_type]
+                missing_set, extra_set = comparison_key_sets[period_name][spec.team][
+                    issue_type
+                ]
+                missing = sorted(missing_set)
+                extra = sorted(extra_set)
+                team_result[issue_type] = {
+                    "reference_count": len(expected_keys),
+                    "script_count": len(actual_keys),
+                    "missing_count": len(missing),
+                    "extra_count": len(extra),
+                    "missing": [
+                        {
+                            "key": key,
+                            **task_details(
+                                key,
+                                issue_type,
+                                period_name,
+                                spec.team,
+                            ),
+                        }
+                        for key in missing
+                    ],
+                    "extra": [
+                        {
+                            "key": key,
+                            **task_details(
+                                key,
+                                issue_type,
+                                period_name,
+                                spec.team,
+                            ),
+                        }
+                        for key in extra
+                    ],
+                }
+            team_result["squad_code"] = spec.squad_code
+            period_result[spec.team] = team_result
+            print(
+                f"DEBUG XLSX {config['label']} · {spec.team}: "
+                f"Story {team_result['Story']['script_count']}/"
+                f"{team_result['Story']['reference_count']} "
+                f"(нет={team_result['Story']['missing_count']}, "
+                f"лишних={team_result['Story']['extra_count']}); "
+                f"Bug {team_result['Bug']['script_count']}/"
+                f"{team_result['Bug']['reference_count']} "
+                f"(нет={team_result['Bug']['missing_count']}, "
+                f"лишних={team_result['Bug']['extra_count']})"
+            )
+        comparisons[period_name] = period_result
+
+    payload = {
+        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "read_only": True,
+        "reference_files": [str(path) for path in reference_paths],
+        "periods": {
+            "quarter": {
+                "display_start": quarter_start.isoformat(),
+                "story_start": quarter_story_start.isoformat(),
+                "end_exclusive": quarter_end.isoformat(),
+            },
+            "rolling_90_days": {
+                "display_start": rolling_start.isoformat(),
+                "story_start": rolling_start.isoformat(),
+                "end_exclusive": rolling_end.isoformat(),
+            },
+        },
+        "debug_issue_errors": debug_issue_errors,
+        "comparisons": comparisons,
+    }
+    output_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(f"DEBUG_REFERENCE_JSON={output_path.resolve()}")
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Собирает за последние 90 дней и отдельно за квартал отношение "
+            "заведённых в Jira-проектах команд High+ PSI/ПРОМ-багов "
+            "в любом статусе, кроме «Отклонен исполнителем», "
+            "к зарелизенным Story и публикует таблицы в Confluence."
+        )
+    )
+    parser.add_argument(
+        "--quarter",
+        help="Квартал YYYY-QN. По умолчанию текущий квартал.",
+    )
+    parser.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="Только собрать и вывести метрики, не менять Confluence.",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Показать JQL и ключи учтённых задач.",
+    )
+    parser.add_argument(
+        "--debug-reference",
+        nargs="+",
+        metavar="XLSX",
+        help=(
+            "Сверить ключи квартала и 90 дней с одной или несколькими "
+            "XLSX-выгрузками метрики. Поддерживаются путь, каталог и shell "
+            "glob; публикация Confluence автоматически отключается."
+        ),
+    )
+    parser.add_argument(
+        "--debug-project",
+        metavar="JIRA_PROJECT",
+        help=(
+            "Собрать подробный JSON-аудит одного Jira project: найденные "
+            "релизы и consist-of задачи, кандидаты Bug, PASS/FAIL каждого "
+            "фильтра и полный расчёт. Публикация автоматически отключается."
+        ),
+    )
+    parser.add_argument(
+        "--debug-issue",
+        metavar="JIRA_KEY",
+        help=(
+            "Быстро скачать все поля и changelog одной Jira-задачи для "
+            "точечной диагностики фильтров. Публикация автоматически отключается."
+        ),
+    )
+    parser.add_argument(
+        "--debug-output",
+        help=(
+            "Путь для JSON-аудита --debug-reference, --debug-project или "
+            "--debug-issue. "
+            "По умолчанию имя формируется автоматически в текущем каталоге."
+        ),
+    )
+    args = parser.parse_args(argv)
+    debug_modes = sum(
+        bool(value)
+        for value in (
+            args.debug_reference,
+            args.debug_project,
+            args.debug_issue,
+        )
+    )
+    if debug_modes > 1:
+        parser.error(
+            "--debug-reference, --debug-project и --debug-issue "
+            "нельзя использовать вместе"
+        )
+    return args
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = parse_args(argv)
+    if args.debug_reference or args.debug_project or args.debug_issue:
+        args.no_publish = True
+    job_started = time.perf_counter()
+    execution_log(
+        "Старт quarterly_quality_metrics "
+        f"(публикация={'выключена' if args.no_publish else 'включена'}, "
+        f"verbose={'да' if args.verbose else 'нет'})"
+    )
+    try:
+        team_specs = load_team_specs()
+        rules = MetricRules.defaults()
+        debug_project = str(args.debug_project or "").strip().upper()
+        debug_issue = str(args.debug_issue or "").strip().upper()
+        if debug_issue and not re.fullmatch(r"[A-Z][A-Z0-9_]*-\d+", debug_issue):
+            raise RuntimeError(
+                f"Некорректный Jira key для --debug-issue: {debug_issue}"
+            )
+        debug_team_spec = next(
+            (
+                spec
+                for spec in team_specs
+                if debug_project in spec.project_keys
+            ),
+            None,
+        )
+        if debug_project and debug_team_spec is None:
+            configured_projects = sorted(
+                project_key
+                for spec in team_specs
+                for project_key in spec.project_keys
+            )
+            raise RuntimeError(
+                f"Jira project {debug_project} не привязан ни к одной команде. "
+                f"Настроены: {', '.join(configured_projects)}"
+            )
+        if debug_team_spec is not None:
+            active_team_specs: tuple[TeamSpec, ...] = (
+                TeamSpec(
+                    team=debug_team_spec.team,
+                    squad_code=debug_team_spec.squad_code,
+                    project_keys=(debug_project,),
+                    ke_ids=debug_team_spec.ke_ids,
+                    as_is_ratio=debug_team_spec.as_is_ratio,
+                    target_ratio=debug_team_spec.target_ratio,
+                ),
+            )
+        else:
+            active_team_specs = tuple(team_specs)
+        debug_reference_paths = (
+            expand_debug_reference_paths(args.debug_reference)
+            if args.debug_reference
+            else []
+        )
+        if args.debug_reference and not debug_reference_paths:
+            raise RuntimeError(
+                "--debug-reference не нашёл ни одного существующего XLSX-файла."
+            )
+        if debug_reference_paths:
+            execution_log(
+                f"Debug XLSX: файлов эталона={len(debug_reference_paths)}; "
+                "публикация Confluence отключена"
+            )
+        if debug_project:
+            execution_log(
+                f"Debug project: {debug_project}, "
+                f"команда={debug_team_spec.team}; публикация отключена"
+            )
+        if debug_issue:
+            execution_log(
+                f"Debug issue: {debug_issue}; публикация отключена"
+            )
+        today = datetime.now().astimezone().date()
+        if args.quarter:
+            quarter_start, quarter_calendar_end, quarter = parse_quarter(args.quarter)
+        else:
+            quarter_start, quarter_calendar_end, quarter = quarter_bounds(today)
+
+        quarter_end = quarter_calendar_end
+        rolling_end = today + timedelta(days=1)
+        rolling_start = rolling_end - timedelta(days=90)
+        quarter_story_start = quarter_start - timedelta(
+            days=QUARTER_STORY_LOOKBACK_DAYS
+        )
+        collection_start = min(rolling_start, quarter_story_start)
+        collection_end = max(rolling_end, quarter_end)
+        execution_log(
+            f"Периоды: 90 дней {rolling_start.isoformat()} — "
+            f"{(rolling_end - timedelta(days=1)).isoformat()}; "
+            f"{quarter_start.year} Q{quarter} {quarter_start.isoformat()} — "
+            f"{(quarter_end - timedelta(days=1)).isoformat()}; "
+            f"команд={len(active_team_specs)}"
+        )
+
+        execution_log("Загружаю настройки Jira из config.py")
+        jira = JiraClient(load_jira_settings())
+        if debug_issue:
+            debug_output = (
+                Path(args.debug_output).expanduser()
+                if args.debug_output
+                else Path.cwd()
+                / (
+                    f"quarterly_issue_debug_{debug_issue}_"
+                    + datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
+                    + ".json"
+                )
+            )
+            debug_output.parent.mkdir(parents=True, exist_ok=True)
+            write_issue_debug_report(
+                jira=jira,
+                issue_key=debug_issue,
+                output_path=debug_output,
+                team_specs=team_specs,
+                rules=rules,
+                detection_stage_field_id=DEFAULT_DETECTION_STAGE_FIELD_ID,
+            )
+            execution_log(
+                f"Готово за {elapsed_seconds(job_started)}; "
+                "Confluence не изменён (--debug-issue)"
+            )
+            return 0
+        release_date_name = DEFAULT_RELEASE_DATE_FIELD_NAME
+        field_lookup_started = time.perf_counter()
+        execution_log(
+            f"Jira: определяю поле «{release_date_name}»"
+        )
+        release_date_field_id = find_jira_field_id(
+            jira,
+            configured_jira_field_id(
+                "prod_installed_date_id",
+                DEFAULT_RELEASE_DATE_FIELD_ID,
+            ),
+            release_date_name,
+            (
+                "Дата установки на пром",
+                "Дата установки в ПРОМ",
+                "Дата установки в пром",
+                "Дата установки (ПРОМ)",
+                "Дата установки PROD",
+            ),
+        )
+        execution_log(
+            f"Jira: поле даты релиза={release_date_field_id} "
+            f"({elapsed_seconds(field_lookup_started)})"
+        )
+        detection_stage_field_id = DEFAULT_DETECTION_STAGE_FIELD_ID
+        release_type_field_id = DEFAULT_RELEASE_TYPE_FIELD_ID
+        team_assignment_field_ids = find_team_assignment_field_ids(jira)
+        if team_assignment_field_ids:
+            rendered_team_fields = ", ".join(team_assignment_field_ids[:20])
+            suffix = (
+                f", +{len(team_assignment_field_ids) - 20}"
+                if len(team_assignment_field_ids) > 20
+                else ""
+            )
+            execution_log(
+                "Jira: поля команды/сквада для метрики="
+                f"{rendered_team_fields}{suffix}"
+            )
+
+        (
+            releases,
+            released_issues,
+            release_jql,
+            issue_keys_by_release,
+        ) = collect_released_issues(
+            jira,
+            start=collection_start,
+            end=collection_end,
+            release_project=DEFAULT_RELEASE_PROJECT,
+            release_issue_type=DEFAULT_RELEASE_ISSUE_TYPE,
+            release_ke_field_name=DEFAULT_RELEASE_KE_FIELD_NAME,
+            release_ke_ids=(
+                RELEASE_KE_IDS if DEFAULT_FILTER_RELEASES_BY_KE else ()
+            ),
+            release_created_since=DEFAULT_RELEASE_CREATED_SINCE,
+            release_date_field_id=release_date_field_id,
+            release_type_field_id=release_type_field_id,
+            detection_stage_field_id=detection_stage_field_id,
+            link_keywords=DEFAULT_RELEASE_LINK_KEYWORDS,
+            team_assignment_field_ids=team_assignment_field_ids,
+            verbose=args.verbose,
+            team_project_keys=tuple(
+                project_key
+                for spec in active_team_specs
+                for project_key in spec.project_keys
+            ),
+            additional_release_projects=DEFAULT_ADDITIONAL_RELEASE_PROJECTS,
+        )
+        created_bugs, bugs_jql = collect_created_bugs(
+            jira,
+            active_team_specs,
+            rules,
+            start=collection_start,
+            end=collection_end,
+            detection_stage_field_id=detection_stage_field_id,
+            team_assignment_field_ids=team_assignment_field_ids,
+            verbose=args.verbose,
+        )
+
+        # Story belongs to a reporting period by the installation date of its
+        # linked Release 2.0. Its own resolutiondate can be outside the period;
+        # the corporate metric only requires the current Done status.
+        rolling_releases, rolling_release_issues = select_period_data(
+            releases,
+            released_issues,
+            issue_keys_by_release,
+            start=rolling_start,
+            end=rolling_end,
+            release_date_field_id=release_date_field_id,
+        )
+        quarter_releases, _ = select_period_data(
+            releases,
+            released_issues,
+            issue_keys_by_release,
+            start=quarter_start,
+            end=quarter_end,
+            release_date_field_id=release_date_field_id,
+        )
+        _, quarter_story_release_issues = select_period_data(
+            releases,
+            released_issues,
+            issue_keys_by_release,
+            start=quarter_story_start,
+            end=quarter_end,
+            release_date_field_id=release_date_field_id,
+        )
+        rolling_stories = select_released_stories(
+            rolling_release_issues,
+            rules,
+        )
+        quarter_stories = select_released_stories(
+            quarter_story_release_issues,
+            rules,
+        )
+        rolling_bugs = select_created_issues(
+            created_bugs,
+            start=rolling_start,
+            end=rolling_end,
+        )
+        quarter_bugs = select_created_issues(
+            created_bugs,
+            start=quarter_start,
+            end=quarter_end,
+        )
+        rolling_metric_issues = [*rolling_stories, *rolling_bugs]
+        quarter_metric_issues = [*quarter_stories, *quarter_bugs]
+        execution_log(
+            "Разбиение по периодам завершено: "
+            f"90 дней — релизов={len(rolling_releases)}, "
+            f"Story-кандидатов={len(rolling_stories)}, "
+            f"заведённых багов={len(rolling_bugs)}; "
+            f"квартал — релизов={len(quarter_releases)}, "
+            f"Story-кандидатов={len(quarter_stories)}, "
+            f"заведённых багов={len(quarter_bugs)}; "
+            f"граница Story квартала={quarter_story_start.isoformat()}"
+        )
+
+        rolling_hotfix_count = sum(
+            is_hotfix_release(release, release_type_field_id, DEFAULT_HOTFIX_VALUES)
+            for release in rolling_releases
+        )
+        quarter_hotfix_count = sum(
+            is_hotfix_release(release, release_type_field_id, DEFAULT_HOTFIX_VALUES)
+            for release in quarter_releases
+        )
+        if args.verbose:
+            print("\n=== Последние 90 дней: аудит ===")
+            print(
+                "Источник: Story из consist of установленных релизов; "
+                "Bug по дате создания в Jira-проектах команд."
+            )
+            print_issue_inventory(rolling_metric_issues)
+            print_filter_audit(
+                active_team_specs,
+                rolling_metric_issues,
+                rules,
+                detection_stage_field_id,
+                team_assignment_field_ids,
+            )
+            print(f"\n=== {quarter_start.year} Q{quarter}: аудит ===")
+            print(
+                "Источник: Story из consist of установленных релизов; "
+                "Bug по дате создания в Jira-проектах команд."
+            )
+            print_issue_inventory(quarter_metric_issues)
+            print_filter_audit(
+                active_team_specs,
+                quarter_metric_issues,
+                rules,
+                detection_stage_field_id,
+                team_assignment_field_ids,
+            )
+
+        metrics_started = time.perf_counter()
+        execution_log("Рассчитываю метрики команд и формирую таблицы")
+        rolling_counts = aggregate_issues(
+            active_team_specs,
+            rolling_metric_issues,
+            rules,
+            detection_stage_field_id,
+            team_assignment_field_ids,
+        )
+        quarter_counts = aggregate_issues(
+            active_team_specs,
+            quarter_metric_issues,
+            rules,
+            detection_stage_field_id,
+            team_assignment_field_ids,
+        )
+        rolling_metrics = [
+            calculate_metric(spec, rolling_counts[spec.team])
+            for spec in active_team_specs
+        ]
+        quarter_metrics = [
+            calculate_metric(spec, quarter_counts[spec.team])
+            for spec in active_team_specs
+        ]
+        if debug_reference_paths:
+            debug_output = (
+                Path(args.debug_output).expanduser()
+                if args.debug_output
+                else Path.cwd()
+                / (
+                    "quarterly_reference_debug_"
+                    + datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
+                    + ".json"
+                )
+            )
+            debug_output.parent.mkdir(parents=True, exist_ok=True)
+            write_reference_debug_report(
+                jira=jira,
+                reference_paths=debug_reference_paths,
+                output_path=debug_output,
+                team_specs=team_specs,
+                rules=rules,
+                rolling_metrics=rolling_metrics,
+                quarter_metrics=quarter_metrics,
+                rolling_start=rolling_start,
+                rolling_end=rolling_end,
+                quarter_start=quarter_start,
+                quarter_end=quarter_end,
+                quarter_story_start=quarter_story_start,
+                released_issues=released_issues,
+                created_bugs=created_bugs,
+                releases=releases,
+                issue_keys_by_release=issue_keys_by_release,
+                release_date_field_id=release_date_field_id,
+                detection_stage_field_id=detection_stage_field_id,
+                team_assignment_field_ids=team_assignment_field_ids,
+            )
+        if debug_project:
+            debug_output = (
+                Path(args.debug_output).expanduser()
+                if args.debug_output
+                else Path.cwd()
+                / (
+                    f"quarterly_project_debug_{debug_project}_"
+                    + datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
+                    + ".json"
+                )
+            )
+            debug_output.parent.mkdir(parents=True, exist_ok=True)
+            write_project_debug_report(
+                output_path=debug_output,
+                project_key=debug_project,
+                team_spec=active_team_specs[0],
+                rules=rules,
+                rolling_start=rolling_start,
+                rolling_end=rolling_end,
+                quarter_start=quarter_start,
+                quarter_end=quarter_end,
+                quarter_story_start=quarter_story_start,
+                quarter=quarter,
+                releases=releases,
+                released_issues=released_issues,
+                created_bugs=created_bugs,
+                issue_keys_by_release=issue_keys_by_release,
+                release_jql=release_jql,
+                bugs_jql=bugs_jql,
+                release_date_field_id=release_date_field_id,
+                release_type_field_id=release_type_field_id,
+                detection_stage_field_id=detection_stage_field_id,
+                team_assignment_field_ids=team_assignment_field_ids,
+            )
+        generated_at = datetime.now().astimezone()
+        report_html = render_confluence_html(
+            rolling_metrics=rolling_metrics,
+            quarter_metrics=quarter_metrics,
+            rolling_start=rolling_start,
+            rolling_end=rolling_end,
+            quarter_start=quarter_start,
+            quarter_end=quarter_end,
+            quarter=quarter,
+            rolling_release_count=len(rolling_releases),
+            rolling_hotfix_count=rolling_hotfix_count,
+            quarter_release_count=len(quarter_releases),
+            quarter_hotfix_count=quarter_hotfix_count,
+            generated_at=generated_at,
+        )
+        execution_log(
+            f"Метрики и таблицы сформированы ({elapsed_seconds(metrics_started)})"
+        )
+
+        print(
+            f"\nПоследние 90 дней: {rolling_start.isoformat()} — "
+            f"{(rolling_end - timedelta(days=1)).isoformat()}"
+        )
+        print(
+            f"Релизов: {len(rolling_releases)} "
+            f"(плановых: {len(rolling_releases) - rolling_hotfix_count}, "
+            f"Hotfix: {rolling_hotfix_count}); "
+            f"Story из consist of до фильтра Done: {len(rolling_stories)}; "
+            f"заведённых багов до фильтров: {len(rolling_bugs)}"
+        )
+        print(render_console(rolling_metrics))
+        print(
+            forecast_text(
+                forecast_metric(rolling_metrics, rolling_start, rolling_end, generated_at.date())
+            )
+        )
+
+        print(
+            f"\n{quarter_start.year} Q{quarter}: {quarter_start.isoformat()} — "
+            f"{(quarter_end - timedelta(days=1)).isoformat()}"
+        )
+        print(
+            f"Релизов: {len(quarter_releases)} "
+            f"(плановых: {len(quarter_releases) - quarter_hotfix_count}, "
+            f"Hotfix: {quarter_hotfix_count}); "
+            f"Story из consist of до фильтра Done: {len(quarter_stories)}; "
+            f"заведённых багов до фильтров: {len(quarter_bugs)}"
+        )
+        print(render_console(quarter_metrics))
+        print(
+            forecast_text(
+                forecast_metric(quarter_metrics, quarter_start, quarter_end, generated_at.date())
+            )
+        )
+
+        if args.verbose:
+            print(f"\nФактический JQL релизов: {release_jql}")
+            print(f"Фактический JQL заведённых багов: {bugs_jql}")
+            print("Последние 90 дней:")
+            for metric in rolling_metrics:
+                print(
+                    f"{metric.team}: Story={','.join(metric.story_keys) or '—'}; "
+                    f"Bug={','.join(metric.bug_keys) or '—'}"
+                )
+            print(f"{quarter_start.year} Q{quarter}:")
+            for metric in quarter_metrics:
+                print(
+                    f"{metric.team}: Story={','.join(metric.story_keys) or '—'}; "
+                    f"Bug={','.join(metric.bug_keys) or '—'}"
+                )
+
+        if args.no_publish:
+            execution_log(
+                f"Готово за {elapsed_seconds(job_started)}; "
+                "Confluence не изменён (--no-publish)"
+            )
+            return 0
+
+        publish_started = time.perf_counter()
+        execution_log(
+            f"Confluence: публикую отчёт на страницу {DEFAULT_CONFLUENCE_PAGE_ID}"
+        )
+        publisher = ConfluencePublisher(load_confluence_settings())
+        page_url = publisher.publish(
+            body=report_html,
+            page_id=DEFAULT_CONFLUENCE_PAGE_ID,
+        )
+        print(f"CONFLUENCE_PAGE_URL={page_url}")
+        execution_log(
+            f"Confluence: публикация завершена ({elapsed_seconds(publish_started)}); "
+            f"весь запуск={elapsed_seconds(job_started)}"
+        )
+        return 0
+    except KeyboardInterrupt:
+        execution_log(
+            f"Остановлено пользователем через {elapsed_seconds(job_started)}",
+            error=True,
+        )
+        return 130
+    except Exception as exc:
+        execution_log(
+            f"Ошибка через {elapsed_seconds(job_started)}: {exc}",
+            error=True,
+        )
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

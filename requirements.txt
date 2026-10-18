@@ -1,5 +1,7 @@
 playwright>=1.40.0
 requests>=2.31.0
+# urllib3 2.x warns on macOS system Python 3.9 because it is built with LibreSSL.
+urllib3<2
 python-dotenv>=1.0.0
 jira>=3.5.0
 atlassian-python-api>=3.41.0

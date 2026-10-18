@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="ru">
+  <head><meta charset="utf-8"><title>Stale DOM harness</title></head>
+  <body>
+    <button id="rerender">Rerender</button>
+    <section id="root"><button data-testid="target">Target v1</button></section>
+    <script>
+      document.getElementById('rerender').addEventListener('click', () => {
+        document.getElementById('root').innerHTML = '<button data-testid="target">Target v2</button>';
+      });
+    </script>
+  </body>
+</html>
