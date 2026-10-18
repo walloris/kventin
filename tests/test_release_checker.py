@@ -1474,6 +1474,42 @@ def test_structured_debug_records_retries_budget_and_safe_response_shape(monkeyp
     assert events[-1]['remaining_s'] == 9.5
 
 
+@pytest.mark.parametrize('enabled', [True, False])
+def test_http_debug_switch_works_without_changing_jenkins_command(monkeypatch, capsys, enabled):
+    monkeypatch.delenv('RELEASE_CHECKER_DEBUG_HTTP', raising=False)
+    monkeypatch.setattr(rc, 'HTTP_DEBUG_ENABLED', enabled)
+    session = Mock()
+    session.get.return_value = response(200, {'results': [], 'total': 0})
+    rc.bounded_get(session, 'https://jira.example/path', source='Zephyr', attempts=3,
+                   timeout=3, deadline=rc.time.monotonic() + 10, validate=rc.validate_json_payload)
+    output = capsys.readouterr().out
+    assert ('[HTTP DEBUG]' in output) is enabled
+    assert ('"shape"' in output) is enabled
+    assert session.get.call_count == 1
+
+
+@pytest.mark.parametrize('override,expected', [('0', False), ('1', True), ('false', False), ('true', True)])
+def test_http_debug_environment_overrides_code_switch(monkeypatch, override, expected):
+    monkeypatch.setattr(rc, 'HTTP_DEBUG_ENABLED', not expected)
+    monkeypatch.setenv('RELEASE_CHECKER_DEBUG_HTTP', override)
+    assert rc.http_debug_enabled() is expected
+
+
+def test_http_debug_off_disables_file_logging_too(monkeypatch, tmp_path):
+    monkeypatch.setenv('RELEASE_CHECKER_DEBUG_HTTP', '0')
+    path = tmp_path / 'disabled.jsonl'
+    handlers_before = list(rc.http_debug_logger.handlers)
+    try:
+        rc.configure_http_debug(path)
+        rc.trace_http('PR', 'https://jira.example/path', 200, rc.time.monotonic())
+        assert path.read_text() == ''
+    finally:
+        for handler in list(rc.http_debug_logger.handlers):
+            if handler not in handlers_before:
+                rc.http_debug_logger.removeHandler(handler)
+                handler.close()
+
+
 def test_jsonl_file_and_dry_run_comment_preview(monkeypatch, tmp_path):
     import json
     path = tmp_path / 'http.jsonl'

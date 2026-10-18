@@ -72,6 +72,10 @@ except ImportError:
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.ERROR)
 
+# Промежуточная версия для Jenkins: True — подробная диагностика, False — обычные логи.
+# Команду запуска менять не нужно. RELEASE_CHECKER_DEBUG_HTTP=1/0 переопределяет этот параметр.
+HTTP_DEBUG_ENABLED = True
+
 ALLOWED_TESTERS = {
     "Абдуллаев Магомедэмин Шамильевич",
     "Годунова Дарья Алексеевна", "Гулиев Руслан Иса оглы",
@@ -1264,6 +1268,11 @@ http_debug_logger.setLevel(logging.INFO)
 http_debug_logger.propagate = False
 
 
+def http_debug_enabled():
+    override = os.getenv('RELEASE_CHECKER_DEBUG_HTTP')
+    return HTTP_DEBUG_ENABLED if override is None else override.strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
 def configure_http_debug(path):
     """Optional dedicated JSONL log; never enable third-party wire logging."""
     handler = logging.FileHandler(path, encoding='utf-8')
@@ -1295,7 +1304,7 @@ def response_shape(payload, depth=0):
 
 def trace_http(source, url, outcome, started, attempt=1, params=None, **details):
     elapsed = time.monotonic() - started
-    debug = os.getenv('RELEASE_CHECKER_DEBUG_HTTP', '0') == '1' or bool(http_debug_logger.handlers)
+    debug = http_debug_enabled()
     safe_params = {key: value for key, value in (params or {}).items()
                    if key in {'issueId', 'applicationType', 'dataType', 'startAt', 'maxResults', 'fields'}}
     if debug:
@@ -1370,7 +1379,7 @@ def bounded_get(session, url, *, source, attempts, timeout, deadline, validate=N
                 retry_state['until'] = time.monotonic() + retry_after_seconds(response)
             if response.status_code == 200 and validate is not None:
                 payload = response.json()
-                if os.getenv('RELEASE_CHECKER_DEBUG_HTTP', '0') == '1' or http_debug_logger.handlers:
+                if http_debug_enabled():
                     trace('json', started, attempt, shape=response_shape(payload))
                 validate(payload)
             if response.status_code not in {408, 429, 500, 502, 503, 504} or attempt == attempts:
@@ -1424,7 +1433,7 @@ class CachedJiraReads:
             if key not in self.cache:
                 started = time.monotonic()
                 self.cache[key] = method(*args, **kwargs)
-                if os.getenv('RELEASE_CHECKER_DEBUG_HTTP', '0') == '1':
+                if http_debug_enabled():
                     result = self.cache[key]
                     size = len(result) if isinstance(result, (list, dict)) else 1
                     print(f"[JIRA {name}] objects={size} elapsed={time.monotonic()-started:.2f}s", flush=True)
@@ -5917,8 +5926,10 @@ if __name__ == "__main__":
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(line_buffering=True)
     debug_path = os.getenv('RELEASE_CHECKER_HTTP_LOG', '').strip()
-    if debug_path:
+    if debug_path and http_debug_enabled():
         configure_http_debug(debug_path)
+    print(f"[DIAGNOSTICS] HTTP={'ON' if http_debug_enabled() else 'OFF'} "
+          f"output={'file' if http_debug_logger.handlers else 'console'}", flush=True)
     validator = ReleaseValidator()
     if len(sys.argv) >= 3 and sys.argv[1] == "--dry-run":
         validator.dry_run = True
