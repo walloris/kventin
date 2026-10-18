@@ -10,6 +10,7 @@ import urllib3
 import logging
 import requests
 import tempfile
+from itertools import count
 from html.parser import HTMLParser
 from pathlib import Path
 from collections import defaultdict
@@ -103,6 +104,7 @@ PR_MAX_ATTEMPTS = 3
 PR_RETRY_DELAY_SECONDS = 0.5
 PR_LOOKUP_TIMEOUT_SECONDS = 30
 PR_REQUEST_TIMEOUT_SECONDS = 3
+PR_SUMMARY_TIMEOUT_SECONDS = 5
 PR_DETAIL_TIMEOUT_SECONDS = 12
 PR_FAILURE_COOLDOWN_SECONDS = 15
 PR_LEGACY_PROVIDERS = ('stash', 'bitbucket', 'bitbucket-server')
@@ -151,10 +153,14 @@ ZEPHYR_MAX_RETRIES_PER_REQUEST = int(os.getenv("ZEPHYR_MAX_RETRIES_PER_REQUEST",
 ZEPHYR_MAX_FAILED_REQUESTS = int(os.getenv("ZEPHYR_MAX_FAILED_REQUESTS", "20"))
 ZEPHYR_LOOKUP_TIMEOUT_SECONDS = 45
 ZEPHYR_REQUEST_BUDGET_SECONDS = 32
+# Reserve fallback time inside the existing 45-second cycle lookup budget.
+ZEPHYR_CYCLE_DISCOVERY_SECONDS = 25
+ZEPHYR_CYCLE_METADATA_SECONDS = 8
 ZEPHYR_CYCLE_INDEX_PAGE_SIZE = int(os.getenv("ZEPHYR_CYCLE_INDEX_PAGE_SIZE", "200"))
 ZEPHYR_CASE_FIELDS = 'key,name,status,customFields,issueLinks'
 CHECK_TABLE_HEADER = '|| Проверка || Результат || Время, с || Объекты || Успех / ошибки / предупреждения || Замечания ||'
-COMMENT_TABLE_HEADER = '|| Объект релиза || Замечания ||'
+LEGACY_COMMENT_TABLE_HEADER = '|| Объект релиза || Замечания ||'
+COMMENT_TABLE_HEADER = '|| Объект релиза || Статус || Что требует внимания ||'
 
 # Имя кастомного поля "Вид тестирования" в Zephyr Scale ТК/ТЦ.
 # Поле ищется в customFields ответа API GET /rest/atm/1.0/testcase/{key}
@@ -524,19 +530,16 @@ class ZephyrScaleClient:
         """Один быстрый GET без ретраев для диагностических/спекулятивных endpoint'ов."""
         self._raise_if_failed_request_limit_reached()
         kwargs.setdefault('timeout', self.request_timeout_seconds)
-        started = time.monotonic()
         try:
             response = bounded_get(self.session, url, source='Zephyr', attempts=1,
                 timeout=kwargs.pop('timeout'), deadline=min(time.monotonic() + self.request_timeout_seconds,
                     getattr(self, '_lookup_deadline', None) or float('inf')),
                 retry_state=self.retry_state, **kwargs)
-            trace_http('Zephyr', url, response.status_code, started)
         except requests.exceptions.SSLError as e:
             self.fatal_error = request_failure_kind(e)
-            trace_http('Zephyr', url, self.fatal_error, started)
             raise RuntimeError(self.fatal_error) from e
         except requests.RequestException as e:
-            self._mark_failed_request(str(e))
+            self._mark_failed_request(request_failure_kind(e))
             self._raise_if_failed_request_limit_reached()
             raise
         if response.status_code in {401, 403}:
@@ -862,7 +865,9 @@ class ZephyrScaleClient:
         for endpoint_name, endpoint_path in self._issue_link_endpoint_paths(issue_key):
             url = f"{self.base_url}{endpoint_path}"
             try:
-                response = self._get_once(url)
+                # Retry transient failures, but spend no more than the old single GET.
+                response = self._get_with_retries(
+                    url, deadline=time.monotonic() + self.request_timeout_seconds)
                 if response.status_code != 200:
                     self.last_test_cycle_search_stats.append({
                         'mode': 'issuelink',
@@ -1253,13 +1258,60 @@ def request_failure_kind(exc):
     return type(exc).__name__
 
 
-def trace_http(source, url, outcome, started, attempt=1, params=None):
+_http_request_ids = count(1)
+http_debug_logger = logging.getLogger('release_checker.http')
+http_debug_logger.setLevel(logging.INFO)
+http_debug_logger.propagate = False
+
+
+def configure_http_debug(path):
+    """Optional dedicated JSONL log; never enable third-party wire logging."""
+    handler = logging.FileHandler(path, encoding='utf-8')
+    handler.setFormatter(logging.Formatter('%(message)s'))
+    http_debug_logger.addHandler(handler)
+
+
+def response_shape(payload, depth=0):
+    """Bounded schema sample, with no free-text values or unknown field names."""
+    if isinstance(payload, list):
+        result = {'type': 'list', 'count': len(payload)}
+        if payload and depth < 3:
+            result['first'] = response_shape(payload[0], depth + 1)
+        return result
+    if isinstance(payload, dict):
+        known = {'summary', 'pullrequest', 'overall', 'count', 'byInstanceType',
+                 'detail', 'pullRequests', 'repositories', 'commits', 'errors',
+                 'errorMessages', 'results', 'values', 'items', 'testRuns',
+                 'testCycles', 'testCases', 'total', 'isLast', 'key', 'id',
+                 'name', 'status', 'customFields', 'issueKey', 'issueLinks'}
+        result = {'type': 'object', 'fields': len(payload)}
+        if depth < 3:
+            result['known'] = {key: (value if key in {'total', 'count', 'isLast'}
+                                     and type(value) in (int, bool) else response_shape(value, depth + 1))
+                               for key, value in payload.items() if key in known}
+        return result
+    return {'type': type(payload).__name__}
+
+
+def trace_http(source, url, outcome, started, attempt=1, params=None, **details):
     elapsed = time.monotonic() - started
-    debug = os.getenv('RELEASE_CHECKER_DEBUG_HTTP', '0') == '1'
-    if debug or not str(outcome).startswith('2') or elapsed >= 2:
+    debug = os.getenv('RELEASE_CHECKER_DEBUG_HTTP', '0') == '1' or bool(http_debug_logger.handlers)
+    safe_params = {key: value for key, value in (params or {}).items()
+                   if key in {'issueId', 'applicationType', 'dataType', 'startAt', 'maxResults', 'fields'}}
+    if debug:
+        event = {'time': datetime.now(timezone.utc).isoformat(), 'source': source,
+                 'path': urlsplit(url).path, 'params': safe_params, 'attempt': attempt,
+                 'result': outcome, 'elapsed_s': round(elapsed, 3), **details}
+        line = json.dumps(event, ensure_ascii=False)
+        if http_debug_logger.handlers:
+            http_debug_logger.info(line)
+        else:
+            print('[HTTP DEBUG] ' + line, flush=True)
+        return
+    if source in {'check', 'cycle-lookup'} or outcome in {'request', 'retry', 'cache-hit', 'circuit-open'}:
+        return
+    if not str(outcome).startswith('2') or elapsed >= 2:
         # No headers, tokens, response bodies or arbitrary query strings in CI logs.
-        safe_params = {key: value for key, value in (params or {}).items()
-                       if key in {'issueId', 'applicationType', 'dataType'}}
         print(f"[HTTP {source}] {urlsplit(url).path} {safe_params or ''} "
               f"attempt={attempt} result={outcome} elapsed={elapsed:.2f}s", flush=True)
 
@@ -1285,38 +1337,56 @@ def bounded_get(session, url, *, source, attempts, timeout, deadline, validate=N
     Timeout bounds socket waits; the monotonic deadline prevents further requests
     or sleeps. No retries for TLS/authentication/permanent HTTP failures.
     """
+    request_id = next(_http_request_ids)
+    def trace(outcome, started, attempt, **details):
+        trace_http(source, url, outcome, started, attempt, kwargs.get('params'),
+                   request_id=request_id, remaining_s=round(max(0, deadline - time.monotonic()), 3),
+                   **details)
+
     for attempt in range(1, attempts + 1):
         cooldown = max(0, (retry_state or {}).get('until', 0) - time.monotonic())
         if cooldown:
             if cooldown >= deadline - time.monotonic():
+                trace('budget-exhausted', time.monotonic(), attempt, reason='retry-after')
                 raise requests.Timeout(f'{source}: Retry-After превышает лимит времени')
+            trace('retry', time.monotonic(), attempt, sleep_s=cooldown, reason='retry-after')
             time.sleep(cooldown)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
+            trace('budget-exhausted', time.monotonic(), attempt, reason='deadline')
             raise requests.Timeout(f'{source}: исчерпан лимит времени запроса')
         started = time.monotonic()
         response = None
+        trace('request', started, attempt, timeout_s=min(timeout, remaining))
         try:
             # A total urllib3 timeout shares time between connect and read.
             response = session.get(url, timeout=urllib3.util.Timeout(
                 total=min(timeout, remaining), connect=min(5.0, timeout, remaining)), **kwargs)
-            trace_http(source, url, response.status_code, started, attempt, kwargs.get('params'))
+            trace(response.status_code, started, attempt,
+                  bytes=len(response.content) if isinstance(getattr(response, 'content', None), bytes) else None,
+                  content_type=str((getattr(response, 'headers', None) or {}).get('Content-Type', '')).split(';')[0][:80],
+                  retry_after_s=retry_after_seconds(response))
             if response.status_code in {429, 503} and retry_state is not None:
                 retry_state['until'] = time.monotonic() + retry_after_seconds(response)
             if response.status_code == 200 and validate is not None:
-                validate(response.json())
+                payload = response.json()
+                if os.getenv('RELEASE_CHECKER_DEBUG_HTTP', '0') == '1' or http_debug_logger.handlers:
+                    trace('json', started, attempt, shape=response_shape(payload))
+                validate(payload)
             if response.status_code not in {408, 429, 500, 502, 503, 504} or attempt == attempts:
                 return response
         except requests.exceptions.SSLError:
-            trace_http(source, url, 'TLS', started, attempt, kwargs.get('params'))
+            trace('TLS', started, attempt)
             raise
         except (requests.RequestException, ValueError) as exc:
-            trace_http(source, url, request_failure_kind(exc), started, attempt, kwargs.get('params'))
+            trace(request_failure_kind(exc), started, attempt, exception_type=type(exc).__name__)
             if attempt == attempts:
                 raise
         delay = max(PR_RETRY_DELAY_SECONDS * 2 ** (attempt - 1), retry_after_seconds(response))
         if delay >= deadline - time.monotonic():
+            trace('budget-exhausted', started, attempt, reason='backoff', sleep_s=delay)
             raise requests.Timeout(f'{source}: повтор не помещается в лимит времени (Retry-After/backoff)')
+        trace('retry', started, attempt, sleep_s=delay)
         time.sleep(delay)
     raise requests.Timeout(f'{source}: не выполнен запрос')
 
@@ -1568,14 +1638,20 @@ class ReleaseValidator:
 
     def _get_release_test_cycles(self, release_key: str) -> list[tuple[str, str]]:
         """Один кэшированный Zephyr-поиск ТЦ по ключу релиза."""
+        started = time.monotonic()
         with self.zephyr.lookup_budget(ZEPHYR_LOOKUP_TIMEOUT_SECONDS):
-            return self._get_release_test_cycles_bounded(release_key)
+            cycles = self._get_release_test_cycles_bounded(release_key)
+        trace_http('cycle-lookup', '', 'finished', started, issue=release_key, matches=len(cycles),
+                   partial=any(stat.get('complete') is False for stat in self.zephyr.last_test_cycle_search_stats))
+        return cycles
 
     def _get_release_test_cycles_bounded(self, release_key: str) -> list[tuple[str, str]]:
         if release_key not in self._zephyr_release_cycles_cache:
-            raw_cycles = self.zephyr.get_test_cycles_for_issue(release_key)
+            with self.zephyr.lookup_budget(ZEPHYR_CYCLE_DISCOVERY_SECONDS):
+                raw_cycles = self.zephyr.get_test_cycles_for_issue(release_key)
             if not raw_cycles and not self.zephyr.is_failed_request_limit_reached():
-                raw_cycles = self._get_test_cycles_from_jira_release_metadata(release_key)
+                with self.zephyr.lookup_budget(ZEPHYR_CYCLE_METADATA_SECONDS):
+                    raw_cycles = self._get_test_cycles_from_jira_release_metadata(release_key)
             if not raw_cycles and not self.zephyr.is_failed_request_limit_reached():
                 raw_cycles = self._get_test_cycles_from_direct_cache_or_scan(release_key)
             cycles = [self._get_cycle_name_from_zephyr_item(cycle) for cycle in raw_cycles]
@@ -1840,8 +1916,9 @@ class ReleaseValidator:
     def _get_cycle_metadata(self, url, **kwargs):
         """Jira fallbacks share the cycle discovery deadline, including properties."""
         deadline = getattr(self.zephyr, '_lookup_deadline', None) or time.monotonic() + 12
+        validate = None if '/browse/' in urlsplit(url).path else validate_json_payload
         return bounded_get(self.jira_http, url, source='Jira cycle metadata',
-                           attempts=1, timeout=12, deadline=deadline, **kwargs)
+                           attempts=1, timeout=12, deadline=deadline, validate=validate, **kwargs)
 
     def _collect_test_cycle_keys_from_remote_links(self, release_key: str) -> set[str]:
         url = f"{config['jira']['url'].rstrip('/')}/rest/api/2/issue/{release_key}/remotelink"
@@ -2388,6 +2465,8 @@ class ReleaseValidator:
             print(f"[CHECK {check_id}] {record['status']} {record['seconds']:.2f}s "
                   f"issues={len(record['issues'])} ok={record['success']} "
                   f"errors={record['error']} warnings={record['warning']}", flush=True)
+            trace_http('check', '', record['status'], started, check_id=check_id,
+                       issues=len(record['issues']), errors=record['error'], warnings=record['warning'])
 
     def _reset_release_run(self):
         self.report_data.clear()
@@ -2480,6 +2559,8 @@ class ReleaseValidator:
 
     def _release_comment(self, release_key, is_success):
         grouped = {}
+        labels = {'error': '(x) Исправить', 'unavailable': '(?) Нет данных',
+                  'warning': '(!) Проверить', 'success': '(/) Без замечаний'}
         has_errors = any(data['errors'] for data in self.report_data.values())
         success = is_success and not has_errors
         # PR lookup observations are the explicit exception: they keep a green result.
@@ -2488,22 +2569,39 @@ class ReleaseValidator:
             for data in self.report_data.values() for message in data['warnings'])
         green = success and not other_remarks
         for key, data in self.report_data.items():
-            messages = [self._comment_message(message) for message in data['errors'] + data['warnings']]
-            messages = list(dict.fromkeys(message for message in messages if message))
+            messages = {}
+            for severity, values in (('error', data['errors']), ('warning', data['warnings'])):
+                for original in values:
+                    message = self._comment_message(original)
+                    if message:
+                        kind = 'unavailable' if message.startswith('Не удалось') else severity
+                        messages.setdefault(message, kind)
             if not messages:
                 continue
             object_key = release_key if key == 'GENERAL' else key
-            entry = grouped.setdefault(object_key, {'summary': data['summary'], 'messages': []})
+            entry = grouped.setdefault(object_key, {'summary': data['summary'], 'messages': {}})
             if key == release_key and data['summary']:
                 entry['summary'] = data['summary']
-            entry['messages'].extend(message for message in messages if message not in entry['messages'])
+            for message, kind in messages.items():
+                entry['messages'].setdefault(message, kind)
         if not grouped:
-            grouped[release_key] = {'summary': '', 'messages': [
-                'Ошибок нет.' if success else 'Проверка не завершена. Повторите запуск.']}
+            grouped[release_key] = {'summary': '', 'messages': {
+                'Ошибок нет.' if success else 'Проверка не завершена. Повторите запуск.':
+                'success' if success else 'unavailable'}}
         color, background = ('#14892c', '#e3fcef') if green else ('#de350b', '#ffebe6')
         title = 'Проверка релиза — успешно' if green else 'Проверка релиза — есть замечания'
+        if green and any(data['warnings'] for data in self.report_data.values()):
+            title += ' (есть неблокирующие замечания)'
+        counts = {kind: sum(value == kind for entry in grouped.values() for value in entry['messages'].values())
+                  for kind in ('error', 'unavailable', 'warning')}
         rows = [f'{{panel:title={title}|titleBGColor={background}|titleColor={color}'
-                f'|borderColor={color}|bgColor=#ffffff}}', COMMENT_TABLE_HEADER]
+                f'|borderColor={color}|bgColor=#ffffff}}',
+                f"*Исправить: {counts['error']}* · *Нет данных: {counts['unavailable']}* · "
+                f"*Проверить: {counts['warning']}*", '']
+        if counts['unavailable']:
+            rows.extend(['(?) *Нет данных* — источник не ответил или вернул неполный результат. '
+                         'Это не подтверждает отсутствие ПР или тестов; повторите проверку.', ''])
+        rows.append(COMMENT_TABLE_HEADER)
         for key, entry in sorted(grouped.items(), key=lambda item: (item[0] != release_key, item[0])):
             target = wiki_cell(key)
             if re.fullmatch(r'[A-Z][A-Z0-9_]*-\d+', key):
@@ -2513,7 +2611,8 @@ class ReleaseValidator:
             messages = ' \\\\ \\\\ '.join(
                 f'*{number}.* {wiki_cell(message)}'
                 for number, message in enumerate(entry['messages'], 1))
-            rows.append(f'| {target} | {messages} |')
+            statuses = ' \\\\ '.join(labels[kind] for kind in labels if kind in entry['messages'].values())
+            rows.append(f'| {target} | {statuses} | {messages} |')
         rows.append('{panel}')
         return '\n'.join(rows)
 
@@ -3310,6 +3409,10 @@ class ReleaseValidator:
 
     def _manage_jira_comment(self, release_key, is_success):
         if getattr(self, 'dry_run', False):
+            preview_path = os.getenv('RELEASE_CHECKER_COMMENT_PREVIEW', '').strip()
+            if preview_path:
+                Path(preview_path).write_text(self._release_comment(release_key, is_success), encoding='utf-8')
+                print(f"[DRY RUN] Jira wiki preview: {preview_path}", flush=True)
             print("[DRY RUN] Комментарий Jira не публикуется", flush=True)
             return
         if not self.my_account_id:
@@ -3329,6 +3432,7 @@ class ReleaseValidator:
                     if ("Автоматическая проверка релиза" in comment.body
                             or "Результат проверки" in comment.body
                             or comment.body.startswith(CHECK_TABLE_HEADER)
+                            or LEGACY_COMMENT_TABLE_HEADER in comment.body
                             or COMMENT_TABLE_HEADER in comment.body):
                         try:
                             comment.delete()
@@ -4330,8 +4434,16 @@ class ReleaseValidator:
             if not failure or time.monotonic() < expires:
                 if failure:
                     self._pr_lookup_failures.add(failure)
+                trace_http('PR', url, 'cache-hit', time.monotonic(), params=kwargs.get('params'),
+                           cached_failure=bool(failure))
                 return payload
             del self._pr_http_cache[cache_key]
+        outer_deadline = getattr(self, '_pr_request_deadline', None)
+        if outer_deadline is not None and time.monotonic() >= outer_deadline:
+            self._pr_lookup_failures.add('исчерпан лимит времени проверки PR')
+            trace_http('PR', url, 'budget-exhausted', time.monotonic(), params=kwargs.get('params'))
+            # No request was attempted: do not poison the endpoint circuit/cache.
+            return None
         # Group issue-specific paths, so an outage is not retried for every Story.
         endpoint = re.sub(r'/issue/[^/]+/(remotelink)$', r'/issue/*/\1', url)
         if url.endswith('/detail'):
@@ -4341,16 +4453,18 @@ class ReleaseValidator:
             if time.monotonic() < self._pr_endpoint_retry_at.get(endpoint, 0):
                 cause = self._pr_endpoint_last_error.get(endpoint, 'сбой запроса')
                 self._pr_lookup_failures.add(f'источник временно недоступен после повторных сбоев: {cause}')
+                trace_http('PR', url, 'circuit-open', time.monotonic(), params=kwargs.get('params'))
                 return None
             self._pr_endpoint_failures[endpoint] = 0
-        outer_deadline = getattr(self, '_pr_request_deadline', None)
         is_detail = url.endswith('/detail')
         deadline = min(outer_deadline if outer_deadline is not None else float('inf'),
                        time.monotonic() + (25 if is_detail else 12))
         permanent = False
         try:
+            request_timeout = (PR_DETAIL_TIMEOUT_SECONDS if is_detail else
+                               PR_SUMMARY_TIMEOUT_SECONDS if url.endswith('/summary') else PR_REQUEST_TIMEOUT_SECONDS)
             response = bounded_get(self.jira_http, url, source='PR', attempts=PR_MAX_ATTEMPTS,
-                                   timeout=PR_DETAIL_TIMEOUT_SECONDS if is_detail else PR_REQUEST_TIMEOUT_SECONDS,
+                                   timeout=request_timeout,
                                    deadline=deadline, retry_state=self._pr_retry_state,
                                    validate=validate_json_payload, **kwargs)
             if response.status_code == 200:
@@ -4427,7 +4541,7 @@ class ReleaseValidator:
         sections = (summary or {}).get('summary', {})
         payloads, errors = [], []
         base = config['jira']['url'].rstrip('/')
-        for data_type in data_types:
+        for type_index, data_type in enumerate(data_types):
             section = sections.get(data_type) or {}
             if not isinstance(section, dict):
                 section = {}
@@ -4440,6 +4554,11 @@ class ReleaseValidator:
                 reported = {}
             providers = tuple(reported) or PR_LEGACY_PROVIDERS
             type_payloads = []
+            # A slow first source must not consume the repository/commit fallback.
+            deadline = getattr(self, '_pr_request_deadline', None)
+            type_seconds = (max(0, deadline - time.monotonic()) / (len(data_types) - type_index)
+                            if deadline is not None else PR_LOOKUP_TIMEOUT_SECONDS)
+            type_deadline = time.monotonic() + type_seconds
             for provider in providers:
                 provider_info = reported.get(provider) or {}
                 provider_count = provider_info.get('count') if isinstance(provider_info, dict) else None
@@ -4447,8 +4566,9 @@ class ReleaseValidator:
                     continue
                 obtained = None
                 for api_version in dict.fromkeys((version or 'latest', '1.0')):
-                    payload = self._pr_get_json(f"{base}/rest/dev-status/{api_version}/issue/detail", params={
-                        'issueId': issue_id, 'applicationType': provider, 'dataType': data_type})
+                    with self._pr_lookup_budget(max(0, type_deadline - time.monotonic())):
+                        payload = self._pr_get_json(f"{base}/rest/dev-status/{api_version}/issue/detail", params={
+                            'issueId': issue_id, 'applicationType': provider, 'dataType': data_type})
                     if not isinstance(payload, dict) or not isinstance(payload.get('detail'), list):
                         continue
                     # An empty response for an unrecognized alias proves nothing.
@@ -5796,6 +5916,9 @@ def _diag_pr(validator: 'ReleaseValidator', issue_key: str):
 if __name__ == "__main__":
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(line_buffering=True)
+    debug_path = os.getenv('RELEASE_CHECKER_HTTP_LOG', '').strip()
+    if debug_path:
+        configure_http_debug(debug_path)
     validator = ReleaseValidator()
     if len(sys.argv) >= 3 and sys.argv[1] == "--dry-run":
         validator.dry_run = True

@@ -1049,7 +1049,7 @@ def test_object_comment_escapes_wiki_and_encoded_line_breaks():
     body = checker._release_comment('REL-1', False)
     rows = [line for line in body.splitlines() if line.startswith('| ')]
     assert len(rows) == 1
-    assert re.sub(r'\[ABC-1\|[^]]+\]', 'ABC-1', rows[0]).count('|') == 3
+    assert re.sub(r'\[ABC-1\|[^]]+\]', 'ABC-1', rows[0]).count('|') == 4
     assert body.count('{panel}') == 1
     assert '|| injected ||' not in body
 
@@ -1149,7 +1149,7 @@ def test_missing_or_unavailable_pr_is_green_with_object_remark(lookup):
     body = checker._release_comment('REL-1', True)
     assert '#14892c' in body and '#de350b' not in body
     assert '[ABC-1|' in body and 'ПР' in body
-    assert rc.COMMENT_TABLE_HEADER == '|| Объект релиза || Замечания ||'
+    assert rc.COMMENT_TABLE_HEADER == '|| Объект релиза || Статус || Что требует внимания ||'
 
 
 def test_real_violation_stays_red_alongside_missing_pr():
@@ -1373,6 +1373,163 @@ def test_direct_scan_progress_and_new_issue_links_survive_cache(zephyr, monkeypa
     assert checker._get_direct_scan_high_watermark('HRPQA') == 110
     assert checker._get_cached_test_cycles_for_release('REL-1') == [cycle]
     zephyr.session.get.assert_not_called()
+
+
+def test_slow_pr_endpoint_leaves_time_for_repository(validator, fake_clock):
+    def fetch(url, **kwargs):
+        if url.endswith('/summary'):
+            return response(404)
+        if url.endswith('/remotelink'):
+            return response(200, [])
+        if kwargs['params']['dataType'] == 'pullrequest':
+            fake_clock[0] += kwargs['timeout'].total
+            raise requests.ReadTimeout()
+        assert kwargs['params']['dataType'] == 'repository'
+        fake_clock[0] += 2
+        return response(200, {'detail': [{'repositories': [{'pullRequests': [{'id': 42}]}]}]})
+    validator.jira_http.get.side_effect = fetch
+    evidence = validator._find_issue_pull_request_only_evidence(NS(key='ABC-1', id='123'))
+    assert 'repository' in evidence
+    assert fake_clock[0] <= 16
+
+
+def test_four_second_summary_succeeds_within_existing_budget(validator, fake_clock):
+    def fetch(url, **kwargs):
+        assert kwargs['timeout'].total >= 4
+        fake_clock[0] += 4
+        return response(200, summary_payload(1))
+    validator.jira_http.get.side_effect = fetch
+    assert validator._find_issue_pull_request_only_evidence(NS(key='ABC-1', id='123'))
+    assert fake_clock[0] == 4
+    assert validator.jira_http.get.call_count == 1
+
+
+def test_cycle_index_and_metadata_timeouts_leave_direct_fallback_time(zephyr, fake_clock):
+    checker = zephyr_checker(zephyr)
+    checker._zephyr_release_cycles_cache = {}
+    checker._zephyr_cycle_details_cache = {}
+    checker.jira_http = Mock()
+    cycle = {'key': 'HRPQA-C1', 'name': 'REL-1 regression'}
+    def fetch(url, **kwargs):
+        if '/issuelink/' in url:
+            return response(404)
+        if url.endswith('/HRPQA-C1'):
+            fake_clock[0] += 2
+            return response(200, cycle)
+        fake_clock[0] += kwargs['timeout'].total
+        raise requests.ReadTimeout()
+    zephyr.session.get.side_effect = fetch
+    checker.jira_http.get.side_effect = fetch
+    checker._get_test_cycles_from_direct_cache_or_scan = Mock(
+        side_effect=lambda _: [zephyr.get_test_cycle_details('HRPQA-C1')])
+    assert checker._get_release_test_cycles('REL-1') == [('HRPQA-C1', 'REL-1 regression')]
+    assert fake_clock[0] == 35
+    assert fake_clock[0] <= rc.ZEPHYR_LOOKUP_TIMEOUT_SECONDS
+    assert checker.jira_http.get.call_count == 1
+
+
+def test_cycle_link_retries_without_increasing_its_budget(zephyr, fake_clock):
+    cycle = {'key': 'HRPQA-C1', 'name': 'REL-1 regression'}
+    zephyr.session.get.side_effect = [requests.ConnectionError(), response(200, [cycle])]
+    assert zephyr._get_test_cycles_by_issue_link('REL-1') == [cycle]
+    assert fake_clock[0] == .5
+    assert zephyr.session.get.call_count == 2
+    zephyr.session.get.reset_mock()
+    def slow(url, **kwargs):
+        fake_clock[0] += kwargs['timeout'].total
+        raise requests.Timeout()
+    zephyr.session.get.side_effect = slow
+    assert zephyr._get_test_cycles_by_issue_link('REL-1') == []
+    assert fake_clock[0] == 10.5
+    assert zephyr.session.get.call_count == 1
+
+
+def test_unattempted_pr_source_does_not_poison_next_lookup(validator, fake_clock):
+    url = 'https://jira.example/rest/dev-status/latest/issue/detail'
+    with validator._pr_lookup_budget(0):
+        assert validator._pr_get_json(url) is None
+    validator.jira_http.get.return_value = response(200, {'detail': [{'pullRequests': [{'id': 42}]}]})
+    assert validator._pr_get_json(url)['detail']
+    assert validator.jira_http.get.call_count == 1
+
+
+def test_structured_debug_records_retries_budget_and_safe_response_shape(monkeypatch, capsys, fake_clock):
+    import json
+    monkeypatch.setenv('RELEASE_CHECKER_DEBUG_HTTP', '1')
+    session = Mock()
+    session.get.side_effect = [requests.ReadTimeout('secret-exception'), response(200, {
+        'results': [{'key': 'SECRET-1', 'name': 'secret-name', 'password': 'secret-value'}],
+        'total': 1, 'private-secret-field': 'secret-value'})]
+    rc.bounded_get(session, 'https://jira.example/path?token=secret-query', source='Zephyr',
+                   attempts=3, timeout=3, deadline=10, validate=rc.validate_json_payload,
+                   params={'token': 'secret-param', 'startAt': 0}, headers={'Authorization': 'secret-header'})
+    output = capsys.readouterr().out
+    events = [json.loads(line.removeprefix('[HTTP DEBUG] ')) for line in output.splitlines()]
+    assert 'secret' not in output.lower()
+    assert {e['result'] for e in events} >= {'request', 'retry', 'timeout', 200, 'json'}
+    assert len({e['request_id'] for e in events}) == 1
+    shape = next(e['shape'] for e in events if e['result'] == 'json')
+    assert shape['known']['results']['count'] == 1
+    assert shape['known']['total'] == 1
+    assert events[-1]['remaining_s'] == 9.5
+
+
+def test_jsonl_file_and_dry_run_comment_preview(monkeypatch, tmp_path):
+    import json
+    path = tmp_path / 'http.jsonl'
+    handlers_before = list(rc.http_debug_logger.handlers)
+    try:
+        rc.configure_http_debug(path)
+        rc.trace_http('PR', 'https://jira.example/path', 200, rc.time.monotonic())
+        assert json.loads(path.read_text())['result'] == 200
+    finally:
+        for handler in list(rc.http_debug_logger.handlers):
+            if handler not in handlers_before:
+                rc.http_debug_logger.removeHandler(handler)
+                handler.close()
+    checker = stage_validator()
+    checker.dry_run = True
+    checker.jira_main = Mock()
+    preview = tmp_path / 'comment.wiki'
+    monkeypatch.setenv('RELEASE_CHECKER_COMMENT_PREVIEW', str(preview))
+    checker._manage_jira_comment('REL-1', True)
+    assert preview.read_text() == checker._release_comment('REL-1', True)
+    checker.jira_main.add_comment.assert_not_called()
+    checker.jira_main.comments.assert_not_called()
+
+
+def test_metadata_html_fallback_is_not_validated_as_json(zephyr):
+    checker = zephyr_checker(zephyr)
+    checker.jira_http = Mock()
+    html_response = response(200)
+    html_response.text = '<a>HRPQA-C1</a>'
+    html_response.json = Mock(side_effect=ValueError('HTML'))
+    checker.jira_http.get.return_value = html_response
+    assert checker._collect_test_cycle_keys_from_issue_html('REL-1') == {'HRPQA-C1'}
+    html_response.json.assert_not_called()
+
+
+def test_comment_separates_violations_missing_data_and_advice():
+    checker = stage_validator()
+    checker._log_issue('ABC-1', 'error', 'Отсутствует тестовое покрытие (нет прилинкованных ТК)')
+    checker._log_issue('ABC-2', 'error', 'Zephyr: не удалось получить ТК (timeout)')
+    checker._log_issue('ABC-3', 'warning', 'Pull Request не найден.')
+    body = checker._release_comment('REL-1', False)
+    assert '*Исправить: 1*' in body and '*Нет данных: 1*' in body and '*Проверить: 1*' in body
+    rows = [line for line in body.splitlines() if line.startswith('| ')]
+    assert '(x) Исправить' in rows[0] and 'Нет связанных тест-кейсов.' in rows[0]
+    assert '(?) Нет данных' in rows[1] and 'Не удалось проверить' in rows[1]
+    assert '(!) Проверить' in rows[2]
+
+
+def test_legacy_object_comment_still_recognized():
+    checker = stage_validator()
+    checker.my_account_id = 'bot'
+    checker.jira_main = Mock()
+    old = Mock(author=NS(accountId='bot'), body=rc.LEGACY_COMMENT_TABLE_HEADER)
+    checker.jira_main.comments.return_value = [old]
+    checker._manage_jira_comment('REL-1', True)
+    old.delete.assert_called_once()
 
 
 def test_unwritable_cycle_cache_is_console_only(zephyr, monkeypatch, tmp_path, capsys):
