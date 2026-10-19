@@ -2027,3 +2027,32 @@ def test_compact_index_stops_at_budget(fake_clock):
     assert not result['complete']
     assert result['reason'] == 'budget'
     assert result['pages'] == 4
+
+
+def test_production_index_replays_1570_within_discovery_budget(zephyr, fake_clock, monkeypatch):
+    monkeypatch.setattr(rc, 'ZEPHYR_CYCLE_INDEX_PAGE_SIZE', 5000)
+    offsets = []
+    timings = {0: 7.537, 5000: 8.007, 10000: 5.991, 15000: 0.553, 20000: 0.424, 23059: 0.083}
+    def fetch(url, **kwargs):
+        if '/issuelink/' in url:
+            return response(404)
+        params = kwargs['params']
+        offset = params['startAt']
+        offsets.append(offset)
+        assert params['maxResults'] == 5000
+        assert params['fields'] == 'key,name,issueKey,issueLinks'
+        assert kwargs['timeout'].total >= timings[offset]
+        fake_clock[0] += timings[offset]
+        return response(200, [{'key': f'HRPQA-C{i+1}',
+            'name': ('REL-1' if i < 8 else 'REL-10') + '.api.НФ'}
+            for i in range(offset, min(offset+5000, 23059))])
+    zephyr.session.get.side_effect = fetch
+    with zephyr.lookup_budget(rc.ZEPHYR_CYCLE_DISCOVERY_SECONDS):
+        cycles = zephyr.get_test_cycles_for_issue('REL-1')
+    assert len(cycles) == 8
+    assert offsets == [0, 5000, 10000, 15000, 20000, 23059]
+    assert fake_clock[0] < rc.ZEPHYR_CYCLE_DISCOVERY_SECONDS
+    stats = zephyr.last_test_cycle_search_stats[-1]
+    assert stats['complete'] is True
+    assert stats['total_seen'] == 23059
+    assert stats['pages'] == 6

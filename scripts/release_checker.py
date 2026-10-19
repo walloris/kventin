@@ -76,9 +76,9 @@ logger.setLevel(logging.ERROR)
 # Промежуточная версия для Jenkins: True — подробная диагностика, False — обычные логи.
 # Команду запуска менять не нужно. RELEASE_CHECKER_DEBUG_HTTP=1/0 переопределяет этот параметр.
 HTTP_DEBUG_ENABLED = True
-# Временный read-only эксперимент: обычная команда запускает матрицу API вместо отчёта.
-# False или RELEASE_CHECKER_LOOKUP_DIAGNOSTICS=0 возвращает обычную проверку.
-LOOKUP_DIAGNOSTICS_ENABLED = True
+# Обычная проверка включена. Для read-only эксперимента: True или
+# RELEASE_CHECKER_LOOKUP_DIAGNOSTICS=1 (матрица API вместо отчёта).
+LOOKUP_DIAGNOSTICS_ENABLED = False
 LOOKUP_DIAGNOSTIC_FOCUS = 'cycles'  # both / pr / cycles
 # Из лога №1562: известный цикл для независимой проверки прямого чтения.
 LOOKUP_DIAGNOSTIC_CYCLE = ''
@@ -167,7 +167,8 @@ ZEPHYR_REQUEST_BUDGET_SECONDS = 32
 # Reserve fallback time inside the existing 45-second cycle lookup budget.
 ZEPHYR_CYCLE_DISCOVERY_SECONDS = 25
 ZEPHYR_CYCLE_METADATA_SECONDS = 8
-ZEPHYR_CYCLE_INDEX_PAGE_SIZE = int(os.getenv("ZEPHYR_CYCLE_INDEX_PAGE_SIZE", "200"))
+# Jenkins №1570: 5000 items/page read the full 23059-cycle index within discovery budget.
+ZEPHYR_CYCLE_INDEX_PAGE_SIZE = int(os.getenv("ZEPHYR_CYCLE_INDEX_PAGE_SIZE", "5000"))
 ZEPHYR_CASE_FIELDS = 'key,name,status,customFields,issueLinks'
 CHECK_TABLE_HEADER = '|| Проверка || Результат || Время, с || Объекты || Успех / ошибки / предупреждения || Замечания ||'
 LEGACY_COMMENT_TABLE_HEADER = '|| Объект релиза || Замечания ||'
