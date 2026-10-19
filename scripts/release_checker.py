@@ -2110,6 +2110,8 @@ class ReleaseValidator:
 
     def _get_test_cycle_details_cached(self, cycle_key: str) -> Optional[dict]:
         if cycle_key not in self._zephyr_cycle_details_cache:
+            if self.zephyr.requests_paused():
+                return None
             details = self.zephyr.get_test_cycle_details(cycle_key)
             if details:
                 self._zephyr_cycle_details_cache[cycle_key] = details
@@ -2117,6 +2119,8 @@ class ReleaseValidator:
 
     def _get_test_case_details_cached(self, tc_key: str) -> Optional[dict]:
         if tc_key not in self._zephyr_test_case_details_cache:
+            if self.zephyr.requests_paused():
+                return None
             details = self.zephyr.get_test_case_details(tc_key)
             if details:
                 self._zephyr_test_case_details_cache[tc_key] = details
@@ -2216,6 +2220,15 @@ class ReleaseValidator:
             if getattr(issue.fields, 'issuetype', None)
         }
 
+    def _check_cycle_case_batches(self, release_key, cycles):
+        # Metadata for every required cycle is checked before any bulk case reads.
+        # Small cycles first: a large regression must not starve all other cycles.
+        cache = getattr(self, '_zephyr_cycle_details_cache', {})
+        ordered = sorted(dict.fromkeys(cycles), key=lambda item: len(
+            self.zephyr.get_test_cycle_test_results(cache.get(item[0], {}))))
+        for cycle_key, cycle_name in ordered:
+            self._check_test_cycle_cases_approved(release_key, cycle_key, cycle_name)
+
     def _check_test_cycle_cases_approved(self, release_key: str, cycle_key: str, cycle_name: str) -> None:
         """Проверить, что все ТК внутри ТЦ находятся в статусе Approved."""
         check_key = cycle_key or normalize_test_cycle_name(cycle_name)
@@ -2282,11 +2295,17 @@ class ReleaseValidator:
             )
 
         if unresolved:
+            unresolved = sorted(set(unresolved))
+            print(f"[CYCLE unresolved] {cycle_key}: {', '.join(unresolved)}", flush=True)
+            preview = ', '.join(unresolved[:10])
+            remainder = len(unresolved) - 10
+            if remainder > 0:
+                preview += f"; ещё {remainder} — полный список в логе Jenkins"
             self._log_issue(
                 release_key,
                 "warning",
-                f"ТЦ [{cycle_key}] '{cycle_name}': не удалось получить детали ТК: "
-                + ", ".join(sorted(unresolved))
+                f"ТЦ [{cycle_key}] '{cycle_name}': не удалось получить детали ТК ({len(unresolved)}): "
+                + preview
             )
 
         if not seen_tc_keys:
@@ -3011,6 +3030,7 @@ class ReleaseValidator:
 
         print(f"   Back release: найдено КЭ={len(services)}, ТЦ по ключу релиза={len(cycles)}")
 
+        pending_case_checks = []
         for service_info in services.values():
             service_ke = str(service_info['display'])
             issue_list = ', '.join(sorted(service_info['issue_keys']))
@@ -3051,7 +3071,7 @@ class ReleaseValidator:
                     f"[{tc_key}] '{tc_name}' ✓"
                 )
                 self._check_test_cycle_testing_type(release_key, tc_key, tc_name, 'Регресс')
-                self._check_test_cycle_cases_approved(release_key, tc_key, tc_name)
+                pending_case_checks.append((tc_key, tc_name))
             else:
                 self._log_issue(
                     release_key,
@@ -3076,7 +3096,7 @@ class ReleaseValidator:
                     f"[{tc_key}] '{tc_name}' ✓"
                 )
                 self._check_test_cycle_testing_type(release_key, tc_key, tc_name, 'Регресс')
-                self._check_test_cycle_cases_approved(release_key, tc_key, tc_name)
+                pending_case_checks.append((tc_key, tc_name))
             else:
                 self._log_issue(
                     release_key,
@@ -3102,7 +3122,7 @@ class ReleaseValidator:
                         f"[{tc_key}] '{tc_name}' ✓"
                     )
                     self._check_test_cycle_testing_type(release_key, tc_key, tc_name, ZEPHYR_TESTING_TYPE_NEW)
-                    self._check_test_cycle_cases_approved(release_key, tc_key, tc_name)
+                    pending_case_checks.append((tc_key, tc_name))
                 else:
                     self._log_issue(
                         release_key,
@@ -3110,6 +3130,8 @@ class ReleaseValidator:
                         f"Back release: для КЭ '{service_ke}' есть Story с 'Новая функциональность' = 'Да', "
                         f"но отсутствует ТЦ Zephyr по маске '{api_nf_mask_hint}'"
                     )
+
+        self._check_cycle_case_batches(release_key, pending_case_checks)
 
     def _check_web_release_service_test_cycles(self, release_key: str) -> None:
         """
@@ -3136,6 +3158,7 @@ class ReleaseValidator:
 
         print(f"   Web release: найдено КЭ={len(services)}, ТЦ по ключу релиза={len(cycles)}")
 
+        pending_case_checks = []
         for service_info in services.values():
             service_ke = str(service_info['display'])
             issue_list = ', '.join(sorted(service_info['issue_keys']))
@@ -3171,7 +3194,7 @@ class ReleaseValidator:
                         f"[{tc_key}] '{tc_name}' ✓"
                     )
                     self._check_test_cycle_testing_type(release_key, tc_key, tc_name, ZEPHYR_TESTING_TYPE_NEW)
-                    self._check_test_cycle_cases_approved(release_key, tc_key, tc_name)
+                    pending_case_checks.append((tc_key, tc_name))
                 else:
                     self._log_issue(
                         release_key,
@@ -3204,7 +3227,7 @@ class ReleaseValidator:
                         f"[{tc_key}] '{tc_name}' ✓"
                     )
                     self._check_test_cycle_testing_type(release_key, tc_key, tc_name, 'Регресс')
-                    self._check_test_cycle_cases_approved(release_key, tc_key, tc_name)
+                    pending_case_checks.append((tc_key, tc_name))
                 else:
                     self._log_issue(
                         release_key,
@@ -3219,6 +3242,8 @@ class ReleaseValidator:
                     "success",
                     f"Web release: для КЭ '{service_ke}' проект NEUROUI — pwa.Регресс не требуется ✓"
                 )
+
+        self._check_cycle_case_batches(release_key, pending_case_checks)
 
     def _check_test_cycles(self, release_key: str):
         """

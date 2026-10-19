@@ -713,6 +713,8 @@ def zephyr_checker(zephyr):
     checker.zephyr = zephyr
     checker.jira_main = Mock()
     checker._zephyr_issue_test_cases_cache = {}
+    checker._zephyr_cycle_approved_checked = set()
+    checker._zephyr_cycle_testing_type_checked = set()
     checker._zephyr_test_case_details_cache = {}
     checker._get_consist_of_issues = Mock(return_value=['ABC-1'])
     checker._build_expected_testing_type_map = Mock(return_value={'ABC-1': 'Регресс'})
@@ -1751,3 +1753,56 @@ def test_story_worklog_failure_still_reads_linked_testing_task(validator, monkey
     assert [c.args[0] for c in validator.jira_main.worklogs.call_args_list] == ['ABC-1', 'ABC-2']
     assert not any(c.args[1] == 'error' for c in validator._log_issue.call_args_list)
     assert any('есть списанное время' in c.args[2] for c in validator._log_issue.call_args_list)
+
+
+def test_cycle_batches_check_small_cycles_before_large_regression(zephyr):
+    checker = zephyr_checker(zephyr)
+    checker._zephyr_cycle_details_cache = {
+        'HRPQA-C1': {'items': [{'testCaseKey': 'HRPQA-T1'}] * 200},
+        'HRPQA-C2': {'items': [{'testCaseKey': 'HRPQA-T2'}]},
+    }
+    checker._check_test_cycle_cases_approved = Mock()
+    checker._check_cycle_case_batches('REL-1', [('HRPQA-C1', 'Регресс'), ('HRPQA-C2', 'НФ'), ('HRPQA-C1', 'Регресс')])
+    assert [c.args[1] for c in checker._check_test_cycle_cases_approved.call_args_list] == ['HRPQA-C2', 'HRPQA-C1']
+
+
+def test_web_checks_all_cycle_metadata_before_case_reads(validator):
+    validator._collect_release_service_infos = Mock(return_value={'service': {
+        'display': 'Service', 'issue_keys': {'ABC-1'}, 'has_nf_story': True, 'project_keys': {'abc'}}})
+    validator._get_release_test_cycles = Mock(return_value=[('HRPQA-C1', 'cycle')])
+    validator._find_matching_cycle = Mock(return_value=('HRPQA-C1', 'cycle'))
+    events = []
+    validator._check_test_cycle_testing_type = Mock(side_effect=lambda *args: events.append('metadata'))
+    validator._check_cycle_case_batches = Mock(side_effect=lambda *args: events.append('cases'))
+    validator._check_web_release_service_test_cycles('REL-1')
+    assert events == ['metadata'] * 5 + ['cases']
+    assert len(validator._check_cycle_case_batches.call_args.args[1]) == 5
+
+
+def test_long_unresolved_cycle_list_is_only_in_console(zephyr, capsys):
+    checker = zephyr_checker(zephyr)
+    keys = [f'HRPQA-T{i:04}' for i in range(160)]
+    checker._get_test_cycle_details_cached = Mock(return_value={'items': [{'testCaseKey': key} for key in keys]})
+    checker._get_test_case_details_cached = Mock(return_value=None)
+    checker._run_check('cycle', 'ТЦ', lambda: checker._check_test_cycle_cases_approved('REL-1', 'HRPQA-C1', 'Регресс'))
+    message = checker.report_data['REL-1']['errors'][0]
+    assert 'ещё 150' in message
+    assert keys[-1] not in message
+    assert keys[-1] in capsys.readouterr().out
+    assert checker.check_results[0]['status'] == 'INCOMPLETE'
+
+
+def test_paused_zephyr_detail_reads_use_cache_without_http(zephyr, fake_clock):
+    checker = zephyr_checker(zephyr)
+    checker._zephyr_cycle_details_cache = {'HRPQA-C1': {'key': 'HRPQA-C1'}}
+    checker._zephyr_test_case_details_cache = {'HRPQA-T1': case_payload()}
+    zephyr.retry_state['until'] = fake_clock[0] + 120
+    assert checker._get_test_cycle_details_cached('HRPQA-C1')
+    assert checker._get_test_case_details_cached('HRPQA-T1')
+    for i in range(2, 162):
+        assert checker._get_test_case_details_cached(f'HRPQA-T{i}') is None
+        assert checker._get_test_cycle_details_cached(f'HRPQA-C{i}') is None
+    zephyr.session.get.assert_not_called()
+    fake_clock[0] += 120
+    zephyr.session.get.return_value = response(200, case_payload('HRPQA-T2'))
+    assert checker._get_test_case_details_cached('HRPQA-T2')
