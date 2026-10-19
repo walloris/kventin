@@ -985,6 +985,78 @@ def test_zephyr_retry_after_cannot_be_bypassed_by_search(zephyr, fake_clock):
     assert fake_clock[0] == 0
 
 
+def test_jenkins_long_retry_after_does_not_poison_unused_pr_sources(validator, fake_clock, capsys, monkeypatch):
+    monkeypatch.setenv('RELEASE_CHECKER_DEBUG_HTTP', '1')
+    validator.jira_http.get.return_value = response(429, headers={'Retry-After': '120'})
+    for number in range(24):
+        issue = NS(key=f'ABC-{number + 1}', id=str(number + 1))
+        assert validator._find_issue_pull_request_only_evidence(issue) is None
+        assert any('Retry-After' in reason for reason in validator._pr_lookup_failures)
+    assert validator.jira_http.get.call_count == 1
+    assert fake_clock[0] == 0
+    assert sum(validator._pr_endpoint_failures.values()) == 1
+    assert len(validator._pr_http_cache) == 1
+    assert len(validator._pr_endpoint_retry_at) == 1
+    validator._begin_pr_stage()
+    with pytest.raises(RuntimeError, match='Retry-After'):
+        validator._get_dev_status_payloads('25')
+    assert validator.jira_http.get.call_count == 1
+    output = capsys.readouterr().out
+    assert output.count('"result": "rate-limited"') == 1
+    assert 'circuit-open' not in output
+
+    # The pause expires naturally; no stage reset is needed to recover.
+    fake_clock[0] = 120
+    validator.jira_http.get.return_value = response(200, summary_payload(1))
+    assert validator._find_issue_pull_request_only_evidence(NS(key='ABC-2', id='2'))
+    assert validator.jira_http.get.call_count == 2
+
+
+def test_zephyr_unsent_cooldown_requests_do_not_exhaust_failure_limit(zephyr, fake_clock):
+    zephyr.session.get.return_value = response(429, headers={'Retry-After': '120'})
+    for number in range(30):
+        cases, error = zephyr.get_test_cases_for_issue(f'ABC-{number + 1}')
+        assert not cases and 'Retry-After' in error
+    assert zephyr.session.get.call_count == 1
+    assert zephyr.failed_requests == 1
+    assert not zephyr.is_failed_request_limit_reached()
+    assert fake_clock[0] == 0
+    fake_clock[0] = 120
+    zephyr.session.get.return_value = response(200, [case_payload()])
+    cases, error = zephyr.get_test_cases_for_issue('ABC-1')
+    assert cases and error is None
+    assert zephyr.session.get.call_count == 2
+
+
+@pytest.mark.parametrize('method', ['_get_once', '_get_with_retries'])
+def test_zephyr_unsent_deadline_does_not_count_as_failure(zephyr, fake_clock, method):
+    with zephyr.lookup_budget(0):
+        with pytest.raises(rc.RequestNotSent):
+            getattr(zephyr, method)('https://jira.example/endpoint')
+    zephyr.session.get.assert_not_called()
+    assert zephyr.failed_requests == 0
+
+
+def test_cached_positive_pr_survives_server_pause(validator, fake_clock):
+    issue = NS(key='ABC-1', id='1')
+    validator._pull_request_only_evidence_cache['ABC-1'] = 'PR 42'
+    validator._pr_retry_state = {'until': 120}
+    assert validator._find_issue_pull_request_only_evidence(issue) == 'PR 42'
+    validator.jira_http.get.assert_not_called()
+
+
+def test_direct_scan_does_not_walk_cycle_numbers_during_retry_after(zephyr, fake_clock):
+    checker = zephyr_checker(zephyr)
+    checker._zephyr_cycle_cache = {'projects': {}, 'release_map': {}}
+    checker._get_cached_or_fetch_cycle_details = Mock()
+    zephyr.retry_state['until'] = 120
+    assert checker._get_test_cycles_from_direct_cache_or_scan('REL-1') == []
+    checker._get_cached_or_fetch_cycle_details.assert_not_called()
+    zephyr.session.get.assert_not_called()
+    assert zephyr.last_test_cycle_search_stats[-1]['complete'] is False
+    assert zephyr.failed_requests == 0
+
+
 def test_zephyr_legacy_text_id_and_details_without_key(zephyr):
     case = {'id': 'HRPQA-T1', 'name': 'Legacy case'}
     details = {'status': 'Approved', 'customFields': {'Вид тестирования': 'Регресс'}, 'issueLinks': ['ABC-1']}
@@ -1578,3 +1650,104 @@ def test_unwritable_cycle_cache_is_console_only(zephyr, monkeypatch, tmp_path, c
     assert checker.check_results[0]['status'] == 'NO_FINDINGS'
     assert 'не удалось сохранить' in capsys.readouterr().out
     assert '#14892c' in checker._release_comment('REL-1', True)
+
+
+@pytest.mark.parametrize('failure', ['comments', 'worklogs', 'issue', None])
+def test_artifacts_checks_every_story_despite_independent_failures(validator, monkeypatch, failure):
+    monkeypatch.setattr(rc, 'is_allowed_tester', lambda name: name == 'Tester')
+    stories = {key: NS(key=key, fields=NS(issuetype=NS(name='Story'), issuelinks=[]))
+               for key in ['ABC-1', 'ABC-2']}
+    validator._get_consist_of_issues = Mock(return_value=list(stories))
+
+    def issue(key, **kwargs):
+        if failure == 'issue' and key == 'ABC-1':
+            raise requests.Timeout('metadata')
+        return stories[key]
+
+    def comments(key):
+        if failure == 'comments' and key == 'ABC-1':
+            raise requests.Timeout('comments')
+        return [NS(author=NS(displayName='Tester'))]
+
+    def worklogs(key):
+        if failure == 'worklogs' and key == 'ABC-1':
+            raise requests.Timeout('worklogs')
+        return [NS(author=NS(displayName='Tester'), timeSpentSeconds=60)]
+
+    validator.jira_main.issue.side_effect = issue
+    validator.jira_main.comments.side_effect = comments
+    validator.jira_main.worklogs.side_effect = worklogs
+    validator._check_artifacts('REL-1')
+    assert [c.args[0] for c in validator.jira_main.comments.call_args_list] == list(stories)
+    assert [c.args[0] for c in validator.jira_main.worklogs.call_args_list] == list(stories)
+    messages = [c.args[2] for c in validator._log_issue.call_args_list]
+    assert not any('Нет затреканного' in message for message in messages)
+    if failure:
+        assert any(c.args[1] == 'warning' for c in validator._log_issue.call_args_list)
+
+
+def test_missing_comment_still_checks_time_without_vacuous_success(validator):
+    story = NS(key='ABC-1', fields=NS(issuetype=NS(name='Story'), issuelinks=[]))
+    validator._get_consist_of_issues = Mock(return_value=[story.key])
+    validator.jira_main.issue.return_value = story
+    validator.jira_main.comments.return_value = []
+    validator.jira_main.worklogs.return_value = []
+    validator._check_artifacts('REL-1')
+    validator.jira_main.worklogs.assert_called_once_with(story.key)
+    messages = [c.args[2] for c in validator._log_issue.call_args_list]
+    assert 'Нет комментариев от тестировщика' in messages
+    assert 'Нет затреканного времени от тестировщика' in messages
+    assert not any(c.args[1] == 'success' for c in validator._log_issue.call_args_list)
+
+
+def test_story_checks_continue_after_architecture_failure(validator):
+    story = NS(key='HRC-1', fields=NS(description='', status=NS(name='Done'), issuelinks=[],
+                                    customfield_24000='Да', customfield_18400='Нет'))
+    validator._get_consist_of_issues = Mock(return_value=[story.key])
+    validator.jira_main.search_issues.return_value = [story]
+    validator.jira_main.issue.return_value = NS(changelog=NS(histories=[]))
+    validator._check_story_architecture_subtask = Mock(side_effect=requests.Timeout())
+    validator._check_required_platform_label = Mock()
+    validator._check_story_requirements_block = Mock(return_value=False)
+    validator._check_story_requirements_timing = Mock(side_effect=requests.Timeout())
+    validator._calc_status_days = Mock(return_value=0)
+    validator._check_stories('REL-1')
+    validator._check_required_platform_label.assert_called_once_with(story, 'Story')
+    validator._check_story_requirements_block.assert_called_once_with(story)
+    validator._calc_status_days.assert_called_once()
+    assert any('отсутствует описание' in c.args[2] for c in validator._log_issue.call_args_list)
+
+
+@pytest.mark.parametrize('actual,expected_level', [('Новый функционал', 'success'), ('НФ', 'error')])
+def test_cycle_testing_type_requires_full_field_value(validator, actual, expected_level):
+    validator._zephyr_cycle_testing_type_checked = set()
+    validator._get_test_cycle_details_cached = Mock(return_value={'key': 'HRPQA-R1'})
+    validator.zephyr = Mock()
+    validator.zephyr.get_test_case_custom_field.return_value = actual
+    validator._check_test_cycle_testing_type('REL-1', 'HRPQA-R1', 'НФ release', rc.ZEPHYR_TESTING_TYPE_NEW)
+    assert validator._log_issue.call_args.args[1] == expected_level
+
+
+@pytest.mark.parametrize('actual,expected', [('Новый функционал', 'PASS'), ('НФ', 'FAIL')])
+def test_new_functionality_test_case_uses_full_testing_type(zephyr, actual, expected):
+    checker = zephyr_checker(zephyr)
+    checker._build_expected_testing_type_map.return_value = {'ABC-1': rc.ZEPHYR_TESTING_TYPE_NEW}
+    case = case_payload(customFields={'Вид тестирования': actual})
+    zephyr.session.get.side_effect = lambda url, **kw: response(200, [case] if url.endswith('/testcases') else case)
+    checker._run_check('cases', 'ТК', lambda: checker._check_zephyr_test_cases('REL-1'))
+    assert checker.check_results[0]['status'] == expected
+
+
+def test_story_worklog_failure_still_reads_linked_testing_task(validator, monkeypatch):
+    monkeypatch.setattr(rc, 'is_allowed_tester', lambda name: name == 'Tester')
+    story = NS(key='ABC-1', fields=NS(issuetype=NS(name='Story'),
+               issuelinks=[NS(outwardIssue=NS(key='ABC-2'))]))
+    task = NS(key='ABC-2', fields=NS(issuetype=NS(name='Task'), summary='Тестирование'))
+    validator._get_consist_of_issues = Mock(return_value=[story.key])
+    validator.jira_main.issue.side_effect = lambda key, **kw: story if key == story.key else task
+    validator.jira_main.comments.return_value = [NS(author=NS(displayName='Tester'))]
+    validator.jira_main.worklogs.side_effect = [requests.Timeout(), [NS(author=NS(displayName='Tester'), timeSpentSeconds=60)]]
+    validator._check_artifacts('REL-1')
+    assert [c.args[0] for c in validator.jira_main.worklogs.call_args_list] == ['ABC-1', 'ABC-2']
+    assert not any(c.args[1] == 'error' for c in validator._log_issue.call_args_list)
+    assert any('есть списанное время' in c.args[2] for c in validator._log_issue.call_args_list)

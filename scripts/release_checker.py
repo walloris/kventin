@@ -506,10 +506,14 @@ class ZephyrScaleClient:
         deadline = getattr(self, '_lookup_deadline', None)
         return deadline is not None and time.monotonic() >= deadline
 
+    def requests_paused(self):
+        return self.retry_state.get('until', 0) > time.monotonic()
+
     def _get_with_retries(self, url: str, **kwargs) -> requests.Response:
         self._raise_if_failed_request_limit_reached()
+        lookup_deadline = getattr(self, '_lookup_deadline', None)
         deadline = min(kwargs.pop('deadline', float('inf')),
-                       getattr(self, '_lookup_deadline', None) or float('inf'),
+                       lookup_deadline if lookup_deadline is not None else float('inf'),
                        time.monotonic() + ZEPHYR_REQUEST_BUDGET_SECONDS)
         validate = kwargs.pop('validate', validate_json_payload)
         try:
@@ -520,6 +524,8 @@ class ZephyrScaleClient:
         except requests.exceptions.SSLError as exc:
             self.fatal_error = request_failure_kind(exc)
             raise RuntimeError(self.fatal_error) from exc
+        except RequestNotSent:
+            raise  # Budget/cooldown skips are not failures of the Zephyr service.
         except (requests.RequestException, ValueError) as exc:
             self._mark_failed_request(request_failure_kind(exc))
             raise
@@ -534,14 +540,17 @@ class ZephyrScaleClient:
         """Один быстрый GET без ретраев для диагностических/спекулятивных endpoint'ов."""
         self._raise_if_failed_request_limit_reached()
         kwargs.setdefault('timeout', self.request_timeout_seconds)
+        lookup_deadline = getattr(self, '_lookup_deadline', None)
         try:
             response = bounded_get(self.session, url, source='Zephyr', attempts=1,
                 timeout=kwargs.pop('timeout'), deadline=min(time.monotonic() + self.request_timeout_seconds,
-                    getattr(self, '_lookup_deadline', None) or float('inf')),
+                    lookup_deadline if lookup_deadline is not None else float('inf')),
                 retry_state=self.retry_state, **kwargs)
         except requests.exceptions.SSLError as e:
             self.fatal_error = request_failure_kind(e)
             raise RuntimeError(self.fatal_error) from e
+        except RequestNotSent:
+            raise
         except requests.RequestException as e:
             self._mark_failed_request(request_failure_kind(e))
             self._raise_if_failed_request_limit_reached()
@@ -1340,6 +1349,10 @@ def retry_after_seconds(response):
             return 0.0
 
 
+class RequestNotSent(requests.Timeout):
+    """A local deadline/Retry-After prevented sending any HTTP request."""
+
+
 def bounded_get(session, url, *, source, attempts, timeout, deadline, validate=None, retry_state=None, **kwargs):
     """Retry safe reads only, with one shared deadline for requests and backoff.
 
@@ -1347,6 +1360,7 @@ def bounded_get(session, url, *, source, attempts, timeout, deadline, validate=N
     or sleeps. No retries for TLS/authentication/permanent HTTP failures.
     """
     request_id = next(_http_request_ids)
+    sent = 0
     def trace(outcome, started, attempt, **details):
         trace_http(source, url, outcome, started, attempt, kwargs.get('params'),
                    request_id=request_id, remaining_s=round(max(0, deadline - time.monotonic()), 3),
@@ -1357,18 +1371,21 @@ def bounded_get(session, url, *, source, attempts, timeout, deadline, validate=N
         if cooldown:
             if cooldown >= deadline - time.monotonic():
                 trace('budget-exhausted', time.monotonic(), attempt, reason='retry-after')
-                raise requests.Timeout(f'{source}: Retry-After превышает лимит времени')
+                error = RequestNotSent if sent == 0 else requests.Timeout
+                raise error(f'{source}: Retry-After превышает лимит времени')
             trace('retry', time.monotonic(), attempt, sleep_s=cooldown, reason='retry-after')
             time.sleep(cooldown)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             trace('budget-exhausted', time.monotonic(), attempt, reason='deadline')
-            raise requests.Timeout(f'{source}: исчерпан лимит времени запроса')
+            error = RequestNotSent if sent == 0 else requests.Timeout
+            raise error(f'{source}: исчерпан лимит времени запроса')
         started = time.monotonic()
         response = None
         trace('request', started, attempt, timeout_s=min(timeout, remaining))
         try:
             # A total urllib3 timeout shares time between connect and read.
+            sent += 1
             response = session.get(url, timeout=urllib3.util.Timeout(
                 total=min(timeout, remaining), connect=min(5.0, timeout, remaining)), **kwargs)
             trace(response.status_code, started, attempt,
@@ -1708,6 +1725,11 @@ class ReleaseValidator:
     def _get_test_cycles_from_direct_cache_or_scan_bounded(self, release_key: str) -> list[dict]:
         """Найти ТЦ через локальный кэш или bounded direct scan по ключам HRPQA-C..."""
         cached_cycles = self._get_cached_test_cycles_for_release(release_key)
+        if self.zephyr.requests_paused():
+            self.zephyr.last_test_cycle_search_stats.append({
+                'mode': 'direct-scan', 'status': 'exception', 'complete': False,
+                'error': 'Retry-After: direct scan deferred'})
+            return cached_cycles
         if not ZEPHYR_DIRECT_CYCLE_SCAN_ENABLED:
             if cached_cycles:
                 self._log_issue(
@@ -1748,7 +1770,8 @@ class ReleaseValidator:
 
         with self.zephyr.lookup_budget(20):
             for cycle_number in range(high_watermark, min_number - 1, -1):
-                if self.zephyr.is_failed_request_limit_reached() or self.zephyr.lookup_budget_exhausted():
+                if (self.zephyr.is_failed_request_limit_reached() or self.zephyr.lookup_budget_exhausted()
+                        or self.zephyr.requests_paused()):
                     break
                 cycle_key = f"{project_key}-C{cycle_number}"
                 details = self._get_cached_or_fetch_cycle_details(project_key, cycle_key)
@@ -1820,7 +1843,8 @@ class ReleaseValidator:
         current = high_watermark
         misses = 0
         for cycle_number in range(high_watermark + 1, high_watermark + ZEPHYR_DIRECT_CYCLE_SCAN_FORWARD_LIMIT + 1):
-            if self.zephyr.is_failed_request_limit_reached() or self.zephyr.lookup_budget_exhausted():
+            if (self.zephyr.is_failed_request_limit_reached() or self.zephyr.lookup_budget_exhausted()
+                    or self.zephyr.requests_paused()):
                 break
             cycle_key = f"{project_key}-C{cycle_number}"
             details = self.zephyr.get_test_cycle_details(cycle_key)
@@ -3077,7 +3101,7 @@ class ReleaseValidator:
                         f"Back release: для КЭ '{service_ke}' найден API НФ ТЦ "
                         f"[{tc_key}] '{tc_name}' ✓"
                     )
-                    self._check_test_cycle_testing_type(release_key, tc_key, tc_name, 'НФ')
+                    self._check_test_cycle_testing_type(release_key, tc_key, tc_name, ZEPHYR_TESTING_TYPE_NEW)
                     self._check_test_cycle_cases_approved(release_key, tc_key, tc_name)
                 else:
                     self._log_issue(
@@ -3146,7 +3170,7 @@ class ReleaseValidator:
                         f"Web release: для КЭ '{service_ke}' найден {nf_channel_name} НФ ТЦ "
                         f"[{tc_key}] '{tc_name}' ✓"
                     )
-                    self._check_test_cycle_testing_type(release_key, tc_key, tc_name, 'НФ')
+                    self._check_test_cycle_testing_type(release_key, tc_key, tc_name, ZEPHYR_TESTING_TYPE_NEW)
                     self._check_test_cycle_cases_approved(release_key, tc_key, tc_name)
                 else:
                     self._log_issue(
@@ -3204,7 +3228,7 @@ class ReleaseValidator:
           1. ТЦ получаем через Zephyr API (поиск + issuelink, все проекты).
           2. Если есть Story с 'Новая функциональность' = 'Да' -> должен быть
              ТЦ с 'НФ' или 'NF' в названии,
-             кастомное поле 'Вид тестирования' = 'НФ',
+             кастомное поле 'Вид тестирования' = 'Новый функционал',
              в составе ТЦ только ТК из этих Story (не более).
           3. Обязательно должен быть ТЦ с 'Регресс' или 'Regress' в названии,
              кастомное поле 'Вид тестирования' = 'Регресс'.
@@ -3332,10 +3356,10 @@ class ReleaseValidator:
                         release_key, "warning",
                         f"ТЦ [{tc_key}] '{name}': поле '{ZEPHYR_TESTING_TYPE_FIELD}' не найдено"
                     )
-                elif vt.strip().casefold() != 'нф':
+                elif vt.strip().casefold() != ZEPHYR_TESTING_TYPE_NEW.casefold():
                     self._log_issue(
                         release_key, "error",
-                        f"ТЦ [{tc_key}] '{name}': '{ZEPHYR_TESTING_TYPE_FIELD}' = '{vt}', ожидается 'НФ'"
+                        f"ТЦ [{tc_key}] '{name}': '{ZEPHYR_TESTING_TYPE_FIELD}' = '{vt}', ожидается '{ZEPHYR_TESTING_TYPE_NEW}'"
                     )
                 else:
                     self._log_issue(
@@ -3511,10 +3535,7 @@ class ReleaseValidator:
     def _get_tester_worklog_authors(self, issue: object) -> set[str]:
         """Возвращает множество тестировщиков со списанием времени > 0 в задаче."""
         authors: set[str] = set()
-        try:
-            worklogs = self.jira_main.worklogs(issue.key)
-        except Exception:
-            return authors
+        worklogs = self.jira_main.worklogs(getattr(issue, 'key', issue))
 
         for wl in worklogs:
             author_name = self._get_author_name(wl.author)
@@ -3522,7 +3543,7 @@ class ReleaseValidator:
                 authors.add(author_name)
         return authors
 
-    def _get_linked_testing_tasks(self, issue: object) -> list[str]:
+    def _get_linked_testing_tasks(self, issue: object, errors: Optional[list[str]] = None) -> list[str]:
         """
         Возвращает ключи связанных Task с признаком тестирования.
         Нужны для кейса, когда время списано не в Story, а в тестовой Task.
@@ -3537,7 +3558,10 @@ class ReleaseValidator:
                 continue
             try:
                 linked_full = self.jira_main.issue(linked_issue.key, fields='summary,issuetype')
-            except Exception:
+            except Exception as exc:
+                self._log_issue(issue, "warning", f"Не удалось проверить связанную задачу {linked_issue.key}: {exc}")
+                if errors is not None:
+                    errors.append(linked_issue.key)
                 continue
 
             issue_type = linked_full.fields.issuetype.name.lower() if linked_full.fields.issuetype else ''
@@ -3586,59 +3610,64 @@ class ReleaseValidator:
             return
 
         for artifact_key in artifact_keys:
+            artifact = artifact_key
+            metadata_ok = True
             try:
                 artifact = self.jira_main.issue(artifact_key)
-                artifact_project = self._issue_project_key(artifact)
-                comments = self.jira_main.comments(artifact.key)
-                comment_authors: set[str] = set()
-                worklog_required_comment_authors: set[str] = set()
+            except Exception as exc:
+                metadata_ok = False
+                self._log_issue(artifact_key, "warning", f"Не удалось получить данные задачи для проверки связанных списаний: {exc}")
+
+            comment_authors: set[str] = set()
+            required_authors: set[str] = set()
+            comments_ok = True
+            try:
+                comments = self.jira_main.comments(artifact_key)
                 for comment in comments:
-                    author_name = self._get_author_name(comment.author)
-                    is_exempt_author = self._is_worklog_exempt_comment_author(
-                        author_name,
-                        artifact_project,
-                    )
-                    if is_allowed_tester(author_name) or is_exempt_author:
-                        comment_authors.add(author_name)
-                    if is_allowed_tester(author_name) and not is_exempt_author:
-                        worklog_required_comment_authors.add(author_name)
-
-                if not comment_authors:
+                    author = self._get_author_name(comment.author)
+                    exempt = self._is_worklog_exempt_comment_author(author, artifact_key.split('-')[0])
+                    if is_allowed_tester(author) or exempt:
+                        comment_authors.add(author)
+                    if is_allowed_tester(author) and not exempt:
+                        required_authors.add(author)
+                if comment_authors:
+                    self._log_issue(artifact, "success", f"Есть комментарии от: {', '.join(sorted(comment_authors))}")
+                else:
                     self._log_issue(artifact, "error", "Нет комментариев от тестировщика")
-                else:
-                    self._log_issue(artifact, "success", f"Есть комментарии от: {', '.join(comment_authors)}")
+            except Exception as exc:
+                comments_ok = False
+                self._log_issue(artifact, "warning", f"Не удалось проверить комментарии тестировщика: {exc}")
 
-                # Обязательная проверка:
-                # у тестировщика, оставившего комментарий, должно быть списанное время
-                # либо в самой Story/Bug, либо (для Story) в связанной тестовой Task.
-                direct_worklog_authors = self._get_tester_worklog_authors(artifact)
-                worklog_authors = set(direct_worklog_authors)
+            # Независимо от комментариев и PR читаем все доступные списания.
+            worklog_authors: set[str] = set()
+            worklogs_ok = metadata_ok
+            sources = [artifact]
+            if metadata_ok and getattr(artifact.fields.issuetype, 'name', '').lower() == 'story':
+                try:
+                    discovery_errors: list[str] = []
+                    sources.extend(self._get_linked_testing_tasks(artifact, errors=discovery_errors))
+                    worklogs_ok = worklogs_ok and not discovery_errors
+                except Exception as exc:
+                    worklogs_ok = False
+                    self._log_issue(artifact, "warning", f"Не удалось проверить связанные тестовые Task: {exc}")
+            for source in sources:
+                try:
+                    worklog_authors.update(self._get_tester_worklog_authors(source))
+                except Exception as exc:
+                    worklogs_ok = False
+                    self._log_issue(artifact, "warning", f"Не удалось получить списанное время из {getattr(source, 'key', source)}: {exc}")
 
-                issue_type = artifact.fields.issuetype.name.lower() if artifact.fields.issuetype else ''
-                if issue_type == 'story':
-                    for task_key in self._get_linked_testing_tasks(artifact):
-                        try:
-                            task_issue = self.jira_main.issue(task_key)
-                        except Exception:
-                            continue
-                        worklog_authors.update(self._get_tester_worklog_authors(task_issue))
-
-                missing_time_authors = sorted(worklog_required_comment_authors - worklog_authors)
-                if missing_time_authors:
-                    self._log_issue(
-                        artifact,
-                        "error",
-                        "Нет затреканного времени от тестировщиков с комментариями: "
-                        + ", ".join(missing_time_authors)
-                    )
-                else:
-                    self._log_issue(
-                        artifact,
-                        "success",
-                        "У всех тестировщиков с комментариями, для которых требуется worklog, есть списанное время ✓"
-                    )
-            except Exception as e:
-                self._log_issue(artifact_key, "error", f"Ошибка проверки артефактов: {e}")
+            missing = sorted(required_authors - worklog_authors)
+            if comments_ok and comment_authors and not missing:
+                self._log_issue(artifact, "success", "У всех тестировщиков с комментариями, для которых требуется worklog, есть списанное время ✓")
+            elif missing and worklogs_ok:
+                self._log_issue(artifact, "error", "Нет затреканного времени от тестировщиков с комментариями: " + ", ".join(missing))
+            elif missing:
+                self._log_issue(artifact, "warning", "Не удалось подтвердить списанное время: " + ", ".join(missing))
+            elif worklog_authors:
+                self._log_issue(artifact, "success", "Есть списанное время от: " + ", ".join(sorted(worklog_authors)))
+            elif worklogs_ok:
+                self._log_issue(artifact, "error", "Нет затреканного времени от тестировщика")
 
     def _check_release_coverage(self, release_key):
         linked_keys = self._get_consist_of_issues(release_key)
@@ -4036,6 +4065,14 @@ class ReleaseValidator:
         except Exception as exc:
             self._log_issue(story, "error", f"Story: не удалось проверить sub-task 'Анализ архитектуры': {exc}")
 
+    def _run_story_check(self, story, name, callback):
+        """Ошибка одной проверки не отменяет остальные проверки Story."""
+        try:
+            return callback()
+        except Exception as exc:
+            self._log_issue(story, "warning", f"Story: не удалось выполнить проверку '{name}': {exc}")
+            return None
+
     def _check_stories(self, release_key: str) -> None:
         """Проверка Story: описание + обязательные поля + Epic Link + время в тест-статусах + Task внутри Story"""
         STORY_FIELDS = {
@@ -4078,10 +4115,10 @@ class ReleaseValidator:
 
         for story in story_issues:
             story_project = story.key.split('-')[0]
-            self._check_story_architecture_subtask(story)
+            self._run_story_check(story, 'Анализ архитектуры', lambda: self._check_story_architecture_subtask(story))
 
             # --- 0. Проверка обязательного лейбла контура ---
-            self._check_required_platform_label(story, "Story")
+            self._run_story_check(story, 'Контур', lambda: self._check_required_platform_label(story, "Story"))
 
             # --- 1. Проверка описания Story ---
             description = getattr(story.fields, 'description', None)
@@ -4141,10 +4178,10 @@ class ReleaseValidator:
                 )
 
             # --- 3. Проверка блока требований и архитектуры ---
-            requirements_block_is_valid = self._check_story_requirements_block(story)
+            requirements_block_is_valid = self._run_story_check(story, 'Требования', lambda: self._check_story_requirements_block(story))
             if story_full is not None:
-                self._check_story_requirements_timing(story, story_full.changelog)
-            if not requirements_block_is_valid:
+                self._run_story_check(story, 'Порядок привязки требований', lambda: self._check_story_requirements_timing(story, story_full.changelog))
+            if requirements_block_is_valid is False:
                 story_status = story.fields.status.name if getattr(story.fields, 'status', None) else ''
                 if normalize_status_name(story_status) in CORRUPTED_STORY_STATUSES:
                     self._log_issue(
@@ -4447,6 +4484,10 @@ class ReleaseValidator:
                            cached_failure=bool(failure))
                 return payload
             del self._pr_http_cache[cache_key]
+        cooldown_reason = self._pr_cooldown_reason()
+        if cooldown_reason:
+            self._pr_lookup_failures.add(cooldown_reason)
+            return None
         outer_deadline = getattr(self, '_pr_request_deadline', None)
         if outer_deadline is not None and time.monotonic() >= outer_deadline:
             self._pr_lookup_failures.add('исчерпан лимит времени проверки PR')
@@ -4489,6 +4530,9 @@ class ReleaseValidator:
             failure = request_failure_kind(exc)
             permanent = True
             self._pr_endpoint_failures[endpoint] = PR_ENDPOINT_FAILURE_LIMIT
+        except RequestNotSent as exc:
+            self._pr_lookup_failures.add(str(exc))
+            return None
         except (requests.RequestException, ValueError) as exc:
             failure = request_failure_kind(exc)
             if isinstance(exc, requests.Timeout) and 'лимит' in str(exc):
@@ -4500,6 +4544,18 @@ class ReleaseValidator:
         self._pr_lookup_failures.add(failure)
         self._pr_http_cache[cache_key] = (None, failure, expires)
         return None
+
+    def _pr_cooldown_reason(self):
+        """Stop source fan-out during a server-requested pause; log it only once."""
+        state = getattr(self, '_pr_retry_state', {})
+        until = state.get('until', 0)
+        remaining = until - time.monotonic()
+        if remaining <= 0:
+            return ''
+        if state.get('reported_until') != until:
+            trace_http('PR', '', 'rate-limited', time.monotonic(), retry_after_s=round(remaining, 2))
+            state['reported_until'] = until
+        return f'PR: сервер ограничил запросы; Retry-After, осталось {remaining:.1f} с'
 
     def _begin_pr_stage(self):
         """A transient failure in PR presence must not disable merged/GigaCode reads."""
@@ -4546,7 +4602,13 @@ class ReleaseValidator:
         cache_key = (issue_id, tuple(data_types))
         if cache_key in self._dev_status_payload_cache:
             return self._dev_status_payload_cache[cache_key]
+        cooldown_reason = self._pr_cooldown_reason()
+        if cooldown_reason:
+            raise RuntimeError(cooldown_reason)
         version, summary = self._get_dev_summary(issue_id)
+        cooldown_reason = self._pr_cooldown_reason()
+        if cooldown_reason:
+            raise RuntimeError(cooldown_reason)
         sections = (summary or {}).get('summary', {})
         payloads, errors = [], []
         base = config['jira']['url'].rstrip('/')
@@ -4578,6 +4640,9 @@ class ReleaseValidator:
                     with self._pr_lookup_budget(max(0, type_deadline - time.monotonic())):
                         payload = self._pr_get_json(f"{base}/rest/dev-status/{api_version}/issue/detail", params={
                             'issueId': issue_id, 'applicationType': provider, 'dataType': data_type})
+                    cooldown_reason = self._pr_cooldown_reason()
+                    if payload is None and cooldown_reason:
+                        raise RuntimeError(cooldown_reason)
                     if not isinstance(payload, dict) or not isinstance(payload.get('detail'), list):
                         continue
                     # An empty response for an unrecognized alias proves nothing.
@@ -4736,11 +4801,19 @@ class ReleaseValidator:
         if not hasattr(self, '_pr_lookup_failures'):
             self._pr_lookup_failures = set()
         count = None
+        cooldown_reason = self._pr_cooldown_reason()
+        if cooldown_reason:
+            self._pr_lookup_failures.add(cooldown_reason)
+            return None
         if issue_id:
             _, summary = self._get_dev_summary(issue_id)
             count = self._summary_pr_count(summary)
             if count is not None and count > 0:
                 return f"Jira development: связанных PR — {count}"
+        cooldown_reason = self._pr_cooldown_reason()
+        if cooldown_reason:
+            self._pr_lookup_failures.add(cooldown_reason)
+            return None
         links = None
         base = config['jira']['url'].rstrip('/')
         if issue_key:
