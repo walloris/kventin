@@ -185,7 +185,7 @@ def test_missing_architecture_task(validator):
     assert 'отсутствует' in validator._log_issue.call_args.args[2]
 
 
-@pytest.mark.parametrize('days,expected', [(0, 'success'), (1, 'success'), (6.9, 'success'), (6.9001, 'error')])
+@pytest.mark.parametrize('days,expected', [(0, 'success'), (1, 'success'), (6.9, 'success'), (6.9001, 'warning')])
 def test_testing_duration_boundary_and_no_minimum(validator, days, expected):
     story = NS(key='HRC-1', fields=NS(
         description='Test', status=NS(name='In Progress'), issuelinks=[],
@@ -1806,3 +1806,103 @@ def test_paused_zephyr_detail_reads_use_cache_without_http(zephyr, fake_clock):
     fake_clock[0] += 120
     zephyr.session.get.return_value = response(200, case_payload('HRPQA-T2'))
     assert checker._get_test_case_details_cached('HRPQA-T2')
+
+
+def test_testing_time_deviation_is_visible_and_nonblocking():
+    checker = stage_validator()
+    message = 'Story: суммарное время в тест-статусах (7.05 д.) больше 115% норматива (6.9 д. из 6.0 д.)'
+    checker._run_check('stories', 'Story', lambda: checker._log_issue('ABC-1', 'warning', message))
+    assert not checker.report_data['ABC-1']['errors']
+    comment = checker._release_comment('REL-1', True)
+    assert '(x) Исправить' not in comment
+    assert '(!) Отклонение' in comment
+    assert '*Отклонения: 1*' in comment
+    assert '#14892c' in comment
+    assert 'Отклонение —' in checker._checks_wiki_table()
+
+
+def matrix_response(status=200, payload=None, headers=None):
+    result = response(status, payload, headers or {'Content-Type': 'application/json'})
+    result.content = b'{}'
+    return result
+
+
+def matrix_session():
+    session = Mock()
+    session.headers = {}
+    def fetch(url, **kwargs):
+        if url.endswith('/issue/REL-1'):
+            return matrix_response(payload={'fields': {'issuelinks': [
+                {'type': {'name': 'consists of'}, 'outwardIssue': {'key': 'ABC-1'}}]}})
+        if url.endswith('/issue/ABC-1'):
+            return matrix_response(payload={'id': '123', 'key': 'ABC-1'})
+        if url.endswith('/testrun/search'):
+            return matrix_response(payload=[{'key': 'HRPQA-C1', 'name': 'REL-1.api.НФ'},
+                                            {'key': 'HRPQA-C2', 'name': 'REL-10.api.НФ'}])
+        if '/dev-status/' in url:
+            return matrix_response(payload={'detail': [{'pullRequests': [{'id': '42'}]}]})
+        return matrix_response(payload=[])
+    session.get.side_effect = fetch
+    return session
+
+
+def test_lookup_matrix_compares_variants_without_writes(monkeypatch, capsys):
+    monkeypatch.setenv('RELEASE_CHECKER_DIAG_FOCUS', 'both')
+    monkeypatch.delenv('RELEASE_CHECKER_DIAG_ISSUE', raising=False)
+    session = matrix_session()
+    records = rc._diag_lookup_matrix('REL-1', session)
+    assert len([r for r in records if r['method'].startswith('PR detail')]) == 18
+    assert all(r['result'] == 'PR_EVIDENCE' for r in records if r['method'].startswith('PR detail'))
+    baseline = next(r for r in records if r['method'] == 'cycle project index baseline')
+    control = next(r for r in records if r['method'] == 'cycle negative filter control')
+    assert baseline['release_matches'] == 1
+    assert baseline['unrelated'] == 1
+    assert baseline['keys_fingerprint'] == control['keys_fingerprint']
+    assert 'mixed response' in baseline['filter_note']
+    session.post.assert_not_called()
+    session.put.assert_not_called()
+    session.delete.assert_not_called()
+    assert '[LOOKUP MATRIX SUMMARY]' in capsys.readouterr().out
+
+
+def test_lookup_matrix_honors_shared_retry_after_without_waiting(monkeypatch, fake_clock):
+    monkeypatch.setenv('RELEASE_CHECKER_DIAG_ISSUE', 'ABC-1')
+    session = matrix_session()
+    session.get.side_effect = lambda *args, **kwargs: matrix_response(429, headers={'Retry-After': '120'})
+    records = rc._diag_lookup_matrix('REL-1', session)
+    assert session.get.call_count == 1
+    assert all(r['reason'] == 'Retry-After' for r in records[1:])
+    assert fake_clock[0] == 0
+
+
+def test_lookup_matrix_bounds_total_time_and_attempts(monkeypatch, fake_clock):
+    monkeypatch.setenv('RELEASE_CHECKER_DIAG_ISSUE', 'ABC-1')
+    session = matrix_session()
+    def timeout(url, **kwargs):
+        fake_clock[0] += kwargs['timeout'].total
+        raise requests.Timeout()
+    session.get.side_effect = timeout
+    records = rc._diag_lookup_matrix('REL-1', session)
+    assert fake_clock[0] <= 130
+    assert session.get.call_count < 20
+    assert any(r.get('reason') == 'budget' for r in records)
+
+
+def test_lookup_matrix_does_not_log_raw_service_errors(monkeypatch, capsys):
+    monkeypatch.setenv('RELEASE_CHECKER_DIAG_ISSUE', 'ABC-1')
+    session = matrix_session()
+    session.get.side_effect = lambda *args, **kw: matrix_response(payload={
+        'errors': [{'message': 'Connection timeout token=SUPER_SECRET', 'url': 'https://private/internal'}]})
+    records = rc._diag_lookup_matrix('REL-1', session)
+    assert records[0]['result'] == 'API_ERROR'
+    assert 'timeout' in records[0]['error_categories']
+    output = capsys.readouterr().out
+    assert 'SUPER_SECRET' not in output
+    assert 'https://private' not in output
+
+
+@pytest.mark.parametrize('focus,excluded', [('cycles', 'PR detail'), ('pr', 'cycle ')])
+def test_lookup_matrix_can_isolate_each_service(monkeypatch, focus, excluded):
+    monkeypatch.setenv('RELEASE_CHECKER_DIAG_FOCUS', focus)
+    records = rc._diag_lookup_matrix('REL-1', matrix_session())
+    assert not any(r['method'].startswith(excluded) for r in records)

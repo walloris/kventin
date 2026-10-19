@@ -5,6 +5,7 @@ import sys
 import re
 import time
 import html
+import hashlib
 import json
 import urllib3
 import logging
@@ -75,6 +76,12 @@ logger.setLevel(logging.ERROR)
 # Промежуточная версия для Jenkins: True — подробная диагностика, False — обычные логи.
 # Команду запуска менять не нужно. RELEASE_CHECKER_DEBUG_HTTP=1/0 переопределяет этот параметр.
 HTTP_DEBUG_ENABLED = True
+# Временный read-only эксперимент: обычная команда запускает матрицу API вместо отчёта.
+# False или RELEASE_CHECKER_LOOKUP_DIAGNOSTICS=0 возвращает обычную проверку.
+LOOKUP_DIAGNOSTICS_ENABLED = True
+LOOKUP_DIAGNOSTIC_FOCUS = 'both'  # both / pr / cycles
+# Из лога №1562: известный цикл для независимой проверки прямого чтения.
+LOOKUP_DIAGNOSTIC_CYCLE = 'HRPQA-C138867'
 
 ALLOWED_TESTERS = {
     "Абдуллаев Магомедэмин Шамильевич",
@@ -2559,11 +2566,16 @@ class ReleaseValidator:
             rows.append('| Проверки не выполнены | INCOMPLETE | — | 0 | 0 / 0 / 0 | Нет результатов проверок |')
         return '\n'.join(rows)
 
+    @staticmethod
+    def _is_testing_time_deviation(message):
+        return 'суммарное время в тест-статусах' in message and 'больше' in message
+
     def _finding_wiki(self, key, status, message):
         target = wiki_cell(key)
         if key != 'GENERAL' and re.fullmatch(r'[A-Z][A-Z0-9_]*-\d+', key):
             target = f"[{key}|{config['jira']['url'].rstrip('/')}/browse/{key}]"
-        return f"{target}: {'Ошибка' if status == 'error' else 'Предупреждение'} — {wiki_cell(message)}"
+        label = 'Отклонение' if self._is_testing_time_deviation(message) else ('Ошибка' if status == 'error' else 'Предупреждение')
+        return f"{target}: {label} — {wiki_cell(message)}"
 
     @staticmethod
     def _comment_message(message):
@@ -2612,12 +2624,12 @@ class ReleaseValidator:
     def _release_comment(self, release_key, is_success):
         grouped = {}
         labels = {'error': '(x) Исправить', 'unavailable': '(?) Нет данных',
-                  'warning': '(!) Проверить', 'success': '(/) Без замечаний'}
+                  'warning': '(!) Проверить', 'deviation': '(!) Отклонение', 'success': '(/) Без замечаний'}
         has_errors = any(data['errors'] for data in self.report_data.values())
         success = is_success and not has_errors
         # PR lookup observations are the explicit exception: they keep a green result.
         other_remarks = any(self._comment_message(message) and not (
-            'pull request' in message.casefold() or re.search(r'\bpr\b', message, re.I))
+            self._is_testing_time_deviation(message) or 'pull request' in message.casefold() or re.search(r'\bpr\b', message, re.I))
             for data in self.report_data.values() for message in data['warnings'])
         green = success and not other_remarks
         for key, data in self.report_data.items():
@@ -2626,7 +2638,8 @@ class ReleaseValidator:
                 for original in values:
                     message = self._comment_message(original)
                     if message:
-                        kind = 'unavailable' if message.startswith('Не удалось') else severity
+                        kind = ('deviation' if self._is_testing_time_deviation(original) else
+                                'unavailable' if message.startswith('Не удалось') else severity)
                         messages.setdefault(message, kind)
             if not messages:
                 continue
@@ -2645,11 +2658,11 @@ class ReleaseValidator:
         if green and any(data['warnings'] for data in self.report_data.values()):
             title += ' (есть неблокирующие замечания)'
         counts = {kind: sum(value == kind for entry in grouped.values() for value in entry['messages'].values())
-                  for kind in ('error', 'unavailable', 'warning')}
+                  for kind in ('error', 'unavailable', 'warning', 'deviation')}
         rows = [f'{{panel:title={title}|titleBGColor={background}|titleColor={color}'
                 f'|borderColor={color}|bgColor=#ffffff}}',
                 f"*Исправить: {counts['error']}* · *Нет данных: {counts['unavailable']}* · "
-                f"*Проверить: {counts['warning']}*", '']
+                f"*Проверить: {counts['warning']}* · *Отклонения: {counts['deviation']}*", '']
         if counts['unavailable']:
             rows.extend(['(?) *Нет данных* — источник не ответил или вернул неполный результат. '
                          'Это не подтверждает отсутствие ПР или тестов; повторите проверку.', ''])
@@ -4232,7 +4245,7 @@ class ReleaseValidator:
                     target_days_rounded = round(target_days, 2)
                     if actual_days > max_days:
                         self._log_issue(
-                            story, "error",
+                            story, "warning",
                             f"Story: суммарное время в тест-статусах "
                             f"({actual_days_rounded} д.) больше {max_percent}% норматива "
                             f"({max_days_rounded} д. из {target_days_rounded} д.) "
@@ -6020,6 +6033,160 @@ def _diag_pr(validator: 'ReleaseValidator', issue_key: str):
                 print(f"  snippet={matched.group(0)}")
 
 
+def _diag_lookup_matrix(release_input, session=None):
+    """Read-only comparison; no SDK initialization, retries, pagination or Jira writes."""
+    release_key = extract_issue_key_from_url(release_input)
+    focus = os.getenv('RELEASE_CHECKER_DIAG_FOCUS', LOOKUP_DIAGNOSTIC_FOCUS).strip().lower()
+    if focus not in {'both', 'pr', 'cycles'}:
+        raise ValueError('RELEASE_CHECKER_DIAG_FOCUS must be both/pr/cycles')
+    if not re.fullmatch(r'[A-Z][A-Z0-9_]*-\d+', release_key or ''):
+        raise ValueError('Expected Jira release key')
+    session = session or ReleaseHttpSession()
+    session.verify = release_tls_policy()
+    session.headers.update({'Authorization': f"Bearer {config['jira']['token']}", 'Accept': 'application/json'})
+    base = config['jira']['url'].rstrip('/')
+    started = time.monotonic()
+    overall_deadline = started + 130
+    cooldown = 0.0
+    records = []
+    parser = ReleaseValidator.__new__(ReleaseValidator)
+    print('[LOOKUP MATRIX] read-only; normal report disabled; 130s network budget; one attempt per method', flush=True)
+
+    def probe(name, path, params=None, *, deadline=None, kind='metadata'):
+        nonlocal cooldown
+        record = {'method': name, 'path': path, 'result': 'SKIP', 'seconds': 0.0}
+        records.append(record)
+        now = time.monotonic()
+        end = min(overall_deadline, deadline or overall_deadline)
+        payload = None
+        if cooldown > now:
+            record.update(reason='Retry-After', retry_after_s=round(cooldown - now, 2))
+        elif end <= now:
+            record['reason'] = 'budget'
+        else:
+            try:
+                # All probes share server cooldown, including Jira and Zephyr paths.
+                response = session.get(base + path, params=params or {}, timeout=urllib3.util.Timeout(
+                    total=min(12, end-now), connect=min(5, end-now)))
+                record.update(http=response.status_code,
+                              content_type=response.headers.get('Content-Type', '').split(';')[0],
+                              bytes=len(response.content))
+                if response.status_code in (429, 503):
+                    pause = retry_after_seconds(response)
+                    # Even without Retry-After, don't hammer the server with alternative routes.
+                    cooldown = time.monotonic() + max(2, pause)
+                    record['retry_after_s'] = pause
+                record['result'] = 'HTTP_ERROR'
+                if response.status_code == 200:
+                    payload = response.json()
+                    record['shape'] = response_shape(payload)
+                    errors = (payload.get('errors') or payload.get('errorMessages')) if isinstance(payload, dict) else None
+                    if errors:
+                        record['result'] = 'API_ERROR'
+                        # Only fixed categories, never raw service messages, URLs or tokens.
+                        error_text = json.dumps(errors, ensure_ascii=False).lower()
+                        record['error_categories'] = [label for label, words in {
+                            'timeout': ('timeout', 'timed out'), 'permission': ('forbidden', 'permission', 'unauthorized'),
+                            'connection': ('connection', 'connectexception'), 'application_link': ('application link', 'applink'),
+                        }.items() if any(word in error_text for word in words)] or ['unclassified']
+                    elif kind == 'pr':
+                        record['result'] = 'PR_EVIDENCE' if parser._extract_pull_request_evidence(payload) else 'NO_PR_EVIDENCE'
+                    elif kind == 'cycles':
+                        items = (payload if isinstance(payload, list) else next(
+                            (payload[k] for k in ('values', 'results', 'items', 'testRuns', 'testCycles')
+                             if isinstance(payload, dict) and isinstance(payload.get(k), list)),
+                            [payload] if isinstance(payload, dict) and payload.get('key') else []))
+                        cycle_items = [item for item in items if isinstance(item, dict)]
+                        matches = [item for item in cycle_items if re.search(
+                            re.escape(release_key) + r'(?!\d)', json.dumps(item, ensure_ascii=False))]
+                        record.update(count=len(items), release_matches=len(matches),
+                                      keys_fingerprint=hashlib.sha256(json.dumps(sorted(str(item.get('key', '')) for item in cycle_items)).encode()).hexdigest()[:16],
+                                      unrelated=len(cycle_items)-len(matches),
+                                      matching_keys=[item.get('key') for item in matches[:20]])
+                        record['result'] = 'RELEASE_MATCHES' if matches else 'NO_RELEASE_MATCHES'
+                        baseline = next((r for r in records if r['method'] == 'cycle project index baseline'), None)
+                        if baseline and baseline is not record and cycle_items:
+                            record['same_page_as_baseline'] = baseline.get('keys_fingerprint') == record['keys_fingerprint']
+                        if matches and len(matches) < len(cycle_items):
+                            record['filter_note'] = 'mixed response: filter may be ignored; no completeness claim'
+                    else:
+                        record['result'] = 'JSON_OK'
+            except Exception as exc:
+                record.update(result='EXCEPTION', exception=type(exc).__name__)
+            record['seconds'] = round(time.monotonic()-now, 3)
+        print('[LOOKUP MATRIX] ' + json.dumps(record, ensure_ascii=False), flush=True)
+        return payload if record['result'] not in ('HTTP_ERROR', 'API_ERROR', 'EXCEPTION', 'SKIP') else None
+
+    # Bootstrap through the same bounded HTTP path, without hidden SDK retries.
+    release = probe('release-links', f'/rest/api/2/issue/{release_key}', {'fields': 'issuelinks'}, deadline=started+10)
+    issue_key = os.getenv('RELEASE_CHECKER_DIAG_ISSUE', '').strip()
+    if not issue_key and isinstance(release, dict):
+        for link in release.get('fields', {}).get('issuelinks', []):
+            if any(word in str(link.get('type', {}).get('name', '')).lower() for word in ('consist', 'part')):
+                issue_key = (link.get('outwardIssue') or link.get('inwardIssue') or {}).get('key', '')
+                if issue_key:
+                    break
+    if issue_key and not re.fullmatch(r'[A-Z][A-Z0-9_]*-\d+', issue_key):
+        raise ValueError('Invalid RELEASE_CHECKER_DIAG_ISSUE')
+    pr_deadline = min(overall_deadline, time.monotonic()+60)
+    if issue_key and focus != 'cycles':
+        issue = probe('PR issue fields', f'/rest/api/2/issue/{issue_key}', {'fields': '*all'}, deadline=pr_deadline, kind='pr')
+        issue_id = str((issue or {}).get('id', ''))
+        probe('PR remote links', f'/rest/api/2/issue/{issue_key}/remotelink', deadline=pr_deadline, kind='pr')
+        if issue_id.isdigit():
+            for version in ('latest', '1.0'):
+                probe(f'PR summary {version}', f'/rest/dev-status/{version}/issue/summary',
+                      {'issueId': issue_id}, deadline=pr_deadline, kind='pr')
+            for data_type in ('pullrequest', 'repository', 'commit'):
+                for provider in ('stash', 'bitbucket', 'bitbucket-server'):
+                    for version in ('latest', '1.0'):
+                        probe(f'PR detail {version}/{provider}/{data_type}', f'/rest/dev-status/{version}/issue/detail',
+                              {'issueId': issue_id, 'applicationType': provider, 'dataType': data_type},
+                              deadline=pr_deadline, kind='pr')
+        else:
+            print('[LOOKUP MATRIX] PR detail SKIP: issue id unavailable', flush=True)
+    elif focus != 'cycles':
+        print('[LOOKUP MATRIX] PR SKIP: no linked issue; set RELEASE_CHECKER_DIAG_ISSUE', flush=True)
+
+    if focus != 'pr':
+        cycle_deadline = min(overall_deadline, time.monotonic()+60)
+        # Optional known key avoids relying on search to test the direct-read endpoint.
+        cycle_key = os.getenv('RELEASE_CHECKER_DIAG_CYCLE', LOOKUP_DIAGNOSTIC_CYCLE).strip()
+        metadata = probe('cycle Jira fields/links', f'/rest/api/2/issue/{release_key}',
+                         {'fields': '*all'}, deadline=cycle_deadline)
+        remote = probe('cycle remote links', f'/rest/api/2/issue/{release_key}/remotelink', deadline=cycle_deadline)
+        if not cycle_key:
+            keys = re.findall(r'HRPQA-C\d+', json.dumps([metadata, remote]))
+            cycle_key = keys[0] if keys else ''
+        if cycle_key and not re.fullmatch(r'[A-Z][A-Z0-9_]*-C\d+', cycle_key):
+            raise ValueError('Invalid RELEASE_CHECKER_DIAG_CYCLE')
+        if cycle_key:
+            probe('cycle direct key', f'/rest/atm/1.0/testrun/{cycle_key}', deadline=cycle_deadline, kind='cycles')
+        else:
+            print('[LOOKUP MATRIX] cycle direct key SKIP: set RELEASE_CHECKER_DIAG_CYCLE', flush=True)
+        for endpoint in ('testruns', 'testcycles'):
+            probe(f'cycle issuelink/{endpoint}', f'/rest/atm/1.0/issuelink/{release_key}/{endpoint}',
+                  deadline=cycle_deadline, kind='cycles')
+        projection = {'fields': 'key,name,issueKey,issueLinks', 'maxResults': 50, 'startAt': 0}
+        query = f'projectKey = "{ZEPHYR_TC_PROJECT_KEY}"'
+        candidates = [
+            ('project index baseline', {'query': query}),
+            ('name query', {'query': query + f' AND name LIKE "{release_key}"'}),
+            ('issueKey parameter', {'query': query, 'issueKey': release_key}),
+            ('issueKeys parameter', {'query': query, 'issueKeys': release_key}),
+            ('negative filter control', {'query': query, 'issueKey': 'HRPRELEASE-0'}),
+        ]
+        for name, params in candidates:
+            probe('cycle '+name, '/rest/atm/1.0/testrun/search', {**projection, **params}, deadline=cycle_deadline, kind='cycles')
+        probe('cycle alternate search', '/rest/atm/1.0/testcycle/search',
+              {**projection, 'query': query, 'issueKey': release_key}, deadline=cycle_deadline, kind='cycles')
+    print('[LOOKUP MATRIX SUMMARY] ' + json.dumps({
+        'release': release_key, 'issue': issue_key, 'seconds': round(time.monotonic()-started, 2),
+        'methods': [{'method': r['method'], 'result': r['result'], 'reason': r.get('reason', '')} for r in records],
+        'note': 'HTTP 200/empty is not proof of working lookup; no release readiness verdict'}, ensure_ascii=False), flush=True)
+    return records
+
+
 if __name__ == "__main__":
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(line_buffering=True)
@@ -6028,6 +6195,12 @@ if __name__ == "__main__":
         configure_http_debug(debug_path)
     print(f"[DIAGNOSTICS] HTTP={'ON' if http_debug_enabled() else 'OFF'} "
           f"output={'file' if http_debug_logger.handlers else 'console'}", flush=True)
+    matrix_override = os.getenv('RELEASE_CHECKER_LOOKUP_DIAGNOSTICS')
+    matrix_enabled = LOOKUP_DIAGNOSTICS_ENABLED if matrix_override is None else matrix_override.lower() in {'1', 'true', 'yes', 'on'}
+    explicit_matrix = len(sys.argv) >= 3 and sys.argv[1] == '--diag-lookups'
+    if explicit_matrix or (matrix_enabled and len(sys.argv) > 1 and not sys.argv[1].startswith('--')):
+        _diag_lookup_matrix(sys.argv[2] if explicit_matrix else sys.argv[1])
+        sys.exit(0)  # Diagnostic completion, not a release-readiness verdict.
     validator = ReleaseValidator()
     if len(sys.argv) >= 3 and sys.argv[1] == "--dry-run":
         validator.dry_run = True
