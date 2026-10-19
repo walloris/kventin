@@ -1853,8 +1853,8 @@ def test_lookup_matrix_compares_variants_without_writes(monkeypatch, capsys, fak
     records = rc._diag_lookup_matrix('REL-1', session)
     assert len([r for r in records if r['method'].startswith('PR detail')]) == 18
     assert all(r['result'] == 'PR_EVIDENCE' for r in records if r['method'].startswith('PR detail'))
-    baseline = next(r for r in records if r['method'] == 'cycle project index baseline')
-    control = next(r for r in records if r['method'] == 'cycle negative filter control')
+    baseline = next(r for r in records if r['method'] == 'cycle index size=1000 offset=0')
+    control = next(r for r in records if r['method'] == 'cycle index size=5000 offset=0')
     assert baseline['release_matches'] == 1
     assert baseline['unrelated'] == 1
     assert baseline['keys_fingerprint'] == control['keys_fingerprint']
@@ -1885,7 +1885,7 @@ def test_lookup_matrix_bounds_total_time_and_attempts(monkeypatch, fake_clock):
     records = rc._diag_lookup_matrix('REL-1', session)
     assert fake_clock[0] <= 130
     assert session.get.call_count < 20
-    assert any(r.get('reason') == 'budget' for r in records)
+    assert all(r['result'] in {'EXCEPTION', 'SKIP'} for r in records)
 
 
 def test_lookup_matrix_does_not_log_raw_service_errors(monkeypatch, capsys, fake_clock):
@@ -1910,6 +1910,7 @@ def test_lookup_matrix_can_isolate_each_service(monkeypatch, focus, excluded, fa
 
 @pytest.mark.parametrize('retry_after', [None, '3'])
 def test_matrix_short_throttle_does_not_skip_remaining_methods(monkeypatch, fake_clock, retry_after):
+    monkeypatch.setenv('RELEASE_CHECKER_DIAG_CYCLE', 'HRPQA-C1')
     monkeypatch.setenv('RELEASE_CHECKER_DIAG_FOCUS', 'both')
     session = matrix_session()
     fetch = session.get.side_effect
@@ -1983,3 +1984,46 @@ def test_matrix_discovers_cycle_keys_from_metadata_and_properties(monkeypatch, f
     direct = [r for r in records if r.get('cycle_key')]
     assert {r['cycle_key'] for r in direct} == {'HRPQA-C2', 'HRPQA-C3'}
     assert all(r['result'] == 'RELEASE_MATCHES' for r in direct)
+
+
+def test_compact_cycle_index_handles_server_page_cap(fake_clock):
+    rows = [{'key': f'HRPQA-C{i}', 'name': ('REL-1' if i == 3 else 'REL-10') + '.api.НФ'} for i in range(5)]
+    offsets = []
+    def probe(name, path, params, **kwargs):
+        offsets.append(params['startAt'])
+        assert params['fields'] == 'key,name,issueKey,issueLinks'
+        return rows[params['startAt']:params['startAt']+2]
+    result = rc._diag_cycle_index(probe, 'REL-1', 45)
+    assert offsets == [0, 0, 2, 4, 5]
+    assert result['complete']
+    assert result['unique_cycles'] == 5
+    assert result['matches'] == ['HRPQA-C3']
+
+
+def test_compact_index_rejects_ignored_pagination(fake_clock):
+    probe = Mock(return_value=[{'key': 'HRPQA-C1', 'name': 'REL-1.api.НФ'}])
+    result = rc._diag_cycle_index(probe, 'REL-1', 45)
+    assert not result['complete']
+    assert result['reason'] == 'pagination_not_advancing'
+    assert probe.call_count == 3
+
+
+def test_compact_index_keeps_matches_when_later_request_fails(fake_clock):
+    probe = Mock(side_effect=[
+        [{'key': 'HRPQA-C1', 'name': 'REL-1.api.НФ'}],
+        [{'key': 'HRPQA-C1', 'name': 'REL-1.api.НФ'}, {'key': 'HRPQA-C2', 'name': 'REL-2.api.НФ'}],
+        None])
+    result = rc._diag_cycle_index(probe, 'REL-1', 45)
+    assert not result['complete']
+    assert result['matches'] == ['HRPQA-C1']
+    assert result['reason'] == 'request_failed_or_throttled'
+
+
+def test_compact_index_stops_at_budget(fake_clock):
+    def probe(name, path, params, **kwargs):
+        fake_clock[0] += min(12, kwargs['deadline'] - fake_clock[0])
+        return [{'key': f"HRPQA-C{params['startAt']+1}", 'name': 'REL-1.api.НФ'}]
+    result = rc._diag_cycle_index(probe, 'REL-1', 45)
+    assert not result['complete']
+    assert result['reason'] == 'budget'
+    assert result['pages'] == 4

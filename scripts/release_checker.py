@@ -81,7 +81,7 @@ HTTP_DEBUG_ENABLED = True
 LOOKUP_DIAGNOSTICS_ENABLED = True
 LOOKUP_DIAGNOSTIC_FOCUS = 'cycles'  # both / pr / cycles
 # Из лога №1562: известный цикл для независимой проверки прямого чтения.
-LOOKUP_DIAGNOSTIC_CYCLE = 'HRPQA-C138867'
+LOOKUP_DIAGNOSTIC_CYCLE = ''
 
 ALLOWED_TESTERS = {
     "Абдуллаев Магомедэмин Шамильевич",
@@ -6033,6 +6033,67 @@ def _diag_pr(validator: 'ReleaseValidator', issue_key: str):
                 print(f"  snippet={matched.group(0)}")
 
 
+def _diag_cycle_index(probe, release_key, deadline):
+    """Bounded compact index experiment; empty next page proves completion, not page size."""
+    query = f'projectKey = "{ZEPHYR_TC_PROJECT_KEY}"'
+    def page(size, offset):
+        payload = probe(f'cycle index size={size} offset={offset}', '/rest/atm/1.0/testrun/search',
+                        {'query': query, 'fields': 'key,name,issueKey,issueLinks',
+                         'maxResults': size, 'startAt': offset}, deadline=deadline, kind='cycles')
+        if isinstance(payload, list):
+            return payload
+        if isinstance(payload, dict):
+            return next((payload[field] for field in ('values', 'results', 'testRuns', 'testCycles')
+                         if isinstance(payload.get(field), list)), None)
+        return None
+
+    result = {'complete': False, 'reason': 'request_failed', 'pages': 0, 'unique_cycles': 0, 'matches': []}
+    small = page(1000, 0)
+    if small is None:
+        return result
+    result['pages'] = 1
+    large = page(5000, 0) if small and time.monotonic() < deadline else None
+    size = 5000 if large is not None and len(large) >= len(small) else 1000
+    items = large if size == 5000 else small
+    result.update(requested_page_size=size, initial_count=len(items))
+    if large is not None:
+        result['pages'] += 1
+    seen, matched = set(), set()
+    offset = 0
+    for _ in range(32):
+        if items is None:
+            result['reason'] = 'request_failed_or_throttled'
+            break
+        if not items:
+            result.update(complete=True, reason='empty_next_page')
+            break
+        keys = {str(item.get('key')) for item in items if isinstance(item, dict) and item.get('key')}
+        if len(keys) != len(items):
+            result['reason'] = 'invalid_or_duplicate_keys'
+            break
+        if not keys - seen:
+            result['reason'] = 'pagination_not_advancing'
+            break
+        if keys & seen:
+            result['reason'] = 'overlapping_pages'
+            break
+        seen.update(keys)
+        for item in items:
+            if ZephyrScaleClient._cycle_mentions_issue(
+                    {field: item.get(field) for field in ('name', 'issueKey', 'issueLinks', 'links')}, release_key):
+                matched.add(item['key'])
+        offset += len(items)  # Servers may silently cap maxResults.
+        if time.monotonic() >= deadline:
+            result['reason'] = 'budget'
+            break
+        items = page(size, offset)
+        result['pages'] += 1
+    else:
+        result['reason'] = 'page_limit'
+    result.update(unique_cycles=len(seen), matches=sorted(matched))
+    return result
+
+
 def _diag_lookup_matrix(release_input, session=None):
     """Read-only comparison; no SDK initialization, retries, pagination or Jira writes."""
     release_key = extract_issue_key_from_url(release_input)
@@ -6198,22 +6259,8 @@ def _diag_lookup_matrix(release_input, session=None):
                   f'/rest/atm/1.0/testrun/{key}', deadline=cycle_deadline, kind='cycles')
         if not candidates_by_key:
             print('[LOOKUP MATRIX] cycle direct key SKIP: no keys in metadata; set RELEASE_CHECKER_DIAG_CYCLE', flush=True)
-        for endpoint in ('testruns', 'testcycles'):
-            probe(f'cycle issuelink/{endpoint}', f'/rest/atm/1.0/issuelink/{release_key}/{endpoint}',
-                  deadline=cycle_deadline, kind='cycles')
-        projection = {'fields': 'key,name,issueKey,issueLinks', 'maxResults': 50, 'startAt': 0}
-        query = f'projectKey = "{ZEPHYR_TC_PROJECT_KEY}"'
-        candidates = [
-            ('project index baseline', {'query': query}),
-            ('name query', {'query': query + f' AND name LIKE "{release_key}"'}),
-            ('issueKey parameter', {'query': query, 'issueKey': release_key}),
-            ('issueKeys parameter', {'query': query, 'issueKeys': release_key}),
-            ('negative filter control', {'query': query, 'issueKey': 'HRPRELEASE-0'}),
-        ]
-        for name, params in candidates:
-            probe('cycle '+name, '/rest/atm/1.0/testrun/search', {**projection, **params}, deadline=cycle_deadline, kind='cycles')
-        probe('cycle alternate search', '/rest/atm/1.0/testcycle/search',
-              {**projection, 'query': query, 'issueKey': release_key}, deadline=cycle_deadline, kind='cycles')
+        index_result = _diag_cycle_index(probe, release_key, min(cycle_deadline, time.monotonic()+45))
+        print('[LOOKUP INDEX SUMMARY] ' + json.dumps(index_result, ensure_ascii=False), flush=True)
     print('[LOOKUP MATRIX SUMMARY] ' + json.dumps({
         'release': release_key, 'issue': issue_key, 'focus': focus, 'seconds': round(time.monotonic()-started, 2),
         'methods': [{'method': r['method'], 'result': r['result'], 'reason': r.get('reason', '')} for r in records],
