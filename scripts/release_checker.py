@@ -79,7 +79,7 @@ HTTP_DEBUG_ENABLED = True
 # Временный read-only эксперимент: обычная команда запускает матрицу API вместо отчёта.
 # False или RELEASE_CHECKER_LOOKUP_DIAGNOSTICS=0 возвращает обычную проверку.
 LOOKUP_DIAGNOSTICS_ENABLED = True
-LOOKUP_DIAGNOSTIC_FOCUS = 'both'  # both / pr / cycles
+LOOKUP_DIAGNOSTIC_FOCUS = 'cycles'  # both / pr / cycles
 # Из лога №1562: известный цикл для независимой проверки прямого чтения.
 LOOKUP_DIAGNOSTIC_CYCLE = 'HRPQA-C138867'
 
@@ -6048,22 +6048,30 @@ def _diag_lookup_matrix(release_input, session=None):
     started = time.monotonic()
     overall_deadline = started + 130
     cooldown = 0.0
+    next_request_at = started
     records = []
     parser = ReleaseValidator.__new__(ReleaseValidator)
     print('[LOOKUP MATRIX] read-only; normal report disabled; 130s network budget; one attempt per method', flush=True)
 
     def probe(name, path, params=None, *, deadline=None, kind='metadata'):
-        nonlocal cooldown
+        nonlocal cooldown, next_request_at
         record = {'method': name, 'path': path, 'result': 'SKIP', 'seconds': 0.0}
         records.append(record)
         now = time.monotonic()
         end = min(overall_deadline, deadline or overall_deadline)
         payload = None
+        # Brief pacing/cooldowns consume the existing budget; long pauses are not waited out.
+        delay = max(cooldown, next_request_at) - now
+        if 0 < delay <= 5 and delay < end - now:
+            time.sleep(delay)
+            record['wait_s'] = round(delay, 3)
+            now = time.monotonic()
         if cooldown > now:
             record.update(reason='Retry-After', retry_after_s=round(cooldown - now, 2))
-        elif end <= now:
+        elif end <= now or next_request_at > now:
             record['reason'] = 'budget'
         else:
+            next_request_at = now + 0.5
             try:
                 # All probes share server cooldown, including Jira and Zephyr paths.
                 response = session.get(base + path, params=params or {}, timeout=urllib3.util.Timeout(
@@ -6137,8 +6145,8 @@ def _diag_lookup_matrix(release_input, session=None):
             for version in ('latest', '1.0'):
                 probe(f'PR summary {version}', f'/rest/dev-status/{version}/issue/summary',
                       {'issueId': issue_id}, deadline=pr_deadline, kind='pr')
-            for data_type in ('pullrequest', 'repository', 'commit'):
-                for provider in ('stash', 'bitbucket', 'bitbucket-server'):
+            for provider in ('stash', 'bitbucket', 'bitbucket-server'):
+                for data_type in ('pullrequest', 'repository', 'commit'):
                     for version in ('latest', '1.0'):
                         probe(f'PR detail {version}/{provider}/{data_type}', f'/rest/dev-status/{version}/issue/detail',
                               {'issueId': issue_id, 'applicationType': provider, 'dataType': data_type},
@@ -6181,7 +6189,7 @@ def _diag_lookup_matrix(release_input, session=None):
         probe('cycle alternate search', '/rest/atm/1.0/testcycle/search',
               {**projection, 'query': query, 'issueKey': release_key}, deadline=cycle_deadline, kind='cycles')
     print('[LOOKUP MATRIX SUMMARY] ' + json.dumps({
-        'release': release_key, 'issue': issue_key, 'seconds': round(time.monotonic()-started, 2),
+        'release': release_key, 'issue': issue_key, 'focus': focus, 'seconds': round(time.monotonic()-started, 2),
         'methods': [{'method': r['method'], 'result': r['result'], 'reason': r.get('reason', '')} for r in records],
         'note': 'HTTP 200/empty is not proof of working lookup; no release readiness verdict'}, ensure_ascii=False), flush=True)
     return records

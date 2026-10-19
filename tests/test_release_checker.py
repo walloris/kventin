@@ -1846,7 +1846,7 @@ def matrix_session():
     return session
 
 
-def test_lookup_matrix_compares_variants_without_writes(monkeypatch, capsys):
+def test_lookup_matrix_compares_variants_without_writes(monkeypatch, capsys, fake_clock):
     monkeypatch.setenv('RELEASE_CHECKER_DIAG_FOCUS', 'both')
     monkeypatch.delenv('RELEASE_CHECKER_DIAG_ISSUE', raising=False)
     session = matrix_session()
@@ -1888,7 +1888,7 @@ def test_lookup_matrix_bounds_total_time_and_attempts(monkeypatch, fake_clock):
     assert any(r.get('reason') == 'budget' for r in records)
 
 
-def test_lookup_matrix_does_not_log_raw_service_errors(monkeypatch, capsys):
+def test_lookup_matrix_does_not_log_raw_service_errors(monkeypatch, capsys, fake_clock):
     monkeypatch.setenv('RELEASE_CHECKER_DIAG_ISSUE', 'ABC-1')
     session = matrix_session()
     session.get.side_effect = lambda *args, **kw: matrix_response(payload={
@@ -1902,7 +1902,40 @@ def test_lookup_matrix_does_not_log_raw_service_errors(monkeypatch, capsys):
 
 
 @pytest.mark.parametrize('focus,excluded', [('cycles', 'PR detail'), ('pr', 'cycle ')])
-def test_lookup_matrix_can_isolate_each_service(monkeypatch, focus, excluded):
+def test_lookup_matrix_can_isolate_each_service(monkeypatch, focus, excluded, fake_clock):
     monkeypatch.setenv('RELEASE_CHECKER_DIAG_FOCUS', focus)
     records = rc._diag_lookup_matrix('REL-1', matrix_session())
     assert not any(r['method'].startswith(excluded) for r in records)
+
+
+@pytest.mark.parametrize('retry_after', [None, '3'])
+def test_matrix_short_throttle_does_not_skip_remaining_methods(monkeypatch, fake_clock, retry_after):
+    monkeypatch.setenv('RELEASE_CHECKER_DIAG_FOCUS', 'both')
+    session = matrix_session()
+    fetch = session.get.side_effect
+    calls = []
+    throttled_at = []
+    def get(url, **kwargs):
+        calls.append(fake_clock[0])
+        if len(calls) == 11:
+            throttled_at.append(fake_clock[0])
+            return matrix_response(429, headers={'Retry-After': retry_after} if retry_after else {})
+        return fetch(url, **kwargs)
+    session.get.side_effect = get
+    records = rc._diag_lookup_matrix('REL-1', session)
+    assert len(throttled_at) == 1
+    assert all(b-a >= 0.5 for a, b in zip(calls, calls[1:]))
+    assert calls[11]-calls[10] >= (3 if retry_after else 2)
+    assert all(r['result'] != 'SKIP' for r in records)
+    assert any(r['method'] == 'cycle direct key' and r['http'] == 200 for r in records)
+    assert fake_clock[0] < 60
+
+
+def test_matrix_repeated_throttles_remain_bounded(monkeypatch, fake_clock):
+    monkeypatch.setenv('RELEASE_CHECKER_DIAG_FOCUS', 'cycles')
+    session = matrix_session()
+    session.get.side_effect = lambda *a, **kw: matrix_response(429, headers={})
+    records = rc._diag_lookup_matrix('REL-1', session)
+    assert session.get.call_count == len(records)
+    assert fake_clock[0] < 60
+    assert all(r['result'] == 'HTTP_ERROR' for r in records)
