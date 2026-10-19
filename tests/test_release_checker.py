@@ -1939,3 +1939,47 @@ def test_matrix_repeated_throttles_remain_bounded(monkeypatch, fake_clock):
     assert session.get.call_count == len(records)
     assert fake_clock[0] < 60
     assert all(r['result'] == 'HTTP_ERROR' for r in records)
+
+
+@pytest.mark.parametrize('cycle_release,expected', [('REL-1', 'RELEASE_MATCHES'), ('REL-10', 'NO_RELEASE_MATCHES')])
+def test_matrix_direct_cycle_does_not_treat_executions_as_cycles(monkeypatch, fake_clock, cycle_release, expected):
+    monkeypatch.setenv('RELEASE_CHECKER_DIAG_FOCUS', 'cycles')
+    monkeypatch.setenv('RELEASE_CHECKER_DIAG_CYCLE', 'HRPQA-C1')
+    session = matrix_session()
+    fetch = session.get.side_effect
+    def get(url, **kwargs):
+        if url.endswith('/testrun/HRPQA-C1'):
+            return matrix_response(payload={'key': 'HRPQA-C1', 'name': cycle_release + '.api.Регресс',
+                'issueKey': cycle_release, 'items': [{'testCaseKey': 'HRPQA-T1', 'comment': 'REL-1'}] * 183})
+        return fetch(url, **kwargs)
+    session.get.side_effect = get
+    records = rc._diag_lookup_matrix('REL-1', session)
+    direct = next(r for r in records if r['method'] == 'cycle direct key')
+    assert direct['result'] == expected
+    assert direct['count'] == 1
+    assert direct['execution_count'] == 183
+    assert direct['matching_keys'] == (['HRPQA-C1'] if cycle_release == 'REL-1' else [])
+
+
+def test_matrix_discovers_cycle_keys_from_metadata_and_properties(monkeypatch, fake_clock):
+    monkeypatch.setenv('RELEASE_CHECKER_DIAG_FOCUS', 'cycles')
+    monkeypatch.setenv('RELEASE_CHECKER_DIAG_CYCLE', '')
+    session = matrix_session()
+    fetch = session.get.side_effect
+    def get(url, **kwargs):
+        if url.endswith('/remotelink'):
+            return matrix_response(payload=[{'object': {'url': 'https://jira.example/HRPQA-C2'}}])
+        if url.endswith('/properties'):
+            return matrix_response(payload={'keys': [{'key': 'zephyr-cycles'}]})
+        if url.endswith('/properties/zephyr-cycles'):
+            return matrix_response(payload={'value': ['HRPQA-C3']})
+        if '/testrun/HRPQA-C' in url:
+            return matrix_response(payload={'key': url.rsplit('/', 1)[1], 'issueKey': 'REL-1', 'items': []})
+        return fetch(url, **kwargs)
+    session.get.side_effect = get
+    records = rc._diag_lookup_matrix('REL-1', session)
+    hints = next(r for r in records if r['method'] == 'cycle remote links')
+    assert hints['cycle_keys'] == ['HRPQA-C2']
+    direct = [r for r in records if r.get('cycle_key')]
+    assert {r['cycle_key'] for r in direct} == {'HRPQA-C2', 'HRPQA-C3'}
+    assert all(r['result'] == 'RELEASE_MATCHES' for r in direct)

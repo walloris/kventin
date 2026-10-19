@@ -6099,14 +6099,25 @@ def _diag_lookup_matrix(release_input, session=None):
                         }.items() if any(word in error_text for word in words)] or ['unclassified']
                     elif kind == 'pr':
                         record['result'] = 'PR_EVIDENCE' if parser._extract_pull_request_evidence(payload) else 'NO_PR_EVIDENCE'
+                    elif kind == 'cycle_hints':
+                        keys = sorted(parser._extract_test_cycle_keys(payload))
+                        record.update(cycle_key_count=len(keys), cycle_keys=keys[:30])
+                        record['result'] = 'CYCLE_HINTS' if keys else 'NO_CYCLE_HINTS'
                     elif kind == 'cycles':
-                        items = (payload if isinstance(payload, list) else next(
+                        # A keyed cycle is one object; its items are execution results, not cycles.
+                        is_cycle = isinstance(payload, dict) and re.fullmatch(
+                            r'[A-Z][A-Z0-9_]*-C\d+', str(payload.get('key', '')))
+                        items = [payload] if is_cycle else (payload if isinstance(payload, list) else next(
                             (payload[k] for k in ('values', 'results', 'items', 'testRuns', 'testCycles')
                              if isinstance(payload, dict) and isinstance(payload.get(k), list)),
                             [payload] if isinstance(payload, dict) and payload.get('key') else []))
                         cycle_items = [item for item in items if isinstance(item, dict)]
-                        matches = [item for item in cycle_items if re.search(
-                            re.escape(release_key) + r'(?!\d)', json.dumps(item, ensure_ascii=False))]
+                        matches = [item for item in cycle_items
+                                   if parser._test_cycle_belongs_to_release(
+                                       {field: item.get(field) for field in ('name', 'issueKey', 'issueLinks', 'links')},
+                                       release_key)]
+                        if is_cycle:
+                            record.update(cycle_key=payload['key'], execution_count=len(payload.get('items') or []))
                         record.update(count=len(items), release_matches=len(matches),
                                       keys_fingerprint=hashlib.sha256(json.dumps(sorted(str(item.get('key', '')) for item in cycle_items)).encode()).hexdigest()[:16],
                                       unrelated=len(cycle_items)-len(matches),
@@ -6161,17 +6172,32 @@ def _diag_lookup_matrix(release_input, session=None):
         # Optional known key avoids relying on search to test the direct-read endpoint.
         cycle_key = os.getenv('RELEASE_CHECKER_DIAG_CYCLE', LOOKUP_DIAGNOSTIC_CYCLE).strip()
         metadata = probe('cycle Jira fields/links', f'/rest/api/2/issue/{release_key}',
-                         {'fields': '*all'}, deadline=cycle_deadline)
-        remote = probe('cycle remote links', f'/rest/api/2/issue/{release_key}/remotelink', deadline=cycle_deadline)
-        if not cycle_key:
-            keys = re.findall(r'HRPQA-C\d+', json.dumps([metadata, remote]))
-            cycle_key = keys[0] if keys else ''
+                         {'fields': '*all'}, deadline=cycle_deadline, kind='cycle_hints')
+        remote = probe('cycle remote links', f'/rest/api/2/issue/{release_key}/remotelink', deadline=cycle_deadline, kind='cycle_hints')
+        sources = [metadata, remote]
+        properties = probe('cycle property index', f'/rest/api/2/issue/{release_key}/properties',
+                           deadline=cycle_deadline, kind='cycle_hints')
+        if isinstance(properties, dict):
+            relevant = [item.get('key') for item in properties.get('keys', [])
+                        if isinstance(item, dict) and isinstance(item.get('key'), str)
+                        and any(word in item['key'].lower() for word in ('zephyr', 'tm4j', 'atm', 'test', 'cycle'))]
+            for prop in relevant[:5]:
+                sources.append(probe('cycle property value',
+                    f'/rest/api/2/issue/{release_key}/properties/{quote(prop, safe="")}',
+                    deadline=cycle_deadline, kind='cycle_hints'))
         if cycle_key and not re.fullmatch(r'[A-Z][A-Z0-9_]*-C\d+', cycle_key):
             raise ValueError('Invalid RELEASE_CHECKER_DIAG_CYCLE')
-        if cycle_key:
-            probe('cycle direct key', f'/rest/atm/1.0/testrun/{cycle_key}', deadline=cycle_deadline, kind='cycles')
-        else:
-            print('[LOOKUP MATRIX] cycle direct key SKIP: set RELEASE_CHECKER_DIAG_CYCLE', flush=True)
+        discovered = sorted(parser._extract_test_cycle_keys(sources))
+        candidates_by_key = list(dict.fromkeys(([cycle_key] if cycle_key else []) + discovered))
+        print('[LOOKUP MATRIX] cycle candidates ' + json.dumps({
+            'discovered_keys': discovered[:30], 'discovered_count': len(discovered),
+            'anchor_key': cycle_key, 'selected': candidates_by_key[:5],
+            'not_probed': max(0, len(candidates_by_key)-5)}, ensure_ascii=False), flush=True)
+        for index, key in enumerate(candidates_by_key[:5]):
+            probe('cycle direct key' if index == 0 else 'cycle discovered key ' + key,
+                  f'/rest/atm/1.0/testrun/{key}', deadline=cycle_deadline, kind='cycles')
+        if not candidates_by_key:
+            print('[LOOKUP MATRIX] cycle direct key SKIP: no keys in metadata; set RELEASE_CHECKER_DIAG_CYCLE', flush=True)
         for endpoint in ('testruns', 'testcycles'):
             probe(f'cycle issuelink/{endpoint}', f'/rest/atm/1.0/issuelink/{release_key}/{endpoint}',
                   deadline=cycle_deadline, kind='cycles')
