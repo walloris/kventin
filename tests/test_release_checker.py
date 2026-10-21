@@ -494,7 +494,7 @@ def test_all_applicable_release_stages_execute_despite_one_crash(failed_method, 
     checker._consist_of_cache = {}
     checker._release_service_infos_cache = {}
     methods = [
-        '_check_test_subtask', '_check_artifacts', '_check_release_coverage',
+        '_check_release_service_consistency', '_check_test_subtask', '_check_artifacts', '_check_release_coverage',
         '_check_zephyr_test_cases', '_check_back_release_service_test_cycles',
         '_check_web_release_service_test_cycles', '_check_bugs', '_check_stories',
         '_check_required_pull_requests', '_check_unlinked_release_items_pull_requests',
@@ -507,7 +507,7 @@ def test_all_applicable_release_stages_execute_despite_one_crash(failed_method, 
     assert checker.check_release('REL-1') is ready
     for name in methods:
         getattr(checker, name).assert_called_once()
-    assert len(checker.check_results) == 16
+    assert len(checker.check_results) == 17
     assert not any(r['status'] == 'RUNNING' for r in checker.check_results)
 
 
@@ -2056,3 +2056,126 @@ def test_production_index_replays_1570_within_discovery_budget(zephyr, fake_cloc
     assert stats['complete'] is True
     assert stats['total_seen'] == 23059
     assert stats['pages'] == 6
+
+
+USER_CYCLE_SERVICES = [
+    ('CoreUI(2298599)', ('Safari', 'WEB', 'PWA', 'iPad')),
+    ('HRP.CoreUI-Dates(3304476)', ('WEB', 'PWA', 'iPad', 'Safari')),
+    ('HRP.CoreUI-Posts(3304476)', ('Safari', 'WEB', 'PWA', 'iPad')),
+    ('HRP-Admin(3589425)', ('Safari', 'iPad', 'PWA', 'WEB')),
+    ('HRP.CoreUI-Support(5452083)', ('WEB', 'PWA', 'iPad', 'Safari')),
+    ('HRP.Launchpad(5452082)', ('iPad', 'Safari', 'PWA', 'WEB')),
+    ('HRP.CoreUI-Configurator(5452084)', ('WEB', 'API')),
+    ('NeuroSearchBar(9643401)', ('iPad', 'SberBrowser', 'Safari')),
+    ('HRP.CoreUI-Neuro(9644020)', ('SberBrowser', 'Safari', 'iPad')),
+]
+
+
+@pytest.mark.parametrize('service,channel', [(service, channel) for service, channels in USER_CYCLE_SERVICES for channel in channels])
+@pytest.mark.parametrize('prefix', ['', 'CI01234567 '])
+def test_user_cycle_names_match_service_and_channel(validator, service, channel, prefix):
+    aliases = rc.BACK_API_CHANNEL_ALIASES if channel == 'API' else next(
+        aliases for _, aliases in rc.WEB_REGRESS_CHANNELS if channel.casefold() in aliases)
+    name = f' HRPRELEASE-148167. {service}. {channel}. Regress '
+    assert validator._find_matching_cycle([('HRPQA-C1', name)], 'HRPRELEASE-148167',
+                                          prefix+service, aliases, rc.BACK_REGRESS_CYCLE_ALIASES)
+    russian = name.replace('Regress', 'Регресс').replace('148167', '147712')
+    assert validator._find_matching_cycle([('HRPQA-C2', russian)], 'HRPRELEASE-147712',
+                                          prefix+service, aliases, rc.BACK_REGRESS_CYCLE_ALIASES)
+    assert not validator._find_matching_cycle([('HRPQA-C1', name)], 'HRPRELEASE-148168',
+                                              prefix+service, aliases, rc.BACK_REGRESS_CYCLE_ALIASES)
+
+
+@pytest.mark.parametrize('left,right,expected', [
+    ('CI01234567 HRP.CoreUI-Dates', 'HRP. CoreUI-Dates(3304476)', True),
+    ('HRP.CoreUI-Dates(3304476)', 'HRP.CoreUI-Posts(3304476)', False),
+    ('CoreUI(1)', 'CoreUI(2)', False),
+    ('CI01234567 CoreUI', 'CI07654321 CoreUI', False),
+    ('CI01234567 CoreUI', 'CI01234567 CoreUI renamed', True),
+    ('CoreUI', 'CoreUI-Dates', False),
+    ('', '', False),
+])
+def test_service_identity_does_not_confuse_names_or_ids(left, right, expected):
+    assert rc.service_ke_matches(left, right) is expected
+
+
+def service_issue(key, services, labels=None):
+    return NS(key=key, fields=NS(summary=key, assignee=None, labels=labels or [], customfield_ke=services))
+
+
+def setup_service_check(validator, release_services, task_services):
+    release = service_issue('REL-1', release_services)
+    tasks = [service_issue(f'ABC-{i+1}', services) for i, services in enumerate(task_services)]
+    validator._get_jira_field_id_by_names = Mock(return_value='customfield_ke')
+    validator._get_consist_of_issues = Mock(return_value=[task.key for task in tasks])
+    validator.jira_main.search_issues.return_value = tasks
+    return release, tasks
+
+
+def test_service_check_all_tasks_continue_after_mismatch_and_empty_field(validator):
+    release, tasks = setup_service_check(validator, ['CI01234567 CoreUI', 'HRP.CoreUI-Dates(3304476)'],
+        [['CoreUI(2298599)'], ['HRP.CoreUI-Posts(3304476)'], [], ['HRP.CoreUI-Dates(3304476)']])
+    validator._check_release_service_consistency(release)
+    assert [c.args[1] for c in validator._log_issue.call_args_list] == ['success', 'error', 'error', 'success']
+    assert validator.jira_main.search_issues.call_count == 1
+    assert validator.jira_main.search_issues.call_args.kwargs['maxResults'] is False
+
+
+@pytest.mark.parametrize('mobile_service', [
+    'CI02257858 HRP-ios', 'CI02935717 HRP-Android', 'CI03521872 HRP.iOS МП.МП-iPAD',
+    'CI06355438 HRP. SberTab', 'HRP-ios', 'HRP-Android', 'HRP.iOS МП.МП-iPAD', 'HRP. SberTab',
+])
+def test_mobile_release_service_is_exempt(validator, mobile_service):
+    release, _ = setup_service_check(validator, [mobile_service], [['Different']])
+    validator._check_release_service_consistency(release)
+    validator.jira_main.search_issues.assert_not_called()
+    assert validator._log_issue.call_args.args[1] == 'success'
+    assert 'не требуется' in validator._log_issue.call_args.args[2]
+
+
+def test_mobile_label_exempts_without_field_lookup(validator):
+    release = service_issue('REL-1', [], ['mobile'])
+    validator._get_jira_field_id_by_names = Mock()
+    validator._check_release_service_consistency(release)
+    validator._get_jira_field_id_by_names.assert_not_called()
+
+
+def test_multiple_task_services_must_all_be_in_release(validator):
+    release, _ = setup_service_check(validator, ['CoreUI'], [['CoreUI', 'Other']])
+    validator._check_release_service_consistency(release)
+    assert validator._log_issue.call_args.args[1] == 'error'
+    assert 'Other' in validator._log_issue.call_args.args[2]
+
+
+def test_service_check_reports_unreturned_task(validator):
+    release, tasks = setup_service_check(validator, ['CoreUI'], [['CoreUI'], ['CoreUI']])
+    validator.jira_main.search_issues.return_value = tasks[:1]
+    validator._check_release_service_consistency(release)
+    assert validator._log_issue.call_args.args[0] == 'ABC-2'
+    assert 'не удалось' in validator._log_issue.call_args.args[2]
+
+
+def test_service_check_missing_metadata_is_clear_in_comment(validator):
+    release, _ = setup_service_check(validator, ['CoreUI'], [['CoreUI']])
+    validator._get_jira_field_id_by_names.return_value = None
+    validator._check_release_service_consistency(release)
+    message = validator._log_issue.call_args.args[2]
+    assert rc.ReleaseValidator._comment_message(message) == 'Не удалось проверить совпадение КЭ задач и релиза.'
+    validator.jira_main.search_issues.assert_not_called()
+
+
+def test_service_mismatch_is_blocking_in_release_report():
+    checker = stage_validator()
+    checker.jira_main = Mock()
+    release, _ = setup_service_check(checker, ['CoreUI'], [['Other']])
+    checker._run_check('service_consistency', 'КЭ', lambda: checker._check_release_service_consistency(release))
+    assert checker.check_results[0]['status'] == 'FAIL'
+    assert checker.report_data['ABC-1']['errors']
+
+
+def test_service_check_missing_release_value_blocks_comparison(validator):
+    release, _ = setup_service_check(validator, [], [['CoreUI']])
+    validator._check_release_service_consistency(release)
+    assert validator._log_issue.call_args.args[1] == 'error'
+    assert 'поле релиза не заполнено' in validator._log_issue.call_args.args[2]
+    validator.jira_main.search_issues.assert_not_called()

@@ -226,12 +226,12 @@ WEB_REGRESS_CHANNELS = (
     ('ipad', ('ipad',)),
     ('pwa', ('pwa',)),
     ('safari', ('safari',)),
-    ('sberbrowser', ('sberbrowser',)),
+    ('sberbrowser', ('sberbrowser', 'web')),
 )
 WEB_REGRESS_CHANNELS_NEUROUI = (
     ('ipad', ('ipad',)),
     ('safari', ('safari',)),
-    ('sberbrowser', ('sberbrowser',)),
+    ('sberbrowser', ('sberbrowser', 'web')),
 )
 
 
@@ -368,10 +368,40 @@ def service_ke_name_aliases(service_ke: str) -> list[str]:
     """Варианты имени КЭ для ТЦ: полное значение Jira и имя без хвостового ID в скобках."""
     original = normalize_field_text(service_ke)
     aliases = [original] if original else []
-    without_parenthesized_id = normalize_field_text(re.sub(r'\s*\([^)]*\)\s*$', '', original))
+    without_ci = re.sub(r'^CI\d+\s+', '', original, flags=re.I).strip()
+    if without_ci and without_ci != original:
+        aliases.append(without_ci)
+    without_parenthesized_id = normalize_field_text(re.sub(r'\s*\(\d+\)\s*$', '', without_ci))
     if without_parenthesized_id and without_parenthesized_id.casefold() not in {a.casefold() for a in aliases}:
         aliases.append(without_parenthesized_id)
     return aliases
+
+
+MOBILE_SERVICE_CI_CODES = {'CI02257858', 'CI02935717', 'CI03521872', 'CI06355438'}
+MOBILE_SERVICE_NAMES = {'hrp-ios', 'hrp-android', 'hrp.ios мп.мп-ipad', 'hrp.sbertab'}
+
+
+def service_ke_identity(value):
+    text = normalize_field_text(value)
+    ci = re.match(r'^(CI\d+)\b\s*', text, re.I)
+    code = ci.group(1).upper() if ci else ''
+    if ci:
+        text = text[ci.end():]
+    object_id = re.search(r'\((\d+)\)\s*$', text)
+    numeric_id = object_id.group(1) if object_id else ''
+    if object_id:
+        text = text[:object_id.start()]
+    return code, normalize_test_cycle_name(text), numeric_id
+
+
+def service_ke_matches(left, right):
+    left_ci, left_name, left_id = service_ke_identity(left)
+    right_ci, right_name, right_id = service_ke_identity(right)
+    if left_ci and right_ci:
+        return left_ci == right_ci
+    if left_id and right_id and left_id != right_id:
+        return False
+    return bool(left_name and left_name == right_name)
 
 
 def extract_jira_field_value(raw_val: object) -> Optional[str]:
@@ -2402,6 +2432,53 @@ class ReleaseValidator:
                     return cycle_key, cycle_name
         return None
 
+    def _check_release_service_consistency(self, release):
+        """Every linked task's service must belong to the release's service set."""
+        if 'mobile' in self._issue_labels_casefold(release):
+            self._log_issue(release, 'success', 'КЭ: мобильный релиз — проверка совпадения не требуется')
+            return
+        field_id = self._get_jira_field_id_by_names(SERVICE_KE_FIELD_NAME_CANDIDATES)
+        if not field_id:
+            self._log_issue(release, 'error', 'КЭ: не удалось определить поле конфигурационных единиц')
+            return
+        release_services = self._extract_issue_service_ke_values(release, field_id)
+        if any(service_ke_identity(value)[0] in MOBILE_SERVICE_CI_CODES
+               or service_ke_identity(value)[1] in MOBILE_SERVICE_NAMES for value in release_services):
+            self._log_issue(release, 'success', 'КЭ: мобильный релиз — проверка совпадения не требуется')
+            return
+        if not release_services:
+            self._log_issue(release, 'error', 'КЭ: поле релиза не заполнено; невозможно сравнить КЭ задач')
+            return
+        keys = self._get_consist_of_issues(release.key)
+        if not keys:
+            return
+        try:
+            issues = self.jira_main.search_issues(
+                f"key in ({','.join(keys)})",
+                fields=f'summary,issuetype,assignee,{field_id},customfield_24000', maxResults=False)
+        except Exception as exc:
+            self._log_issue(release, 'error', f'КЭ: не удалось получить задачи для сравнения: {exc}')
+            return
+        returned = set()
+        for issue in issues:
+            returned.add(issue.key)
+            try:
+                services = self._extract_issue_service_ke_values(issue, field_id)
+                if not services:
+                    self._log_issue(issue, 'error', 'КЭ: поле задачи не заполнено')
+                    continue
+                missing = [value for value in services if not any(
+                    service_ke_matches(value, allowed) for allowed in release_services)]
+                if missing:
+                    self._log_issue(issue, 'error', 'КЭ задачи отсутствуют в релизе: '
+                                    + ', '.join(missing) + '. КЭ релиза: ' + ', '.join(release_services))
+                else:
+                    self._log_issue(issue, 'success', 'КЭ задачи соответствуют релизу ✓')
+            except Exception as exc:
+                self._log_issue(issue.key, 'error', f'КЭ: не удалось проверить соответствие: {exc}')
+        for key in sorted(set(keys) - returned):
+            self._log_issue(key, 'error', 'КЭ: не удалось получить задачу для сравнения с релизом')
+
     def _collect_release_service_infos(
         self,
         release_key: str,
@@ -2595,6 +2672,8 @@ class ReleaseValidator:
             'ошибка получения', 'ошибка поиска', 'ошибка проверки', 'timeout', 'httppool', 'httpsconnectionpool',
             'временно не отдал', 'проверка тц пропущена', 'диагностика:', '/rest/', 'status=', 'traceback'))
         if technical:
+            if lower.startswith('кэ:'):
+                return 'Не удалось проверить совпадение КЭ задач и релиза.'
             if 'aifixed' in lower or 'gigacode' in lower:
                 return 'Не удалось проверить необходимость лейбла AIFIXED.'
             if 'pull request' in lower or re.search(r'\bpr\b', lower):
@@ -2718,6 +2797,7 @@ class ReleaseValidator:
 
         labels = self._issue_labels_casefold(release)
         checks = [
+            ('service_consistency', 'Совпадение КЭ задач и релиза', lambda: self._check_release_service_consistency(release), True, ''),
             ('test_subtask', 'Списание времени в тестировании релиза', lambda: self._check_test_subtask(release), True, ''),
             ('artifacts', 'Комментарии тестировщиков и worklog', lambda: self._check_artifacts(release_key), True, ''),
             ('coverage', 'Связь задач с тест-кейсами', lambda: self._check_release_coverage(release_key), True, ''),
