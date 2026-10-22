@@ -435,7 +435,7 @@ def test_comment_includes_warnings_and_execution_table_on_failure():
     checker._run_check('story', 'Story', lambda: checker._log_issue('ABC-1', 'error', 'Нет описания'))
     checker._manage_jira_comment('REL-1', False)
     body = checker.jira_main.add_comment.call_args.args[1]
-    assert 'Не удалось проверить необходимость лейбла AIFIXED.' in body
+    assert 'Не удалось определить, использовался ли GigaCode при написании кода. Необходимость лейбла AIFIXED не установлена.' in body
     assert 'Нет описания' in body
     assert 'INCOMPLETE' not in body
     assert rc.COMMENT_TABLE_HEADER in body
@@ -451,7 +451,7 @@ def test_comment_keeps_optional_warnings_on_success():
     checker._run_check('giga', 'GigaCode', lambda: checker._log_issue('ABC-1', 'warning', 'AIFIXED: не удалось проверить'), required=False)
     checker._manage_jira_comment('REL-1', True)
     body = checker.jira_main.add_comment.call_args.args[1]
-    assert 'Не удалось проверить необходимость лейбла AIFIXED.' in body
+    assert 'Не удалось определить, использовался ли GigaCode при написании кода. Необходимость лейбла AIFIXED не установлена.' in body
     assert rc.COMMENT_TABLE_HEADER in body
     assert '#de350b' in body  # Non-PR remarks are red even when advisory.
     assert 'INCOMPLETE' not in body

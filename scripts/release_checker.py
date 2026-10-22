@@ -2675,7 +2675,9 @@ class ReleaseValidator:
             if lower.startswith('кэ:'):
                 return 'Не удалось проверить совпадение КЭ задач и релиза.'
             if 'aifixed' in lower or 'gigacode' in lower:
-                return 'Не удалось проверить необходимость лейбла AIFIXED.'
+                if 'не удалось добавить лейбл' in lower:
+                    return 'Использование GigaCode подтверждено, но не удалось добавить лейбл AIFIXED.'
+                return 'Не удалось определить, использовался ли GigaCode при написании кода. Необходимость лейбла AIFIXED не установлена.'
             if 'pull request' in lower or re.search(r'\bpr\b', lower):
                 return 'Не удалось проверить ПР. Повторите проверку.'
             if 'metadata' in lower or re.search(r'\bкэ\b', lower):
@@ -5311,7 +5313,7 @@ class ReleaseValidator:
                     self._log_issue(
                         target_issue,
                         "warning",
-                        f"AIFIXED: не удалось проверить {issue_to_check.key}: {e}"
+                        f"AIFIXED: не удалось определить использование GigaCode в {issue_to_check.key}: {e}"
                     )
 
             if not matched_issue:
