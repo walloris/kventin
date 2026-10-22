@@ -1299,6 +1299,7 @@ def test_direct_cycle_scan_stops_at_its_budget(zephyr, fake_clock):
 @pytest.mark.parametrize('merged_result,blocking', [('PR 42 (merged)', True), (requests.Timeout(), False)])
 def test_unlinked_merged_violation_blocks_but_unavailable_pr_does_not(merged_result, blocking):
     checker = stage_validator()
+    checker._check_unlinked_other_releases = Mock(return_value=set())
     issue = NS(key='ABC-2', id='2', fields=NS(summary='Removed task', assignee=None,
                issuetype=NS(name='Story'), labels=[], issuelinks=[]))
     checker._get_unlinked_release_issue_keys = Mock(return_value={'ABC-2'})
@@ -2349,3 +2350,59 @@ def test_frontend_respects_cooldown(zephyr, fake_clock):
     zephyr.retry_state['until'] = fake_clock[0] + 60
     assert zephyr.get_test_cycles_from_frontend('REL-1') == ([], False)
     zephyr.session.get.assert_not_called()
+
+
+@pytest.mark.parametrize('statuses,accepted', [([], False), (['В работе'], False),
+    (['Установлен на ПРОМ'], True), (['В работе', 'Установлен на ПРОМ'], True), ([None], False)])
+def test_unlinked_requires_installed_other_release(statuses, accepted):
+    checker = stage_validator()
+    checker.jira_main = Mock()
+    links = [NS(outwardIssue=NS(key=f'REL-{i+2}')) for i in range(len(statuses))]
+    links.append(NS(inwardIssue=NS(key='REL-1')))
+    issue = NS(key='ABC-2', fields=NS(summary='Task', assignee=None, issuelinks=links))
+    checker.jira_main.search_issues.return_value = [
+        NS(key=f'REL-{i+2}', fields=NS(status=NS(name=status)))
+        for i, status in enumerate(statuses) if status is not None]
+    assert checker._check_unlinked_other_releases([issue], 'REL-1') == ({'ABC-2'} if accepted else set())
+    assert bool(checker.report_data['ABC-2']['errors']) is not accepted
+
+
+def test_installed_other_release_allows_merged_pr():
+    checker = stage_validator()
+    issue = NS(key='ABC-2', fields=NS(summary='Task', assignee=None,
+        issuetype=NS(name='Story'), labels=[], issuelinks=[NS(inwardIssue=NS(key='REL-2'))]))
+    checker._get_unlinked_release_issue_keys = Mock(return_value={'ABC-2'})
+    checker._get_release_story_bug_keys = Mock(return_value=set())
+    checker.jira_main = Mock()
+    checker.jira_main.search_issues.side_effect = [[issue],
+        [NS(key='REL-2', fields=NS(status=NS(name='Установлен на ПРОМ')))]]
+    checker._find_issue_merged_pull_request_evidence = Mock(return_value='PR 42')
+    checker._check_unlinked_release_items_pull_requests('REL-1')
+    checker._find_issue_merged_pull_request_evidence.assert_called_once_with(issue)
+    assert not checker.report_data['ABC-2']['errors']
+
+
+@pytest.mark.parametrize('exemption', ['label', 'linked_story'])
+def test_pr_exemptions_do_not_skip_other_release_requirement(exemption):
+    checker = stage_validator()
+    issue = NS(key='ABC-2', fields=NS(summary='Task', assignee=None,
+        issuetype=NS(name='Story'), labels=['review_confirmed'] if exemption == 'label' else [],
+        issuelinks=[NS(outwardIssue=NS(key='ABC-1'))] if exemption == 'linked_story' else []))
+    checker._get_unlinked_release_issue_keys = Mock(return_value={'ABC-2'})
+    checker._get_release_story_bug_keys = Mock(return_value={'ABC-1'})
+    checker.jira_main = Mock()
+    checker.jira_main.search_issues.return_value = [issue]
+    checker._find_issue_merged_pull_request_evidence = Mock()
+    checker._check_unlinked_release_items_pull_requests('REL-1')
+    assert checker.report_data['ABC-2']['errors']
+    checker._find_issue_merged_pull_request_evidence.assert_not_called()
+
+
+def test_other_release_read_failure_blocks():
+    checker = stage_validator()
+    checker.jira_main = Mock()
+    checker.jira_main.search_issues.side_effect = requests.Timeout()
+    issue = NS(key='ABC-2', fields=NS(summary='Task', assignee=None,
+        issuelinks=[NS(outwardIssue=NS(key='REL-2'))]))
+    assert checker._check_unlinked_other_releases([issue], 'REL-1') == set()
+    assert 'статус не удалось получить' in str(checker.report_data['ABC-2']['errors'])

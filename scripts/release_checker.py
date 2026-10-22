@@ -2911,7 +2911,7 @@ class ReleaseValidator:
             ('bugs', 'Баги: поля, статусы, контур, причины пропуска и Confluence', lambda: self._check_bugs(release_key, is_hotfix=is_hotfix), True, ''),
             ('stories', 'Story: поля, архитектура, сроки тестирования и Task', lambda: self._check_stories(release_key), True, ''),
             ('required_pr', 'Наличие связи PR', lambda: self._check_required_pull_requests(release_key), False, ''),
-            ('unlinked_pr', 'Merged PR у отлинкованных задач', lambda: self._check_unlinked_release_items_pull_requests(release_key), False, ''),
+            ('unlinked_pr', 'PR и другой релиз у отлинкованных задач', lambda: self._check_unlinked_release_items_pull_requests(release_key), False, ''),
             ('gigacode', 'GigaCode и AIFIXED', lambda: self._check_gigacode_aifixed_labels(release_key), False, ''),
             ('cloud', 'Cloud: лейбл внешнего рынка', lambda: self._check_cloud_label(release_key, release.fields.summary), True,
              '' if 'cloud' in release.fields.summary.casefold() else 'релиз не Cloud'),
@@ -5385,8 +5385,8 @@ class ReleaseValidator:
         except Exception as e:
             self._log_issue(
                 release_key,
-                "warning",
-                f"Отлинкованные задачи: не удалось получить changelog релиза для проверки merged PR: {e}"
+                "error",
+                f"Отлинкованные задачи: не удалось получить историю связей релиза: {type(e).__name__}"
             )
             return set()
 
@@ -5396,7 +5396,9 @@ class ReleaseValidator:
         changelog = getattr(release, 'changelog', None)
         histories = getattr(changelog, 'histories', []) or []
         if changelog is None or getattr(changelog, 'total', len(histories)) > len(histories):
-            raise RuntimeError('не удалось получить полную историю связей релиза')
+            self._log_issue(release_key, 'error',
+                            'Отлинкованные задачи: не удалось получить полную историю связей релиза.')
+            return set()
         for history in histories:
             for item in getattr(history, 'items', []) or []:
                 field_name = normalize_field_text(getattr(item, 'field', '')).casefold()
@@ -5451,6 +5453,54 @@ class ReleaseValidator:
                 linked_keys.add(linked_issue.key)
         return linked_keys
 
+    def _check_unlinked_other_releases(self, issues, release_key: str) -> set[str]:
+        """Check removed tasks independently of PR exemptions, with one bulk read."""
+        candidates = {}
+        for issue in issues:
+            keys = set()
+            for link in getattr(issue.fields, 'issuelinks', []) or []:
+                linked = getattr(link, 'outwardIssue', None) or getattr(link, 'inwardIssue', None)
+                key = getattr(linked, 'key', '')
+                fields = getattr(linked, 'fields', None)
+                kind = getattr(getattr(fields, 'issuetype', None), 'name', '').casefold()
+                if key and key != release_key and (
+                        key.split('-')[0] == release_key.split('-')[0]
+                        or kind in {'release', 'релиз', 'релизный объект'}):
+                    keys.add(key)
+            candidates[issue.key] = keys
+        all_keys = sorted(set().union(*candidates.values())) if candidates else []
+        releases = {}
+        if all_keys:
+            try:
+                releases = {item.key: item for item in self.jira_main.search_issues(
+                    f"key in ({','.join(all_keys)})", fields='status,issuetype', maxResults=False)}
+            except Exception as exc:
+                print(f'   Unlinked release lookup failed: {type(exc).__name__}')
+        accepted = set()
+        for issue in issues:
+            keys = candidates[issue.key]
+            installed = [key for key in sorted(keys) if key in releases and
+                         normalize_field_text(getattr(getattr(releases[key].fields, 'status', None),
+                                                      'name', '')).casefold() == 'установлен на пром']
+            if installed:
+                accepted.add(issue.key)
+                self._log_issue(issue, 'success',
+                    'Отлинкованная задача связана с другим релизом в статусе '
+                    '«Установлен на ПРОМ»: ' + ', '.join(installed) + ' ✓')
+            elif not keys:
+                self._log_issue(issue, 'error',
+                    'Отлинкованная задача: отсутствует связь с другим релизом '
+                    'в статусе «Установлен на ПРОМ».')
+            else:
+                statuses = []
+                for key in sorted(keys):
+                    status = getattr(getattr(releases[key].fields, 'status', None), 'name', '') if key in releases else ''
+                    statuses.append(f'{key}: {status or "статус не удалось получить"}')
+                self._log_issue(issue, 'error',
+                    'Отлинкованная задача: не подтверждён другой релиз в статусе '
+                    '«Установлен на ПРОМ». ' + '; '.join(statuses))
+        return accepted
+
     def _check_unlinked_release_items_pull_requests(self, release_key: str) -> None:
         unlinked_keys = sorted(self._get_unlinked_release_issue_keys(release_key))
         if not unlinked_keys:
@@ -5469,8 +5519,8 @@ class ReleaseValidator:
         except Exception as e:
             self._log_issue(
                 release_key,
-                "warning",
-                f"Отлинкованные задачи: не удалось получить задачи для проверки merged PR: {e}"
+                "error",
+                f"Отлинкованные задачи: не удалось получить задачи для проверки PR и другого релиза: {type(e).__name__}"
             )
             return
 
@@ -5481,6 +5531,11 @@ class ReleaseValidator:
             if issue.fields.issuetype and issue.fields.issuetype.name.casefold() in issue_types_to_check
         }
 
+        returned_keys = {issue.key for issue in issues}
+        for missing_key in sorted(set(unlinked_keys) - returned_keys):
+            self._log_issue(release_key, 'error',
+                            f'Отлинкованная задача {missing_key}: не удалось получить задачу для проверки другого релиза.')
+        installed_elsewhere = self._check_unlinked_other_releases(list(issues_by_key.values()), release_key)
         for issue_key in unlinked_keys:
             issue = issues_by_key.get(issue_key)
             if not issue:
@@ -5516,7 +5571,10 @@ class ReleaseValidator:
                 )
                 continue
 
-            if merged_pr:
+            if merged_pr and issue_key in installed_elsewhere:
+                self._log_issue(issue, 'success',
+                                'Отлинкованная задача: merged PR допустим — другой релиз установлен на ПРОМ ✓')
+            elif merged_pr:
                 self._log_issue(
                     issue,
                     "error",
