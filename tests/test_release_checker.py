@@ -893,6 +893,7 @@ def test_gigacode_marker_in_pr_does_not_require_other_sources(validator):
 
 
 def test_failed_cycle_search_does_not_poison_following_stage(zephyr):
+    zephyr.get_test_cycles_from_frontend = Mock(return_value=([], False))
     checker = zephyr_checker(zephyr)
     checker._zephyr_release_cycles_cache = {}
     cycle = {'key': 'HRPQA-C1', 'name': 'REL-1 API Регресс'}
@@ -1246,6 +1247,7 @@ def test_zephyr_direct_links_precede_broad_project_search(zephyr):
 
 
 def test_transient_search_failure_does_not_disable_direct_lookup(zephyr):
+    zephyr.get_test_cycles_from_frontend = Mock(return_value=([], False))
     checker = zephyr_checker(zephyr)
     checker._zephyr_release_cycles_cache = {}
     cycle = {'key': 'HRPQA-C1', 'name': 'REL-1 API Регресс'}
@@ -1387,6 +1389,7 @@ def test_invalid_cycle_index_is_not_proof_of_absence(zephyr, payload):
 
 @pytest.mark.parametrize('termination', ['repeat', 'timeout'])
 def test_partial_cycle_index_keeps_matches_but_marks_check_incomplete(zephyr, termination):
+    zephyr.get_test_cycles_from_frontend = Mock(return_value=([], False))
     checker = zephyr_checker(zephyr)
     checker._zephyr_release_cycles_cache = {}
     page = [{'key': 'HRPQA-C1', 'name': 'REL-1 regression'}]
@@ -1497,7 +1500,7 @@ def test_cycle_index_and_metadata_timeouts_leave_direct_fallback_time(zephyr, fa
     checker._get_test_cycles_from_direct_cache_or_scan = Mock(
         side_effect=lambda _: [zephyr.get_test_cycle_details('HRPQA-C1')])
     assert checker._get_release_test_cycles('REL-1') == [('HRPQA-C1', 'REL-1 regression')]
-    assert fake_clock[0] == 35
+    assert fake_clock[0] == 43
     assert fake_clock[0] <= rc.ZEPHYR_LOOKUP_TIMEOUT_SECONDS
     assert checker.jira_http.get.call_count == 1
 
@@ -2294,3 +2297,55 @@ def test_gigacode_task_evidence_resolves_previous_task_failure(validator):
     validator._check_gigacode_aifixed_labels('REL-1')
     validator._add_label_if_missing.assert_called_once_with(issue, 'AIFIXED')
     assert all(call.args[1] == 'success' for call in validator._log_issue.call_args_list)
+
+
+@pytest.mark.parametrize('bad', ['offset', 'total', 'repeat', 'shape'])
+def test_frontend_rejects_incomplete_pages(zephyr, bad):
+    item = {'key': 'HRPQA-C1', 'name': 'REL-1. WEB. Regress'}
+    second = {'results': [dict(item, key='HRPQA-C2')], 'total': 2, 'startAt': 1}
+    if bad == 'offset': second['startAt'] = 0
+    if bad == 'total': second['total'] = 3
+    if bad == 'repeat': second['results'] = [item]
+    if bad == 'shape': second = {'children': []}
+    zephyr.session.get.side_effect = [response(200, {'results': [item], 'total': 2, 'startAt': 0}), response(200, second)]
+    matches, complete = zephyr.get_test_cycles_from_frontend('REL-1')
+    assert not complete
+    assert matches == [item]
+
+
+def test_frontend_reads_capped_pages_and_exact_release_name(zephyr):
+    rows = [{'key': 'HRPQA-C1', 'name': 'REL-10. WEB. Regress'},
+            {'key': 'HRPQA-C2', 'name': 'REL-1. WEB. Regress'}]
+    def fetch(url, **kwargs):
+        assert url.endswith('/rest/tests/1.0/testrun/search')
+        assert kwargs['headers'] == {'jira-project-id': '88701'}
+        assert 'folderTreeId' not in kwargs['params']['query']
+        offset = kwargs['params']['startAt']
+        return response(200, {'results': rows[offset:offset+1], 'total': 2, 'startAt': offset})
+    zephyr.session.get.side_effect = fetch
+    assert zephyr.get_test_cycles_from_frontend('REL-1') == ([rows[1]], True)
+    assert zephyr.session.get.call_count == 2
+
+
+@pytest.mark.parametrize('primary_complete', [True, False])
+def test_frontend_fallback_only_after_failed_primary(zephyr, primary_complete):
+    checker = zephyr_checker(zephyr)
+    checker._zephyr_release_cycles_cache = {}
+    checker._get_test_cycles_from_jira_release_metadata = Mock(return_value=[])
+    checker._get_test_cycles_from_direct_cache_or_scan = Mock(return_value=[])
+    checker._log_test_cycle_search_debug = Mock()
+    zephyr.get_test_cycles_for_issue = Mock(return_value=[])
+    zephyr.last_test_cycle_search_stats = [{'mode': 'search', 'complete': primary_complete,
+                                           'status': 200 if primary_complete else 'exception'}]
+    row = {'key': 'HRPQA-C1', 'name': 'REL-1. WEB. Regress'}
+    zephyr.session.get.return_value = response(200, {'results': [row], 'total': 1, 'startAt': 0})
+    result = checker._get_release_test_cycles('REL-1')
+    assert result == ([] if primary_complete else [(row['key'], row['name'])])
+    assert zephyr.session.get.call_count == (0 if primary_complete else 1)
+    assert checker._zephyr_release_cycles_cache['REL-1'] == result
+
+
+def test_frontend_respects_cooldown(zephyr, fake_clock):
+    zephyr.retry_state['until'] = fake_clock[0] + 60
+    assert zephyr.get_test_cycles_from_frontend('REL-1') == ([], False)
+    zephyr.session.get.assert_not_called()

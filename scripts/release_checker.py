@@ -1124,6 +1124,70 @@ class ZephyrScaleClient:
         # must report incomplete discovery and never cache this as a full list.
         return matched
 
+    def get_test_cycles_from_frontend(self, issue_key: str) -> tuple[list[dict], bool]:
+        """Bounded fallback using the UI search contract (results/total/startAt).
+
+        Read the entire project, not the unrelated folder from a captured curl.
+        Keep browser cookies out of the client; reuse the configured credentials.
+        """
+        matched, seen = [], set()
+        offset, total, pages, complete = 0, None, 0, False
+        error = ''
+        project_id = os.getenv('ZEPHYR_FRONTEND_PROJECT_ID', '88701')
+        try:
+            if not project_id.isdigit():
+                raise ValueError('Invalid frontend project ID')
+            with self.lookup_budget(8):
+                for _ in range(32):
+                    if self.requests_paused() or self.lookup_budget_exhausted():
+                        raise RequestNotSent('Frontend search deferred by shared deadline/cooldown')
+                    reply = self._get_with_retries(
+                        f'{self.base_url}/rest/tests/1.0/testrun/search',
+                        headers={'jira-project-id': project_id},
+                        params={'fields': 'id,key,name',
+                                'query': f'testRun.projectId IN ({project_id}) ORDER BY testRun.createdOn DESC',
+                                'maxResults': 5000, 'startAt': offset, 'archived': 'false'})
+                    if reply.status_code != 200:
+                        raise ValueError(f'Frontend HTTP {reply.status_code}')
+                    payload = reply.json()
+                    if (not isinstance(payload, dict)
+                            or not isinstance(payload.get('results'), list)
+                            or type(payload.get('total')) is not int
+                            or type(payload.get('startAt')) is not int
+                            or payload['startAt'] != offset):
+                        raise ValueError('Invalid frontend search envelope/offset')
+                    if total is not None and total != payload['total']:
+                        raise ValueError('Frontend total changed during pagination')
+                    total = payload['total']
+                    items = payload['results']
+                    pages += 1
+                    if total < offset + len(items) or (not items and offset < total):
+                        raise ValueError('Inconsistent frontend total')
+                    for item in items:
+                        key = self.get_test_cycle_key(item) if isinstance(item, dict) else ''
+                        if (not re.fullmatch(r'[A-Z][A-Z0-9_]*-C\d+', key)
+                                or key in seen or not isinstance(item.get('name'), str)):
+                            raise ValueError('Invalid cycle or repeated frontend page')
+                        seen.add(key)
+                        if self._cycle_mentions_issue({'name': item['name']}, issue_key):
+                            matched.append({'key': key, 'name': item['name']})
+                    offset += len(items)
+                    if offset == total:
+                        complete = True
+                        break
+                if not complete:
+                    raise ValueError('Frontend page limit reached')
+        except (requests.RequestException, ValueError, RuntimeError) as exc:
+            # No upstream response bodies or credentials in fallback diagnostics.
+            error = type(exc).__name__
+        self.last_test_cycle_search_stats.append({
+            'mode': 'frontend-search', 'status': 200 if complete else 'exception',
+            'pages': pages, 'total_seen': offset, 'count': len(matched),
+            'complete': complete, 'error': error})
+        print(f'   Zephyr frontend index: pages={pages} seen={offset} '
+              f'matched={len(matched)} complete={complete} error={error}')
+        return matched, complete
+
     def _search_test_cycles_by_name_query(self, project_key: str, issue_key: str) -> list[dict]:
         url = f"{self.base_url}/rest/atm/1.0/testrun/search"
         query = f'projectKey = "{project_key}" AND name ~ "{issue_key}"'
@@ -1730,6 +1794,24 @@ class ReleaseValidator:
         if release_key not in self._zephyr_release_cycles_cache:
             with self.zephyr.lookup_budget(ZEPHYR_CYCLE_DISCOVERY_SECONDS):
                 raw_cycles = self.zephyr.get_test_cycles_for_issue(release_key)
+            stats = self.zephyr.last_test_cycle_search_stats
+            primary_complete = any(stat.get('mode') == 'search' and stat.get('complete') is True
+                                   for stat in stats)
+            primary_failed = (any(stat.get('complete') is False for stat in stats)
+                              or (not raw_cycles and not primary_complete
+                                  and self._zephyr_last_cycle_search_had_technical_failure()))
+            if (primary_failed and not self.zephyr.is_failed_request_limit_reached()
+                    and not self.zephyr.requests_paused()
+                    and not self.zephyr.lookup_budget_exhausted()):
+                fallback, complete = self.zephyr.get_test_cycles_from_frontend(release_key)
+                merged = {self.zephyr.get_test_cycle_key(item): item for item in raw_cycles}
+                merged.update({self.zephyr.get_test_cycle_key(item): item for item in fallback})
+                raw_cycles = list(merged.values())
+                if complete:
+                    # The independent full index recovered discovery; previous
+                    # attempts remain in console logs, not as active failures.
+                    self.zephyr.last_test_cycle_search_stats = [
+                        self.zephyr.last_test_cycle_search_stats[-1]]
             if not raw_cycles and not self.zephyr.is_failed_request_limit_reached():
                 with self.zephyr.lookup_budget(ZEPHYR_CYCLE_METADATA_SECONDS):
                     raw_cycles = self._get_test_cycles_from_jira_release_metadata(release_key)
