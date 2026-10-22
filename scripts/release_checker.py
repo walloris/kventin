@@ -1297,7 +1297,24 @@ class ReleaseHttpSession(requests.Session):
         return super().request(method, url, **kwargs)
 
 
+class DevelopmentAPIError(ValueError):
+    """Safe error categories; raw server messages never escape into reports/logs."""
+    def __init__(self, errors):
+        text = json.dumps(errors, ensure_ascii=False).casefold()
+        categories = [label for label, patterns in {
+            'upstream_timeout': ('timeout', 'timed out'),
+            'permission': ('forbidden', 'unauthorized', 'permission', '401', '403'),
+            'connection': ('connection', 'connectexception'),
+            'application_link': ('applink', 'application link'),
+            'rate_limit': ('too many requests', 'rate limit', '429'),
+        }.items() if any(pattern in text for pattern in patterns)]
+        self.categories = categories or ['unclassified']
+        super().__init__('API application error: ' + ', '.join(self.categories))
+
+
 def request_failure_kind(exc):
+    if isinstance(exc, DevelopmentAPIError):
+        return str(exc)
     if isinstance(exc, requests.exceptions.SSLError):
         return 'TLS: ошибка сертификата; проверьте RELEASE_CHECKER_CA_BUNDLE/VERIFY_SSL'
     if isinstance(exc, requests.Timeout):
@@ -1459,7 +1476,7 @@ def validate_json_payload(payload):
     if not isinstance(payload, (dict, list)):
         raise ValueError('Expected JSON object or list')
     if isinstance(payload, dict) and (payload.get('errors') or payload.get('errorMessages')):
-        raise ValueError('API returned application errors')
+        raise DevelopmentAPIError(payload.get('errors') or payload.get('errorMessages'))
 
 
 def wiki_cell(value):
@@ -2610,6 +2627,7 @@ class ReleaseValidator:
         self.check_results = []
         self._active_check = None
         self._reset_pr_run_state()
+        self._gigacode_result_cache = {}
         if isinstance(self.jira_main, CachedJiraReads):
             self.jira_main.clear()
         for name, value in vars(self).items():
@@ -4983,17 +5001,161 @@ class ReleaseValidator:
     def _issue_has_pull_request(self, issue) -> bool:
         return self._find_issue_pull_request_evidence(issue) is not None
 
-    def _issue_has_gigacode_pull_request(self, issue) -> Optional[str]:
+    @staticmethod
+    def _gigacode_objects(payload, data_type):
+        """Inspect actual PR/commit objects, never provider metadata or error messages."""
+        objects = []
+        container_seen = False
+        partial = False
+        names = {'pullRequests'} if data_type == 'pullrequest' else {'commits'}
+        def walk(node):
+            nonlocal container_seen, partial
+            if isinstance(node, dict):
+                if node.get('isLast') is False or node.get('hasMore') is True:
+                    partial = True
+                for key, value in node.items():
+                    if key in names and isinstance(value, list):
+                        container_seen = True
+                        objects.extend(item for item in value if isinstance(item, dict))
+                        if any(not isinstance(item, dict) for item in value):
+                            partial = True
+                    elif key not in {'errors', 'errorMessages', '_instance'}:
+                        walk(value)
+            elif isinstance(node, list):
+                for item in node:
+                    walk(item)
+        walk(payload.get('detail', []))
+        return objects, container_seen, partial
+
+    def _lookup_gigacode(self, issue):
+        """Three-state lookup with independent source outcomes and bounded fallback."""
+        started = time.monotonic()
         issue_id = str(getattr(issue, 'id', '') or '')
+        result = {'state': 'UNKNOWN', 'marker': None, 'sources': []}
+        def event(state, **details):
+            row = {'state': state, **details}
+            result['sources'].append(row)
+            if http_debug_enabled():
+                print('[GIGACODE] ' + json.dumps({'issue': getattr(issue, 'key', ''),
+                    'elapsed_s': round(time.monotonic()-started, 3), **row}, ensure_ascii=False), flush=True)
         if not issue_id:
-            raise RuntimeError('нет Jira ID для проверки GigaCode')
+            event('UNKNOWN', reason='missing_issue_id')
+            return result
+        cache = getattr(self, '_gigacode_result_cache', {})
+        self._gigacode_result_cache = cache
+        if issue_id in cache:
+            result.update(state='FOUND', marker=cache[issue_id])
+            event('RESULT', verdict='FOUND', reason='positive_cache')
+            return result
+        base = config['jira']['url'].rstrip('/')
+        previous_failures = getattr(self, '_pr_lookup_failures', set())
+        self._pr_lookup_failures = set()
+        try:
+            with self._pr_lookup_budget():
+                version, summary = self._get_dev_summary(issue_id)
+                sections = (summary or {}).get('summary', {})
+                event('SUMMARY', available=bool(summary), api_version=version,
+                      failures=sorted(self._pr_lookup_failures))
+                unknown = []
+                repository_commit_providers = set()
+                types = ('pullrequest', 'repository', 'commit')
+                for type_index, data_type in enumerate(types):
+                    section = sections.get(data_type) or {}
+                    section = section if isinstance(section, dict) else {}
+                    count = (section.get('overall') or {}).get('count') if isinstance(section.get('overall'), dict) else None
+                    count = count if type(count) is int and count >= 0 else None
+                    if count == 0:
+                        event('EMPTY', data_type=data_type, reason='summary_zero')
+                        continue
+                    if self._pr_cooldown_reason():
+                        unknown.append(data_type)
+                        event('SKIP', data_type=data_type, reason='server_cooldown')
+                        continue
+                    reported = section.get('byInstanceType') or {}
+                    reported = reported if isinstance(reported, dict) else {}
+                    providers = tuple(reported) or PR_LEGACY_PROVIDERS
+                    type_deadline = time.monotonic() + max(0, self._pr_request_deadline-time.monotonic()) / (len(types)-type_index)
+                    type_checked = False
+                    for provider_index, provider in enumerate(providers):
+                        provider_info = reported.get(provider)
+                        provider_count = provider_info.get('count') if isinstance(provider_info, dict) else None
+                        if type(provider_count) is int and provider_count == 0:
+                            event('EMPTY', data_type=data_type, provider=provider, reason='provider_zero')
+                            continue
+                        if data_type == 'commit' and count is None and provider in repository_commit_providers:
+                            event('CHECKED', data_type=data_type, provider=provider, reason='commits_read_from_repository')
+                            type_checked = True
+                            if not reported:
+                                break
+                            continue
+                        obtained = False
+                        provider_deadline = time.monotonic() + max(0, type_deadline-time.monotonic()) / (len(providers)-provider_index)
+                        versions = tuple(dict.fromkeys((version or 'latest', '1.0')))
+                        for version_index, api_version in enumerate(versions):
+                            if self._pr_cooldown_reason():
+                                event('SKIP', data_type=data_type, provider=provider, reason='server_cooldown')
+                                break
+                            remaining = provider_deadline-time.monotonic()
+                            if remaining <= 0:
+                                event('SKIP', data_type=data_type, provider=provider, reason='budget')
+                                break
+                            self._pr_lookup_failures = set()
+                            with self._pr_lookup_budget(remaining / (len(versions)-version_index)):
+                                payload = self._pr_get_json(f'{base}/rest/dev-status/{api_version}/issue/detail', params={
+                                    'issueId': issue_id, 'applicationType': provider, 'dataType': data_type})
+                            if not isinstance(payload, dict) or not isinstance(payload.get('detail'), list):
+                                event('UNAVAILABLE', data_type=data_type, provider=provider, api_version=api_version,
+                                      failures=sorted(self._pr_lookup_failures), reason='request_failed_or_invalid_shape')
+                                continue
+                            objects, container_seen, partial = self._gigacode_objects(payload, data_type)
+                            marker = self._find_gigacode_marker(objects)
+                            fields = {field: sum(isinstance(obj.get(field), str) and bool(obj[field]) for obj in objects)
+                                      for field in ('title', 'name', 'description', 'message')}
+                            expected = provider_count if type(provider_count) is int and provider_count >= 0 else count
+                            repositories = [repo for detail in payload['detail'] if isinstance(detail, dict)
+                                            for repo in (detail.get('repositories') if isinstance(detail.get('repositories'), list) else [])
+                                            if isinstance(repo, dict)]
+                            # Repository completeness is checked separately from commit count.
+                            if data_type == 'repository':
+                                enough = bool(repositories) and all(isinstance(repo.get('commits'), list) for repo in repositories)
+                                enough = enough and (expected is None or len(repositories) >= expected)
+                            else:
+                                enough = expected is None or len(objects) >= expected
+                            text_available = all(any(isinstance(obj.get(field), str) and obj[field]
+                                for field in ('title', 'name', 'description', 'message')) for obj in objects)
+                            covered = container_seen and not partial and enough and text_available and bool(objects)
+                            event('FOUND' if marker else 'CHECKED' if covered else 'INCOMPLETE',
+                                  data_type=data_type, provider=provider, api_version=api_version,
+                                  objects=len(objects), text_fields=fields, partial=partial,
+                                  expected_count=expected, container_seen=container_seen)
+                            if marker:
+                                result.update(state='FOUND', marker=marker)
+                                cache[issue_id] = marker
+                                event('RESULT', verdict='FOUND')
+                                return result
+                            if covered:
+                                if data_type == 'repository':
+                                    repository_commit_providers.add(provider)
+                                obtained = type_checked = True
+                                break
+                        if reported and not obtained:
+                            unknown.append(f'{provider}/{data_type}')
+                        if obtained and not reported:
+                            break  # Unreported historical providers are aliases.
+                    if not type_checked:
+                        unknown.append(data_type)
+                result['state'] = 'UNKNOWN' if unknown else 'NOT_FOUND'
+                event('RESULT', verdict=result['state'], unresolved=sorted(set(unknown)))
+                return result
+        finally:
+            self._pr_lookup_failures = previous_failures
 
-        for _, _, payload in self._get_dev_status_payloads(issue_id, find_evidence=self._find_gigacode_marker):
-            gigacode_marker = self._find_gigacode_marker(payload)
-            if gigacode_marker:
-                return gigacode_marker
-
-        return None
+    def _issue_has_gigacode_pull_request(self, issue) -> Optional[str]:
+        result = self._lookup_gigacode(issue)
+        if result['state'] == 'UNKNOWN':
+            # Detailed source failures stay exclusively in [GIGACODE]/HTTP logs.
+            raise RuntimeError('неполные данные для проверки GigaCode')
+        return result['marker']
 
     def _add_label_if_missing(self, issue, label: str) -> bool:
         labels = list(getattr(issue.fields, 'labels', []) or [])
@@ -5300,7 +5462,7 @@ class ReleaseValidator:
                 continue
             matched_issue = None
             matched_marker = None
-            check_failed = False
+            failed_issues = []
             for issue_to_check in issues_to_check:
                 try:
                     gigacode_marker = self._issue_has_gigacode_pull_request(issue_to_check)
@@ -5309,15 +5471,16 @@ class ReleaseValidator:
                         matched_marker = gigacode_marker
                         break
                 except Exception as e:
-                    check_failed = True
-                    self._log_issue(
-                        target_issue,
-                        "warning",
-                        f"AIFIXED: не удалось определить использование GigaCode в {issue_to_check.key}: {e}"
-                    )
+                    failed_issues.append(issue_to_check.key)
+                    if http_debug_enabled():
+                        print('[GIGACODE] ' + json.dumps({'issue': issue_to_check.key,
+                            'state': 'ISSUE_UNAVAILABLE', 'exception_type': type(e).__name__}, ensure_ascii=False), flush=True)
 
             if not matched_issue:
-                if check_failed:
+                if failed_issues:
+                    for issue_key in failed_issues:
+                        self._log_issue(target_issue, 'warning',
+                            f'AIFIXED: не удалось определить использование GigaCode в {issue_key}')
                     continue
                 self._log_issue(target_issue, "success", "AIFIXED: GigaCode PR/commit не найден — лейбл AIFIXED не требуется ✓")
                 continue

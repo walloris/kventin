@@ -2179,3 +2179,118 @@ def test_service_check_missing_release_value_blocks_comparison(validator):
     assert validator._log_issue.call_args.args[1] == 'error'
     assert 'поле релиза не заполнено' in validator._log_issue.call_args.args[2]
     validator.jira_main.search_issues.assert_not_called()
+
+
+def giga_summary(pr=0, repo=0, commit=0):
+    return {'summary': {kind: {'overall': {'count': count}, 'byInstanceType': {'stash': {'count': count}}}
+                        for kind, count in [('pullrequest', pr), ('repository', repo), ('commit', commit)]}}
+
+
+def test_gigacode_all_zero_is_known_absence_without_detail(validator):
+    validator._pr_get_json = Mock(return_value=giga_summary())
+    result = validator._lookup_gigacode(NS(key='ABC-1', id='1'))
+    assert result['state'] == 'NOT_FOUND'
+    assert validator._pr_get_json.call_count == 1
+
+
+@pytest.mark.parametrize('payload', [
+    {'detail': []}, {'detail': [{'_instance': {'name': '#GigaCode Agent'}}]},
+    {'detail': [{'pullRequests': [{'id': '1'}]}]},
+    {'detail': [{'pullRequests': [{'id': '1', 'name': 'ordinary'}], 'isLast': False}]},
+])
+def test_gigacode_empty_metadata_and_partial_data_are_unknown(validator, payload):
+    validator._pr_get_json = Mock(side_effect=lambda url, **kw: giga_summary(pr=1) if url.endswith('/summary') else payload)
+    result = validator._lookup_gigacode(NS(key='ABC-1', id='1'))
+    assert result['state'] == 'UNKNOWN'
+    assert any(r['state'] == 'INCOMPLETE' for r in result['sources'])
+
+
+def test_gigacode_visible_pr_text_without_marker_is_checked(validator):
+    validator._pr_get_json = Mock(side_effect=lambda url, **kw: giga_summary(pr=1) if url.endswith('/summary') else
+        {'detail': [{'pullRequests': [{'id': '1', 'name': 'normal PR', 'description': 'normal description'}]}]})
+    result = validator._lookup_gigacode(NS(key='ABC-1', id='1'))
+    assert result['state'] == 'NOT_FOUND'
+    checked = next(row for row in result['sources'] if row['state'] == 'CHECKED')
+    assert checked['text_fields']['description'] == 1
+
+
+def test_gigacode_marker_survives_partial_response_and_is_cached(validator):
+    validator._pr_get_json = Mock(side_effect=lambda url, **kw: giga_summary(pr=3) if url.endswith('/summary') else
+        {'detail': [{'pullRequests': [{'description': '#GigaCode Agent'}], 'isLast': False}]})
+    issue = NS(key='ABC-1', id='1')
+    assert validator._lookup_gigacode(issue)['state'] == 'FOUND'
+    validator._pr_get_json.reset_mock()
+    validator._pr_retry_state = {'until': rc.time.monotonic()+120}
+    assert validator._lookup_gigacode(issue)['state'] == 'FOUND'
+    validator._pr_get_json.assert_not_called()
+
+
+def test_gigacode_unknown_is_not_cached_as_absence(validator):
+    validator._pr_get_json = Mock(side_effect=lambda url, **kw: giga_summary(pr=1) if url.endswith('/summary') else {'detail': []})
+    issue = NS(key='ABC-1', id='1')
+    assert validator._lookup_gigacode(issue)['state'] == 'UNKNOWN'
+    validator._pr_get_json.side_effect = lambda url, **kw: giga_summary(pr=1) if url.endswith('/summary') else {
+        'detail': [{'pullRequests': [{'name': '#GigaCode Agent'}]}]}
+    assert validator._lookup_gigacode(issue)['state'] == 'FOUND'
+
+
+def test_gigacode_log_explains_unknown_but_comment_keeps_only_existing_text(validator, capsys, monkeypatch):
+    monkeypatch.setenv('RELEASE_CHECKER_DEBUG_HTTP', '1')
+    secret = 'PRIVATE_PR_CONTENT'
+    validator._pr_get_json = Mock(side_effect=lambda url, **kw: giga_summary(pr=2) if url.endswith('/summary') else {
+        'detail': [{'pullRequests': [{'title': secret, 'description': secret}]}]})
+    with pytest.raises(RuntimeError) as error:
+        validator._issue_has_gigacode_pull_request(NS(key='ABC-1', id='1'))
+    output = capsys.readouterr().out
+    assert secret not in output
+    assert 'INCOMPLETE' in output and 'expected_count' in output and 'text_fields' in output
+    comment = validator._comment_message(f'AIFIXED: не удалось определить использование GigaCode: {error.value}')
+    assert comment == 'Не удалось определить, использовался ли GigaCode при написании кода. Необходимость лейбла AIFIXED не установлена.'
+    assert 'expected_count' not in comment
+
+
+def test_api_application_error_categories_do_not_expose_messages():
+    with pytest.raises(rc.DevelopmentAPIError) as error:
+        rc.validate_json_payload({'errors': [{'message': 'connection timed out token=SECRET_VALUE'}]})
+    assert 'upstream_timeout' in rc.request_failure_kind(error.value)
+    assert 'SECRET_VALUE' not in str(error.value)
+
+
+def test_gigacode_provider_zero_does_not_override_positive_total(validator):
+    payload = giga_summary(pr=1)
+    payload['summary']['pullrequest']['byInstanceType']['stash']['count'] = 0
+    validator._pr_get_json = Mock(return_value=payload)
+    assert validator._lookup_gigacode(NS(key='ABC-1', id='1'))['state'] == 'UNKNOWN'
+
+
+def test_gigacode_timeouts_stay_within_issue_budget(validator, fake_clock):
+    validator.jira_http.get.side_effect = requests.Timeout()
+    with validator._pr_lookup_budget(12):
+        result = validator._lookup_gigacode(NS(key='ABC-1', id='1'))
+    assert result['state'] == 'UNKNOWN'
+    assert fake_clock[0] <= 12
+
+
+def test_repository_commit_objects_avoid_unsupported_commit_alias(validator):
+    summary = giga_summary(pr=0, repo=1)
+    del summary['summary']['commit']
+    def fetch(url, **kwargs):
+        if url.endswith('/summary'):
+            return summary
+        assert kwargs['params']['dataType'] == 'repository'
+        return {'detail': [{'repositories': [{'commits': [{'message': 'ordinary commit'}]}]}]}
+    validator._pr_get_json = Mock(side_effect=fetch)
+    result = validator._lookup_gigacode(NS(key='ABC-1', id='1'))
+    assert result['state'] == 'NOT_FOUND'
+    assert any(row.get('reason') == 'commits_read_from_repository' for row in result['sources'])
+    assert validator._pr_get_json.call_count == 2
+
+
+def test_gigacode_task_evidence_resolves_previous_task_failure(validator):
+    issue = NS(key='ABC-1', fields=NS(labels=[]))
+    validator._get_release_pr_targets = Mock(return_value=[(issue, [NS(key='ABC-2'), NS(key='ABC-3')])])
+    validator._issue_has_gigacode_pull_request = Mock(side_effect=[RuntimeError('unavailable'), '#GigaCode Agent'])
+    validator._add_label_if_missing = Mock(return_value=True)
+    validator._check_gigacode_aifixed_labels('REL-1')
+    validator._add_label_if_missing.assert_called_once_with(issue, 'AIFIXED')
+    assert all(call.args[1] == 'success' for call in validator._log_issue.call_args_list)
