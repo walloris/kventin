@@ -484,7 +484,8 @@ def test_merged_pr_in_structured_array_without_url_is_detected(validator):
     ('_check_required_pull_requests', True),
     ('_check_unlinked_release_items_pull_requests', True),
 ])
-def test_all_applicable_release_stages_execute_despite_one_crash(failed_method, ready):
+def test_all_applicable_release_stages_execute_despite_one_crash(failed_method, ready, monkeypatch):
+    monkeypatch.setattr(rc.subprocess, 'run', Mock(return_value=NS(returncode=0, stdout='✅ PASS')))
     checker = stage_validator()
     release = NS(key='REL-1', fields=NS(summary='Cloud release', labels=['back', 'web'],
                                       assignee=None, issuelinks=[]))
@@ -507,7 +508,8 @@ def test_all_applicable_release_stages_execute_despite_one_crash(failed_method, 
     assert checker.check_release('REL-1') is ready
     for name in methods:
         getattr(checker, name).assert_called_once()
-    assert len(checker.check_results) == 17
+    assert len(checker.check_results) == 18
+    assert checker.check_results[0]['id'] == 'sdd'
     assert not any(r['status'] == 'RUNNING' for r in checker.check_results)
 
 
@@ -2406,3 +2408,95 @@ def test_other_release_read_failure_blocks():
         issuelinks=[NS(outwardIssue=NS(key='REL-2'))]))
     assert checker._check_unlinked_other_releases([issue], 'REL-1') == set()
     assert 'статус не удалось получить' in str(checker.report_data['ABC-2']['errors'])
+
+
+@pytest.mark.parametrize('outcome', [1, 2, -15, FileNotFoundError('node'), OSError('launch failed')])
+def test_sdd_failure_stops_before_any_other_release_work(monkeypatch, outcome):
+    checker = stage_validator()
+    checker._reset_release_run = Mock()
+    checker.jira_main = Mock()
+    checker._check_required_platform_label = Mock()
+    runner = Mock(side_effect=outcome) if isinstance(outcome, Exception) else Mock(
+        return_value=NS(returncode=outcome, stdout='❌ FAIL'))
+    monkeypatch.setattr(rc.subprocess, 'run', runner)
+    assert checker.check_release('REL-1') is False
+    checker.jira_main.issue.assert_not_called()
+    checker._check_required_platform_label.assert_not_called()
+    assert len(checker.check_results) == 1
+    assert checker.check_results[0]['required'] is True
+    assert checker.check_results[0]['status'] in {'FAIL', 'INCOMPLETE'}
+    assert sum(len(row['errors']) for row in checker.report_data.values()) > 0
+
+
+def test_sdd_uses_config_and_absolute_script_path(monkeypatch):
+    checker = stage_validator()
+    runner = Mock(return_value=NS(returncode=0, stdout='✅ PASS'))
+    monkeypatch.setattr(rc.subprocess, 'run', runner)
+    monkeypatch.setattr(rc, 'config', {'jira': {'url': 'https://jira.example/', 'token': 'test-token'}})
+    monkeypatch.setenv('JIRA_BASE_URL', 'https://wrong.example')
+    monkeypatch.setenv('DEBUG', '1')
+    checker._run_check('sdd', 'SDD', lambda: checker._check_sdd_gate('REL-1'))
+    assert checker.check_results[0]['status'] == 'PASS'
+    args, kwargs = runner.call_args
+    assert args[0] == ['node', str(rc.script_dir / 'release-gate-sdd.mjs'), 'REL-1']
+    assert kwargs['env']['JIRA_BASE_URL'] == 'https://jira.example'
+    assert kwargs['env']['JIRA_API_TOKEN'] == 'test-token'
+    assert kwargs['env']['DEBUG'] == '0'
+
+
+@pytest.mark.parametrize('scenario,expected', [
+    ('pass', 0), ('missing_label', 1), ('missing_openspec', 1),
+    ('no_stories', 0), ('unknown_without_label', 0), ('jira_error', 2),
+])
+def test_original_sdd_script_contract(tmp_path, scenario, expected):
+    import os
+    import shutil
+    import subprocess
+    node = shutil.which('node')
+    if not node:
+        pytest.skip('Node.js required for original SDD contract tests')
+    preload = tmp_path / 'fake-jira.mjs'
+    preload.write_text('''
+const scenario = process.env.SDD_TEST_SCENARIO;
+globalThis.setTimeout = (callback) => { callback(); return 0; };
+globalThis.fetch = async (url) => {
+  let data;
+  if (scenario === 'jira_error') throw new Error('synthetic network error');
+  if (url.includes('/search?')) data = {issues: scenario === 'no_stories' ? [] : [{key:'ST-1'}]};
+  else if (url.includes('fields=labels')) data = {fields:{labels: ['missing_label', 'unknown_without_label'].includes(scenario) ? [] : ['SDD']}};
+  else if (url.includes('/issue/ST-1?')) data = {id:'42'};
+  else if (url.includes('/issue/summary?')) data = {summary:{repository:{overall:{count:1}}}};
+  else if (url.includes('/issue/detail?')) data = scenario === 'unknown_without_label'
+    ? {detail:[], errors:[{error:'timeout'}]}
+    : {detail:[{repositories:[{commits:[{files:scenario === 'missing_openspec' ? [] : [{path:'openspec/ST-1/spec.md'}]}]}]}]};
+  else throw new Error('Unexpected URL: ' + url);
+  return {ok:true, json:async()=>data};
+};
+''', encoding='utf-8')
+    result = subprocess.run([node, '--import', str(preload), str(rc.script_dir / 'release-gate-sdd.mjs'), 'REL-1'],
+                            env={**os.environ, 'JIRA_API_TOKEN':'fake-token', 'JIRA_BASE_URL':'https://jira.example',
+                                 'DEBUG':'0', 'SDD_TEST_SCENARIO':scenario}, capture_output=True, text=True, timeout=10)
+    assert result.returncode == expected, result.stderr
+
+
+@pytest.mark.parametrize('outcome', [1, 2, FileNotFoundError('node')])
+def test_masked_entrypoint_also_blocks_remaining_checks(monkeypatch, outcome):
+    import ast
+    import base64
+    import zlib
+    tree = ast.parse((rc.script_dir / 'masked_release_cheker.py').read_text())
+    payload = next(n.value.value for n in tree.body if isinstance(n, ast.Assign)
+                   and any(isinstance(t, ast.Name) and t.id == '_p' for t in n.targets))
+    decoded = ast.parse(zlib.decompress(base64.b64decode(payload)).decode())
+    cls = next(n for n in decoded.body if isinstance(n, ast.ClassDef) and n.name == 'ReleaseValidator')
+    methods = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in {'_check_sdd_gate', 'check_release'}]
+    namespace = vars(rc).copy()
+    exec(compile(ast.Module(body=methods, type_ignores=[]), '<masked-gate>', 'exec'), namespace)
+    checker = stage_validator()
+    checker.jira_main = Mock()
+    checker._check_sdd_gate = namespace['_check_sdd_gate'].__get__(checker)
+    runner = Mock(side_effect=outcome) if isinstance(outcome, Exception) else Mock(
+        return_value=NS(returncode=outcome, stdout='❌ FAIL'))
+    monkeypatch.setattr(rc.subprocess, 'run', runner)
+    assert namespace['check_release'](checker, 'REL-1') is False
+    checker.jira_main.issue.assert_not_called()

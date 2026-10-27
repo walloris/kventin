@@ -11,6 +11,7 @@ import urllib3
 import logging
 import requests
 import tempfile
+import subprocess
 from itertools import count
 from html.parser import HTMLParser
 from pathlib import Path
@@ -2863,10 +2864,41 @@ class ReleaseValidator:
         rows.append('{panel}')
         return '\n'.join(rows)
 
+    def _check_sdd_gate(self, release_key: str) -> None:
+        """Run the original SDD script unchanged; its exit code is authoritative."""
+        env = os.environ.copy()
+        env['JIRA_API_TOKEN'] = config['jira']['token']
+        env['JIRA_BASE_URL'] = config['jira']['url'].rstrip('/')
+        # The original DEBUG output may contain raw HTTP response bodies.
+        env['DEBUG'] = '0'
+        result = subprocess.run(
+            ['node', str(script_dir / 'release-gate-sdd.mjs'), release_key],
+            env=env, capture_output=True, text=True, encoding='utf-8', errors='replace',
+            check=False,
+        )
+        output = result.stdout.strip()
+        if output:
+            print(output, flush=True)
+        if result.returncode == 0:
+            self._log_issue(release_key, 'success', 'SDD: проверка пройдена')
+        elif result.returncode == 1:
+            self._log_issue(release_key, 'error',
+                            'SDD: проверка не пройдена. Остальные проверки не запускались.'
+                            + ('\n' + output if output else ''))
+        else:
+            self._log_issue(release_key, 'error',
+                            f'SDD: проверка не выполнена (код {result.returncode}). '
+                            'Остальные проверки не запускались.')
+
     def check_release(self, release_key):
         self._reset_release_run()
         print(f"🔍 Проверка релиза: {release_key}")
         print("⏳ Выполняется анализ...\n")
+
+        self._run_check('sdd', 'SDD: лейбл и openspec', lambda: self._check_sdd_gate(release_key))
+        if self.check_results[-1]['status'] != 'PASS':
+            print("\n[CHECK SUMMARY]\n" + self._checks_wiki_table(), flush=True)
+            return False
 
         try:
             release = self.jira_main.issue(release_key, expand='subtasks')
