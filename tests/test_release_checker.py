@@ -485,7 +485,8 @@ def test_merged_pr_in_structured_array_without_url_is_detected(validator):
     ('_check_unlinked_release_items_pull_requests', True),
 ])
 def test_all_applicable_release_stages_execute_despite_one_crash(failed_method, ready, monkeypatch):
-    monkeypatch.setattr(rc.subprocess, 'run', Mock(return_value=NS(returncode=0, stdout='✅ PASS')))
+    monkeypatch.setattr(rc.ReleaseValidator, '_check_sdd_gate',
+                        lambda self, key: self._log_issue(key, 'success', 'SDD: проверка пройдена'))
     checker = stage_validator()
     release = NS(key='REL-1', fields=NS(summary='Cloud release', labels=['back', 'web'],
                                       assignee=None, issuelinks=[]))
@@ -2410,197 +2411,319 @@ def test_other_release_read_failure_blocks():
     assert 'статус не удалось получить' in str(checker.report_data['ABC-2']['errors'])
 
 
-@pytest.mark.parametrize('outcome', [1, 2, -15, FileNotFoundError('node'), OSError('launch failed')])
-def test_sdd_failure_stops_before_any_other_release_work(monkeypatch, outcome):
+@pytest.fixture
+def native_sdd(monkeypatch):
+    """Native SDD requests never access the network or sleep in tests."""
     checker = stage_validator()
+    session = Mock()
+    session.headers = {}
+    monkeypatch.setattr(rc.requests, 'Session', lambda: nullcontext(session))
+    monkeypatch.setattr(rc, 'config', {'jira': {'url': 'https://jira.example', 'token': 'test-token'}})
+    monkeypatch.setattr(rc.time, 'sleep', Mock())
     checker._reset_release_run = Mock()
     checker.jira_main = Mock()
-    checker._check_required_platform_label = Mock()
-    runner = Mock(side_effect=outcome) if isinstance(outcome, Exception) else Mock(
-        return_value=NS(returncode=outcome, stdout='❌ FAIL'))
-    monkeypatch.setattr(rc.subprocess, 'run', runner)
-    assert checker.check_release('REL-1') is False
-    checker.jira_main.issue.assert_not_called()
-    checker._check_required_platform_label.assert_not_called()
-    assert len(checker.check_results) == 1
-    assert checker.check_results[0]['required'] is True
-    assert checker.check_results[0]['status'] in {'FAIL', 'INCOMPLETE'}
-    assert sum(len(row['errors']) for row in checker.report_data.values()) > 0
+    return checker, session
 
 
-def test_sdd_uses_config_and_absolute_script_path(monkeypatch):
-    checker = stage_validator()
-    runner = Mock(return_value=NS(returncode=0, stdout='✅ PASS'))
-    monkeypatch.setattr(rc.subprocess, 'run', runner)
-    monkeypatch.setattr(rc, 'config', {'jira': {'url': 'https://jira.example/', 'token': 'test-token'}})
-    monkeypatch.setenv('JIRA_BASE_URL', 'https://wrong.example')
-    monkeypatch.setenv('DEBUG', '1')
+def sdd_responses(labels=None, detail=None, *, issues=None, issue_id='42', repo_count=1):
+    """One linked Story and its API responses in original request order."""
+    data = [
+        {'issues': [{'key': 'ST-1'}] if issues is None else issues},
+        {'fields': {'labels': ['SDD'] if labels is None else labels}},
+        {'id': issue_id},
+        {'summary': {'repository': {'overall': {'count': repo_count}}}},
+        {'detail': [{'repositories': [{'commits': [{'files': [{'path': 'openspec/ST-1/spec.md'}]}]}]}]}
+        if detail is None else detail,
+    ]
+    return [response(200, item) for item in data]
+
+
+@pytest.mark.parametrize('labels,path,expected,errors', [
+    (['SDD'], 'openspec/ST-1/spec.md', 'PASS', 0),
+    (['sDd'], 'OPENSPEC/st-1/spec.md', 'PASS', 0),
+    (['#SDD'], 'openspec/ST-1/spec.md', 'FAIL', 1),
+    ([' SDD '], 'openspec/ST-1/spec.md', 'FAIL', 1),
+    ([], 'openspec/ST-1/spec.md', 'FAIL', 1),
+    (['SDD'], 'docs/openspec/ST-1/spec.md', 'FAIL', 1),
+    (['SDD'], 'openspec/ST-10/spec.md', 'PASS', 0),
+    (['SDD'], 'openspec/team/ST-1/spec.md', 'PASS', 0),
+    (['SDD'], 'openspec/ST-2/spec.md', 'FAIL', 1),
+    ([], 'openspec/ST-2/spec.md', 'FAIL', 2),
+])
+def test_native_sdd_original_decision_rules(native_sdd, labels, path, expected, errors):
+    checker, session = native_sdd
+    detail = {'detail': [{'repositories': [{'commits': [{'files': [{'path': path}]}]}]}]}
+    session.get.side_effect = sdd_responses(labels, detail)
+    checker._run_check('sdd', 'SDD', lambda: checker._check_sdd_gate('REL-1'))
+    assert checker.check_results[0]['status'] == expected
+    assert len(checker.report_data['ST-1']['errors']) == errors
+    assert session.headers == {'Authorization': 'Bearer test-token', 'Accept': 'application/json'}
+    assert session.get.call_args_list[0].kwargs['params'] == {
+        'jql': 'issue IN linkedIssues("REL-1") AND type = Story', 'maxResults': 200, 'fields': 'key'}
+    for call in session.get.call_args_list:
+        assert call.kwargs['timeout'] == (5, 30)
+        assert 'verify' in call.kwargs
+    assert rc.time.sleep.call_args_list == [((11,),)]
+
+
+def test_native_sdd_has_no_linked_stories(native_sdd):
+    checker, session = native_sdd
+    session.get.side_effect = sdd_responses(issues=[])[:1]
     checker._run_check('sdd', 'SDD', lambda: checker._check_sdd_gate('REL-1'))
     assert checker.check_results[0]['status'] == 'PASS'
-    args, kwargs = runner.call_args
-    assert args[0] == ['node', str(rc.script_dir / 'release-gate-sdd.mjs'), 'REL-1']
-    assert kwargs['env']['JIRA_BASE_URL'] == 'https://jira.example'
-    assert kwargs['env']['JIRA_API_TOKEN'] == 'test-token'
-    assert kwargs['env']['DEBUG'] == '0'
+    assert session.get.call_count == 1
+    assert rc.time.sleep.call_count == 0
 
 
-@pytest.mark.parametrize('scenario,expected', [
-    ('pass', 0), ('missing_label', 1), ('missing_openspec', 1),
-    ('no_stories', 0), ('unknown_without_label', 0), ('jira_error', 2),
-])
-def test_original_sdd_script_contract(tmp_path, scenario, expected, monkeypatch):
-    import os
-    import shutil
-    import subprocess
-    node = shutil.which('node')
-    if not node:
-        pytest.skip('Node.js required for original SDD contract tests')
-    preload = tmp_path / 'fake-jira.mjs'
-    preload.write_text('''
-const scenario = process.env.SDD_TEST_SCENARIO;
-globalThis.setTimeout = (callback) => { callback(); return 0; };
-globalThis.fetch = async (url) => {
-  let data;
-  if (scenario === 'jira_error') throw new Error('synthetic network error');
-  if (url.includes('/search?')) data = {issues: scenario === 'no_stories' ? [] : [{key:'ST-1'}]};
-  else if (url.includes('fields=labels')) data = {fields:{labels: ['missing_label', 'unknown_without_label'].includes(scenario) ? [] : ['SDD']}};
-  else if (url.includes('/issue/ST-1?')) data = {id:'42'};
-  else if (url.includes('/issue/summary?')) data = {summary:{repository:{overall:{count:1}}}};
-  else if (url.includes('/issue/detail?')) data = scenario === 'unknown_without_label'
-    ? {detail:[], errors:[{error:'timeout'}]}
-    : {detail:[{repositories:[{commits:[{files:scenario === 'missing_openspec' ? [] : [{path:'openspec/ST-1/spec.md'}]}]}]}]};
-  else throw new Error('Unexpected URL: ' + url);
-  return {ok:true, json:async()=>data};
-};
-''', encoding='utf-8')
-    result = subprocess.run([node, '--import', str(preload), str(rc.script_dir / 'release-gate-sdd.mjs'), 'REL-1'],
-                            env={**os.environ, 'JIRA_API_TOKEN':'fake-token', 'JIRA_BASE_URL':'https://jira.example',
-                                 'DEBUG':'0', 'SDD_TEST_SCENARIO':scenario}, capture_output=True, text=True, timeout=10)
-    assert result.returncode == expected, result.stderr
-    checker = stage_validator()
-    monkeypatch.setattr(rc.subprocess, 'run', Mock(return_value=result))
+@pytest.mark.parametrize('kind', ['timeout_errors', 'other_errors', 'http_error'])
+def test_native_sdd_unknown_does_not_invent_missing_artifacts(native_sdd, kind):
+    checker, session = native_sdd
+    retry = response(503) if kind == 'http_error' else response(200, {
+        'detail': [], 'errors': [{'error': 'timeout' if kind == 'timeout_errors' else 'other failure'}]})
+    session.get.side_effect = sdd_responses(labels=[])[:4] + [retry] * 4
     checker._run_check('sdd', 'SDD', lambda: checker._check_sdd_gate('REL-1'))
-    body = checker._release_comment('REL-1', expected == 0)
-    if scenario == 'missing_label':
-        assert 'Добавьте в Jira' in body and 'без символа &#35;' in body
-    elif scenario == 'missing_openspec':
-        assert 'openspec/ST-1' in body and 'свяжите коммит с ST-1' in body
-    elif expected == 0:
-        assert checker.check_results[0]['status'] == 'PASS'
+    assert checker.check_results[0]['status'] == 'WARN'
+    assert not checker.report_data['ST-1']['errors']
+    assert 'не блокирует гейт' in checker.report_data['ST-1']['warnings'][0]
+    assert rc.time.sleep.call_count == 4
+    assert 'X-Requested-With' not in session.headers
 
 
-@pytest.mark.parametrize('outcome', [1, 2, FileNotFoundError('node')])
-def test_masked_entrypoint_also_blocks_remaining_checks(monkeypatch, outcome):
+@pytest.mark.parametrize('summary_response', [response(200, {}), response(403),
+    response(200, {'summary': {'repository': {'overall': {'count': 0}}}})])
+def test_native_sdd_summary_without_repositories_is_false(native_sdd, summary_response):
+    checker, session = native_sdd
+    session.get.side_effect = sdd_responses()[:3] + [summary_response]
+    assert checker.check_release('REL-1') is False
+    checker.jira_main.issue.assert_not_called()
+    assert 'openspec/ST-1' in checker.report_data['ST-1']['errors'][0]
+    assert session.get.call_count == 4
+    assert rc.time.sleep.call_count == 0
+
+
+def test_native_sdd_missing_issue_id_is_false(native_sdd):
+    checker, session = native_sdd
+    session.get.side_effect = sdd_responses(issue_id=None)[:3]
+    assert checker.check_release('REL-1') is False
+    assert 'openspec/ST-1' in checker.report_data['ST-1']['errors'][0]
+    assert session.get.call_count == 3
+
+
+def test_native_sdd_retry_success_and_other_instance_error(native_sdd):
+    checker, session = native_sdd
+    session.get.side_effect = sdd_responses()[:4] + [response(503),
+        response(200, {'detail': [], 'errors': [{'error': 'timeout'}]}),
+        response(200, {**sdd_responses()[-1].json(), 'errors': [{'error': 'other instance timeout'}]})]
+    checker._run_check('sdd', 'SDD', lambda: checker._check_sdd_gate('REL-1'))
+    assert checker.check_results[0]['status'] == 'PASS'
+    assert rc.time.sleep.call_count == 3
+
+
+@pytest.mark.parametrize('failure,detail', [
+    (requests.Timeout('private-secret'), 'таймаут'),
+    (requests.exceptions.SSLError('private-secret'), 'TLS'),
+    (requests.ConnectionError('private-secret'), 'подключения'),
+    (response(401), 'HTTP 401'), (response(403), 'HTTP 403'),
+    (response(500), 'HTTP 500'), (response(200, []), 'формат данных'),
+])
+def test_native_sdd_technical_errors_block_without_secret_leaks(native_sdd, failure, detail):
+    checker, session = native_sdd
+    session.get.side_effect = failure if isinstance(failure, Exception) else [failure]
+    assert checker.check_release('REL-1') is False
+    checker.jira_main.issue.assert_not_called()
+    assert checker.check_results[0]['status'] == 'INCOMPLETE'
+    body = checker._release_comment('REL-1', False)
+    assert detail in body
+    assert 'Остальные проверки не запускались' in body
+    assert 'private-secret' not in body
+
+
+def test_native_sdd_invalid_json_blocks(native_sdd):
+    checker, session = native_sdd
+    session.get.return_value = NS(status_code=200, json=Mock(side_effect=ValueError('private-secret')))
+    assert checker.check_release('REL-1') is False
+    body = checker._release_comment('REL-1', False)
+    assert 'некорректный JSON' in body and 'private-secret' not in body
+
+
+def test_native_sdd_no_new_runtime_or_companion_file(native_sdd, monkeypatch, tmp_path):
+    checker, session = native_sdd
+    monkeypatch.setattr(rc, 'script_dir', tmp_path)
+    session.get.side_effect = sdd_responses()
+    checker._run_check('sdd', 'SDD', lambda: checker._check_sdd_gate('REL-1'))
+    assert checker.check_results[0]['status'] == 'PASS'
+    assert list(tmp_path.iterdir()) == []
+    assert not hasattr(rc, 'SDD_GATE_SOURCE')
+    assert not hasattr(rc, 'subprocess')
+
+
+def test_native_sdd_comment_lists_both_missing_requirements(native_sdd):
+    checker, session = native_sdd
+    session.get.side_effect = sdd_responses(labels=[], detail={'detail': []})
+    assert checker.check_release('REL-1') is False
+    body = checker._release_comment('REL-1', False)
+    assert '[ST-1|' in body and 'Добавьте в Jira' in body
+    assert 'без символа &#35;' in body and 'openspec/ST-1' in body
+    assert 'свяжите коммит с ST-1' in body
+
+
+def test_native_sdd_unknown_still_allows_remaining_checks(native_sdd):
+    """Do not silently strengthen the supplied unknown=PASS policy."""
+    checker, session = native_sdd
+    session.get.side_effect = sdd_responses(labels=[])[:4] + [response(503)] * 4
+    checker.jira_main.issue.return_value = NS(key='REL-1', fields=NS(
+        summary='Release', labels=[], assignee=None, issuelinks=[]))
+    checker._extract_consist_of_issues = Mock(return_value=None)
+    for name in ('_check_required_platform_label', '_check_release_service_consistency',
+                 '_check_test_subtask', '_check_artifacts', '_check_release_coverage',
+                 '_check_zephyr_test_cases', '_check_back_release_service_test_cycles',
+                 '_check_web_release_service_test_cycles', '_check_bugs', '_check_stories',
+                 '_check_required_pull_requests', '_check_unlinked_release_items_pull_requests',
+                 '_check_gigacode_aifixed_labels', '_check_cloud_label',
+                 '_check_sbrppl_third_party_label', '_check_sbrppl_story_points',
+                 '_check_summary_description_match'):
+        setattr(checker, name, Mock())
+    assert checker.check_release('REL-1') is True
+    checker.jira_main.issue.assert_called_once()
+    checker._check_artifacts.assert_called_once()
+    assert checker.check_results[0]['status'] == 'WARN'
+
+
+def test_packed_entrypoint_uses_same_native_sdd(monkeypatch, native_sdd):
+    """The older packed entrypoint must not retain JavaScript or stale SDD code."""
     import ast
     import base64
     import zlib
     tree = ast.parse((rc.script_dir / 'masked_release_cheker.py').read_text())
     payload = next(n.value.value for n in tree.body if isinstance(n, ast.Assign)
                    and any(isinstance(t, ast.Name) and t.id == '_p' for t in n.targets))
-    decoded = ast.parse(zlib.decompress(base64.b64decode(payload)).decode())
-    cls = next(n for n in decoded.body if isinstance(n, ast.ClassDef) and n.name == 'ReleaseValidator')
+    decoded = zlib.decompress(base64.b64decode(payload)).decode()
+    assert 'SDD_GATE_SOURCE' not in decoded and 'subprocess' not in decoded
+    namespace = dict(vars(rc))
+    parsed = ast.parse(decoded)
+    helpers = [n for n in parsed.body if isinstance(n, (ast.ClassDef, ast.FunctionDef))
+               and n.name in {'SddCheckError', 'sdd_get_json', 'sdd_story_result'}]
+    exec(compile(ast.Module(body=helpers, type_ignores=[]), '<packed-sdd>', 'exec'), namespace)
+    cls = next(n for n in parsed.body if isinstance(n, ast.ClassDef) and n.name == 'ReleaseValidator')
     methods = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in {'_check_sdd_gate', 'check_release'}]
-    namespace = vars(rc).copy()
-    exec(compile(ast.Module(body=methods, type_ignores=[]), '<masked-gate>', 'exec'), namespace)
-    checker = stage_validator()
-    checker.jira_main = Mock()
+    exec(compile(ast.Module(body=methods, type_ignores=[]), '<packed-gate>', 'exec'), namespace)
+    checker, session = native_sdd
     checker._check_sdd_gate = namespace['_check_sdd_gate'].__get__(checker)
-    runner = Mock(side_effect=outcome) if isinstance(outcome, Exception) else Mock(
-        return_value=NS(returncode=outcome, stdout='❌ FAIL'))
-    monkeypatch.setattr(rc.subprocess, 'run', runner)
+    session.get.side_effect = sdd_responses(labels=[], detail={'detail': []})
     assert namespace['check_release'](checker, 'REL-1') is False
     checker.jira_main.issue.assert_not_called()
+    assert len(checker.report_data['ST-1']['errors']) == 2
 
 
-def test_sdd_reports_each_missing_requirement_in_comment(monkeypatch, capsys):
-    """A mixed failure retains every concrete remedy in both report formats."""
-    output = '''
-[REL-1](https://jira.example/browse/REL-1)
-  [ST-1](https://jira.example/browse/ST-1)   #SDD: 🔴   openspec: 🟢
-  [ST-2](https://jira.example/browse/ST-2)   #SDD: 🟢   openspec: 🔴
-  [ST-3](https://jira.example/browse/ST-3)   #SDD: 🔴   openspec: 🔴
-  [ST-4](https://jira.example/browse/ST-4)   #SDD: 🔴   openspec: ⚪
-  [ST-5](https://jira.example/browse/ST-5)   #SDD: 🟢   openspec: 🟢
-❌ FAIL
-'''
-    monkeypatch.setattr(rc.subprocess, 'run', Mock(return_value=NS(returncode=1, stdout=output)))
+@pytest.mark.parametrize('kind', ['approved', 'testing_type'])
+def test_required_cycle_without_key_is_incomplete(kind):
+    """A cycle name cannot substitute for the key needed to validate its contents."""
     checker = stage_validator()
-    checker._reset_release_run = Mock()
-    checker.jira_main = Mock()
-    assert checker.check_release('REL-1') is False
-    checker.jira_main.issue.assert_not_called()
-    assert len(checker.report_data['ST-1']['errors']) == 1
-    assert 'без символа #' in checker.report_data['ST-1']['errors'][0]
-    assert 'openspec/ST-2' in checker.report_data['ST-2']['errors'][0]
-    assert len(checker.report_data['ST-3']['errors']) == 2
-    assert not checker.report_data['ST-4']['errors']
-    assert 'Отсутствие артефактов не подтверждено' in checker.report_data['ST-4']['warnings'][0]
-    assert not checker.report_data['ST-5']['errors']
-    body = checker._release_comment('REL-1', False)
-    for key in ('ST-1', 'ST-2', 'ST-3', 'ST-4'):
-        assert f'[{key}|' in body
-    for text in ('Добавьте в Jira', 'без символа &#35;', 'openspec/ST-2', 'openspec/ST-3',
-                 'свяжите коммит', 'Отсутствие артефактов не подтверждено'):
-        assert text in body
-    assert 'Остальные проверки не запускались' in body
-    assert '#SDD: 🔴' not in body
-    assert 'openspec/ST-3' in capsys.readouterr().out
-
-
-@pytest.mark.parametrize('outcome,detail', [
-    (FileNotFoundError('node'), 'Установите Node.js 18+'),
-    (2, 'права токена на чтение Story и dev-status'),
-    (1, 'не вернул подробности по Story'),
-])
-def test_sdd_technical_remedy_survives_jira_comment(monkeypatch, outcome, detail):
-    """Technical failures show an actionable remedy rather than a generic message."""
-    runner = Mock(side_effect=outcome) if isinstance(outcome, Exception) else Mock(
-        return_value=NS(returncode=outcome, stdout=''))
-    monkeypatch.setattr(rc.subprocess, 'run', runner)
-    checker = stage_validator()
-    checker._run_check('sdd', 'SDD', lambda: checker._check_sdd_gate('REL-1'))
-    body = checker._release_comment('REL-1', False)
-    assert detail in body
-    assert 'Остальные проверки не запускались' in body
-    assert checker.check_results[0]['status'] in {'FAIL', 'INCOMPLETE'}
-
-
-@pytest.mark.parametrize('stderr,remedy', [
-    ("Error: Cannot find module '/scripts/release-gate-sdd.mjs'\ncode: MODULE_NOT_FOUND", 'не смог загрузить'),
-    ('SyntaxError: Unexpected token', 'Проверьте версию Node.js'),
-    ('ReferenceError: fetch is not defined', 'недоступен встроенный fetch'),
-    ('EACCES: Permission denied', 'Нет прав на чтение'),
-    ("ReferenceError: Cannot access 'DEBUG' before initialization", 'токен Jira задан'),
-    ('unknown launch failure', 'Причина отказа не установлена'),
-])
-def test_sdd_empty_stdout_is_technical_failure(monkeypatch, stderr, remedy):
-    """A startup failure must never be presented as missing Story requirements."""
-    runner = Mock(return_value=NS(returncode=1, stdout='', stderr=stderr + '\nBearer private-secret'))
-    monkeypatch.setattr(rc.subprocess, 'run', runner)
-    checker = stage_validator()
-    checker._reset_release_run = Mock()
-    checker.jira_main = Mock()
-    assert checker.check_release('REL-1') is False
-    checker.jira_main.issue.assert_not_called()
+    checker._zephyr_cycle_approved_checked = set()
+    checker._zephyr_cycle_testing_type_checked = set()
+    callback = (lambda: checker._check_test_cycle_cases_approved('REL-1', '', 'Release regress')) if kind == 'approved' else (
+        lambda: checker._check_test_cycle_testing_type('REL-1', '', 'Release regress', 'Регресс'))
+    checker._run_check('web_cycles', 'Web: ТЦ', callback)
     assert checker.check_results[0]['status'] == 'INCOMPLETE'
-    assert len(checker.report_data['REL-1']['errors']) == 1
-    body = checker._release_comment('REL-1', False)
-    assert remedy in body
-    assert 'Требования Story не оценены' in body
-    assert 'Исправьте замечания по Story' not in body
-    assert 'private-secret' not in body
+    assert checker.report_data['REL-1']['errors']
+    assert 'отсутствует ключ ТЦ' in checker.report_data['REL-1']['errors'][0]
 
 
-def test_sdd_missing_script_explains_deployment_problem(monkeypatch, tmp_path):
-    """Identify an incomplete deployment before launching Node.js."""
-    monkeypatch.setattr(rc, 'script_dir', tmp_path)
-    runner = Mock()
-    monkeypatch.setattr(rc.subprocess, 'run', runner)
+def test_confluence_unavailable_page_blocks_and_does_not_skip_other_pages(monkeypatch):
+    """Unreadable Confluence data is not proof that no production bugs are listed."""
+    monkeypatch.setattr(rc, 'config', {'jira': {'url': 'https://jira.example'},
+                                     'confluence': {'url': 'https://wiki.example'}})
     checker = stage_validator()
-    checker._run_check('sdd', 'SDD', lambda: checker._check_sdd_gate('REL-1'))
-    runner.assert_not_called()
+    checker.confluence = Mock()
+    checker.confluence_parent_page = 'root'
+    checker.confluence.get_child_pages.return_value = [
+        {'id': '1', 'title': 'HRC prod 1'}, {'id': '2', 'title': 'HRC prod 2'}]
+    checker.confluence.get_page_by_id.side_effect = [requests.Timeout('private-secret'),
+        {'body': {'storage': {'value': '<p>HRC-1</p>'}}}]
+    bug = NS(key='HRC-1', fields=NS(summary='Prod bug', assignee=None))
+    checker._run_check('bugs', 'Баги', lambda: checker._check_confluence([bug]))
     assert checker.check_results[0]['status'] == 'INCOMPLETE'
-    body = checker._release_comment('REL-1', False)
-    assert 'отсутствует файл' in body
-    assert 'Скопируйте release-gate-sdd.mjs' in body
-    assert 'Остальные проверки не запускались' in body
+    assert checker.report_data['GENERAL']['errors']
+    assert checker.report_data['HRC-1']['errors']
+    assert checker.confluence.get_page_by_id.call_count == 2
+    assert 'private-secret' not in checker._release_comment('REL-1', False)
+
+
+@pytest.mark.parametrize('content,found', [
+    ('<p>HRC-10 HRC-100 XHRC-1 HRC-1X</p>', False),
+    ('<p>HRC-1</p>', True),
+    ('<ac:parameter ac:name="key">HRC-1</ac:parameter>', True),
+    ('<a href="https://jira.example/browse/HRC-1">Bug</a>', True),
+])
+def test_confluence_matches_complete_bug_key(validator, monkeypatch, content, found):
+    monkeypatch.setattr(rc, 'config', {'confluence': {'url': 'https://wiki.example'}})
+    validator.confluence = Mock()
+    validator.confluence_parent_page = 'root'
+    validator.confluence.get_child_pages.return_value = [{'id': '1', 'title': 'HRC prod'}]
+    validator.confluence.get_page_by_id.return_value = {'body': {'storage': {'value': content}}}
+    validator._check_confluence([NS(key='HRC-1')])
+    assert validator._log_issue.called is found
+
+
+def status_transition(date, status):
+    """A minimal Jira changelog entry for chronology regressions."""
+    return NS(created=date, items=[NS(field='status', toString=status)])
+
+
+@pytest.mark.parametrize('histories,total,start_at', [([], 200, 0),
+    ([status_transition('2026-10-01T10:00:00+00:00', 'Done')], 1, 1)])
+def test_partial_history_never_produces_precise_duration_or_timing_success(histories, total, start_at):
+    checker = stage_validator()
+    changelog = NS(histories=histories, total=total, startAt=start_at)
+    with pytest.raises(ValueError, match='неполную историю'):
+        checker._calc_status_days(changelog, ['IFT'])
+    story = NS(key='HRC-1', fields=NS(summary='Story', assignee=None))
+    checker._run_check('stories', 'Story', lambda: checker._run_story_check(
+        story, 'Порядок привязки требований', lambda: checker._check_story_requirements_timing(story, changelog)))
+    assert checker.check_results[0]['status'] == 'INCOMPLETE'
+    assert checker.report_data['HRC-1']['errors']
+
+
+@pytest.mark.parametrize('timestamp', ['broken', '', '2026-10-01T10:00:00'])
+def test_invalid_history_timestamp_is_not_silently_skipped(timestamp):
+    checker = stage_validator()
+    changelog = NS(histories=[status_transition(timestamp, 'IFT')])
+    with pytest.raises(ValueError, match='Некорректная дата'):
+        checker._calc_status_days(changelog, ['IFT'])
+    with pytest.raises(ValueError, match='Некорректная дата'):
+        checker._check_story_requirements_timing(NS(key='HRC-1'), changelog)
+
+
+def test_complete_history_duration_still_counts_testing_intervals():
+    changelog = NS(histories=[status_transition('2026-10-02T10:00:00+00:00', 'Done'),
+                              status_transition('2026-10-01T10:00:00+00:00', 'IFT')], total=2, startAt=0)
+    assert rc.ReleaseValidator._calc_status_days(changelog, ['IFT']) == 1.0
+
+
+def test_requirements_changes_sort_by_real_timestamp_not_timezone_text(validator):
+    changelog = NS(histories=[
+        status_transition('2026-10-01T12:00:00+03:00', 'UAT'),
+        NS(created='2026-10-01T10:00:00+00:00', items=[
+            NS(field='customfield_21100', fieldId='customfield_21100')]),
+    ], total=2, startAt=0)
+    validator._check_story_requirements_timing(NS(key='HRC-1'), changelog)
+    assert validator._log_issue.call_count == 1
+    assert validator._log_issue.call_args.args[1] == 'error'
+    assert 'после перехода' in validator._log_issue.call_args.args[2]
+
+
+@pytest.mark.parametrize('ready,logged_error,expected', [(False, False, False), (True, True, False), (True, False, True)])
+def test_report_honors_validation_verdict_and_errors(monkeypatch, ready, logged_error, expected):
+    checker = stage_validator()
+    monkeypatch.setattr(rc, 'config', {'jira': {'url': 'https://jira.example'}})
+    checker._manage_jira_comment = Mock()
+    def validate(key):
+        if logged_error:
+            checker._log_issue(key, 'error', 'Confirmed failure')
+        return ready
+    checker.check_release = validate
+    assert checker.generate_report('REL-1') is expected
+    checker._manage_jira_comment.assert_called_once_with('REL-1', expected)
+    if not expected:
+        assert checker.report_data['REL-1']['errors']
+        assert '#de350b' in checker._release_comment('REL-1', False)

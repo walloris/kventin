@@ -11,7 +11,6 @@ import urllib3
 import logging
 import requests
 import tempfile
-import subprocess
 from itertools import count
 from html.parser import HTMLParser
 from pathlib import Path
@@ -1578,6 +1577,80 @@ class CachedJiraReads:
         return read
 
 
+# SDD decision rules mirror the supplied gate; HTTP uses the existing Python stack.
+class SddCheckError(RuntimeError):
+    """An SDD request failed; messages contain no server bodies or credentials."""
+
+
+def sdd_get_json(session: requests.Session, base_url: str, path: str,
+                 params: dict, *, allow_http_failure: bool = False) -> Optional[dict]:
+    """Read one SDD endpoint, retaining the original non-2xx handling."""
+    try:
+        response = session.get(base_url.rstrip('/') + path, params=params, timeout=(5, 30),
+                               verify=release_tls_policy())
+    except requests.exceptions.SSLError:
+        raise SddCheckError('Ошибка TLS. Проверьте RELEASE_CHECKER_CA_BUNDLE и политику TLS.') from None
+    except requests.Timeout:
+        raise SddCheckError('Истёк таймаут запроса Jira/Bitbucket. Повторите запуск.') from None
+    except requests.RequestException:
+        raise SddCheckError('Ошибка подключения к Jira/Bitbucket. Проверьте сеть и доступ.') from None
+    if not 200 <= response.status_code < 300:
+        if allow_http_failure:
+            return None
+        advice = ('Проверьте токен и права чтения Jira.' if response.status_code in {401, 403}
+                  else 'Проверьте доступность Jira и повторите запуск.')
+        raise SddCheckError(f'Jira HTTP {response.status_code}. {advice}')
+    try:
+        payload = response.json()
+    except ValueError:
+        raise SddCheckError('Jira/Bitbucket вернул некорректный JSON. Повторите запуск.') from None
+    if not isinstance(payload, dict):
+        raise SddCheckError('Jira/Bitbucket вернул неожиданный формат данных. Повторите запуск.')
+    return payload
+
+
+def sdd_story_result(session: requests.Session, base_url: str, key: str) -> tuple[bool, Optional[bool]]:
+    """Check one Story, preserving label, prefix, summary and retry semantics."""
+    issue = sdd_get_json(session, base_url, f'/rest/api/2/issue/{key}', {'fields': 'labels'})
+    labels = (issue.get('fields') or {}).get('labels') or []
+    has_sdd = any(label.lower() == 'sdd' for label in labels)
+    resolved = sdd_get_json(session, base_url, f'/rest/api/2/issue/{key}', {'fields': 'summary'})
+    issue_id = resolved.get('id')
+    if not issue_id:
+        return has_sdd, False
+    summary = sdd_get_json(session, base_url, '/rest/dev-status/1.0/issue/summary',
+                           {'issueId': issue_id, '_': int(time.time() * 1000)}, allow_http_failure=True)
+    repository = ((summary or {}).get('summary') or {}).get('repository') or {}
+    repo_count = (repository.get('overall') or {}).get('count') or 0
+    if repo_count == 0:
+        return has_sdd, False
+    session.headers['X-Requested-With'] = 'XMLHttpRequest'
+    try:
+        for _ in range(4):
+            time.sleep(11)
+            data = sdd_get_json(session, base_url, '/rest/dev-status/1.0/issue/detail',
+                                {'issueId': issue_id, 'applicationType': 'stash',
+                                 'dataType': 'repository', '_': int(time.time() * 1000)},
+                                allow_http_failure=True)
+            if data is None:
+                continue
+            details = data.get('detail') or []
+            if not details and (data.get('errors') or []):
+                continue
+            pattern = re.compile(r'(?:/|^)' + re.escape(key.lower()), re.I)
+            for group in details:
+                for repo in group.get('repositories') or []:
+                    for commit in repo.get('commits') or []:
+                        for file in commit.get('files') or []:
+                            path = file['path'].lower()
+                            if path.startswith('openspec/') and pattern.search(path):
+                                return has_sdd, True
+            return has_sdd, False
+        return has_sdd, None
+    finally:
+        session.headers.pop('X-Requested-With', None)
+
+
 class ReleaseValidator:
     def __init__(self):
         self.jira_main = CachedJiraReads(JIRA(
@@ -2377,8 +2450,8 @@ class ReleaseValidator:
         if not cycle_key:
             self._log_issue(
                 release_key,
-                "warning",
-                f"ТЦ '{cycle_name}': нет key, невозможно проверить статусы ТК внутри ТЦ"
+                "error",
+                f"ТЦ '{cycle_name}': не удалось проверить статусы ТК — отсутствует ключ ТЦ"
             )
             return
 
@@ -2472,8 +2545,8 @@ class ReleaseValidator:
         if not cycle_key:
             self._log_issue(
                 release_key,
-                "warning",
-                f"ТЦ '{cycle_name}': нет key, невозможно проверить поле '{ZEPHYR_TESTING_TYPE_FIELD}'"
+                "error",
+                f"ТЦ '{cycle_name}': не удалось проверить поле '{ZEPHYR_TESTING_TYPE_FIELD}' — отсутствует ключ ТЦ"
             )
             return
 
@@ -2867,98 +2940,59 @@ class ReleaseValidator:
         return '\n'.join(rows)
 
     def _check_sdd_gate(self, release_key: str) -> None:
-        """Run the original SDD script unchanged; its exit code is authoritative."""
-        gate_path = script_dir / 'release-gate-sdd.mjs'
-        if not gate_path.is_file():
-            self._log_issue(release_key, 'error',
-                            f'SDD: проверка не выполнена — отсутствует файл {gate_path}. '
-                            'Скопируйте release-gate-sdd.mjs из репозитория в каталог '
-                            'рядом с release_checker.py. Остальные проверки не запускались.')
-            return
-        env = os.environ.copy()
-        env['JIRA_API_TOKEN'] = config['jira']['token']
-        env['JIRA_BASE_URL'] = config['jira']['url'].rstrip('/')
-        # The original DEBUG output may contain raw HTTP response bodies.
-        env['DEBUG'] = '0'
+        """Run the native Python SDD gate before all other release checks."""
+        current_key = release_key
         try:
-            result = subprocess.run(
-                ['node', str(gate_path), release_key],
-                env=env, capture_output=True, text=True, encoding='utf-8', errors='replace',
-                check=False,
-            )
-        except FileNotFoundError:
-            self._log_issue(release_key, 'error',
-                            'SDD: проверка не выполнена — Node.js недоступен. '
-                            'Установите Node.js 18+ и добавьте node в PATH среды запуска. '
-                            'Остальные проверки не запускались.')
-            return
-        output = result.stdout.strip()
-        if output:
-            print(output, flush=True)
-        if result.returncode == 0:
-            self._log_issue(release_key, 'success', 'SDD: проверка пройдена')
-        elif result.returncode == 1:
-            # Read findings from the original output without recomputing its verdict.
-            rows = re.findall(
-                r'^\s*\[([A-Z][A-Z0-9_]*-\d+)\]\([^\n]*?\)\s+'
-                r'#SDD:\s*(🟢|🔴)\s+openspec:\s*(🟢|🔴|⚪)',
-                output, re.MULTILINE,
-            )
-            if not rows:
-                stderr = getattr(result, 'stderr', '') or ''
-                # Use fixed explanations, never raw stderr (which may contain secrets).
-                if 'MODULE_NOT_FOUND' in stderr or 'ERR_MODULE_NOT_FOUND' in stderr:
-                    reason = ('Node.js не смог загрузить скрипт или модуль. '
-                              'Проверьте наличие release-gate-sdd.mjs рядом с release_checker.py '
-                              'и целостность файла из репозитория.')
-                elif 'SyntaxError' in stderr or 'bad option' in stderr:
-                    reason = ('Node.js не смог выполнить синтаксис или параметры запуска. '
-                              'Проверьте версию Node.js (требуется 18+) и целостность '
-                              'release-gate-sdd.mjs; также проверьте NODE_OPTIONS.')
-                elif 'fetch is not defined' in stderr:
-                    reason = ('В Node.js недоступен встроенный fetch. Установите Node.js 18+ '
-                              'и уберите отключение fetch из NODE_OPTIONS.')
-                elif 'EACCES' in stderr or 'Permission denied' in stderr:
-                    reason = ('Нет прав на чтение или запуск файла гейта. '
-                              'Проверьте права пользователя среды запуска на скрипт и Node.js.')
-                elif "Cannot access 'DEBUG' before initialization" in stderr:
-                    reason = ('Исходный гейт завершился до инициализации DEBUG. '
-                              'Проверьте, что токен Jira задан в конфигурации release_checker.py: '
-                              'при пустом токене исходный скрипт выдаёт эту ошибку.')
+            with requests.Session() as session:
+                session.headers.update({'Authorization': f"Bearer {config['jira']['token']}",
+                                        'Accept': 'application/json'})
+                base_url = config['jira']['url'].rstrip('/')
+                search = sdd_get_json(session, base_url, '/rest/api/2/search', {
+                    'jql': f'issue IN linkedIssues("{release_key}") AND type = Story',
+                    'maxResults': 200, 'fields': 'key'})
+                stories = [issue['key'].upper() for issue in (search.get('issues') or [])]
+                if not stories:
+                    self._log_issue(release_key, 'success',
+                                    'SDD: связанных Story нет; по исходным правилам гейт пройден.')
+                    return
+                failed = False
+                for current_key in stories:
+                    has_sdd, openspec = sdd_story_result(session, base_url, current_key)
+                    print(f"  [{current_key}]({base_url}/browse/{current_key})   "
+                          f"#SDD: {'🟢' if has_sdd else '🔴'}   openspec: "
+                          + ('⚪' if openspec is None else ('🟢' if openspec else '🔴')), flush=True)
+                    if openspec is None:
+                        self._log_issue(current_key, 'warning',
+                                        'SDD: статус openspec неизвестен — Jira/Bitbucket '
+                                        'не вернул данные. Отсутствие артефактов не подтверждено. '
+                                        'Повторите проверку после восстановления доступа. '
+                                        'По исходным правилам эта Story не блокирует гейт.')
+                        continue
+                    if not has_sdd:
+                        failed = True
+                        self._log_issue(current_key, 'error',
+                                        'SDD: у Story отсутствует лейбл SDD. Добавьте в Jira '
+                                        'лейбл SDD (без символа #; регистр не важен).')
+                    if not openspec:
+                        failed = True
+                        self._log_issue(current_key, 'error',
+                                        f'SDD: в данных Bitbucket по Story не найдены файлы '
+                                        f'openspec/{current_key}. Добавьте артефакты SDD в этот каталог '
+                                        f'и свяжите коммит с {current_key}, чтобы файлы отображались '
+                                        'в Jira dev-status. Повторите проверку после обновления данных.')
+                if failed:
+                    self._log_issue(release_key, 'error',
+                                    'SDD: проверка не пройдена. Исправьте замечания по Story '
+                                    'и повторите запуск. Остальные проверки не запускались.')
                 else:
-                    reason = ('Скрипт не вернул подробности по Story. Причина отказа '
-                              'не установлена. Проверьте Node.js 18+, NODE_OPTIONS, '
-                              'целостность release-gate-sdd.mjs и настройку токена Jira.')
-                self._log_issue(release_key, 'error',
-                                'SDD: проверка не выполнена (код 1). ' + reason
-                                + ' Требования Story не оценены. Остальные проверки не запускались.')
-                return
-            self._log_issue(release_key, 'error',
-                            'SDD: проверка не пройдена. Исправьте замечания по Story '
-                            'и повторите запуск. Остальные проверки не запускались.')
-            for key, sdd, openspec in dict.fromkeys(rows):
-                if openspec == '⚪':
-                    self._log_issue(key, 'warning',
-                                    'SDD: статус openspec неизвестен — Jira/Bitbucket '
-                                    'не вернул данные. Отсутствие артефактов не подтверждено. '
-                                    'Повторите проверку после восстановления доступа.')
-                    continue
-                if sdd == '🔴':
-                    self._log_issue(key, 'error',
-                                    'SDD: у Story отсутствует лейбл SDD. Добавьте в Jira '
-                                    'лейбл SDD (без символа #; регистр не важен).')
-                if openspec == '🔴':
-                    self._log_issue(key, 'error',
-                                    f'SDD: в данных Bitbucket по Story не найдены файлы '
-                                    f'openspec/{key}. Добавьте артефакты SDD в этот каталог '
-                                    f'и свяжите коммит с {key}, чтобы файлы отображались '
-                                    'в Jira dev-status. Повторите проверку после обновления данных.')
-        else:
-            self._log_issue(release_key, 'error',
-                            f'SDD: проверка не выполнена (код {result.returncode}). '
-                            'Список недостающих требований не получен. Проверьте доступ '
-                            'к Jira/Bitbucket, права токена на чтение Story и dev-status, '
-                            'настройку корпоративного CA для Node.js и повторите запуск. '
+                    self._log_issue(release_key, 'success', 'SDD: проверка пройдена')
+        except SddCheckError as exc:
+            self._log_issue(current_key, 'error',
+                            f'SDD: проверка не выполнена. {exc} Остальные проверки не запускались.')
+        except (KeyError, TypeError, AttributeError, ValueError):
+            self._log_issue(current_key, 'error',
+                            'SDD: проверка не выполнена — некорректная конфигурация или формат '
+                            'ответа Jira/Bitbucket. Проверьте URL, токен и доступ к API. '
                             'Остальные проверки не запускались.')
 
     def check_release(self, release_key):
@@ -2967,7 +3001,7 @@ class ReleaseValidator:
         print("⏳ Выполняется анализ...\n")
 
         self._run_check('sdd', 'SDD: лейбл и openspec', lambda: self._check_sdd_gate(release_key))
-        if self.check_results[-1]['status'] != 'PASS':
+        if self.check_results[-1]['status'] not in {'PASS', 'WARN'}:
             print("\n[CHECK SUMMARY]\n" + self._checks_wiki_table(), flush=True)
             return False
 
@@ -4039,6 +4073,17 @@ class ReleaseValidator:
                 return None
 
     @staticmethod
+    def _complete_changelog_histories(changelog) -> list:
+        """Reject truncated Jira history instead of deriving a false success."""
+        histories = getattr(changelog, 'histories', None)
+        if histories is None:
+            raise ValueError('Jira не вернула историю изменений')
+        if (getattr(changelog, 'startAt', 0) != 0
+                or getattr(changelog, 'total', len(histories)) > len(histories)):
+            raise ValueError('Jira вернула неполную историю изменений')
+        return histories
+
+    @staticmethod
     def _calc_status_days(changelog, monitored_statuses: list[str]) -> float:
         """
         По ченщикам changelog вычисляет суммарное время (в днях) нахождения
@@ -4050,13 +4095,13 @@ class ReleaseValidator:
 
         # Собираем все переходы статуса в хронологическом порядке
         transitions: list[tuple[datetime, str]] = []
-        for history in changelog.histories:
+        for history in ReleaseValidator._complete_changelog_histories(changelog):
             for item in history.items:
                 if item.field == 'status':
                     ts_str = history.created  # формат "2024-04-01T12:34:56.000+0300"
                     ts = ReleaseValidator._parse_jira_datetime(ts_str)
-                    if ts is None:
-                        continue
+                    if ts is None or ts.tzinfo is None:
+                        raise ValueError('Некорректная дата перехода статуса в истории Jira')
                     new_status = (item.toString or '').lower()
                     transitions.append((ts, new_status))
 
@@ -4301,16 +4346,14 @@ class ReleaseValidator:
         late_status_name = ''
         field_changes_after_late_status: list[tuple[str, object]] = []
 
-        histories = sorted(
-            getattr(changelog, 'histories', []) or [],
-            key=lambda history: getattr(history, 'created', '') or ''
-        )
-
-        for history in histories:
+        dated_histories = []
+        for history in self._complete_changelog_histories(changelog):
             changed_at = self._parse_jira_datetime(getattr(history, 'created', ''))
-            if changed_at is None:
-                continue
+            if changed_at is None or changed_at.tzinfo is None:
+                raise ValueError('Некорректная дата изменения в истории Jira')
+            dated_histories.append((changed_at, history))
 
+        for changed_at, history in sorted(dated_histories, key=lambda pair: pair[0]):
             for item in getattr(history, 'items', []) or []:
                 item_field = normalize_field_text(getattr(item, 'field', ''))
                 item_field_id = normalize_field_text(getattr(item, 'fieldId', ''))
@@ -6254,13 +6297,15 @@ class ReleaseValidator:
                     page_url = f"{confluence_base}/pages/viewpage.action?pageId={page['id']}"
 
                     for bug in prod_bugs:
-                        if bug.key in content:
+                        if re.search(r'(?<![A-Za-z0-9_])' + re.escape(bug.key) + r'(?![A-Za-z0-9_])', content):
                             self._log_issue(
                                 bug, "error",
                                 f"Баг найден на Confluence: [{page['title']}|{page_url}]"
                             )
                 except Exception:
-                    pass
+                    self._log_issue('GENERAL', 'error',
+                                    f"Confluence: не удалось проверить страницу {page.get('id', '—')}. "
+                                    'Проверьте доступ к странице и повторите запуск.')
 
         except Exception as e:
             self._log_issue("GENERAL", "error", f"Ошибка проверки Confluence: {e}")
@@ -6273,7 +6318,10 @@ class ReleaseValidator:
         print(f"🔗 {config['jira']['url']}/browse/{release_key}")
         print(f"{'=' * 80}\n")
 
-        self.check_release(release_key)
+        ready = self.check_release(release_key)
+        if not ready and not any(data['errors'] for data in self.report_data.values()):
+            self._log_issue(release_key, 'error',
+                            'Проверка не завершена. Повторите запуск; готовность релиза не подтверждена.')
 
         total_errors = sum(len(d['errors']) for d in self.report_data.values())
 
@@ -6303,7 +6351,7 @@ class ReleaseValidator:
 
             print("-" * 40)
 
-        is_success = (total_errors == 0)
+        is_success = bool(ready) and total_errors == 0
 
         print("=" * 80)
         if is_success:
