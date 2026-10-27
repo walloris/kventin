@@ -2563,3 +2563,44 @@ def test_sdd_technical_remedy_survives_jira_comment(monkeypatch, outcome, detail
     assert detail in body
     assert 'Остальные проверки не запускались' in body
     assert checker.check_results[0]['status'] in {'FAIL', 'INCOMPLETE'}
+
+
+@pytest.mark.parametrize('stderr,remedy', [
+    ("Error: Cannot find module '/scripts/release-gate-sdd.mjs'\ncode: MODULE_NOT_FOUND", 'не смог загрузить'),
+    ('SyntaxError: Unexpected token', 'Проверьте версию Node.js'),
+    ('ReferenceError: fetch is not defined', 'недоступен встроенный fetch'),
+    ('EACCES: Permission denied', 'Нет прав на чтение'),
+    ("ReferenceError: Cannot access 'DEBUG' before initialization", 'токен Jira задан'),
+    ('unknown launch failure', 'Причина отказа не установлена'),
+])
+def test_sdd_empty_stdout_is_technical_failure(monkeypatch, stderr, remedy):
+    """A startup failure must never be presented as missing Story requirements."""
+    runner = Mock(return_value=NS(returncode=1, stdout='', stderr=stderr + '\nBearer private-secret'))
+    monkeypatch.setattr(rc.subprocess, 'run', runner)
+    checker = stage_validator()
+    checker._reset_release_run = Mock()
+    checker.jira_main = Mock()
+    assert checker.check_release('REL-1') is False
+    checker.jira_main.issue.assert_not_called()
+    assert checker.check_results[0]['status'] == 'INCOMPLETE'
+    assert len(checker.report_data['REL-1']['errors']) == 1
+    body = checker._release_comment('REL-1', False)
+    assert remedy in body
+    assert 'Требования Story не оценены' in body
+    assert 'Исправьте замечания по Story' not in body
+    assert 'private-secret' not in body
+
+
+def test_sdd_missing_script_explains_deployment_problem(monkeypatch, tmp_path):
+    """Identify an incomplete deployment before launching Node.js."""
+    monkeypatch.setattr(rc, 'script_dir', tmp_path)
+    runner = Mock()
+    monkeypatch.setattr(rc.subprocess, 'run', runner)
+    checker = stage_validator()
+    checker._run_check('sdd', 'SDD', lambda: checker._check_sdd_gate('REL-1'))
+    runner.assert_not_called()
+    assert checker.check_results[0]['status'] == 'INCOMPLETE'
+    body = checker._release_comment('REL-1', False)
+    assert 'отсутствует файл' in body
+    assert 'Скопируйте release-gate-sdd.mjs' in body
+    assert 'Остальные проверки не запускались' in body

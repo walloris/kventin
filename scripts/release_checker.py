@@ -2868,6 +2868,13 @@ class ReleaseValidator:
 
     def _check_sdd_gate(self, release_key: str) -> None:
         """Run the original SDD script unchanged; its exit code is authoritative."""
+        gate_path = script_dir / 'release-gate-sdd.mjs'
+        if not gate_path.is_file():
+            self._log_issue(release_key, 'error',
+                            f'SDD: проверка не выполнена — отсутствует файл {gate_path}. '
+                            'Скопируйте release-gate-sdd.mjs из репозитория в каталог '
+                            'рядом с release_checker.py. Остальные проверки не запускались.')
+            return
         env = os.environ.copy()
         env['JIRA_API_TOKEN'] = config['jira']['token']
         env['JIRA_BASE_URL'] = config['jira']['url'].rstrip('/')
@@ -2875,7 +2882,7 @@ class ReleaseValidator:
         env['DEBUG'] = '0'
         try:
             result = subprocess.run(
-                ['node', str(script_dir / 'release-gate-sdd.mjs'), release_key],
+                ['node', str(gate_path), release_key],
                 env=env, capture_output=True, text=True, encoding='utf-8', errors='replace',
                 check=False,
             )
@@ -2891,15 +2898,44 @@ class ReleaseValidator:
         if result.returncode == 0:
             self._log_issue(release_key, 'success', 'SDD: проверка пройдена')
         elif result.returncode == 1:
-            self._log_issue(release_key, 'error',
-                            'SDD: проверка не пройдена. Исправьте замечания по Story '
-                            'и повторите запуск. Остальные проверки не запускались.')
             # Read findings from the original output without recomputing its verdict.
             rows = re.findall(
                 r'^\s*\[([A-Z][A-Z0-9_]*-\d+)\]\([^\n]*?\)\s+'
                 r'#SDD:\s*(🟢|🔴)\s+openspec:\s*(🟢|🔴|⚪)',
                 output, re.MULTILINE,
             )
+            if not rows:
+                stderr = getattr(result, 'stderr', '') or ''
+                # Use fixed explanations, never raw stderr (which may contain secrets).
+                if 'MODULE_NOT_FOUND' in stderr or 'ERR_MODULE_NOT_FOUND' in stderr:
+                    reason = ('Node.js не смог загрузить скрипт или модуль. '
+                              'Проверьте наличие release-gate-sdd.mjs рядом с release_checker.py '
+                              'и целостность файла из репозитория.')
+                elif 'SyntaxError' in stderr or 'bad option' in stderr:
+                    reason = ('Node.js не смог выполнить синтаксис или параметры запуска. '
+                              'Проверьте версию Node.js (требуется 18+) и целостность '
+                              'release-gate-sdd.mjs; также проверьте NODE_OPTIONS.')
+                elif 'fetch is not defined' in stderr:
+                    reason = ('В Node.js недоступен встроенный fetch. Установите Node.js 18+ '
+                              'и уберите отключение fetch из NODE_OPTIONS.')
+                elif 'EACCES' in stderr or 'Permission denied' in stderr:
+                    reason = ('Нет прав на чтение или запуск файла гейта. '
+                              'Проверьте права пользователя среды запуска на скрипт и Node.js.')
+                elif "Cannot access 'DEBUG' before initialization" in stderr:
+                    reason = ('Исходный гейт завершился до инициализации DEBUG. '
+                              'Проверьте, что токен Jira задан в конфигурации release_checker.py: '
+                              'при пустом токене исходный скрипт выдаёт эту ошибку.')
+                else:
+                    reason = ('Скрипт не вернул подробности по Story. Причина отказа '
+                              'не установлена. Проверьте Node.js 18+, NODE_OPTIONS, '
+                              'целостность release-gate-sdd.mjs и настройку токена Jira.')
+                self._log_issue(release_key, 'error',
+                                'SDD: проверка не выполнена (код 1). ' + reason
+                                + ' Требования Story не оценены. Остальные проверки не запускались.')
+                return
+            self._log_issue(release_key, 'error',
+                            'SDD: проверка не пройдена. Исправьте замечания по Story '
+                            'и повторите запуск. Остальные проверки не запускались.')
             for key, sdd, openspec in dict.fromkeys(rows):
                 if openspec == '⚪':
                     self._log_issue(key, 'warning',
@@ -2917,11 +2953,6 @@ class ReleaseValidator:
                                     f'openspec/{key}. Добавьте артефакты SDD в этот каталог '
                                     f'и свяжите коммит с {key}, чтобы файлы отображались '
                                     'в Jira dev-status. Повторите проверку после обновления данных.')
-            if not rows:
-                self._log_issue(release_key, 'error',
-                                'SDD: скрипт завершился с отказом, но не вернул '
-                                'подробности по Story. Проверьте наличие release-gate-sdd.mjs '
-                                'рядом с Python-скриптом, настройку токена Jira и повторите запуск.')
         else:
             self._log_issue(release_key, 'error',
                             f'SDD: проверка не выполнена (код {result.returncode}). '
