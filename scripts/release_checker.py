@@ -2761,6 +2761,8 @@ class ReleaseValidator:
         """Keep the action needed by the release owner; diagnostics stay in logs."""
         text = clean_report_text(message)
         lower = text.casefold()
+        if lower.startswith('sdd:'):
+            return normalize_field_text(text)
         if any(marker in lower for marker in ('zephyr debug:', 'zephyr direct scan:', 'gigachat',
                                               'сохранить кэш zephyr', 'баги не найдены в составе')):
             return ''
@@ -2871,11 +2873,18 @@ class ReleaseValidator:
         env['JIRA_BASE_URL'] = config['jira']['url'].rstrip('/')
         # The original DEBUG output may contain raw HTTP response bodies.
         env['DEBUG'] = '0'
-        result = subprocess.run(
-            ['node', str(script_dir / 'release-gate-sdd.mjs'), release_key],
-            env=env, capture_output=True, text=True, encoding='utf-8', errors='replace',
-            check=False,
-        )
+        try:
+            result = subprocess.run(
+                ['node', str(script_dir / 'release-gate-sdd.mjs'), release_key],
+                env=env, capture_output=True, text=True, encoding='utf-8', errors='replace',
+                check=False,
+            )
+        except FileNotFoundError:
+            self._log_issue(release_key, 'error',
+                            'SDD: проверка не выполнена — Node.js недоступен. '
+                            'Установите Node.js 18+ и добавьте node в PATH среды запуска. '
+                            'Остальные проверки не запускались.')
+            return
         output = result.stdout.strip()
         if output:
             print(output, flush=True)
@@ -2883,11 +2892,42 @@ class ReleaseValidator:
             self._log_issue(release_key, 'success', 'SDD: проверка пройдена')
         elif result.returncode == 1:
             self._log_issue(release_key, 'error',
-                            'SDD: проверка не пройдена. Остальные проверки не запускались.'
-                            + ('\n' + output if output else ''))
+                            'SDD: проверка не пройдена. Исправьте замечания по Story '
+                            'и повторите запуск. Остальные проверки не запускались.')
+            # Read findings from the original output without recomputing its verdict.
+            rows = re.findall(
+                r'^\s*\[([A-Z][A-Z0-9_]*-\d+)\]\([^\n]*?\)\s+'
+                r'#SDD:\s*(🟢|🔴)\s+openspec:\s*(🟢|🔴|⚪)',
+                output, re.MULTILINE,
+            )
+            for key, sdd, openspec in dict.fromkeys(rows):
+                if openspec == '⚪':
+                    self._log_issue(key, 'warning',
+                                    'SDD: статус openspec неизвестен — Jira/Bitbucket '
+                                    'не вернул данные. Отсутствие артефактов не подтверждено. '
+                                    'Повторите проверку после восстановления доступа.')
+                    continue
+                if sdd == '🔴':
+                    self._log_issue(key, 'error',
+                                    'SDD: у Story отсутствует лейбл SDD. Добавьте в Jira '
+                                    'лейбл SDD (без символа #; регистр не важен).')
+                if openspec == '🔴':
+                    self._log_issue(key, 'error',
+                                    f'SDD: в данных Bitbucket по Story не найдены файлы '
+                                    f'openspec/{key}. Добавьте артефакты SDD в этот каталог '
+                                    f'и свяжите коммит с {key}, чтобы файлы отображались '
+                                    'в Jira dev-status. Повторите проверку после обновления данных.')
+            if not rows:
+                self._log_issue(release_key, 'error',
+                                'SDD: скрипт завершился с отказом, но не вернул '
+                                'подробности по Story. Проверьте наличие release-gate-sdd.mjs '
+                                'рядом с Python-скриптом, настройку токена Jira и повторите запуск.')
         else:
             self._log_issue(release_key, 'error',
                             f'SDD: проверка не выполнена (код {result.returncode}). '
+                            'Список недостающих требований не получен. Проверьте доступ '
+                            'к Jira/Bitbucket, права токена на чтение Story и dev-status, '
+                            'настройку корпоративного CA для Node.js и повторите запуск. '
                             'Остальные проверки не запускались.')
 
     def check_release(self, release_key):

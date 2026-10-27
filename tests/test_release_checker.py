@@ -2448,7 +2448,7 @@ def test_sdd_uses_config_and_absolute_script_path(monkeypatch):
     ('pass', 0), ('missing_label', 1), ('missing_openspec', 1),
     ('no_stories', 0), ('unknown_without_label', 0), ('jira_error', 2),
 ])
-def test_original_sdd_script_contract(tmp_path, scenario, expected):
+def test_original_sdd_script_contract(tmp_path, scenario, expected, monkeypatch):
     import os
     import shutil
     import subprocess
@@ -2477,6 +2477,16 @@ globalThis.fetch = async (url) => {
                             env={**os.environ, 'JIRA_API_TOKEN':'fake-token', 'JIRA_BASE_URL':'https://jira.example',
                                  'DEBUG':'0', 'SDD_TEST_SCENARIO':scenario}, capture_output=True, text=True, timeout=10)
     assert result.returncode == expected, result.stderr
+    checker = stage_validator()
+    monkeypatch.setattr(rc.subprocess, 'run', Mock(return_value=result))
+    checker._run_check('sdd', 'SDD', lambda: checker._check_sdd_gate('REL-1'))
+    body = checker._release_comment('REL-1', expected == 0)
+    if scenario == 'missing_label':
+        assert 'Добавьте в Jira' in body and 'без символа &#35;' in body
+    elif scenario == 'missing_openspec':
+        assert 'openspec/ST-1' in body and 'свяжите коммит с ST-1' in body
+    elif expected == 0:
+        assert checker.check_results[0]['status'] == 'PASS'
 
 
 @pytest.mark.parametrize('outcome', [1, 2, FileNotFoundError('node')])
@@ -2500,3 +2510,56 @@ def test_masked_entrypoint_also_blocks_remaining_checks(monkeypatch, outcome):
     monkeypatch.setattr(rc.subprocess, 'run', runner)
     assert namespace['check_release'](checker, 'REL-1') is False
     checker.jira_main.issue.assert_not_called()
+
+
+def test_sdd_reports_each_missing_requirement_in_comment(monkeypatch, capsys):
+    """A mixed failure retains every concrete remedy in both report formats."""
+    output = '''
+[REL-1](https://jira.example/browse/REL-1)
+  [ST-1](https://jira.example/browse/ST-1)   #SDD: 🔴   openspec: 🟢
+  [ST-2](https://jira.example/browse/ST-2)   #SDD: 🟢   openspec: 🔴
+  [ST-3](https://jira.example/browse/ST-3)   #SDD: 🔴   openspec: 🔴
+  [ST-4](https://jira.example/browse/ST-4)   #SDD: 🔴   openspec: ⚪
+  [ST-5](https://jira.example/browse/ST-5)   #SDD: 🟢   openspec: 🟢
+❌ FAIL
+'''
+    monkeypatch.setattr(rc.subprocess, 'run', Mock(return_value=NS(returncode=1, stdout=output)))
+    checker = stage_validator()
+    checker._reset_release_run = Mock()
+    checker.jira_main = Mock()
+    assert checker.check_release('REL-1') is False
+    checker.jira_main.issue.assert_not_called()
+    assert len(checker.report_data['ST-1']['errors']) == 1
+    assert 'без символа #' in checker.report_data['ST-1']['errors'][0]
+    assert 'openspec/ST-2' in checker.report_data['ST-2']['errors'][0]
+    assert len(checker.report_data['ST-3']['errors']) == 2
+    assert not checker.report_data['ST-4']['errors']
+    assert 'Отсутствие артефактов не подтверждено' in checker.report_data['ST-4']['warnings'][0]
+    assert not checker.report_data['ST-5']['errors']
+    body = checker._release_comment('REL-1', False)
+    for key in ('ST-1', 'ST-2', 'ST-3', 'ST-4'):
+        assert f'[{key}|' in body
+    for text in ('Добавьте в Jira', 'без символа &#35;', 'openspec/ST-2', 'openspec/ST-3',
+                 'свяжите коммит', 'Отсутствие артефактов не подтверждено'):
+        assert text in body
+    assert 'Остальные проверки не запускались' in body
+    assert '#SDD: 🔴' not in body
+    assert 'openspec/ST-3' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('outcome,detail', [
+    (FileNotFoundError('node'), 'Установите Node.js 18+'),
+    (2, 'права токена на чтение Story и dev-status'),
+    (1, 'не вернул подробности по Story'),
+])
+def test_sdd_technical_remedy_survives_jira_comment(monkeypatch, outcome, detail):
+    """Technical failures show an actionable remedy rather than a generic message."""
+    runner = Mock(side_effect=outcome) if isinstance(outcome, Exception) else Mock(
+        return_value=NS(returncode=outcome, stdout=''))
+    monkeypatch.setattr(rc.subprocess, 'run', runner)
+    checker = stage_validator()
+    checker._run_check('sdd', 'SDD', lambda: checker._check_sdd_gate('REL-1'))
+    body = checker._release_comment('REL-1', False)
+    assert detail in body
+    assert 'Остальные проверки не запускались' in body
+    assert checker.check_results[0]['status'] in {'FAIL', 'INCOMPLETE'}
