@@ -8,6 +8,8 @@ import requests
 
 from scripts import release_checker as rc
 
+REAL_SDD_RELEASE_ARTIFACTS = rc.sdd_release_artifacts
+
 
 @pytest.fixture
 def validator(monkeypatch):
@@ -2422,6 +2424,7 @@ def native_sdd(monkeypatch):
     monkeypatch.setattr(rc.time, 'sleep', Mock())
     monkeypatch.delenv('BITBUCKET_BASE_URL', raising=False)
     monkeypatch.delenv('BITBUCKET_API_TOKEN', raising=False)
+    monkeypatch.setattr(rc, 'sdd_release_artifacts', Mock(return_value=False))
     checker._reset_release_run = Mock()
     checker.jira_main = Mock()
     return checker, session
@@ -2616,16 +2619,19 @@ def test_packed_entrypoint_uses_same_native_sdd(monkeypatch, native_sdd):
     helpers = [n for n in parsed.body if isinstance(n, (ast.ClassDef, ast.FunctionDef))
                and n.name in {'SddCheckError', 'sdd_get_json', 'sdd_file_evidence', 'sdd_story_result',
                                   'sdd_bitbucket_changes_url', 'sdd_bitbucket_path',
-                                  'sdd_bitbucket_commit_files', 'sdd_bitbucket_settings', 'sdd_complete_commit_files'}]
-    import inspect
-    source_fn = ast.parse(inspect.getsource(rc.sdd_story_result)).body[0]
-    packed_fn = next(n for n in helpers if n.name == 'sdd_story_result')
-    assert ast.dump(source_fn) == ast.dump(packed_fn)
+                                  'sdd_bitbucket_commit_files', 'sdd_bitbucket_settings', 'sdd_complete_commit_files',
+                                  'sdd_bitbucket_read', 'sdd_commit_story_result',
+                                  'sdd_pull_request_api_url', 'sdd_release_artifacts', '_diag_sdd_story'}]
+    source_defs = {n.name: n for n in ast.parse((rc.script_dir / 'release_checker.py').read_text()).body
+                   if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
+    for helper in helpers:
+        assert ast.dump(helper) == ast.dump(source_defs[helper.name]), helper.name
     exec(compile(ast.Module(body=helpers, type_ignores=[]), '<packed-sdd>', 'exec'), namespace)
     cls = next(n for n in parsed.body if isinstance(n, ast.ClassDef) and n.name == 'ReleaseValidator')
     methods = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in {'_check_sdd_gate', 'check_release'}]
     exec(compile(ast.Module(body=methods, type_ignores=[]), '<packed-gate>', 'exec'), namespace)
     checker, session = native_sdd
+    namespace['sdd_release_artifacts'] = rc.sdd_release_artifacts
     checker._check_sdd_gate = namespace['_check_sdd_gate'].__get__(checker)
     session.get.side_effect = sdd_responses(labels=[], detail={'detail': []})
     assert namespace['check_release'](checker, 'REL-1') is False
@@ -3007,3 +3013,164 @@ def test_sdd_explicit_release_ca_override_still_wins(native_sdd, monkeypatch):
     rc.config['bitbucket'] = {'url': 'https://git.example', 'token': 'bb', 'verify_ssl': False}
     monkeypatch.setenv('RELEASE_CHECKER_CA_BUNDLE', '/configured/ca.pem')
     assert rc.sdd_bitbucket_settings()[2] == '/configured/ca.pem'
+
+
+SDD_RELEASE = 'HRPRELEASE-147210'
+SDD_SOURCE_SHA = '5e05e90f8e609c7c4acad5696d1e77f1fb9681bd'
+SDD_RELEASE_PR = 'https://stash.sigma.sbrf.ru/projects/HRPLATFORM/repos/spine-search/pull-requests/1381/diff'
+
+
+def sdd_release_pr_metadata(branch='release/HRPRELEASE-147210', state='OPEN', commit=SDD_SOURCE_SHA):
+    return {'id': 1381, 'state': state, 'updatedDate': 2,
+            'fromRef': {'id': 'refs/heads/' + branch, 'latestCommit': commit,
+                        'repository': {'project': {'key': 'HRPLATFORM'}, 'slug': 'spine-search'}}}
+
+
+def sdd_release_context(monkeypatch, jira, metadata=None, paths=None, include_jira=True):
+    """The user's release PR tree, unrelated to the Story's deployment-only commits."""
+    pr_session, tree_session = Mock(), Mock()
+    pr_session.headers, tree_session.headers = {}, {}
+    pr_session.get.return_value = response(200, metadata or sdd_release_pr_metadata())
+    tree_session.get.return_value = response(200, {'values': paths if paths is not None else [
+        'openspec/changes/archive/2026-08-25-SEARCHCS-1718/specs/issues-upload-rate-limit/spec.md',
+        'openspec/changes/archive/2026-09-25-SEARCHCS-1742/specs/profile-privacy-settings-indexing/spec.md',
+        'openspec/changes/archive/2026-10-02-SEARCHCS-1831/specs/issues-for-sign-index/spec.md'],
+        'isLastPage': True})
+    contexts = ([nullcontext(jira)] if include_jira else []) + [nullcontext(pr_session), nullcontext(tree_session)]
+    factory = Mock(side_effect=contexts)
+    monkeypatch.setattr(rc.requests, 'Session', factory)
+    monkeypatch.setattr(rc, 'sdd_release_artifacts', REAL_SDD_RELEASE_ARTIFACTS)
+    rc.config['bitbucket'] = {'url': 'https://stash.sigma.sbrf.ru', 'token': 'test-bb', 'verify_ssl': False}
+    return pr_session, tree_session, factory
+
+
+def test_sdd_release_pr_finds_archived_spec_not_changed_in_story_commits(native_sdd, monkeypatch, capsys):
+    checker, jira = native_sdd
+    preview = {'detail': [{'repositories': [{'commits': [{'files': [{'path': 'HRP-pipeline/config.yaml'}]}]}]}]}
+    jira.get.side_effect = sdd_responses(detail=preview, issues=[{'key': 'SEARCHCS-1831'}]) + [
+        response(200, {'id': 'release-id'}),
+        response(200, {'detail': [{'pullRequests': [{'url': SDD_RELEASE_PR}]}]})]
+    pr_session, tree, _ = sdd_release_context(monkeypatch, jira)
+    checker._run_check('sdd', 'SDD', lambda: checker._check_sdd_gate(SDD_RELEASE))
+    assert checker.check_results[0]['status'] == 'PASS'
+    assert tree.get.call_args.kwargs['params']['at'] == SDD_SOURCE_SHA
+    assert tree.get.call_args.args[0].endswith('/projects/HRPLATFORM/repos/spine-search/files')
+    assert '/pull-requests/1381' in pr_session.get.call_args.args[0]
+    output = capsys.readouterr().out
+    assert '"stage": "release_source"' in output and SDD_SOURCE_SHA in output
+    assert '"stage": "release_artifacts"' in output
+
+
+def test_sdd_release_tree_is_cached_for_all_stories(native_sdd, monkeypatch):
+    _, jira = native_sdd
+    jira.get.side_effect = [response(200, {'id': 'release-id'}),
+        response(200, {'detail': [{'pullRequests': [{'url': SDD_RELEASE_PR}]}]})]
+    _, tree, factory = sdd_release_context(monkeypatch, jira, include_jira=False)
+    for story in ('SEARCHCS-1831', 'SEARCHCS-1742', 'SEARCHCS-1718'):
+        assert REAL_SDD_RELEASE_ARTIFACTS(jira, 'https://jira.example', SDD_RELEASE, story) is True
+    assert jira.get.call_count == 2
+    assert tree.get.call_count == 1
+    assert factory.call_count == 2
+
+
+@pytest.mark.parametrize('branch,state', [
+    ('release/HRPRELEASE-147211', 'OPEN'), ('feature/SEARCHCS-1831', 'OPEN'),
+    ('release/HRPRELEASE-147210', 'DECLINED')])
+def test_sdd_does_not_accept_wrong_release_or_declined_pr(native_sdd, monkeypatch, branch, state):
+    _, jira = native_sdd
+    _, tree, _ = sdd_release_context(monkeypatch, jira,
+                                    metadata=sdd_release_pr_metadata(branch=branch, state=state), include_jira=False)
+    assert REAL_SDD_RELEASE_ARTIFACTS(jira, 'https://jira.example', SDD_RELEASE, 'SEARCHCS-1831', SDD_RELEASE_PR) is False
+    tree.get.assert_not_called()
+    jira.get.assert_not_called()
+
+
+def test_sdd_release_pr_uses_source_repository_for_forks(native_sdd, monkeypatch):
+    _, jira = native_sdd
+    metadata = sdd_release_pr_metadata()
+    metadata['fromRef']['repository'] = {'project': {'key': 'FORK'}, 'slug': 'search-release'}
+    _, tree, _ = sdd_release_context(monkeypatch, jira, metadata=metadata, include_jira=False)
+    assert REAL_SDD_RELEASE_ARTIFACTS(jira, 'https://jira.example', SDD_RELEASE, 'SEARCHCS-1831', SDD_RELEASE_PR)
+    assert '/projects/FORK/repos/search-release/files' in tree.get.call_args.args[0]
+    assert tree.get.call_args.kwargs['params']['at'] == SDD_SOURCE_SHA
+
+
+def test_sdd_release_tree_permission_failure_is_not_absence(native_sdd, monkeypatch):
+    _, jira = native_sdd
+    _, tree, _ = sdd_release_context(monkeypatch, jira, include_jira=False)
+    tree.get.return_value = response(403)
+    with pytest.raises(rc.SddCheckError, match='Bitbucket HTTP 403'):
+        REAL_SDD_RELEASE_ARTIFACTS(jira, 'https://jira.example', SDD_RELEASE, 'SEARCHCS-1831', SDD_RELEASE_PR)
+
+
+def test_sdd_release_diagnostic_accepts_exact_pr_without_jira_pr_discovery(native_sdd, monkeypatch):
+    _, jira = native_sdd
+    jira.get.side_effect = sdd_responses(detail={'detail': []})[1:]
+    _, tree, _ = sdd_release_context(monkeypatch, jira)
+    assert rc._diag_sdd_story('SEARCHCS-1831', SDD_RELEASE, SDD_RELEASE_PR) == 0
+    assert tree.get.call_args.kwargs['params']['at'] == SDD_SOURCE_SHA
+    assert jira.get.call_count == 4
+
+
+def test_sdd_release_tree_artifact_does_not_replace_required_sdd_label(native_sdd, monkeypatch):
+    checker, jira = native_sdd
+    jira.get.side_effect = sdd_responses(labels=[], detail={'detail': []}, issues=[{'key': 'SEARCHCS-1831'}]) + [
+        response(200, {'id': 'release-id'}),
+        response(200, {'detail': [{'pullRequests': [{'url': SDD_RELEASE_PR}]}]})]
+    sdd_release_context(monkeypatch, jira)
+    checker._run_check('sdd', 'SDD', lambda: checker._check_sdd_gate(SDD_RELEASE))
+    assert checker.check_results[0]['status'] == 'FAIL'
+    assert len(checker.report_data['SEARCHCS-1831']['errors']) == 1
+    assert 'лейбл SDD' in checker.report_data['SEARCHCS-1831']['errors'][0]
+
+
+def test_sdd_release_source_can_be_discovered_from_jira_remote_links(native_sdd, monkeypatch):
+    _, jira = native_sdd
+    jira.get.side_effect = [response(200, {'id': 'release-id'}), response(200, {'detail': []}),
+                           response(200, [{'object': {'url': SDD_RELEASE_PR}}])]
+    _, tree, _ = sdd_release_context(monkeypatch, jira, include_jira=False)
+    assert REAL_SDD_RELEASE_ARTIFACTS(jira, 'https://jira.example', SDD_RELEASE, 'SEARCHCS-1831')
+    assert jira.get.call_args.args[0].endswith('/remotelink')
+    assert tree.get.call_count == 1
+
+
+def test_sdd_old_merged_release_pr_cannot_override_current_open_tree(native_sdd, monkeypatch):
+    _, jira = native_sdd
+    old_pr = SDD_RELEASE_PR.replace('/1381/', '/1300/')
+    jira.get.side_effect = [response(200, {'id': 'release-id'}), response(200, {
+        'detail': [{'pullRequests': [{'url': old_pr}, {'url': SDD_RELEASE_PR}]}]})]
+    old = sdd_release_pr_metadata(state='MERGED', commit='a'*40)
+    old['id'], old['updatedDate'] = 1300, 1
+    current = sdd_release_pr_metadata()
+    old_session, current_session, tree = Mock(), Mock(), Mock()
+    for session in (old_session, current_session, tree):
+        session.headers = {}
+    old_session.get.return_value = response(200, old)
+    current_session.get.return_value = response(200, current)
+    tree.get.return_value = response(200, {'values': ['src/current.py'], 'isLastPage': True})
+    monkeypatch.setattr(rc.requests, 'Session', Mock(side_effect=[
+        nullcontext(old_session), nullcontext(current_session), nullcontext(tree)]))
+    rc.config['bitbucket'] = {'url': 'https://stash.sigma.sbrf.ru', 'token': 'test-bb'}
+    assert REAL_SDD_RELEASE_ARTIFACTS(jira, 'https://jira.example', SDD_RELEASE, 'SEARCHCS-1831') is False
+    assert tree.get.call_count == 1
+    assert tree.get.call_args.kwargs['params']['at'] == SDD_SOURCE_SHA
+
+
+def test_sdd_release_tree_pages_are_pinned_to_same_source_commit(native_sdd, monkeypatch):
+    _, jira = native_sdd
+    _, tree, _ = sdd_release_context(monkeypatch, jira, include_jira=False)
+    tree.get.side_effect = [response(200, {'values': ['src/a.py'], 'isLastPage': False, 'nextPageStart': 21}),
+        response(200, {'values': ['openspec/changes/archive/2026-10-02-SEARCHCS-1831/spec.md'], 'isLastPage': True})]
+    assert REAL_SDD_RELEASE_ARTIFACTS(jira, 'https://jira.example', SDD_RELEASE, 'SEARCHCS-1831', SDD_RELEASE_PR)
+    assert [call.kwargs['params']['start'] for call in tree.get.call_args_list] == [0, 21]
+    assert all(call.kwargs['params']['at'] == SDD_SOURCE_SHA for call in tree.get.call_args_list)
+
+
+def test_sdd_missing_pr_branch_is_unavailable_not_confirmed_absence(native_sdd, monkeypatch):
+    _, jira = native_sdd
+    metadata = sdd_release_pr_metadata()
+    metadata['fromRef'].pop('id')
+    _, tree, _ = sdd_release_context(monkeypatch, jira, metadata=metadata, include_jira=False)
+    with pytest.raises(rc.SddCheckError, match='исходную ветку'):
+        REAL_SDD_RELEASE_ARTIFACTS(jira, 'https://jira.example', SDD_RELEASE, 'SEARCHCS-1831', SDD_RELEASE_PR)
+    tree.get.assert_not_called()

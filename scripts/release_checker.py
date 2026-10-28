@@ -1583,7 +1583,8 @@ class SddCheckError(RuntimeError):
 
 
 def sdd_get_json(session: requests.Session, base_url: str, path: str,
-                 params: dict, *, allow_http_failure: bool = False) -> Optional[dict]:
+                 params: dict, *, allow_http_failure: bool = False,
+                 allow_list: bool = False) -> Optional[Union[dict, list]]:
     """Read one SDD endpoint, retaining the original non-2xx handling."""
     try:
         response = session.get(base_url.rstrip('/') + path, params=params, timeout=(5, 30),
@@ -1604,7 +1605,7 @@ def sdd_get_json(session: requests.Session, base_url: str, path: str,
         payload = response.json()
     except ValueError:
         raise SddCheckError('Jira/Bitbucket вернул некорректный JSON. Повторите запуск.') from None
-    if not isinstance(payload, dict):
+    if not isinstance(payload, dict) and not (allow_list and isinstance(payload, list)):
         raise SddCheckError('Jira/Bitbucket вернул неожиданный формат данных. Повторите запуск.')
     return payload
 
@@ -1724,8 +1725,10 @@ def sdd_bitbucket_settings() -> tuple[str, str, Union[bool, str]]:
     return env_base or base, env_token or config_token, verify
 
 
-def sdd_bitbucket_commit_files(url: str, key: str) -> list[dict]:
-    """Read all change pages, or stop once matching SDD evidence is established."""
+def sdd_bitbucket_read(url: str, key: str, *, params: Optional[dict] = None,
+                       raw: bool = False, stop_on_match: bool = True,
+                       stage: str = 'bitbucket_changes') -> Union[dict, list[dict]]:
+    """Read scoped Bitbucket metadata or paged file paths with shared authentication."""
     configured_base, token, verify = sdd_bitbucket_settings()
     if configured_base:
         configured = urlsplit(configured_base)
@@ -1749,7 +1752,7 @@ def sdd_bitbucket_commit_files(url: str, key: str) -> list[dict]:
             bitbucket.headers['Authorization'] = f'Bearer {token}'
         for page_number in range(100):
             try:
-                response = bitbucket.get(url, params={'start': start, 'limit': 1000},
+                response = bitbucket.get(url, params={**(params or {}), 'start': start, 'limit': 1000},
                                          timeout=(5, 30), verify=verify, allow_redirects=False)
             except requests.exceptions.SSLError:
                 raise SddCheckError('Bitbucket: ошибка TLS. Проверьте bitbucket.verify_ssl и RELEASE_CHECKER_CA_BUNDLE.') from None
@@ -1757,7 +1760,7 @@ def sdd_bitbucket_commit_files(url: str, key: str) -> list[dict]:
                 raise SddCheckError('Bitbucket: не удалось получить список изменений коммита. '
                                     'Проверьте сеть и повторите запуск.') from None
             if http_debug_enabled():
-                print('[SDD DATA] ' + json.dumps({'story': key, 'stage': 'bitbucket_changes',
+                print('[SDD DATA] ' + json.dumps({'story': key, 'stage': stage,
                       'host': urlsplit(url).hostname, 'start': start, 'status': response.status_code,
                       'auth': 'bitbucket_token' if token else 'anonymous'}, ensure_ascii=False), flush=True)
             if not 200 <= response.status_code < 300:
@@ -1769,16 +1772,18 @@ def sdd_bitbucket_commit_files(url: str, key: str) -> list[dict]:
                 page = response.json()
             except ValueError:
                 raise SddCheckError('Bitbucket вернул некорректный JSON вместо списка изменений.') from None
+            if raw and isinstance(page, dict):
+                return page
             if not isinstance(page, dict) or not isinstance(page.get('values'), list):
                 raise SddCheckError('Bitbucket вернул неожиданный формат списка изменений.')
             for change in page['values']:
                 if isinstance(change, dict) and change.get('nodeType') == 'DIRECTORY':
                     continue
-                path = sdd_bitbucket_path(change.get('path') if isinstance(change, dict) else None)
+                path = sdd_bitbucket_path(change.get('path') if isinstance(change, dict) else change)
                 if path is None:
                     raise SddCheckError('Bitbucket не вернул путь изменённого файла.')
                 files.append({'path': path})
-                if pattern.search(path.lower()):
+                if stop_on_match and pattern.search(path.lower()):
                     return files
             if page.get('isLastPage') is True:
                 if page.get('truncated') is True:
@@ -1790,6 +1795,11 @@ def sdd_bitbucket_commit_files(url: str, key: str) -> list[dict]:
                 raise SddCheckError('Bitbucket не вернул корректное продолжение списка изменений.')
             start = next_start
     raise SddCheckError('Достигнут лимит чтения страниц Bitbucket. Отсутствие openspec не подтверждено.')
+
+
+def sdd_bitbucket_commit_files(url: str, key: str) -> list[dict]:
+    """Retrieve the changed file paths of a linked commit."""
+    return sdd_bitbucket_read(url, key)
 
 
 def sdd_complete_commit_files(data: dict, key: str) -> list[str]:
@@ -1822,7 +1832,7 @@ def sdd_complete_commit_files(data: dict, key: str) -> list[str]:
     return failures
 
 
-def sdd_story_result(session: requests.Session, base_url: str, key: str) -> tuple[bool, Optional[bool]]:
+def sdd_commit_story_result(session: requests.Session, base_url: str, key: str) -> tuple[bool, Optional[bool]]:
     """Check one Story using the updated openspec/.*<key>.* matching rule."""
     issue = sdd_get_json(session, base_url, f'/rest/api/2/issue/{key}', {'fields': 'labels'})
     labels = (issue.get('fields') or {}).get('labels') or []
@@ -1883,7 +1893,151 @@ def sdd_story_result(session: requests.Session, base_url: str, key: str) -> tupl
         session.headers.pop('X-Requested-With', None)
 
 
-def _diag_sdd_story(key_or_url: str) -> int:
+def sdd_pull_request_api_url(value: object) -> Optional[str]:
+    """Normalize a linked PR browser URL to its read-only metadata endpoint."""
+    if not isinstance(value, str):
+        return None
+    parts = urlsplit(value)
+    if parts.scheme != 'https' or not parts.hostname or parts.username or parts.password:
+        return None
+    match = re.search(r'/projects/([A-Za-z0-9_~.-]+)/repos/([A-Za-z0-9_.-]+)/pull-requests/(\d+)(?:/|$)',
+                      parts.path)
+    if not match or any(segment in {'.', '..'} for segment in match.groups()[:2]):
+        return None
+    prefix = re.sub(r'/rest/api/(?:1\.0|latest)$', '', parts.path[:match.start()])
+    project, repo, pr_id = match.groups()
+    return (f'https://{parts.netloc}{prefix}/rest/api/1.0/projects/{quote(project, safe="")}'
+            f'/repos/{quote(repo, safe="")}/pull-requests/{pr_id}')
+
+
+def sdd_release_artifacts(session: requests.Session, base_url: str, release_key: str,
+                          story_key: str, explicit_pr: Optional[str] = None) -> bool:
+    """Check the source commit tree of this release's PRs, shared across its Stories."""
+    cache = session.__dict__.setdefault('_sdd_release_artifacts', {})
+    cache_key = (release_key, explicit_pr)
+    if cache_key not in cache:
+        urls = []
+        if explicit_pr:
+            url = sdd_pull_request_api_url(explicit_pr)
+            if not url:
+                raise SddCheckError('Некорректная ссылка релизного PR для SDD.')
+            urls.append(url)
+        else:
+            release = sdd_get_json(session, base_url, f'/rest/api/2/issue/{release_key}', {'fields': 'summary'})
+            issue_id = release.get('id')
+            if not issue_id:
+                raise SddCheckError('Jira не вернула ID релиза для поиска исходного PR.')
+            data = sdd_get_json(session, base_url, '/rest/dev-status/1.0/issue/detail', {
+                'issueId': issue_id, 'applicationType': 'stash', 'dataType': 'pullrequest'})
+            if not isinstance(data.get('detail'), list):
+                raise SddCheckError('Jira не вернула список релизных PR.')
+            for group in data['detail']:
+                for pr in group.get('pullRequests') or []:
+                    url = sdd_pull_request_api_url(pr.get('url'))
+                    if url:
+                        urls.append(url)
+            if not urls:
+                links = sdd_get_json(session, base_url, f'/rest/api/2/issue/{release_key}/remotelink',
+                                     {}, allow_list=True)
+                if not isinstance(links, list):
+                    raise SddCheckError('Jira не вернула список внешних ссылок релиза.')
+                for link in links:
+                    obj = link.get('object') if isinstance(link, dict) else None
+                    url = sdd_pull_request_api_url(obj.get('url') if isinstance(obj, dict) else None)
+                    if url:
+                        urls.append(url)
+                if not urls and (data.get('errors') or []):
+                    raise SddCheckError('Jira не смогла прочитать релизные PR. Повторите проверку SDD.')
+        paths, failures, sources = [], [], []
+        candidates = {}
+        for url in dict.fromkeys(urls):
+            try:
+                pr = sdd_bitbucket_read(url, story_key, raw=True, stage='bitbucket_pr')
+                if pr.get('state') == 'DECLINED':
+                    continue
+                if pr.get('state') not in {'OPEN', 'MERGED'}:
+                    raise SddCheckError('Bitbucket не вернул состояние релизного PR.')
+                ref = pr.get('fromRef') or {}
+                branch = ref.get('id') or ref.get('displayId') or ''
+                if not isinstance(branch, str) or not branch:
+                    raise SddCheckError('Bitbucket не вернул исходную ветку релизного PR.')
+                branch = branch.removeprefix('refs/heads/')
+                if branch.casefold() != ('release/' + release_key).casefold():
+                    continue
+                commit_id = ref.get('latestCommit')
+                repo = ref.get('repository') or {}
+                project = (repo.get('project') or {}).get('key')
+                slug = repo.get('slug')
+                if (not isinstance(commit_id, str) or not re.fullmatch(r'[a-fA-F0-9]{40,64}', commit_id)
+                        or not isinstance(project, str) or not re.fullmatch(r'[A-Za-z0-9_~.-]+', project)
+                        or project in {'.', '..'} or not isinstance(slug, str)
+                        or not re.fullmatch(r'[A-Za-z0-9_.-]+', slug) or slug in {'.', '..'}):
+                    raise SddCheckError('Bitbucket не вернул репозиторий и исходный commit ID релизного PR.')
+                parts = urlsplit(url)
+                api_prefix = parts.path.split('/projects/', 1)[0]
+                files_url = (f'{parts.scheme}://{parts.netloc}{api_prefix}/projects/{quote(project, safe="")}'
+                             f'/repos/{quote(slug, safe="")}/files')
+                group_key = (files_url, branch.casefold())
+                updated = pr.get('updatedDate') if type(pr.get('updatedDate')) is int else 0
+                pr_id = pr.get('id') if type(pr.get('id')) is int else int(url.rsplit('/', 1)[-1])
+                priority = (pr.get('state') == 'OPEN', updated, pr_id)
+                if group_key not in candidates or priority > candidates[group_key][0]:
+                    candidates[group_key] = (priority, project, slug, branch, commit_id, files_url)
+            except SddCheckError as exc:
+                if str(exc) not in failures:
+                    failures.append(str(exc))
+        for _, project, slug, branch, commit_id, files_url in candidates.values():
+            try:
+                files = sdd_bitbucket_read(files_url, story_key, params={'at': commit_id},
+                                           stop_on_match=False, stage='release_tree')
+                paths.extend(file['path'] for file in files)
+                sources.append((project, slug, commit_id))
+                if http_debug_enabled():
+                    print('[SDD DATA] ' + json.dumps({'stage': 'release_source', 'release': release_key,
+                          'project': project, 'repository': slug, 'branch': branch,
+                          'commit': commit_id, 'files': len(files)}, ensure_ascii=False), flush=True)
+            except SddCheckError as exc:
+                if str(exc) not in failures:
+                    failures.append(str(exc))
+        cache[cache_key] = paths, failures, sources
+        if http_debug_enabled():
+            print('[SDD DATA] ' + json.dumps({'stage': 'release_sources', 'release': release_key,
+                  'pr_candidates': len(set(urls)), 'accepted_sources': len(sources),
+                  'failures': len(failures)}, ensure_ascii=False), flush=True)
+    paths, failures, sources = cache[cache_key]
+    pattern = re.compile(r'openspec/[^\r\n\u2028\u2029]*' + re.escape(story_key.lower()), re.I)
+    matches = [path for path in paths if pattern.search(path.lower())]
+    if http_debug_enabled():
+        print('[SDD DATA] ' + json.dumps({'stage': 'release_artifacts', 'story': story_key,
+              'release': release_key, 'sources': len(sources), 'matches': len(matches),
+              'matching_paths_sample': [path[:300] for path in matches[:5]]}, ensure_ascii=False), flush=True)
+    if matches:
+        return True
+    if failures:
+        raise SddCheckError('SDD: не удалось проверить исходное дерево релизного PR. ' + ' '.join(failures[:2]))
+    return False
+
+
+def sdd_story_result(session: requests.Session, base_url: str, key: str,
+                     release_key: Optional[str] = None,
+                     explicit_pr: Optional[str] = None) -> tuple[bool, Optional[bool]]:
+    """Use Story commits first, then the pinned source tree of the release PR."""
+    try:
+        has_sdd, openspec = sdd_commit_story_result(session, base_url, key)
+    except SddCheckError:
+        if not release_key or not sdd_release_artifacts(session, base_url, release_key, key, explicit_pr):
+            raise
+        labels = sdd_get_json(session, base_url, f'/rest/api/2/issue/{key}', {'fields': 'labels'})
+        has_sdd = any(label.lower() == 'sdd' for label in ((labels.get('fields') or {}).get('labels') or []))
+        return has_sdd, True
+    if openspec is not True and release_key:
+        if sdd_release_artifacts(session, base_url, release_key, key, explicit_pr):
+            return has_sdd, True
+    return has_sdd, openspec
+
+
+def _diag_sdd_story(key_or_url: str, release_key: Optional[str] = None,
+                    explicit_pr: Optional[str] = None) -> int:
     """Read one Story's SDD sources without creating validators or Jira comments."""
     key = extract_issue_key_from_url(key_or_url)
     if not re.fullmatch(r'[A-Z][A-Z0-9_]*-\d+', key):
@@ -1897,9 +2051,16 @@ def _diag_sdd_story(key_or_url: str) -> int:
         with requests.Session() as session:
             session.headers.update({'Authorization': f"Bearer {config['jira']['token']}",
                                     'Accept': 'application/json'})
-            has_sdd, openspec = sdd_story_result(session, config['jira']['url'], key)
+            if release_key and not re.fullmatch(r'[A-Z][A-Z0-9_]*-\d+', release_key):
+                raise SddCheckError('Некорректный ключ релиза для диагностики SDD.')
+            if explicit_pr and not release_key:
+                raise SddCheckError('Для диагностики релизного PR укажите ключ релиза.')
+            if not release_key:
+                print('[SDD DIAG] Проверяются только коммиты Story. Для учёта релизного PR '
+                      'добавьте ключ релиза: --diag-sdd STORY RELEASE.', flush=True)
+            has_sdd, openspec = sdd_story_result(session, config['jira']['url'], key, release_key, explicit_pr)
         print('[SDD DIAG] ' + json.dumps({'story': key, 'has_sdd': has_sdd,
-              'openspec': openspec, 'read_only': True}, ensure_ascii=False), flush=True)
+              'openspec': openspec, 'release': release_key, 'read_only': True}, ensure_ascii=False), flush=True)
         return 2 if openspec is None else (0 if has_sdd and openspec else 1)
     except SddCheckError as exc:
         print(f'[SDD DIAG] INCOMPLETE: {exc}', flush=True)
@@ -3220,7 +3381,7 @@ class ReleaseValidator:
                     return
                 failed = False
                 for current_key in stories:
-                    has_sdd, openspec = sdd_story_result(session, base_url, current_key)
+                    has_sdd, openspec = sdd_story_result(session, base_url, current_key, release_key)
                     print(f"  [{current_key}]({base_url}/browse/{current_key})   "
                           f"#SDD: {'🟢' if has_sdd else '🔴'}   openspec: "
                           + ('⚪' if openspec is None else ('🟢' if openspec else '🔴')), flush=True)
@@ -3239,12 +3400,12 @@ class ReleaseValidator:
                     if not openspec:
                         failed = True
                         self._log_issue(current_key, 'error',
-                                        f'SDD: среди файлов связанных коммитов, возвращённых Jira dev-status, '
+                                        f'SDD: по связанным коммитам и исходным деревьям PR релиза {release_key} '
                                         f'не найден путь по правилу openspec/.*{current_key}.*. '
                                         'Допускаются вложенные и архивные каталоги, например '
                                         f'openspec/changes/archive/2026-10-02-{current_key}/spec.md. '
                                         'Если артефакты уже есть в Bitbucket, проверьте связь коммита '
-                                        f'с {current_key} и выдачу путей файлов в Jira dev-status. '
+                                        f'с {current_key}, связь PR с релизом {release_key} и доступ к исходной ветке. '
                                         'Создавать отдельный каталог openspec/ID не требуется.')
                 if failed:
                     self._log_issue(release_key, 'error',
@@ -7086,7 +7247,8 @@ if __name__ == "__main__":
         _diag_lookup_matrix(sys.argv[2] if explicit_matrix else sys.argv[1])
         sys.exit(0)  # Diagnostic completion, not a release-readiness verdict.
     if len(sys.argv) >= 3 and sys.argv[1] == '--diag-sdd':
-        sys.exit(_diag_sdd_story(sys.argv[2]))
+        sys.exit(_diag_sdd_story(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None,
+                                 sys.argv[4] if len(sys.argv) > 4 else None))
     validator = ReleaseValidator()
     if len(sys.argv) >= 3 and sys.argv[1] == "--dry-run":
         validator.dry_run = True
