@@ -2444,9 +2444,19 @@ def sdd_responses(labels=None, detail=None, *, issues=None, issue_id='42', repo_
     (['#SDD'], 'openspec/ST-1/spec.md', 'FAIL', 1),
     ([' SDD '], 'openspec/ST-1/spec.md', 'FAIL', 1),
     ([], 'openspec/ST-1/spec.md', 'FAIL', 1),
-    (['SDD'], 'docs/openspec/ST-1/spec.md', 'FAIL', 1),
+    (['SDD'], 'docs/openspec/ST-1/spec.md', 'PASS', 0),
     (['SDD'], 'openspec/ST-10/spec.md', 'PASS', 0),
     (['SDD'], 'openspec/team/ST-1/spec.md', 'PASS', 0),
+    (['SDD'], 'docs/openspec/changes/feature-ST-1-new/spec.md', 'PASS', 0),
+    (['SDD'], 'src/OPENSPEC/changes/feature-st-1-new.md', 'PASS', 0),
+    (['SDD'], 'openspec/prefixST-1suffix.md', 'PASS', 0),
+    (['SDD'], 'ST-1/openspec/other/spec.md', 'FAIL', 1),
+    (['SDD'], 'docs/openspec-ST-1/spec.md', 'FAIL', 1),
+    (['SDD'], 'docs/spec/ST-1/spec.md', 'FAIL', 1),
+    (['SDD'], 'openspec/folder\nST-1/spec.md', 'FAIL', 1),
+    (['SDD'], 'openspec/folder\rST-1/spec.md', 'FAIL', 1),
+    (['SDD'], 'openspec/folder\u2028ST-1/spec.md', 'FAIL', 1),
+    (['SDD'], 'openspec/folder\u2029ST-1/spec.md', 'FAIL', 1),
     (['SDD'], 'openspec/ST-2/spec.md', 'FAIL', 1),
     ([], 'openspec/ST-2/spec.md', 'FAIL', 2),
 ])
@@ -2603,6 +2613,10 @@ def test_packed_entrypoint_uses_same_native_sdd(monkeypatch, native_sdd):
     parsed = ast.parse(decoded)
     helpers = [n for n in parsed.body if isinstance(n, (ast.ClassDef, ast.FunctionDef))
                and n.name in {'SddCheckError', 'sdd_get_json', 'sdd_story_result'}]
+    import inspect
+    source_fn = ast.parse(inspect.getsource(rc.sdd_story_result)).body[0]
+    packed_fn = next(n for n in helpers if n.name == 'sdd_story_result')
+    assert ast.dump(source_fn) == ast.dump(packed_fn)
     exec(compile(ast.Module(body=helpers, type_ignores=[]), '<packed-sdd>', 'exec'), namespace)
     cls = next(n for n in parsed.body if isinstance(n, ast.ClassDef) and n.name == 'ReleaseValidator')
     methods = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in {'_check_sdd_gate', 'check_release'}]

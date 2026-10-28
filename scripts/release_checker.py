@@ -1610,7 +1610,7 @@ def sdd_get_json(session: requests.Session, base_url: str, path: str,
 
 
 def sdd_story_result(session: requests.Session, base_url: str, key: str) -> tuple[bool, Optional[bool]]:
-    """Check one Story, preserving label, prefix, summary and retry semantics."""
+    """Check one Story using the updated openspec/.*<key>.* matching rule."""
     issue = sdd_get_json(session, base_url, f'/rest/api/2/issue/{key}', {'fields': 'labels'})
     labels = (issue.get('fields') or {}).get('labels') or []
     has_sdd = any(label.lower() == 'sdd' for label in labels)
@@ -1637,13 +1637,14 @@ def sdd_story_result(session: requests.Session, base_url: str, key: str) -> tupl
             details = data.get('detail') or []
             if not details and (data.get('errors') or []):
                 continue
-            pattern = re.compile(r'(?:/|^)' + re.escape(key.lower()), re.I)
+            # JavaScript's dot excludes these four line terminators.
+            pattern = re.compile(r'openspec/[^\r\n\u2028\u2029]*' + re.escape(key.lower()), re.I)
             for group in details:
                 for repo in group.get('repositories') or []:
                     for commit in repo.get('commits') or []:
                         for file in commit.get('files') or []:
                             path = file['path'].lower()
-                            if path.startswith('openspec/') and pattern.search(path):
+                            if pattern.search(path):
                                 return has_sdd, True
             return has_sdd, False
         return has_sdd, None
