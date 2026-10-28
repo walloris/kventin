@@ -2420,6 +2420,8 @@ def native_sdd(monkeypatch):
     monkeypatch.setattr(rc.requests, 'Session', lambda: nullcontext(session))
     monkeypatch.setattr(rc, 'config', {'jira': {'url': 'https://jira.example', 'token': 'test-token'}})
     monkeypatch.setattr(rc.time, 'sleep', Mock())
+    monkeypatch.delenv('BITBUCKET_BASE_URL', raising=False)
+    monkeypatch.delenv('BITBUCKET_API_TOKEN', raising=False)
     checker._reset_release_run = Mock()
     checker.jira_main = Mock()
     return checker, session
@@ -2612,7 +2614,9 @@ def test_packed_entrypoint_uses_same_native_sdd(monkeypatch, native_sdd):
     namespace = dict(vars(rc))
     parsed = ast.parse(decoded)
     helpers = [n for n in parsed.body if isinstance(n, (ast.ClassDef, ast.FunctionDef))
-               and n.name in {'SddCheckError', 'sdd_get_json', 'sdd_file_evidence', 'sdd_story_result'}]
+               and n.name in {'SddCheckError', 'sdd_get_json', 'sdd_file_evidence', 'sdd_story_result',
+                                  'sdd_bitbucket_changes_url', 'sdd_bitbucket_path',
+                                  'sdd_bitbucket_commit_files', 'sdd_complete_commit_files'}]
     import inspect
     source_fn = ast.parse(inspect.getsource(rc.sdd_story_result)).body[0]
     packed_fn = next(n for n in helpers if n.name == 'sdd_story_result')
@@ -2812,3 +2816,141 @@ def test_sdd_diagnostic_invalid_story_does_not_request_api(native_sdd):
     _, session = native_sdd
     assert rc._diag_sdd_story('invalid') == 2
     session.get.assert_not_called()
+
+
+@pytest.mark.parametrize('repo_url,expected', [
+    ('https://git.example/projects/HRP/repos/search/browse', 'https://git.example/rest/api/1.0/projects/HRP/repos/search'),
+    ('https://git.example/stash/projects/HRP/repos/search/browse', 'https://git.example/stash/rest/api/1.0/projects/HRP/repos/search'),
+    ('https://git.example/rest/api/1.0/projects/HRP/repos/search', 'https://git.example/rest/api/1.0/projects/HRP/repos/search'),
+    ('https://user:secret@git.example/projects/HRP/repos/search', None),
+    ('http://git.example/projects/HRP/repos/search', None),
+])
+def test_sdd_builds_only_linked_bitbucket_changes_route(repo_url, expected):
+    commit_id = 'a' * 40
+    result = rc.sdd_bitbucket_changes_url({'url': repo_url}, {'id': commit_id})
+    assert result == (expected + '/commits/' + commit_id + '/changes' if expected else None)
+
+
+@pytest.mark.parametrize('path,expected', [
+    ('openspec/ST-1/spec.md', 'openspec/ST-1/spec.md'),
+    ({'toString': 'openspec/ST-1/spec.md'}, 'openspec/ST-1/spec.md'),
+    ({'components': ['openspec', 'changes', 'archive', '2026-10-02-SEARCHCS-1831', 'spec.md']},
+     'openspec/changes/archive/2026-10-02-SEARCHCS-1831/spec.md'),
+    ({'parent': 'openspec/ST-1', 'name': 'spec.md'}, 'openspec/ST-1/spec.md'),
+    (None, None), ({}, None),
+])
+def test_sdd_normalizes_bitbucket_change_paths(path, expected):
+    assert rc.sdd_bitbucket_path(path) == expected
+
+
+def sdd_linked_truncated_detail(file_count=2):
+    """A linked commit whose Jira preview omits an archived OpenSpec file."""
+    return {'detail': [{'repositories': [{'url': 'https://git.example/projects/HRP/repos/search/browse',
+        'commits': [{'id': 'a' * 40, 'fileCount': file_count,
+                     'files': [{'path': 'HRP-pipeline/config.yaml'}]}]}]}]}
+
+
+def bitbucket_test_session(monkeypatch, jira_session=None):
+    bb = Mock()
+    bb.headers = {}
+    contexts = ([nullcontext(jira_session)] if jira_session is not None else []) + [nullcontext(bb)]
+    factory = Mock(side_effect=contexts)
+    monkeypatch.setattr(rc.requests, 'Session', factory)
+    return bb, factory
+
+
+def test_sdd_reads_second_bitbucket_page_for_screenshot_path(native_sdd, monkeypatch, capsys):
+    checker, jira = native_sdd
+    key = 'SEARCHCS-1831'
+    jira.get.side_effect = sdd_responses(detail=sdd_linked_truncated_detail(), issues=[{'key': key}])
+    bb, factory = bitbucket_test_session(monkeypatch, jira)
+    bb.get.side_effect = [response(200, {'values': [{'path': {'components': ['HRP-pipeline', 'config.yaml']}}],
+                                       'isLastPage': False, 'nextPageStart': 37}),
+                            response(200, {'values': [{'path': {'components': ['openspec', 'changes', 'archive',
+                               '2026-10-02-SEARCHCS-1831', 'specs', 'issues-for-sign-index', 'spec.md']}}],
+                                           'isLastPage': True})]
+    checker._run_check('sdd', 'SDD', lambda: checker._check_sdd_gate('REL-1'))
+    assert checker.check_results[0]['status'] == 'PASS'
+    assert [call.kwargs['params']['start'] for call in bb.get.call_args_list] == [0, 37]
+    assert 'Authorization' not in bb.headers
+    assert all(call.kwargs['allow_redirects'] is False for call in bb.get.call_args_list)
+    output = capsys.readouterr().out
+    assert '"stage": "expanded_files"' in output and '"matches": 1' in output
+    assert factory.call_count == 2
+
+
+def test_sdd_full_bitbucket_list_without_match_is_fail_not_incomplete(native_sdd, monkeypatch):
+    checker, jira = native_sdd
+    jira.get.side_effect = sdd_responses(detail=sdd_linked_truncated_detail())
+    bb, _ = bitbucket_test_session(monkeypatch, jira)
+    bb.get.return_value = response(200, {'values': [{'path': 'config/a.yaml'}, {'path': 'config/b.yaml'}],
+                                       'isLastPage': True})
+    assert checker.check_release('REL-1') is False
+    assert checker.check_results[0]['status'] == 'FAIL'
+    assert 'не найден путь' in checker.report_data['ST-1']['errors'][0]
+
+
+@pytest.mark.parametrize('status', [401, 403, 302])
+def test_sdd_bitbucket_access_failure_stays_blocking_and_clear(native_sdd, monkeypatch, status):
+    checker, jira = native_sdd
+    jira.get.side_effect = sdd_responses(detail=sdd_linked_truncated_detail())
+    bb, _ = bitbucket_test_session(monkeypatch, jira)
+    bb.get.return_value = response(status)
+    assert checker.check_release('REL-1') is False
+    assert checker.check_results[0]['status'] == 'INCOMPLETE'
+    body = checker._release_comment('REL-1', False)
+    assert f'Bitbucket HTTP {status}' in body
+    assert 'не найден путь' not in body
+    if status in {401, 403}:
+        assert 'BITBUCKET_API_TOKEN' in rc.html.unescape(body) and 'REPO_READ' in rc.html.unescape(body)
+    assert 'Authorization' not in bb.headers
+
+
+@pytest.mark.parametrize('page', [
+    {'values': [], 'isLastPage': False, 'nextPageStart': 0},
+    {'values': [], 'isLastPage': False},
+    {'values': [], 'isLastPage': True, 'truncated': True},
+    {'values': [{'path': None}], 'isLastPage': True},
+    {'unexpected': []},
+])
+def test_sdd_invalid_bitbucket_pages_are_not_absence(native_sdd, monkeypatch, page):
+    checker, jira = native_sdd
+    jira.get.side_effect = sdd_responses(detail=sdd_linked_truncated_detail())
+    bb, _ = bitbucket_test_session(monkeypatch, jira)
+    bb.get.return_value = response(200, page)
+    assert checker.check_release('REL-1') is False
+    assert checker.check_results[0]['status'] == 'INCOMPLETE'
+    assert bb.get.call_count == 1
+
+
+def test_sdd_server_cap_detected_even_if_bitbucket_reports_last_page(native_sdd, monkeypatch):
+    checker, jira = native_sdd
+    jira.get.side_effect = sdd_responses(detail=sdd_linked_truncated_detail(file_count=5000))
+    bb, _ = bitbucket_test_session(monkeypatch, jira)
+    bb.get.return_value = response(200, {'values': [{'path': 'config/a.yaml'}], 'isLastPage': True})
+    assert checker.check_release('REL-1') is False
+    assert checker.check_results[0]['status'] == 'INCOMPLETE'
+
+
+def test_sdd_bitbucket_token_is_scoped_to_explicit_base(native_sdd, monkeypatch):
+    monkeypatch.setenv('BITBUCKET_BASE_URL', 'https://git.example/stash')
+    monkeypatch.setenv('BITBUCKET_API_TOKEN', 'bitbucket-test-token')
+    bb, _ = bitbucket_test_session(monkeypatch)
+    bb.get.return_value = response(200, {'values': [{'path': 'openspec/ST-1/spec.md'}], 'isLastPage': True})
+    paths = rc.sdd_bitbucket_commit_files('https://git.example/stash/rest/api/1.0/projects/HRP/repos/search/commits/'
+                                        + 'a'*40 + '/changes', 'ST-1')
+    assert paths == [{'path': 'openspec/ST-1/spec.md'}]
+    assert bb.headers['Authorization'] == 'Bearer bitbucket-test-token'
+    assert bb.headers['Authorization'] != 'Bearer test-token'
+
+
+@pytest.mark.parametrize('configured', ['', 'https://different.example', 'https://git.example/other-context'])
+def test_sdd_never_sends_bitbucket_token_to_unconfigured_destination(native_sdd, monkeypatch, configured):
+    monkeypatch.setenv('BITBUCKET_BASE_URL', configured)
+    monkeypatch.setenv('BITBUCKET_API_TOKEN', 'private-token')
+    bb, factory = bitbucket_test_session(monkeypatch)
+    with pytest.raises(rc.SddCheckError):
+        rc.sdd_bitbucket_commit_files('https://git.example/rest/api/1.0/projects/HRP/repos/search/commits/'
+                                     + 'a'*40 + '/changes', 'ST-1')
+    factory.assert_not_called()
+    bb.get.assert_not_called()

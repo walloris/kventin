@@ -1656,6 +1656,147 @@ def sdd_file_evidence(data: dict, key: str) -> tuple[bool, dict]:
     return stats['matches'] > 0, stats
 
 
+def sdd_bitbucket_changes_url(repo: dict, commit: dict) -> Optional[str]:
+    """Build only the documented commit-changes route from linked Bitbucket URLs."""
+    for candidate in (commit.get('url'), repo.get('url')):
+        if not isinstance(candidate, str):
+            continue
+        parts = urlsplit(candidate)
+        if (parts.scheme != 'https' or not parts.hostname or parts.username or parts.password
+                or parts.query or parts.fragment):
+            continue
+        match = re.search(r'/projects/([A-Za-z0-9_~.-]+)/repos/([A-Za-z0-9_.-]+)(?:/|$)', parts.path)
+        if not match:
+            continue
+        commit_id = commit.get('id')
+        if not isinstance(commit_id, str) or not re.fullmatch(r'[A-Fa-f0-9]{7,64}', commit_id):
+            continue
+        prefix = parts.path[:match.start()]
+        # A REST self-link may include the API prefix already.
+        prefix = re.sub(r'/rest/api/(?:1\.0|latest)$', '', prefix)
+        project, slug = match.groups()
+        if project in {'.', '..'} or slug in {'.', '..'}:
+            continue
+        return (f'https://{parts.netloc}{prefix}/rest/api/1.0/projects/{quote(project, safe="")}'
+                f'/repos/{quote(slug, safe="")}/commits/{commit_id}/changes')
+    return None
+
+
+def sdd_bitbucket_path(path: object) -> Optional[str]:
+    """Normalize the path representations returned by the Bitbucket changes API."""
+    if isinstance(path, str):
+        return path or None
+    if not isinstance(path, dict):
+        return None
+    if isinstance(path.get('toString'), str) and path['toString']:
+        return path['toString']
+    components = path.get('components')
+    if isinstance(components, list) and components and all(isinstance(c, str) for c in components):
+        return '/'.join(components)
+    if isinstance(path.get('name'), str) and isinstance(path.get('parent', ''), str):
+        return '/'.join(p for p in (path.get('parent', ''), path['name']) if p) or None
+    return None
+
+
+def sdd_bitbucket_commit_files(url: str, key: str) -> list[dict]:
+    """Read all change pages, or stop once matching SDD evidence is established."""
+    configured_base = os.getenv('BITBUCKET_BASE_URL', '').rstrip('/')
+    token = os.getenv('BITBUCKET_API_TOKEN', '')
+    if configured_base:
+        configured = urlsplit(configured_base)
+        actual = urlsplit(url)
+        if (configured.scheme != 'https' or configured.username or configured.password
+                or configured.query or configured.fragment or not configured.hostname
+                or configured.netloc.lower() != actual.netloc.lower()
+                or not actual.path.startswith(configured.path.rstrip('/') + '/rest/api/')):
+            raise SddCheckError('URL связанного коммита не соответствует BITBUCKET_BASE_URL. '
+                                'Проверьте настроенный адрес Bitbucket.')
+    elif token:
+        raise SddCheckError('Для BITBUCKET_API_TOKEN задайте BITBUCKET_BASE_URL — адрес его Bitbucket.')
+    pattern = re.compile(r'openspec/[^\r\n\u2028\u2029]*' + re.escape(key.lower()), re.I)
+    files = []
+    start = 0
+    with requests.Session() as bitbucket:
+        # Never forward Jira's bearer token or cookies, or load unrelated netrc credentials.
+        bitbucket.auth = lambda request: request
+        bitbucket.headers.update({'Accept': 'application/json'})
+        if token:
+            bitbucket.headers['Authorization'] = f'Bearer {token}'
+        for page_number in range(100):
+            try:
+                response = bitbucket.get(url, params={'start': start, 'limit': 1000},
+                                         timeout=(5, 30), verify=release_tls_policy(), allow_redirects=False)
+            except requests.exceptions.SSLError:
+                raise SddCheckError('Bitbucket: ошибка TLS. Проверьте RELEASE_CHECKER_CA_BUNDLE.') from None
+            except requests.RequestException:
+                raise SddCheckError('Bitbucket: не удалось получить список изменений коммита. '
+                                    'Проверьте сеть и повторите запуск.') from None
+            if http_debug_enabled():
+                print('[SDD DATA] ' + json.dumps({'story': key, 'stage': 'bitbucket_changes',
+                      'host': urlsplit(url).hostname, 'start': start, 'status': response.status_code,
+                      'auth': 'bitbucket_token' if token else 'anonymous'}, ensure_ascii=False), flush=True)
+            if not 200 <= response.status_code < 300:
+                advice = ('Задайте BITBUCKET_BASE_URL и BITBUCKET_API_TOKEN с правом чтения '
+                          'репозитория (REPO_READ).' if response.status_code in {401, 403}
+                          else 'Проверьте доступ к связанному коммиту и Bitbucket API.')
+                raise SddCheckError(f'Bitbucket HTTP {response.status_code}. {advice}')
+            try:
+                page = response.json()
+            except ValueError:
+                raise SddCheckError('Bitbucket вернул некорректный JSON вместо списка изменений.') from None
+            if not isinstance(page, dict) or not isinstance(page.get('values'), list):
+                raise SddCheckError('Bitbucket вернул неожиданный формат списка изменений.')
+            for change in page['values']:
+                if isinstance(change, dict) and change.get('nodeType') == 'DIRECTORY':
+                    continue
+                path = sdd_bitbucket_path(change.get('path') if isinstance(change, dict) else None)
+                if path is None:
+                    raise SddCheckError('Bitbucket не вернул путь изменённого файла.')
+                files.append({'path': path})
+                if pattern.search(path.lower()):
+                    return files
+            if page.get('isLastPage') is True:
+                if page.get('truncated') is True:
+                    raise SddCheckError('Bitbucket обрезал список изменений серверным лимитом. '
+                                        'Отсутствие openspec не подтверждено.')
+                return files
+            next_start = page.get('nextPageStart')
+            if type(next_start) is not int or next_start <= start:
+                raise SddCheckError('Bitbucket не вернул корректное продолжение списка изменений.')
+            start = next_start
+    raise SddCheckError('Достигнут лимит чтения страниц Bitbucket. Отсутствие openspec не подтверждено.')
+
+
+def sdd_complete_commit_files(data: dict, key: str) -> list[str]:
+    """Replace incomplete Jira file previews with the linked commit's full changes."""
+    failures = []
+    for group in data.get('detail') or []:
+        for repo in group.get('repositories') or []:
+            for commit in repo.get('commits') or []:
+                if not isinstance(commit, dict):
+                    continue
+                files = commit.get('files')
+                declared = commit.get('fileCount')
+                incomplete = (not isinstance(files, list)
+                              or (type(declared) is int and declared > len(files))
+                              or any(not isinstance(f, dict) or not isinstance(f.get('path'), str) for f in files))
+                if not incomplete:
+                    continue
+                url = sdd_bitbucket_changes_url(repo, commit)
+                if not url:
+                    failures.append('Jira не передала URL репозитория и полный ID коммита '
+                                    'для чтения изменений из Bitbucket.')
+                    continue
+                try:
+                    commit['files'] = sdd_bitbucket_commit_files(url, key)
+                    if sdd_file_evidence(data, key)[0]:
+                        return failures
+                except SddCheckError as exc:
+                    if str(exc) not in failures:
+                        failures.append(str(exc))
+    return failures
+
+
 def sdd_story_result(session: requests.Session, base_url: str, key: str) -> tuple[bool, Optional[bool]]:
     """Check one Story using the updated openspec/.*<key>.* matching rule."""
     issue = sdd_get_json(session, base_url, f'/rest/api/2/issue/{key}', {'fields': 'labels'})
@@ -1699,9 +1840,18 @@ def sdd_story_result(session: requests.Session, base_url: str, key: str) -> tupl
                 return has_sdd, True
             if any(stats[name] for name in ('missing_repositories', 'missing_commits',
                                             'missing_files', 'invalid_paths', 'truncated_files')):
-                raise SddCheckError('Jira dev-status не передал полный список путей файлов '
-                                    'связанных коммитов. Наличие openspec в Bitbucket не опровергнуто. '
-                                    'Нужен диагностический вывод [SDD DATA] для проверки источника файлов.')
+                failures = sdd_complete_commit_files(data, key)
+                matched, stats = sdd_file_evidence(data, key)
+                if http_debug_enabled():
+                    print('[SDD DATA] ' + json.dumps({'story': key, 'stage': 'expanded_files', **stats},
+                                                     ensure_ascii=False), flush=True)
+                if matched:
+                    return has_sdd, True
+                if failures or any(stats[name] for name in ('missing_repositories', 'missing_commits',
+                                                           'missing_files', 'invalid_paths', 'truncated_files')):
+                    reason = ' '.join(failures[:2]) or 'Источник не вернул полный список файлов.'
+                    raise SddCheckError('Jira dev-status не передал полный список путей файлов. '
+                                        + reason + ' Наличие openspec не опровергнуто.')
             return has_sdd, False
         return has_sdd, None
     finally:
