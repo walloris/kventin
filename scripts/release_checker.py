@@ -6193,8 +6193,9 @@ class ReleaseValidator:
                 linked_keys.add(linked_issue.key)
         return linked_keys
 
-    def _check_unlinked_other_releases(self, issues, release_key: str) -> set[str]:
-        """Check removed tasks independently of PR exemptions, with one bulk read."""
+    def _check_unlinked_other_releases(self, issues, release_key: str,
+                                       merged_issue_keys: Optional[set[str]] = None) -> set[str]:
+        """Require another release; only merged PRs require installation on production."""
         candidates = {}
         for issue in issues:
             keys = set()
@@ -6210,7 +6211,7 @@ class ReleaseValidator:
             candidates[issue.key] = keys
         all_keys = sorted(set().union(*candidates.values())) if candidates else []
         releases = {}
-        if all_keys:
+        if all_keys and (merged_issue_keys is None or merged_issue_keys):
             try:
                 releases = {item.key: item for item in self.jira_main.search_issues(
                     f"key in ({','.join(all_keys)})", fields='status,issuetype', maxResults=False)}
@@ -6222,15 +6223,21 @@ class ReleaseValidator:
             installed = [key for key in sorted(keys) if key in releases and
                          normalize_field_text(getattr(getattr(releases[key].fields, 'status', None),
                                                       'name', '')).casefold() == 'установлен на пром']
-            if installed:
+            requires_installed = merged_issue_keys is None or issue.key in merged_issue_keys
+            if keys and not requires_installed:
+                accepted.add(issue.key)
+                self._log_issue(issue, 'success',
+                    'Отлинкованная задача с невлитым PR связана с другим релизом: '
+                    + ', '.join(sorted(keys)) + ' ✓')
+            elif installed:
                 accepted.add(issue.key)
                 self._log_issue(issue, 'success',
                     'Отлинкованная задача связана с другим релизом в статусе '
                     '«Установлен на ПРОМ»: ' + ', '.join(installed) + ' ✓')
             elif not keys:
                 self._log_issue(issue, 'error',
-                    'Отлинкованная задача: отсутствует связь с другим релизом '
-                    'в статусе «Установлен на ПРОМ».')
+                    'Отлинкованная задача: отсутствует связь с другим релизом'
+                    + (' в статусе «Установлен на ПРОМ».' if requires_installed else '.'))
             else:
                 statuses = []
                 for key in sorted(keys):
@@ -6246,14 +6253,12 @@ class ReleaseValidator:
         if not unlinked_keys:
             return
 
-        print(f"   Проверка merged PR у {len(unlinked_keys)} отлинкованных задач...")
-        current_release_story_bug_keys = self._get_release_story_bug_keys(release_key)
-
+        print(f"   Проверка PR и статусов у {len(unlinked_keys)} отлинкованных задач...")
         keys_str = ",".join(unlinked_keys)
         try:
             issues = self.jira_main.search_issues(
                 f'key in ({keys_str})',
-                fields='summary,issuetype,assignee,labels,issuelinks',
+                fields='summary,issuetype,assignee,labels,issuelinks,status',
                 maxResults=False
             )
         except Exception as e:
@@ -6275,58 +6280,43 @@ class ReleaseValidator:
         for missing_key in sorted(set(unlinked_keys) - returned_keys):
             self._log_issue(release_key, 'error',
                             f'Отлинкованная задача {missing_key}: не удалось получить задачу для проверки другого релиза.')
-        installed_elsewhere = self._check_unlinked_other_releases(list(issues_by_key.values()), release_key)
-        for issue_key in unlinked_keys:
-            issue = issues_by_key.get(issue_key)
-            if not issue:
-                continue
-
-            linked_release_keys = self._extract_linked_issue_keys(issue) & current_release_story_bug_keys
-            if linked_release_keys:
-                self._log_issue(
-                    issue,
-                    "success",
-                    "Отлинкованная от релиза задача связана с задачей/багом в составе релиза "
-                    f"({', '.join(sorted(linked_release_keys))}) — проверка merged PR пропущена ✓"
-                )
-                continue
-
-            issue_labels = {str(label).strip().casefold() for label in (getattr(issue.fields, 'labels', []) or [])}
-            if 'review_confirmed' in issue_labels:
-                self._log_issue(
-                    issue,
-                    "success",
-                    "Отлинкованная от релиза задача имеет лейбл review_confirmed — "
-                    "проверка merged PR пропущена ✓"
-                )
-                continue
-
+        issues_with_pr = []
+        merged_keys = set()
+        for issue in issues_by_key.values():
             try:
-                merged_pr = self._find_issue_merged_pull_request_evidence(issue)
-            except Exception as e:
-                self._log_issue(
-                    issue,
-                    "warning",
-                    f"Отлинкованная задача: не удалось проверить статус PR: {e}"
-                )
+                with self._pr_lookup_budget():
+                    snapshot = self._bitbucket_issue_prs(str(issue.key), str(getattr(issue, 'id', '') or ''))
+            except Exception as exc:
+                self._log_issue(issue, 'warning',
+                    f'Отлинкованная задача: не удалось проверить PR: {type(exc).__name__}')
                 continue
-
-            if merged_pr and issue_key in installed_elsewhere:
-                self._log_issue(issue, 'success',
-                                'Отлинкованная задача: merged PR допустим — другой релиз установлен на ПРОМ ✓')
-            elif merged_pr:
-                self._log_issue(
-                    issue,
-                    "error",
-                    f"Отлинкованная от релиза задача содержит PR в статусе merged ({merged_pr}). "
-                    "Если PR уже влит, задача/баг не должна быть отлинкована от релизного объекта"
-                )
+            if not snapshot['prs']:
+                if snapshot['complete']:
+                    self._log_issue(issue, 'success',
+                        'Отлинкованная задача: PR нет — исключение из релиза допустимо ✓')
+                else:
+                    self._log_issue(issue, 'warning',
+                        'Отлинкованная задача: не удалось подтвердить наличие или отсутствие PR.')
+                continue
+            issues_with_pr.append(issue)
+            if any(pr['state'] == 'MERGED' for _, pr in snapshot['prs']):
+                merged_keys.add(issue.key)
+            elif not snapshot['complete']:
+                self._log_issue(issue, 'warning',
+                    'Отлинкованная задача: PR найден, но полный список и отсутствие MERGED PR не подтверждены.')
+            status = normalize_field_text(getattr(getattr(issue.fields, 'status', None), 'name', ''))
+            if status.casefold() in {'cancelled', 'canceled', 'rejected'}:
+                self._log_issue(issue, 'error',
+                    f'Отлинкованная задача с PR имеет недопустимый статус «{status}»: '
+                    'Cancelled/Rejected при наличии PR запрещены.')
+            elif not status:
+                self._log_issue(issue, 'warning',
+                    'Отлинкованная задача с PR: не удалось проверить статус задачи.')
             else:
-                self._log_issue(
-                    issue,
-                    "success",
-                    "Отлинкованная от релиза задача: merged PR не найден ✓"
-                )
+                self._log_issue(issue, 'success',
+                    f'Отлинкованная задача с PR: статус «{status}» допустим ✓')
+        if issues_with_pr:
+            self._check_unlinked_other_releases(issues_with_pr, release_key, merged_keys)
 
     def _check_gigacode_aifixed_labels(self, release_key: str) -> None:
         AIFIXED_LABEL = 'AIFIXED'

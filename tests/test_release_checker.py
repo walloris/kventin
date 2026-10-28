@@ -1111,21 +1111,19 @@ def test_direct_cycle_scan_stops_at_its_budget(zephyr, fake_clock):
     assert zephyr.get_test_cycle_details.call_count == 2
 
 
-@pytest.mark.parametrize('merged_result,blocking', [('PR 42 (merged)', True), (requests.Timeout(), False)])
+@pytest.mark.parametrize('merged_result,blocking', [('MERGED', True), (requests.Timeout(), False)])
 def test_unlinked_merged_violation_blocks_but_unavailable_pr_does_not(merged_result, blocking):
     checker = stage_validator()
-    checker._check_unlinked_other_releases = Mock(return_value=set())
     issue = NS(key='ABC-2', id='2', fields=NS(summary='Removed task', assignee=None,
-               issuetype=NS(name='Story'), labels=[], issuelinks=[]))
+               status=NS(name='In Progress'), issuetype=NS(name='Story'), labels=[], issuelinks=[]))
     checker._get_unlinked_release_issue_keys = Mock(return_value={'ABC-2'})
-    checker._get_release_story_bug_keys = Mock(return_value={'ABC-1'})
     checker.jira_main = Mock()
     checker.jira_main.search_issues.return_value = [issue]
-    checker._find_issue_merged_pull_request_evidence = Mock()
+    checker._bitbucket_issue_prs = Mock()
     if isinstance(merged_result, Exception):
-        checker._find_issue_merged_pull_request_evidence.side_effect = merged_result
+        checker._bitbucket_issue_prs.side_effect = merged_result
     else:
-        checker._find_issue_merged_pull_request_evidence.return_value = merged_result
+        checker._bitbucket_issue_prs.return_value = {'prs': [('url', {'state': merged_result})], 'complete': True}
     checker._run_check('unlinked_pr', 'Merged PR',
                        lambda: checker._check_unlinked_release_items_pull_requests('REL-1'), required=False)
     assert bool(checker.report_data['ABC-2']['errors']) is blocking
@@ -2089,35 +2087,66 @@ def test_unlinked_requires_installed_other_release(statuses, accepted):
     assert bool(checker.report_data['ABC-2']['errors']) is not accepted
 
 
-def test_installed_other_release_allows_merged_pr():
+@pytest.mark.parametrize('pr_state,release_status,blocking', [
+    ('OPEN', 'В работе', False), ('DECLINED', 'В работе', False),
+    ('MERGED', 'В работе', True), ('MERGED', 'Установлен на ПРОМ', False)])
+def test_unlinked_other_release_installation_depends_on_pr_state(pr_state, release_status, blocking):
     checker = stage_validator()
-    issue = NS(key='ABC-2', fields=NS(summary='Task', assignee=None,
+    issue = NS(key='ABC-2', fields=NS(summary='Task', assignee=None, status=NS(name='In Progress'),
         issuetype=NS(name='Story'), labels=[], issuelinks=[NS(inwardIssue=NS(key='REL-2'))]))
     checker._get_unlinked_release_issue_keys = Mock(return_value={'ABC-2'})
-    checker._get_release_story_bug_keys = Mock(return_value=set())
     checker.jira_main = Mock()
     checker.jira_main.search_issues.side_effect = [[issue],
-        [NS(key='REL-2', fields=NS(status=NS(name='Установлен на ПРОМ')))]]
-    checker._find_issue_merged_pull_request_evidence = Mock(return_value='PR 42')
+        [NS(key='REL-2', fields=NS(status=NS(name=release_status)))]]
+    checker._bitbucket_issue_prs = Mock(return_value={'prs': [('url', {'state': pr_state})], 'complete': True})
     checker._check_unlinked_release_items_pull_requests('REL-1')
-    checker._find_issue_merged_pull_request_evidence.assert_called_once_with(issue)
-    assert not checker.report_data['ABC-2']['errors']
+    assert bool(checker.report_data['ABC-2']['errors']) is blocking
+    assert checker.jira_main.search_issues.call_count == (2 if pr_state == 'MERGED' else 1)
 
 
-@pytest.mark.parametrize('exemption', ['label', 'linked_story'])
-def test_pr_exemptions_do_not_skip_other_release_requirement(exemption):
+@pytest.mark.parametrize('status', ['Cancelled', 'Rejected', 'In Progress'])
+def test_unlinked_without_pr_does_not_require_status_or_another_release(status):
     checker = stage_validator()
-    issue = NS(key='ABC-2', fields=NS(summary='Task', assignee=None,
-        issuetype=NS(name='Story'), labels=['review_confirmed'] if exemption == 'label' else [],
-        issuelinks=[NS(outwardIssue=NS(key='ABC-1'))] if exemption == 'linked_story' else []))
+    issue = NS(key='ABC-2', fields=NS(summary='Task', assignee=None, status=NS(name=status),
+        issuetype=NS(name='Story'), labels=[], issuelinks=[]))
     checker._get_unlinked_release_issue_keys = Mock(return_value={'ABC-2'})
-    checker._get_release_story_bug_keys = Mock(return_value={'ABC-1'})
     checker.jira_main = Mock()
     checker.jira_main.search_issues.return_value = [issue]
-    checker._find_issue_merged_pull_request_evidence = Mock()
+    checker._bitbucket_issue_prs = Mock(return_value={'prs': [], 'complete': True})
+    checker._check_unlinked_other_releases = Mock()
     checker._check_unlinked_release_items_pull_requests('REL-1')
-    assert checker.report_data['ABC-2']['errors']
-    checker._find_issue_merged_pull_request_evidence.assert_not_called()
+    assert not checker.report_data['ABC-2']['errors']
+    checker._check_unlinked_other_releases.assert_not_called()
+
+
+@pytest.mark.parametrize('status', ['Cancelled', 'Rejected', 'CANCELLED', 'canceled'])
+@pytest.mark.parametrize('state', ['OPEN', 'MERGED', 'DECLINED'])
+def test_unlinked_with_pr_rejects_cancelled_rejected_status(status, state):
+    checker = stage_validator()
+    issue = NS(key='ABC-2', fields=NS(summary='Task', assignee=None, status=NS(name=status),
+        issuetype=NS(name='Story'), labels=['review_confirmed'], issuelinks=[]))
+    checker._get_unlinked_release_issue_keys = Mock(return_value={'ABC-2'})
+    checker.jira_main = Mock()
+    checker.jira_main.search_issues.return_value = [issue]
+    checker._bitbucket_issue_prs = Mock(return_value={'prs': [('url', {'state': state})], 'complete': True})
+    checker._check_unlinked_other_releases = Mock(return_value={'ABC-2'})
+    checker._check_unlinked_release_items_pull_requests('REL-1')
+    assert 'недопустимый статус' in str(checker.report_data['ABC-2']['errors'])
+
+
+@pytest.mark.parametrize('complete', [True, False])
+def test_unlinked_no_verified_pr_distinguishes_absence_from_unavailable(complete):
+    checker = stage_validator()
+    issue = NS(key='ABC-2', fields=NS(summary='Task', assignee=None,
+        issuetype=NS(name='Story'), labels=[], issuelinks=[]))
+    checker._get_unlinked_release_issue_keys = Mock(return_value={'ABC-2'})
+    checker.jira_main = Mock()
+    checker.jira_main.search_issues.return_value = [issue]
+    checker._bitbucket_issue_prs = Mock(return_value={'prs': [], 'complete': complete})
+    checker._check_unlinked_other_releases = Mock()
+    checker._check_unlinked_release_items_pull_requests('REL-1')
+    assert bool(checker.report_data['ABC-2']['warnings']) is not complete
+    checker._check_unlinked_other_releases.assert_not_called()
 
 
 def test_other_release_read_failure_blocks():
