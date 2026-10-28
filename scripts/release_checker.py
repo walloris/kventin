@@ -1609,6 +1609,53 @@ def sdd_get_json(session: requests.Session, base_url: str, path: str,
     return payload
 
 
+def sdd_file_evidence(data: dict, key: str) -> tuple[bool, dict]:
+    """Inspect returned commit files without treating omitted files as an empty list."""
+    stats = {'groups': 0, 'repositories': 0, 'commits': 0, 'files': 0,
+             'missing_repositories': 0, 'missing_commits': 0, 'missing_files': 0,
+             'invalid_paths': 0, 'truncated_files': 0, 'errors': len(data.get('errors') or []),
+             'file_paths_sample': [], 'openspec_paths_sample': [], 'matches': 0}
+    pattern = re.compile(r'openspec/[^\r\n\u2028\u2029]*' + re.escape(key.lower()), re.I)
+    details = data.get('detail')
+    if not isinstance(details, list):
+        stats['missing_repositories'] += 1
+        return False, stats
+    stats['groups'] = len(details)
+    for group in details:
+        repositories = group.get('repositories') if isinstance(group, dict) else None
+        if not isinstance(repositories, list):
+            stats['missing_repositories'] += 1
+            continue
+        for repo in repositories:
+            stats['repositories'] += 1
+            commits = repo.get('commits') if isinstance(repo, dict) else None
+            if not isinstance(commits, list):
+                stats['missing_commits'] += 1
+                continue
+            for commit in commits:
+                stats['commits'] += 1
+                files = commit.get('files') if isinstance(commit, dict) else None
+                if not isinstance(files, list):
+                    stats['missing_files'] += 1
+                    continue
+                declared = commit.get('fileCount')
+                if type(declared) is int and declared > len(files):
+                    stats['truncated_files'] += 1
+                for file in files:
+                    stats['files'] += 1
+                    path = file.get('path') if isinstance(file, dict) else None
+                    if not isinstance(path, str):
+                        stats['invalid_paths'] += 1
+                        continue
+                    if len(stats['file_paths_sample']) < 5:
+                        stats['file_paths_sample'].append(path[:300])
+                    if 'openspec/' in path.lower() and len(stats['openspec_paths_sample']) < 5:
+                        stats['openspec_paths_sample'].append(path[:300])
+                    if pattern.search(path.lower()):
+                        stats['matches'] += 1
+    return stats['matches'] > 0, stats
+
+
 def sdd_story_result(session: requests.Session, base_url: str, key: str) -> tuple[bool, Optional[bool]]:
     """Check one Story using the updated openspec/.*<key>.* matching rule."""
     issue = sdd_get_json(session, base_url, f'/rest/api/2/issue/{key}', {'fields': 'labels'})
@@ -1622,6 +1669,13 @@ def sdd_story_result(session: requests.Session, base_url: str, key: str) -> tupl
                            {'issueId': issue_id, '_': int(time.time() * 1000)}, allow_http_failure=True)
     repository = ((summary or {}).get('summary') or {}).get('repository') or {}
     repo_count = (repository.get('overall') or {}).get('count') or 0
+    if http_debug_enabled():
+        providers = repository.get('byInstanceType') or {}
+        print('[SDD DATA] ' + json.dumps({'story': key, 'stage': 'summary',
+              'repo_count': repo_count, 'summary_available': summary is not None,
+              'providers': {provider: (providers.get(provider) or {}).get('count')
+                            for provider in ('stash', 'bitbucket', 'bitbucket-server')
+                            if isinstance(providers.get(provider), dict)}}, ensure_ascii=False), flush=True)
     if repo_count == 0:
         return has_sdd, False
     session.headers['X-Requested-With'] = 'XMLHttpRequest'
@@ -1635,21 +1689,54 @@ def sdd_story_result(session: requests.Session, base_url: str, key: str) -> tupl
             if data is None:
                 continue
             details = data.get('detail') or []
+            matched, stats = sdd_file_evidence(data, key)
+            if http_debug_enabled():
+                print('[SDD DATA] ' + json.dumps({'story': key, 'stage': 'detail',
+                      'provider': 'stash', 'data_type': 'repository', **stats}, ensure_ascii=False), flush=True)
             if not details and (data.get('errors') or []):
                 continue
-            # JavaScript's dot excludes these four line terminators.
-            pattern = re.compile(r'openspec/[^\r\n\u2028\u2029]*' + re.escape(key.lower()), re.I)
-            for group in details:
-                for repo in group.get('repositories') or []:
-                    for commit in repo.get('commits') or []:
-                        for file in commit.get('files') or []:
-                            path = file['path'].lower()
-                            if pattern.search(path):
-                                return has_sdd, True
+            if matched:
+                return has_sdd, True
+            if any(stats[name] for name in ('missing_repositories', 'missing_commits',
+                                            'missing_files', 'invalid_paths', 'truncated_files')):
+                raise SddCheckError('Jira dev-status не передал полный список путей файлов '
+                                    'связанных коммитов. Наличие openspec в Bitbucket не опровергнуто. '
+                                    'Нужен диагностический вывод [SDD DATA] для проверки источника файлов.')
             return has_sdd, False
         return has_sdd, None
     finally:
         session.headers.pop('X-Requested-With', None)
+
+
+def _diag_sdd_story(key_or_url: str) -> int:
+    """Read one Story's SDD sources without creating validators or Jira comments."""
+    key = extract_issue_key_from_url(key_or_url)
+    if not re.fullmatch(r'[A-Z][A-Z0-9_]*-\d+', key):
+        print('[SDD DIAG] Укажите ключ Story, например SEARCHCS-1831.', flush=True)
+        return 2
+    previous_debug = os.environ.get('RELEASE_CHECKER_DEBUG_HTTP')
+    os.environ['RELEASE_CHECKER_DEBUG_HTTP'] = '1'
+    try:
+        if not config['jira']['url'] or not config['jira']['token']:
+            raise SddCheckError('Задайте URL и токен Jira в существующей конфигурации.')
+        with requests.Session() as session:
+            session.headers.update({'Authorization': f"Bearer {config['jira']['token']}",
+                                    'Accept': 'application/json'})
+            has_sdd, openspec = sdd_story_result(session, config['jira']['url'], key)
+        print('[SDD DIAG] ' + json.dumps({'story': key, 'has_sdd': has_sdd,
+              'openspec': openspec, 'read_only': True}, ensure_ascii=False), flush=True)
+        return 2 if openspec is None else (0 if has_sdd and openspec else 1)
+    except SddCheckError as exc:
+        print(f'[SDD DIAG] INCOMPLETE: {exc}', flush=True)
+        return 2
+    except (KeyError, TypeError, AttributeError, ValueError):
+        print('[SDD DIAG] INCOMPLETE: некорректная конфигурация или формат ответа API.', flush=True)
+        return 2
+    finally:
+        if previous_debug is None:
+            os.environ.pop('RELEASE_CHECKER_DEBUG_HTTP', None)
+        else:
+            os.environ['RELEASE_CHECKER_DEBUG_HTTP'] = previous_debug
 
 
 class ReleaseValidator:
@@ -2977,10 +3064,13 @@ class ReleaseValidator:
                     if not openspec:
                         failed = True
                         self._log_issue(current_key, 'error',
-                                        f'SDD: в данных Bitbucket по Story не найдены файлы '
-                                        f'openspec/{current_key}. Добавьте артефакты SDD в этот каталог '
-                                        f'и свяжите коммит с {current_key}, чтобы файлы отображались '
-                                        'в Jira dev-status. Повторите проверку после обновления данных.')
+                                        f'SDD: среди файлов связанных коммитов, возвращённых Jira dev-status, '
+                                        f'не найден путь по правилу openspec/.*{current_key}.*. '
+                                        'Допускаются вложенные и архивные каталоги, например '
+                                        f'openspec/changes/archive/2026-10-02-{current_key}/spec.md. '
+                                        'Если артефакты уже есть в Bitbucket, проверьте связь коммита '
+                                        f'с {current_key} и выдачу путей файлов в Jira dev-status. '
+                                        'Создавать отдельный каталог openspec/ID не требуется.')
                 if failed:
                     self._log_issue(release_key, 'error',
                                     'SDD: проверка не пройдена. Исправьте замечания по Story '
@@ -6820,6 +6910,8 @@ if __name__ == "__main__":
     if explicit_matrix or (matrix_enabled and len(sys.argv) > 1 and not sys.argv[1].startswith('--')):
         _diag_lookup_matrix(sys.argv[2] if explicit_matrix else sys.argv[1])
         sys.exit(0)  # Diagnostic completion, not a release-readiness verdict.
+    if len(sys.argv) >= 3 and sys.argv[1] == '--diag-sdd':
+        sys.exit(_diag_sdd_story(sys.argv[2]))
     validator = ReleaseValidator()
     if len(sys.argv) >= 3 and sys.argv[1] == "--dry-run":
         validator.dry_run = True

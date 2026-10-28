@@ -2506,7 +2506,7 @@ def test_native_sdd_summary_without_repositories_is_false(native_sdd, summary_re
     session.get.side_effect = sdd_responses()[:3] + [summary_response]
     assert checker.check_release('REL-1') is False
     checker.jira_main.issue.assert_not_called()
-    assert 'openspec/ST-1' in checker.report_data['ST-1']['errors'][0]
+    assert 'openspec/.*ST-1.*' in checker.report_data['ST-1']['errors'][0]
     assert session.get.call_count == 4
     assert rc.time.sleep.call_count == 0
 
@@ -2515,7 +2515,7 @@ def test_native_sdd_missing_issue_id_is_false(native_sdd):
     checker, session = native_sdd
     session.get.side_effect = sdd_responses(issue_id=None)[:3]
     assert checker.check_release('REL-1') is False
-    assert 'openspec/ST-1' in checker.report_data['ST-1']['errors'][0]
+    assert 'openspec/.*ST-1.*' in checker.report_data['ST-1']['errors'][0]
     assert session.get.call_count == 3
 
 
@@ -2573,8 +2573,8 @@ def test_native_sdd_comment_lists_both_missing_requirements(native_sdd):
     assert checker.check_release('REL-1') is False
     body = checker._release_comment('REL-1', False)
     assert '[ST-1|' in body and 'Добавьте в Jira' in body
-    assert 'без символа &#35;' in body and 'openspec/ST-1' in body
-    assert 'свяжите коммит с ST-1' in body
+    assert 'без символа &#35;' in body and 'openspec/changes/archive/2026-10-02-ST-1/spec.md' in body
+    assert 'проверьте связь коммита с ST-1' in body
 
 
 def test_native_sdd_unknown_still_allows_remaining_checks(native_sdd):
@@ -2612,7 +2612,7 @@ def test_packed_entrypoint_uses_same_native_sdd(monkeypatch, native_sdd):
     namespace = dict(vars(rc))
     parsed = ast.parse(decoded)
     helpers = [n for n in parsed.body if isinstance(n, (ast.ClassDef, ast.FunctionDef))
-               and n.name in {'SddCheckError', 'sdd_get_json', 'sdd_story_result'}]
+               and n.name in {'SddCheckError', 'sdd_get_json', 'sdd_file_evidence', 'sdd_story_result'}]
     import inspect
     source_fn = ast.parse(inspect.getsource(rc.sdd_story_result)).body[0]
     packed_fn = next(n for n in helpers if n.name == 'sdd_story_result')
@@ -2741,3 +2741,74 @@ def test_report_honors_validation_verdict_and_errors(monkeypatch, ready, logged_
     if not expected:
         assert checker.report_data['REL-1']['errors']
         assert '#de350b' in checker._release_comment('REL-1', False)
+
+
+@pytest.mark.parametrize('key,folder', [
+    ('SEARCHCS-1718', '2026-08-25-SEARCHCS-1718/specs/issues-upload-rate-limit'),
+    ('SEARCHCS-1742', '2026-09-25-SEARCHCS-1742/specs/profile-privacy-settings-indexing'),
+    ('SEARCHCS-1831', '2026-10-02-SEARCHCS-1831/specs/issues-for-sign-index'),
+])
+def test_sdd_accepts_archive_paths_from_reported_screenshot(native_sdd, key, folder, capsys):
+    checker, session = native_sdd
+    path = f'openspec/changes/archive/{folder}/spec.md'
+    data = {'detail': [{'repositories': [{'commits': [{'files': [{'path': path}]}]}]}]}
+    session.get.side_effect = sdd_responses(detail=data, issues=[{'key': key}])
+    checker._run_check('sdd', 'SDD', lambda: checker._check_sdd_gate('REL-1'))
+    assert checker.check_results[0]['status'] == 'PASS'
+    output = capsys.readouterr().out
+    assert path in output and '"matches": 1' in output
+
+
+@pytest.mark.parametrize('repository,stat', [
+    ({'commits': [{'id': 'commit', 'fileCount': 5}]}, 'missing_files'),
+    ({'commits': [{'files': [], 'fileCount': 5}]}, 'truncated_files'),
+    ({'commits': [{'files': [{'path': {'toString': 'openspec/ST-1/spec.md'}}]}]}, 'invalid_paths'),
+    ({'name': 'repository'}, 'missing_commits'),
+])
+def test_sdd_omitted_file_data_blocks_as_incomplete_not_missing_openspec(native_sdd, repository, stat, capsys):
+    checker, session = native_sdd
+    session.get.side_effect = sdd_responses(detail={'detail': [{'repositories': [repository]}]})
+    assert checker.check_release('REL-1') is False
+    checker.jira_main.issue.assert_not_called()
+    assert checker.check_results[0]['status'] == 'INCOMPLETE'
+    body = checker._release_comment('REL-1', False)
+    assert 'не передал полный список' in body
+    assert 'не найден путь' not in body
+    assert f'"{stat}": 1' in capsys.readouterr().out
+
+
+def test_sdd_positive_match_survives_other_commit_without_files(native_sdd):
+    checker, session = native_sdd
+    data = sdd_responses()[-1].json()
+    data['detail'][0]['repositories'][0]['commits'].append({'id': 'omitted-files'})
+    session.get.side_effect = sdd_responses(detail=data)
+    checker._run_check('sdd', 'SDD', lambda: checker._check_sdd_gate('REL-1'))
+    assert checker.check_results[0]['status'] == 'PASS'
+
+
+def test_sdd_diagnostic_samples_respect_debug_switch(native_sdd, monkeypatch, capsys):
+    checker, session = native_sdd
+    monkeypatch.setenv('RELEASE_CHECKER_DEBUG_HTTP', '0')
+    session.get.side_effect = sdd_responses()
+    checker._run_check('sdd', 'SDD', lambda: checker._check_sdd_gate('REL-1'))
+    assert '[SDD DATA]' not in capsys.readouterr().out
+
+
+def test_sdd_read_only_diagnostic_does_not_create_validator(native_sdd, monkeypatch, capsys):
+    _, session = native_sdd
+    monkeypatch.setattr(rc, 'ReleaseValidator', Mock(side_effect=AssertionError('must not be initialized')))
+    monkeypatch.setenv('RELEASE_CHECKER_DEBUG_HTTP', '0')
+    session.get.side_effect = sdd_responses()[1:]
+    assert rc._diag_sdd_story('ST-1') == 0
+    output = capsys.readouterr().out
+    assert '[SDD DATA]' in output and '"matches": 1' in output
+    assert '"read_only": true' in output
+    assert 'test-token' not in output
+    assert rc.os.environ['RELEASE_CHECKER_DEBUG_HTTP'] == '0'
+    assert session.get.call_count == 4
+
+
+def test_sdd_diagnostic_invalid_story_does_not_request_api(native_sdd):
+    _, session = native_sdd
+    assert rc._diag_sdd_story('invalid') == 2
+    session.get.assert_not_called()
