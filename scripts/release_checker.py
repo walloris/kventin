@@ -18,7 +18,7 @@ from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from typing import Optional
+from typing import Optional, Union
 from urllib.parse import quote, urlsplit
 
 script_dir = Path(__file__).resolve().parent
@@ -1698,10 +1698,35 @@ def sdd_bitbucket_path(path: object) -> Optional[str]:
     return None
 
 
+def sdd_bitbucket_settings() -> tuple[str, str, Union[bool, str]]:
+    """Reuse the deployed Bitbucket config; environment settings may override it."""
+    section = config.get('bitbucket') or {}
+    jira_section = config.get('jira') or {}
+    base = section.get('url') or ''
+    config_token = section.get('token') or jira_section.get('bitbucket_token') or ''
+    if not isinstance(base, str) or not isinstance(config_token, str):
+        raise SddCheckError('Проверьте строковые url и token в секции bitbucket конфигурации.')
+    base = base.rstrip('/')
+    env_base = os.getenv('BITBUCKET_BASE_URL', '').rstrip('/')
+    env_token = os.getenv('BITBUCKET_API_TOKEN', '')
+    if env_base and base and config_token and not env_token:
+        old, new = urlsplit(base), urlsplit(env_base)
+        if ((old.scheme, old.netloc.lower(), old.path.rstrip('/'))
+                != (new.scheme, new.netloc.lower(), new.path.rstrip('/'))):
+            raise SddCheckError('BITBUCKET_BASE_URL меняет адрес из конфигурации. '
+                                'Задайте соответствующий BITBUCKET_API_TOKEN для нового адреса.')
+    verify = section.get('verify_ssl', release_tls_policy())
+    if (os.getenv('RELEASE_CHECKER_CA_BUNDLE', '').strip()
+            or os.getenv('RELEASE_CHECKER_VERIFY_SSL') is not None):
+        verify = release_tls_policy()
+    if not isinstance(verify, (bool, str)) or (isinstance(verify, str) and not verify.strip()):
+        raise SddCheckError('Проверьте verify_ssl в секции bitbucket конфигурации.')
+    return env_base or base, env_token or config_token, verify
+
+
 def sdd_bitbucket_commit_files(url: str, key: str) -> list[dict]:
     """Read all change pages, or stop once matching SDD evidence is established."""
-    configured_base = os.getenv('BITBUCKET_BASE_URL', '').rstrip('/')
-    token = os.getenv('BITBUCKET_API_TOKEN', '')
+    configured_base, token, verify = sdd_bitbucket_settings()
     if configured_base:
         configured = urlsplit(configured_base)
         actual = urlsplit(url)
@@ -1709,10 +1734,10 @@ def sdd_bitbucket_commit_files(url: str, key: str) -> list[dict]:
                 or configured.query or configured.fragment or not configured.hostname
                 or configured.netloc.lower() != actual.netloc.lower()
                 or not actual.path.startswith(configured.path.rstrip('/') + '/rest/api/')):
-            raise SddCheckError('URL связанного коммита не соответствует BITBUCKET_BASE_URL. '
-                                'Проверьте настроенный адрес Bitbucket.')
+            raise SddCheckError('URL связанного коммита не соответствует настроенному адресу Bitbucket. '
+                                'Проверьте bitbucket.url в конфигурации или BITBUCKET_BASE_URL.')
     elif token:
-        raise SddCheckError('Для BITBUCKET_API_TOKEN задайте BITBUCKET_BASE_URL — адрес его Bitbucket.')
+        raise SddCheckError('Для токена Bitbucket задайте bitbucket.url в конфигурации или BITBUCKET_BASE_URL.')
     pattern = re.compile(r'openspec/[^\r\n\u2028\u2029]*' + re.escape(key.lower()), re.I)
     files = []
     start = 0
@@ -1725,9 +1750,9 @@ def sdd_bitbucket_commit_files(url: str, key: str) -> list[dict]:
         for page_number in range(100):
             try:
                 response = bitbucket.get(url, params={'start': start, 'limit': 1000},
-                                         timeout=(5, 30), verify=release_tls_policy(), allow_redirects=False)
+                                         timeout=(5, 30), verify=verify, allow_redirects=False)
             except requests.exceptions.SSLError:
-                raise SddCheckError('Bitbucket: ошибка TLS. Проверьте RELEASE_CHECKER_CA_BUNDLE.') from None
+                raise SddCheckError('Bitbucket: ошибка TLS. Проверьте bitbucket.verify_ssl и RELEASE_CHECKER_CA_BUNDLE.') from None
             except requests.RequestException:
                 raise SddCheckError('Bitbucket: не удалось получить список изменений коммита. '
                                     'Проверьте сеть и повторите запуск.') from None
@@ -1736,8 +1761,8 @@ def sdd_bitbucket_commit_files(url: str, key: str) -> list[dict]:
                       'host': urlsplit(url).hostname, 'start': start, 'status': response.status_code,
                       'auth': 'bitbucket_token' if token else 'anonymous'}, ensure_ascii=False), flush=True)
             if not 200 <= response.status_code < 300:
-                advice = ('Задайте BITBUCKET_BASE_URL и BITBUCKET_API_TOKEN с правом чтения '
-                          'репозитория (REPO_READ).' if response.status_code in {401, 403}
+                advice = ('Проверьте bitbucket.url и bitbucket.token в конфигурации и право чтения '
+                          'репозитория (REPO_READ). Переопределения: BITBUCKET_BASE_URL и BITBUCKET_API_TOKEN.' if response.status_code in {401, 403}
                           else 'Проверьте доступ к связанному коммиту и Bitbucket API.')
                 raise SddCheckError(f'Bitbucket HTTP {response.status_code}. {advice}')
             try:

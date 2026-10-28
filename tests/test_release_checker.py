@@ -2616,7 +2616,7 @@ def test_packed_entrypoint_uses_same_native_sdd(monkeypatch, native_sdd):
     helpers = [n for n in parsed.body if isinstance(n, (ast.ClassDef, ast.FunctionDef))
                and n.name in {'SddCheckError', 'sdd_get_json', 'sdd_file_evidence', 'sdd_story_result',
                                   'sdd_bitbucket_changes_url', 'sdd_bitbucket_path',
-                                  'sdd_bitbucket_commit_files', 'sdd_complete_commit_files'}]
+                                  'sdd_bitbucket_commit_files', 'sdd_bitbucket_settings', 'sdd_complete_commit_files'}]
     import inspect
     source_fn = ast.parse(inspect.getsource(rc.sdd_story_result)).body[0]
     packed_fn = next(n for n in helpers if n.name == 'sdd_story_result')
@@ -2954,3 +2954,56 @@ def test_sdd_never_sends_bitbucket_token_to_unconfigured_destination(native_sdd,
                                      + 'a'*40 + '/changes', 'ST-1')
     factory.assert_not_called()
     bb.get.assert_not_called()
+
+
+def test_sdd_uses_existing_bitbucket_section_without_env(native_sdd, monkeypatch, capsys):
+    checker, jira = native_sdd
+    rc.config['bitbucket'] = {'url': 'https://git.example/', 'token': 'configured-bb-token', 'verify_ssl': False}
+    jira.get.side_effect = sdd_responses(detail=sdd_linked_truncated_detail())
+    bb, _ = bitbucket_test_session(monkeypatch, jira)
+    bb.get.return_value = response(200, {'values': [{'path': {'components': ['openspec', 'ST-1', 'spec.md']}}],
+                                       'isLastPage': True})
+    checker._run_check('sdd', 'SDD', lambda: checker._check_sdd_gate('REL-1'))
+    assert checker.check_results[0]['status'] == 'PASS'
+    assert bb.headers['Authorization'] == 'Bearer configured-bb-token'
+    assert bb.get.call_args.kwargs['verify'] is False
+    assert jira.headers['Authorization'] == 'Bearer test-token'
+    assert 'configured-bb-token' not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('verify', [False, True, '/corporate/bitbucket-ca.pem'])
+def test_sdd_bitbucket_config_preserves_tls_setting(native_sdd, monkeypatch, verify):
+    rc.config['bitbucket'] = {'url': 'https://git.example', 'token': 'bb', 'verify_ssl': verify}
+    monkeypatch.delenv('RELEASE_CHECKER_CA_BUNDLE', raising=False)
+    monkeypatch.delenv('RELEASE_CHECKER_VERIFY_SSL', raising=False)
+    assert rc.sdd_bitbucket_settings() == ('https://git.example', 'bb', verify)
+
+
+def test_sdd_dedicated_legacy_bitbucket_token_fallback(native_sdd):
+    rc.config['jira']['bitbucket_token'] = 'legacy-bb-token'
+    rc.config['bitbucket'] = {'url': 'https://git.example', 'token': ''}
+    base, token, _ = rc.sdd_bitbucket_settings()
+    assert (base, token) == ('https://git.example', 'legacy-bb-token')
+    rc.config['bitbucket']['token'] = 'section-bb-token'
+    assert rc.sdd_bitbucket_settings()[1] == 'section-bb-token'
+
+
+def test_sdd_explicit_env_token_and_url_override_config(native_sdd, monkeypatch):
+    rc.config['bitbucket'] = {'url': 'https://old.example', 'token': 'old-token', 'verify_ssl': False}
+    monkeypatch.setenv('BITBUCKET_BASE_URL', 'https://git.example')
+    monkeypatch.setenv('BITBUCKET_API_TOKEN', 'new-token')
+    assert rc.sdd_bitbucket_settings()[:2] == ('https://git.example', 'new-token')
+
+
+def test_sdd_env_host_override_cannot_move_config_token(native_sdd, monkeypatch):
+    rc.config['bitbucket'] = {'url': 'https://old.example', 'token': 'private-config-token'}
+    monkeypatch.setenv('BITBUCKET_BASE_URL', 'https://new.example')
+    with pytest.raises(rc.SddCheckError, match='соответствующий BITBUCKET_API_TOKEN') as error:
+        rc.sdd_bitbucket_settings()
+    assert 'private-config-token' not in str(error.value)
+
+
+def test_sdd_explicit_release_ca_override_still_wins(native_sdd, monkeypatch):
+    rc.config['bitbucket'] = {'url': 'https://git.example', 'token': 'bb', 'verify_ssl': False}
+    monkeypatch.setenv('RELEASE_CHECKER_CA_BUNDLE', '/configured/ca.pem')
+    assert rc.sdd_bitbucket_settings()[2] == '/configured/ca.pem'
