@@ -1584,10 +1584,18 @@ class SddCheckError(RuntimeError):
 
 def sdd_get_json(session: requests.Session, base_url: str, path: str,
                  params: dict, *, allow_http_failure: bool = False,
-                 allow_list: bool = False) -> Optional[Union[dict, list]]:
+                 allow_list: bool = False, deadline: Optional[float] = None,
+                 retry_state: Optional[dict] = None) -> Optional[Union[dict, list]]:
     """Read one SDD endpoint, retaining the original non-2xx handling."""
+    if retry_state and retry_state.get('until', 0) > time.monotonic():
+        raise SddCheckError('Jira: сервер ограничил запросы, действует Retry-After.')
+    remaining = deadline - time.monotonic() if deadline is not None else None
+    if remaining is not None and remaining <= 0:
+        raise SddCheckError('Истёк лимит времени чтения связей Bitbucket из Jira.')
+    timeout = ((5, 30) if remaining is None else
+               urllib3.util.Timeout(total=remaining, connect=min(5, remaining), read=min(30, remaining)))
     try:
-        response = session.get(base_url.rstrip('/') + path, params=params, timeout=(5, 30),
+        response = session.get(base_url.rstrip('/') + path, params=params, timeout=timeout,
                                verify=release_tls_policy())
     except requests.exceptions.SSLError:
         raise SddCheckError('Ошибка TLS. Проверьте RELEASE_CHECKER_CA_BUNDLE и политику TLS.') from None
@@ -1595,6 +1603,8 @@ def sdd_get_json(session: requests.Session, base_url: str, path: str,
         raise SddCheckError('Истёк таймаут запроса Jira/Bitbucket. Повторите запуск.') from None
     except requests.RequestException:
         raise SddCheckError('Ошибка подключения к Jira/Bitbucket. Проверьте сеть и доступ.') from None
+    if retry_state is not None and response.status_code in {429, 503}:
+        retry_state['until'] = time.monotonic() + max(1, retry_after_seconds(response))
     if not 200 <= response.status_code < 300:
         if allow_http_failure:
             return None
@@ -1727,16 +1737,25 @@ def sdd_bitbucket_settings() -> tuple[str, str, Union[bool, str]]:
 
 def sdd_bitbucket_read(url: str, key: str, *, params: Optional[dict] = None,
                        raw: bool = False, stop_on_match: bool = True,
-                       stage: str = 'bitbucket_changes') -> Union[dict, list[dict]]:
+                       stage: str = 'bitbucket_changes', objects: bool = False, find_evidence=None,
+                       deadline: Optional[float] = None, log_prefix: str = 'SDD DATA',
+                       retry_state: Optional[dict] = None) -> Union[dict, list[dict]]:
     """Read scoped Bitbucket metadata or paged file paths with shared authentication."""
+    if retry_state and retry_state.get('until', 0) > time.monotonic():
+        raise SddCheckError('Bitbucket: сервер ограничил запросы, действует Retry-After.')
     configured_base, token, verify = sdd_bitbucket_settings()
+    destination = urlsplit(url)
+    if (destination.scheme != 'https' or not destination.hostname or destination.username
+            or destination.password or destination.query or destination.fragment):
+        raise SddCheckError('Нужен корректный HTTPS URL Bitbucket без реквизитов авторизации.')
     if configured_base:
         configured = urlsplit(configured_base)
         actual = urlsplit(url)
         if (configured.scheme != 'https' or configured.username or configured.password
                 or configured.query or configured.fragment or not configured.hostname
                 or configured.netloc.lower() != actual.netloc.lower()
-                or not actual.path.startswith(configured.path.rstrip('/') + '/rest/api/')):
+                or not any(actual.path.startswith(configured.path.rstrip('/') + '/rest/' + module + '/')
+                           for module in ('api', 'jira'))):
             raise SddCheckError('URL связанного коммита не соответствует настроенному адресу Bitbucket. '
                                 'Проверьте bitbucket.url в конфигурации или BITBUCKET_BASE_URL.')
     elif token:
@@ -1750,19 +1769,27 @@ def sdd_bitbucket_read(url: str, key: str, *, params: Optional[dict] = None,
         bitbucket.headers.update({'Accept': 'application/json'})
         if token:
             bitbucket.headers['Authorization'] = f'Bearer {token}'
+        seen_pages = set()
         for page_number in range(100):
+            remaining = deadline - time.monotonic() if deadline is not None else None
+            if remaining is not None and remaining <= 0:
+                raise SddCheckError('Bitbucket: истёк лимит времени проверки.')
+            timeout = ((5, 30) if remaining is None else
+                       urllib3.util.Timeout(total=remaining, connect=min(5, remaining), read=min(30, remaining)))
             try:
                 response = bitbucket.get(url, params={**(params or {}), 'start': start, 'limit': 1000},
-                                         timeout=(5, 30), verify=verify, allow_redirects=False)
+                                         timeout=timeout, verify=verify, allow_redirects=False)
             except requests.exceptions.SSLError:
                 raise SddCheckError('Bitbucket: ошибка TLS. Проверьте bitbucket.verify_ssl и RELEASE_CHECKER_CA_BUNDLE.') from None
             except requests.RequestException:
                 raise SddCheckError('Bitbucket: не удалось получить список изменений коммита. '
                                     'Проверьте сеть и повторите запуск.') from None
             if http_debug_enabled():
-                print('[SDD DATA] ' + json.dumps({'story': key, 'stage': stage,
+                print('[' + log_prefix + '] ' + json.dumps({'story': key, 'stage': stage,
                       'host': urlsplit(url).hostname, 'start': start, 'status': response.status_code,
                       'auth': 'bitbucket_token' if token else 'anonymous'}, ensure_ascii=False), flush=True)
+            if retry_state is not None and response.status_code in {429, 503}:
+                retry_state['until'] = time.monotonic() + max(1, retry_after_seconds(response))
             if not 200 <= response.status_code < 300:
                 advice = ('Проверьте bitbucket.url и bitbucket.token в конфигурации и право чтения '
                           'репозитория (REPO_READ). Переопределения: BITBUCKET_BASE_URL и BITBUCKET_API_TOKEN.' if response.status_code in {401, 403}
@@ -1772,11 +1799,26 @@ def sdd_bitbucket_read(url: str, key: str, *, params: Optional[dict] = None,
                 page = response.json()
             except ValueError:
                 raise SddCheckError('Bitbucket вернул некорректный JSON вместо списка изменений.') from None
+            if isinstance(page, dict) and (page.get('errors') or page.get('errorMessages')):
+                raise SddCheckError('Bitbucket вернул ошибку API вместо данных.')
             if raw and isinstance(page, dict):
                 return page
             if not isinstance(page, dict) or not isinstance(page.get('values'), list):
                 raise SddCheckError('Bitbucket вернул неожиданный формат списка изменений.')
+            fingerprint = hashlib.sha256(json.dumps(page['values'], sort_keys=True).encode()).hexdigest()
+            if page['values'] and fingerprint in seen_pages:
+                raise SddCheckError('Bitbucket повторил страницу; полный список не получен.')
+            seen_pages.add(fingerprint)
+            if type(page.get('start')) is int and page['start'] != start:
+                raise SddCheckError('Bitbucket проигнорировал смещение страницы.')
             for change in page['values']:
+                if objects:
+                    if not isinstance(change, dict):
+                        raise SddCheckError('Bitbucket вернул некорректный объект в списке.')
+                    files.append(change)
+                    if find_evidence and find_evidence(change):
+                        return files
+                    continue
                 if isinstance(change, dict) and change.get('nodeType') == 'DIRECTORY':
                     continue
                 path = sdd_bitbucket_path(change.get('path') if isinstance(change, dict) else change)
@@ -1787,14 +1829,14 @@ def sdd_bitbucket_read(url: str, key: str, *, params: Optional[dict] = None,
                     return files
             if page.get('isLastPage') is True:
                 if page.get('truncated') is True:
-                    raise SddCheckError('Bitbucket обрезал список изменений серверным лимитом. '
+                    raise SddCheckError('Bitbucket обрезал список серверным лимитом. '
                                         'Отсутствие openspec не подтверждено.')
                 return files
             next_start = page.get('nextPageStart')
             if type(next_start) is not int or next_start <= start:
                 raise SddCheckError('Bitbucket не вернул корректное продолжение списка изменений.')
             start = next_start
-    raise SddCheckError('Достигнут лимит чтения страниц Bitbucket. Отсутствие openspec не подтверждено.')
+    raise SddCheckError('Достигнут лимит чтения страниц Bitbucket. Полнота данных не подтверждена.')
 
 
 def sdd_bitbucket_commit_files(url: str, key: str) -> list[dict]:
@@ -5246,6 +5288,11 @@ class ReleaseValidator:
     def _reset_pr_run_state(self):
         # Successful snapshots last for one release; transient failures expire.
         self._pr_http_cache = {}
+        self._bitbucket_read_cache = {}
+        self._bitbucket_link_cache = {}
+        self._bitbucket_changeset_cache = {}
+        self._bitbucket_retry_state = {}
+        self._bitbucket_jira_retry_state = {}
         self._pr_endpoint_failures = {}
         self._pr_endpoint_last_error = {}
         self._pr_endpoint_retry_at = {}
@@ -5542,26 +5589,244 @@ class ReleaseValidator:
                 return evidence
         return None
 
+    def _bitbucket_api(self, url: str, issue_key: str, *, objects: bool = False,
+                       params: Optional[dict] = None, find_evidence=None):
+        """All release checks use the same scoped Bitbucket reader as the SDD gate."""
+        cache = self.__dict__.setdefault('_bitbucket_read_cache', {})
+        cache_key = (url, json.dumps(params or {}, sort_keys=True), objects, issue_key if find_evidence else '')
+        if cache_key in cache:
+            return cache[cache_key]
+        complete_key = (url, json.dumps(params or {}, sort_keys=True), objects, '')
+        if find_evidence and complete_key in cache:
+            return cache[complete_key]
+        payload = sdd_bitbucket_read(url, issue_key, raw=not objects, objects=objects,
+                                    params=params, find_evidence=find_evidence,
+                                    deadline=getattr(self, '_pr_request_deadline', None),
+                                    stage='objects' if objects else 'metadata', log_prefix='BITBUCKET DATA',
+                                    retry_state=self.__dict__.setdefault('_bitbucket_retry_state', {}))
+        cache[cache_key] = payload
+        return payload
+
+    def _bitbucket_jira_links(self, issue_key: str, issue_id: str) -> dict:
+        """Use Jira only for direct issue-to-PR links, never for PR text or status."""
+        cache = self.__dict__.setdefault('_bitbucket_link_cache', {})
+        cache_key = issue_key or issue_id
+        if cache_key in cache:
+            return cache[cache_key]
+        result = {'urls': [], 'complete': True, 'errors': []}
+        if not re.fullmatch(r'[A-Z][A-Z0-9_]*-\d+', issue_key):
+            return {'urls': [], 'complete': False, 'errors': ['Нет ключа задачи для поиска PR.']}
+        base = config['jira']['url'].rstrip('/')
+        deadline = getattr(self, '_pr_request_deadline', None)
+        try:
+            if not issue_id:
+                issue = sdd_get_json(self.jira_http, base, f'/rest/api/2/issue/{quote(issue_key, safe="")}',
+                                     {'fields': 'summary'}, deadline=deadline, retry_state=self.__dict__.setdefault('_bitbucket_jira_retry_state', {}))
+                issue_id = str(issue.get('id') or '')
+            if not issue_id:
+                raise SddCheckError('Jira не вернула ID задачи для чтения связей PR.')
+            data = sdd_get_json(self.jira_http, base, '/rest/dev-status/1.0/issue/detail',
+                                {'issueId': issue_id, 'applicationType': 'stash', 'dataType': 'pullrequest'},
+                                deadline=deadline, retry_state=self.__dict__.setdefault('_bitbucket_jira_retry_state', {}))
+            details = data.get('detail')
+            if not isinstance(details, list):
+                raise SddCheckError('Jira не вернула список связанных PR.')
+            if data.get('errors') or data.get('errorMessages'):
+                result['errors'].append('Jira вернула неполные связи PR.')
+            seen_container = not details
+            for group in details:
+                if not isinstance(group, dict):
+                    result['errors'].append('Некорректная группа связей PR.')
+                    continue
+                if group.get('isLast') is False or group.get('hasMore') is True:
+                    result['errors'].append('Jira обрезала список связанных PR.')
+                if isinstance(group.get('pullRequests'), list):
+                    seen_container = True
+                for pr in group.get('pullRequests') or []:
+                    url = sdd_pull_request_api_url(pr.get('url') if isinstance(pr, dict) else None)
+                    if url:
+                        result['urls'].append(url)
+                    else:
+                        result['errors'].append('У связанного PR нет проверяемого URL Bitbucket.')
+            if not seen_container:
+                result['errors'].append('Jira не передала контейнер связанных PR.')
+        except SddCheckError as exc:
+            result['errors'].append(str(exc))
+        # Remote links are an independent, direct association with this same issue.
+        if not result['urls']:
+            try:
+                links = sdd_get_json(self.jira_http, base,
+                                     f'/rest/api/2/issue/{quote(issue_key, safe="")}/remotelink', {},
+                                     allow_list=True, deadline=deadline, retry_state=self.__dict__.setdefault('_bitbucket_jira_retry_state', {}))
+                if not isinstance(links, list):
+                    raise SddCheckError('Jira не вернула список внешних ссылок задачи.')
+                for link in links:
+                    obj = link.get('object') if isinstance(link, dict) else None
+                    url = sdd_pull_request_api_url(obj.get('url') if isinstance(obj, dict) else None)
+                    if url:
+                        result['urls'].append(url)
+            except SddCheckError as exc:
+                result['errors'].append(str(exc))
+        result['issue_id'] = issue_id
+        result['urls'] = list(dict.fromkeys(result['urls']))
+        result['errors'] = list(dict.fromkeys(result['errors']))
+        result['complete'] = not result['errors']
+        if result['complete']:
+            cache[cache_key] = result
+        return result
+
+    def _bitbucket_issue_changesets(self, issue_key: str, *, find_evidence=None) -> list[dict]:
+        """Read complete issue changesets, with the proven SDD link-to-commit fallback."""
+        base, _, _ = sdd_bitbucket_settings()
+        if not base:
+            raise SddCheckError('Не задан адрес Bitbucket для чтения связанных коммитов.')
+        try:
+            return self._bitbucket_api(f'{base}/rest/jira/1.0/issues/{quote(issue_key, safe="")}/commits',
+                                       issue_key, objects=True, find_evidence=find_evidence)
+        except SddCheckError:
+            # Some installations restrict the integration resource but allow repo APIs.
+            return self._bitbucket_changesets_from_jira(issue_key, find_evidence=find_evidence)
+
+    def _bitbucket_changesets_from_jira(self, issue_key: str, *, find_evidence=None) -> list[dict]:
+        cache = self.__dict__.setdefault('_bitbucket_changeset_cache', {})
+        if issue_key in cache:
+            return cache[issue_key]
+        base = config['jira']['url'].rstrip('/')
+        deadline = getattr(self, '_pr_request_deadline', None)
+        state = self.__dict__.setdefault('_bitbucket_jira_retry_state', {})
+        links = self.__dict__.get('_bitbucket_link_cache', {}).get(issue_key, {})
+        issue_id = links.get('issue_id')
+        if not issue_id:
+            issue = sdd_get_json(self.jira_http, base, f'/rest/api/2/issue/{quote(issue_key, safe="")}',
+                                 {'fields': 'summary'}, deadline=deadline, retry_state=state)
+            issue_id = issue.get('id')
+        if not issue_id:
+            raise SddCheckError('Jira не вернула ID задачи для чтения коммитов.')
+        expected = None
+        try:
+            summary = sdd_get_json(self.jira_http, base, '/rest/dev-status/1.0/issue/summary',
+                                   {'issueId': issue_id}, deadline=deadline, retry_state=state)
+            sections = summary.get('summary')
+            section = sections.get('repository') if isinstance(sections, dict) else None
+            overall = section.get('overall') if isinstance(section, dict) else None
+            count = overall.get('count') if isinstance(overall, dict) else None
+            if type(count) is int and count >= 0 and not summary.get('errors'):
+                expected = count
+        except SddCheckError:
+            pass  # Known positive commit evidence can still be read without summary.
+        data = sdd_get_json(self.jira_http, base, '/rest/dev-status/1.0/issue/detail',
+                            {'issueId': issue_id, 'applicationType': 'stash', 'dataType': 'repository'},
+                            deadline=deadline, retry_state=state)
+        if not isinstance(data.get('detail'), list):
+            raise SddCheckError('Jira не вернула ссылки на связанные коммиты.')
+        complete = not (data.get('errors') or data.get('errorMessages'))
+        changesets, seen = [], set()
+        for group in data['detail']:
+            if not isinstance(group, dict) or not isinstance(group.get('repositories', []), list):
+                raise SddCheckError('Jira вернула некорректный список репозиториев коммитов.')
+            if group.get('isLast') is False or group.get('hasMore') is True:
+                complete = False
+            for repo in group.get('repositories') or []:
+                if not isinstance(repo, dict):
+                    raise SddCheckError('Jira вернула некорректный репозиторий коммитов.')
+                if not isinstance(repo.get('commits'), list):
+                    raise SddCheckError('Jira не вернула полный список коммитов репозитория.')
+                for commit in repo.get('commits') or []:
+                    url = self._bitbucket_commit_url(commit, repo)
+                    if not url:
+                        raise SddCheckError('Jira не передала адрес связанного коммита Bitbucket.')
+                    if url in seen:
+                        continue
+                    seen.add(url)
+                    full = self._bitbucket_api(url, issue_key)
+                    if not isinstance(full.get('message'), str):
+                        raise SddCheckError('Bitbucket не вернул полное сообщение связанного коммита.')
+                    changeset = {'toCommit': full, 'repository': repo}
+                    changesets.append(changeset)
+                    if find_evidence and find_evidence(changeset):
+                        return changesets
+        # Repository summary counts commits, not repositories (2 commits may share 1 repo).
+        if not complete or expected is None or len(seen) < expected:
+            raise SddCheckError('Не получен полный список связанных коммитов Bitbucket.')
+        cache[issue_key] = changesets
+        return changesets
+
+    def _bitbucket_issue_prs(self, issue_key: str, issue_id: str) -> dict:
+        """Verify actual PR objects in Bitbucket, including MERGED state and full captions."""
+        links = self._bitbucket_jira_links(issue_key, issue_id)
+        result = {'prs': [], 'complete': links['complete'], 'errors': list(links['errors'])}
+        urls = list(links['urls'])
+        if not urls:
+            try:
+                for changeset in self._bitbucket_issue_changesets(issue_key):
+                    commit = changeset.get('toCommit')
+                    repo = changeset.get('repository') or {}
+                    if not isinstance(commit, dict):
+                        raise SddCheckError('Bitbucket не вернул связанный коммит для поиска PR.')
+                    commit_url = self._bitbucket_commit_url(commit, repo)
+                    if not commit_url:
+                        raise SddCheckError('Bitbucket не вернул адрес связанного коммита для поиска PR.')
+                    prs = self._bitbucket_api(commit_url + '/pull-requests', issue_key, objects=True)
+                    repo_api = commit_url.rsplit('/commits/', 1)[0]
+                    for pr in prs:
+                        if not str(pr.get('id', '')).isdigit():
+                            raise SddCheckError('Bitbucket не вернул ID PR связанного коммита.')
+                        urls.append(repo_api + '/pull-requests/' + str(pr['id']))
+            except SddCheckError as exc:
+                result['errors'].append(str(exc))
+                result['complete'] = False
+        for url in dict.fromkeys(urls):
+            try:
+                pr = self._bitbucket_api(url, issue_key)
+                expected_id = int(url.rsplit('/', 1)[-1])
+                if (str(pr.get('id')) != str(expected_id)
+                        or pr.get('state') not in {'OPEN', 'MERGED', 'DECLINED'}):
+                    raise SddCheckError('Bitbucket не подтвердил ID и состояние связанного PR.')
+                result['prs'].append((url, pr))
+            except SddCheckError as exc:
+                result['errors'].append(str(exc))
+                result['complete'] = False
+        return result
+
+    def _bitbucket_commit_url(self, commit: dict, repo: dict) -> Optional[str]:
+        if not isinstance(commit, dict) or not isinstance(repo, dict):
+            return None
+        url = sdd_bitbucket_changes_url(repo, commit)
+        if not url:
+            base, _, _ = sdd_bitbucket_settings()
+            project_data = repo.get('project')
+            project = project_data.get('key') if isinstance(project_data, dict) else None
+            slug = repo.get('slug')
+            if (base and isinstance(project, str) and isinstance(slug, str)
+                    and re.fullmatch(r'[A-Za-z0-9_~.-]+', project) and project not in {'.', '..'}
+                    and re.fullmatch(r'[A-Za-z0-9_.-]+', slug) and slug not in {'.', '..'}):
+                repo_url = f'{base}/projects/{quote(project, safe="")}/repos/{quote(slug, safe="")}'
+                url = sdd_bitbucket_changes_url({'url': repo_url}, commit)
+        return url.rsplit('/changes', 1)[0] if url else None
+
+    def _bitbucket_commit_message(self, commit: dict, repo: dict, issue_key: str) -> str:
+        """Inspect commit messages only; metadata and errors never establish GigaCode use."""
+        if isinstance(commit.get('message'), str):
+            return commit['message']
+        url = self._bitbucket_commit_url(commit, repo)
+        if not url:
+            raise SddCheckError('Bitbucket не вернул сообщение или адрес связанного коммита.')
+        full = self._bitbucket_api(url, issue_key)
+        if not isinstance(full.get('message'), str):
+            raise SddCheckError('Bitbucket не вернул полный текст сообщения коммита.')
+        return full['message']
+
     def _find_issue_merged_pull_request_evidence(self, issue) -> Optional[str]:
         issue_key = str(getattr(issue, 'key', '') or '')
         issue_id = str(getattr(issue, 'id', '') or '')
-        cache_key = issue_key or issue_id
-        if cache_key and cache_key in self._merged_pull_request_evidence_cache:
-            return self._merged_pull_request_evidence_cache[cache_key]
-
-        evidence = None
-        if not issue_id:
-            raise RuntimeError('нет Jira ID для проверки merged PR')
-        if issue_id:
-            for application_type, data_type, payload in self._get_dev_status_payloads(issue_id, data_types=('pullrequest',)):
-                payload_evidence = self._extract_merged_pull_request_evidence_from_payload(payload)
-                if payload_evidence:
-                    evidence = f"dev-status {application_type}/{data_type}: {payload_evidence}"
-                    break
-
-        if cache_key and evidence:
-            self._merged_pull_request_evidence_cache[cache_key] = evidence
-        return evidence
+        with self._pr_lookup_budget():
+            snapshot = self._bitbucket_issue_prs(issue_key, issue_id)
+        for url, pr in snapshot['prs']:
+            if pr['state'] == 'MERGED':
+                return f"Bitbucket PR {pr['id']} (merged): {url}"
+        if not snapshot['complete']:
+            raise RuntimeError('; '.join(snapshot['errors']))
+        return None
 
     def _find_issue_pull_request_evidence(self, issue) -> Optional[str]:
         issue_key = str(getattr(issue, 'key', '') or '')
@@ -5589,62 +5854,12 @@ class ReleaseValidator:
             self._pull_request_only_evidence_cache[cache_key] = evidence
         return evidence
 
-    def _find_issue_pull_request_only_evidence_uncached(
-        self, issue_key: str, issue_id: str,
-    ) -> Optional[str]:
-        if not hasattr(self, '_pr_lookup_failures'):
-            self._pr_lookup_failures = set()
-        count = None
-        cooldown_reason = self._pr_cooldown_reason()
-        if cooldown_reason:
-            self._pr_lookup_failures.add(cooldown_reason)
-            return None
-        if issue_id:
-            _, summary = self._get_dev_summary(issue_id)
-            count = self._summary_pr_count(summary)
-            if count is not None and count > 0:
-                return f"Jira development: связанных PR — {count}"
-        cooldown_reason = self._pr_cooldown_reason()
-        if cooldown_reason:
-            self._pr_lookup_failures.add(cooldown_reason)
-            return None
-        links = None
-        base = config['jira']['url'].rstrip('/')
-        if issue_key:
-            with self._pr_lookup_budget(4):
-                links = self._pr_get_json(f"{base}/rest/api/2/issue/{quote(issue_key, safe='')}/remotelink")
-            if isinstance(links, list):
-                evidence = self._extract_pull_request_evidence(links)
-                if evidence:
-                    return f"Jira remote links: {evidence}"
-        if count == 0 and isinstance(links, list):
-            self._pr_lookup_failures = set()
-            return None
-        # f38c5e1 removed both of these sources. Restore them without treating
-        # commits, repository ids or a PR on a child Task as evidence for a Story.
-        if issue_id:
-            try:
-                with self._pr_lookup_budget(16):
-                    for provider, data_type, payload in self._get_dev_status_payloads(
-                            issue_id, data_types=('pullrequest', 'repository'), find_evidence=self._extract_pull_request_evidence):
-                        evidence = self._dev_status_pull_request_evidence(data_type, payload)
-                        if evidence:
-                            self._pr_lookup_failures = set()
-                            return f"dev-status {provider}/{data_type}: {evidence}"
-            except RuntimeError as exc:
-                self._pr_lookup_failures.add(str(exc))
-        if issue_key:
-            properties = self._pr_get_json(f"{base}/rest/api/2/issue/{quote(issue_key, safe='')}/properties")
-            keys = (properties.get('keys') or []) if isinstance(properties, dict) else []
-            relevant = [item['key'] for item in keys if isinstance(item, dict) and isinstance(item.get('key'), str)
-                        and any(word in item['key'].casefold() for word in ('dev', 'stash', 'bitbucket', 'pull', 'vcs'))]
-            for key in relevant[:3]:
-                payload = self._pr_get_json(f"{base}/rest/api/2/issue/{quote(issue_key, safe='')}/properties/{quote(key, safe='')}")
-                evidence = self._extract_pull_request_evidence(payload)
-                if evidence:
-                    self._pr_lookup_failures = set()
-                    return f"Jira issue property {key}: {evidence}"
-        self._pr_lookup_failures.add('не получены полные данные о связях PR')
+    def _find_issue_pull_request_only_evidence_uncached(self, issue_key: str, issue_id: str) -> Optional[str]:
+        snapshot = self._bitbucket_issue_prs(issue_key, issue_id)
+        self._pr_lookup_failures = set(snapshot['errors'])
+        if snapshot['prs']:
+            url, pr = snapshot['prs'][0]
+            return f"Bitbucket PR {pr['id']}: {url}"
         return None
 
     def _find_issue_pull_request_evidence_uncached(
@@ -5683,127 +5898,79 @@ class ReleaseValidator:
         return objects, container_seen, partial
 
     def _lookup_gigacode(self, issue):
-        """Three-state lookup with independent source outcomes and bounded fallback."""
-        started = time.monotonic()
+        """Read authoritative PR text and complete commit lists through the shared client."""
+        issue_key = str(getattr(issue, 'key', '') or '')
         issue_id = str(getattr(issue, 'id', '') or '')
         result = {'state': 'UNKNOWN', 'marker': None, 'sources': []}
+        cache = self.__dict__.setdefault('_gigacode_result_cache', {})
+        cache_key = issue_key or issue_id
         def event(state, **details):
             row = {'state': state, **details}
             result['sources'].append(row)
             if http_debug_enabled():
-                print('[GIGACODE] ' + json.dumps({'issue': getattr(issue, 'key', ''),
-                    'elapsed_s': round(time.monotonic()-started, 3), **row}, ensure_ascii=False), flush=True)
-        if not issue_id:
-            event('UNKNOWN', reason='missing_issue_id')
+                print('[GIGACODE] ' + json.dumps({'issue': issue_key, **row}, ensure_ascii=False), flush=True)
+        def found(marker):
+            result.update(state='FOUND', marker=marker)
+            cache[cache_key] = marker
+            event('RESULT', verdict='FOUND')
             return result
-        cache = getattr(self, '_gigacode_result_cache', {})
-        self._gigacode_result_cache = cache
-        if issue_id in cache:
-            result.update(state='FOUND', marker=cache[issue_id])
-            event('RESULT', verdict='FOUND', reason='positive_cache')
+        if cache_key in cache:
+            return found(cache[cache_key])
+        if not re.fullmatch(r'[A-Z][A-Z0-9_]*-\d+', issue_key):
+            event('INCOMPLETE', reason='missing_issue_key')
             return result
-        base = config['jira']['url'].rstrip('/')
-        previous_failures = getattr(self, '_pr_lookup_failures', set())
-        self._pr_lookup_failures = set()
-        try:
-            with self._pr_lookup_budget():
-                version, summary = self._get_dev_summary(issue_id)
-                sections = (summary or {}).get('summary', {})
-                event('SUMMARY', available=bool(summary), api_version=version,
-                      failures=sorted(self._pr_lookup_failures))
-                unknown = []
-                repository_commit_providers = set()
-                types = ('pullrequest', 'repository', 'commit')
-                for type_index, data_type in enumerate(types):
-                    section = sections.get(data_type) or {}
-                    section = section if isinstance(section, dict) else {}
-                    count = (section.get('overall') or {}).get('count') if isinstance(section.get('overall'), dict) else None
-                    count = count if type(count) is int and count >= 0 else None
-                    if count == 0:
-                        event('EMPTY', data_type=data_type, reason='summary_zero')
-                        continue
-                    if self._pr_cooldown_reason():
-                        unknown.append(data_type)
-                        event('SKIP', data_type=data_type, reason='server_cooldown')
-                        continue
-                    reported = section.get('byInstanceType') or {}
-                    reported = reported if isinstance(reported, dict) else {}
-                    providers = tuple(reported) or PR_LEGACY_PROVIDERS
-                    type_deadline = time.monotonic() + max(0, self._pr_request_deadline-time.monotonic()) / (len(types)-type_index)
-                    type_checked = False
-                    for provider_index, provider in enumerate(providers):
-                        provider_info = reported.get(provider)
-                        provider_count = provider_info.get('count') if isinstance(provider_info, dict) else None
-                        if type(provider_count) is int and provider_count == 0:
-                            event('EMPTY', data_type=data_type, provider=provider, reason='provider_zero')
-                            continue
-                        if data_type == 'commit' and count is None and provider in repository_commit_providers:
-                            event('CHECKED', data_type=data_type, provider=provider, reason='commits_read_from_repository')
-                            type_checked = True
-                            if not reported:
-                                break
-                            continue
-                        obtained = False
-                        provider_deadline = time.monotonic() + max(0, type_deadline-time.monotonic()) / (len(providers)-provider_index)
-                        versions = tuple(dict.fromkeys((version or 'latest', '1.0')))
-                        for version_index, api_version in enumerate(versions):
-                            if self._pr_cooldown_reason():
-                                event('SKIP', data_type=data_type, provider=provider, reason='server_cooldown')
-                                break
-                            remaining = provider_deadline-time.monotonic()
-                            if remaining <= 0:
-                                event('SKIP', data_type=data_type, provider=provider, reason='budget')
-                                break
-                            self._pr_lookup_failures = set()
-                            with self._pr_lookup_budget(remaining / (len(versions)-version_index)):
-                                payload = self._pr_get_json(f'{base}/rest/dev-status/{api_version}/issue/detail', params={
-                                    'issueId': issue_id, 'applicationType': provider, 'dataType': data_type})
-                            if not isinstance(payload, dict) or not isinstance(payload.get('detail'), list):
-                                event('UNAVAILABLE', data_type=data_type, provider=provider, api_version=api_version,
-                                      failures=sorted(self._pr_lookup_failures), reason='request_failed_or_invalid_shape')
-                                continue
-                            objects, container_seen, partial = self._gigacode_objects(payload, data_type)
-                            marker = self._find_gigacode_marker(objects)
-                            fields = {field: sum(isinstance(obj.get(field), str) and bool(obj[field]) for obj in objects)
-                                      for field in ('title', 'name', 'description', 'message')}
-                            expected = provider_count if type(provider_count) is int and provider_count >= 0 else count
-                            repositories = [repo for detail in payload['detail'] if isinstance(detail, dict)
-                                            for repo in (detail.get('repositories') if isinstance(detail.get('repositories'), list) else [])
-                                            if isinstance(repo, dict)]
-                            # Repository completeness is checked separately from commit count.
-                            if data_type == 'repository':
-                                enough = bool(repositories) and all(isinstance(repo.get('commits'), list) for repo in repositories)
-                                enough = enough and (expected is None or len(repositories) >= expected)
-                            else:
-                                enough = expected is None or len(objects) >= expected
-                            text_available = all(any(isinstance(obj.get(field), str) and obj[field]
-                                for field in ('title', 'name', 'description', 'message')) for obj in objects)
-                            covered = container_seen and not partial and enough and text_available and bool(objects)
-                            event('FOUND' if marker else 'CHECKED' if covered else 'INCOMPLETE',
-                                  data_type=data_type, provider=provider, api_version=api_version,
-                                  objects=len(objects), text_fields=fields, partial=partial,
-                                  expected_count=expected, container_seen=container_seen)
-                            if marker:
-                                result.update(state='FOUND', marker=marker)
-                                cache[issue_id] = marker
-                                event('RESULT', verdict='FOUND')
-                                return result
-                            if covered:
-                                if data_type == 'repository':
-                                    repository_commit_providers.add(provider)
-                                obtained = type_checked = True
-                                break
-                        if reported and not obtained:
-                            unknown.append(f'{provider}/{data_type}')
-                        if obtained and not reported:
-                            break  # Unreported historical providers are aliases.
-                    if not type_checked:
-                        unknown.append(data_type)
-                result['state'] = 'UNKNOWN' if unknown else 'NOT_FOUND'
-                event('RESULT', verdict=result['state'], unresolved=sorted(set(unknown)))
-                return result
-        finally:
-            self._pr_lookup_failures = previous_failures
+        failures = []
+        with self._pr_lookup_budget():
+            snapshot = self._bitbucket_issue_prs(issue_key, issue_id)
+            failures.extend(snapshot['errors'])
+            for url, pr in snapshot['prs']:
+                text = {field: pr.get(field) for field in ('title', 'description')}
+                marker = self._find_gigacode_marker(text)
+                if marker:
+                    return found(marker)
+                if not isinstance(pr.get('title'), str):
+                    failures.append('Bitbucket не вернул заголовок связанного PR.')
+                try:
+                    ref = pr.get('fromRef') if isinstance(pr.get('fromRef'), dict) else {}
+                    repo = ref.get('repository') if isinstance(ref.get('repository'), dict) else {}
+                    issue_pattern = re.compile(r'(?<![A-Za-z0-9_])' + re.escape(issue_key) + r'(?![A-Za-z0-9_])', re.I)
+                    branch_scoped = bool(issue_pattern.search(str(ref.get('id') or ref.get('displayId') or '')))
+                    def related_marker(obj):
+                        message = obj.get('message')
+                        return (self._find_gigacode_marker(message) if isinstance(message, str)
+                                and (branch_scoped or issue_pattern.search(message)) else None)
+                    commits = self._bitbucket_api(url + '/commits', issue_key, objects=True,
+                                                  find_evidence=related_marker)
+                    for commit in commits:
+                        message = self._bitbucket_commit_message(commit, repo, issue_key)
+                        marker = self._find_gigacode_marker(message)
+                        if marker and (branch_scoped or issue_pattern.search(message)):
+                            return found(marker)
+                        if marker and not re.search(r'\b[A-Z][A-Z0-9_]*-\d+\b', message, re.I):
+                            failures.append('Маркер GigaCode в общем PR не удалось связать с проверяемой задачей.')
+                    event('CHECKED', source='bitbucket_pr', pr_id=pr['id'], commits=len(commits))
+                except SddCheckError as exc:
+                    failures.append(str(exc))
+                    event('INCOMPLETE', source='bitbucket_pr', pr_id=pr['id'], reason=str(exc))
+            try:
+                changesets = self._bitbucket_issue_changesets(issue_key,
+                    find_evidence=lambda obj: self._find_gigacode_marker({'message':
+                        (obj['toCommit'].get('message') if isinstance(obj.get('toCommit'), dict) else None)}))
+                for changeset in changesets:
+                    commit = changeset.get('toCommit')
+                    repo = changeset.get('repository') or {}
+                    if not isinstance(commit, dict):
+                        raise SddCheckError('Bitbucket не вернул связанный коммит в changeset.')
+                    marker = self._find_gigacode_marker(self._bitbucket_commit_message(commit, repo, issue_key))
+                    if marker:
+                        return found(marker)
+                event('CHECKED', source='bitbucket_issue_commits', commits=len(changesets))
+            except SddCheckError as exc:
+                failures.append(str(exc))
+                event('INCOMPLETE', source='bitbucket_issue_commits', reason=str(exc))
+        result['state'] = 'UNKNOWN' if failures else 'NOT_FOUND'
+        event('RESULT', verdict=result['state'], failures=list(dict.fromkeys(failures)))
+        return result
 
     def _issue_has_gigacode_pull_request(self, issue) -> Optional[str]:
         result = self._lookup_gigacode(issue)
@@ -6908,93 +7075,30 @@ def _diag_search(validator: 'ReleaseValidator', release_key: str, expected_cycle
 
 
 def _diag_gigacode(validator: 'ReleaseValidator', issue_key: str):
+    """Read-only diagnostic through the same Bitbucket client as the report."""
     try:
         issue = validator.jira_main.issue(issue_key, fields='summary,issuetype,labels')
-    except Exception as e:
-        print(f"Не удалось получить issue {issue_key}: {e}")
-        return
-
-    issue_id = str(getattr(issue, 'id', '') or '')
-    print(f"Jira issue id: {issue_id}  type: {issue.fields.issuetype.name}  summary: {issue.fields.summary}")
-    print(f"Labels: {', '.join(getattr(issue.fields, 'labels', []) or []) or 'None'}")
-
-    base_url = config['jira']['url'].rstrip('/')
-    application_types = ('stash', 'bitbucket', 'bitbucket-server')
-    data_types = ('pullrequest', 'commit', 'repository')
-
-    for application_type in application_types:
-        for data_type in data_types:
-            url = f"{base_url}/rest/dev-status/latest/issue/detail"
-            params = {
-                'issueId': issue_id,
-                'applicationType': application_type,
-                'dataType': data_type,
-            }
-            print(f"\nGET dev-status applicationType={application_type} dataType={data_type}")
-            try:
-                response = validator.jira_http.get(url, params=params, timeout=12)
-            except Exception as e:
-                print(f"  exception={e}")
-                continue
-
-            print(f"  status={response.status_code} bytes={len(response.text)}")
-            if response.status_code != 200:
-                print(f"  body={response.text[:500]}")
-                continue
-
-            try:
-                payload = response.json()
-            except Exception as e:
-                print(f"  json_error={e}")
-                print(f"  body={response.text[:1000]}")
-                continue
-
-            raw = json.dumps(payload, ensure_ascii=False)
-            raw_casefold = raw.casefold()
-            marker = validator._find_gigacode_marker(payload)
-            print(f"  top-level={', '.join(sorted(payload.keys())) if isinstance(payload, dict) else type(payload).__name__}")
-            print(f"  contains GigaCode={'yes' if 'gigacode' in raw_casefold else 'no'}")
-            print(f"  contains Co-authored={'yes' if 'co-authored' in raw_casefold or 'co-authorer' in raw_casefold else 'no'}")
-            print(f"  contains #GigaCode={'yes' if '#gigacode' in raw_casefold else 'no'}")
-            print(f"  parser marker={marker or 'None'}")
-            if marker or 'gigacode' in raw_casefold:
-                for matched in re.finditer(r'.{0,80}(gigacode|co-authored|co-authorer|#gigacode).{0,160}', raw, flags=re.IGNORECASE):
-                    print(f"  snippet={matched.group(0)}")
+        result = validator._lookup_gigacode(issue)
+        print('[GIGACODE DIAG] ' + json.dumps({'issue': issue_key, 'state': result['state'],
+              'marker': result['marker'], 'read_only': True}, ensure_ascii=False), flush=True)
+    except Exception as exc:
+        print('[GIGACODE DIAG] ' + json.dumps({'issue': issue_key, 'state': 'UNKNOWN',
+              'exception_type': type(exc).__name__, 'read_only': True}), flush=True)
 
 
 def _diag_pr(validator: 'ReleaseValidator', issue_key: str):
+    """Show verified PR IDs/states, without printing private captions or raw bodies."""
     try:
         issue = validator.jira_main.issue(issue_key, fields='summary,issuetype,labels')
-    except Exception as e:
-        print(f"Не удалось получить issue {issue_key}: {e}")
-        return
-
-    issue_id = str(getattr(issue, 'id', '') or '')
-    print(f"Jira issue id: {issue_id}  type: {issue.fields.issuetype.name}  summary: {issue.fields.summary}")
-    print(f"Labels: {', '.join(getattr(issue.fields, 'labels', []) or []) or 'None'}")
-    strict_evidence = validator._find_issue_pull_request_only_evidence(issue)
-    broad_evidence = validator._find_issue_pull_request_evidence(issue)
-    print(f"Report parser verdict: has_pr={'yes' if strict_evidence else 'no'}")
-    print(f"Report evidence: {strict_evidence or 'None'}")
-    print(f"Broad legacy evidence: {broad_evidence or 'None'}")
-
-    for application_type, data_type, payload in validator._get_dev_status_payloads(issue_id):
-        raw = json.dumps(payload, ensure_ascii=False)
-        raw_casefold = raw.casefold()
-        pr_evidence = validator._dev_status_pull_request_evidence(data_type, payload)
-        has_pr = pr_evidence is not None
-        print(f"\nPayload applicationType={application_type} dataType={data_type}")
-        print(f"  has_pr={'yes' if has_pr else 'no'}")
-        print(f"  evidence={pr_evidence or 'None'}")
-        print(f"  top-level={', '.join(sorted(payload.keys())) if isinstance(payload, dict) else type(payload).__name__}")
-        print(f"  contains pullrequest-ish={'yes' if 'pullrequest' in re.sub(r'[^a-z0-9]+', '', raw_casefold) else 'no'}")
-        print(f"  contains url={'yes' if 'url' in raw_casefold else 'no'}")
-        print(f"  detail_type={type(payload.get('detail')).__name__ if isinstance(payload, dict) else 'n/a'}")
-        print(f"  detail_len={len(payload.get('detail') or []) if isinstance(payload, dict) and isinstance(payload.get('detail'), list) else 'n/a'}")
-        print(f"  contains files={'yes' if 'files' in raw_casefold else 'no'}")
-        if has_pr or 'pullrequest' in re.sub(r'[^a-z0-9]+', '', raw_casefold):
-            for matched in re.finditer(r'.{0,100}(pullrequest|pull_request|pull request|url|files).{0,180}', raw, flags=re.IGNORECASE):
-                print(f"  snippet={matched.group(0)}")
+        with validator._pr_lookup_budget():
+            snapshot = validator._bitbucket_issue_prs(issue_key, str(getattr(issue, 'id', '') or ''))
+        print('[BITBUCKET PR DIAG] ' + json.dumps({'issue': issue_key,
+              'prs': [{'id': pr['id'], 'state': pr['state']} for _, pr in snapshot['prs']],
+              'complete': snapshot['complete'], 'errors': snapshot['errors'],
+              'read_only': True}, ensure_ascii=False), flush=True)
+    except Exception as exc:
+        print('[BITBUCKET PR DIAG] ' + json.dumps({'issue': issue_key, 'complete': False,
+              'exception_type': type(exc).__name__, 'read_only': True}), flush=True)
 
 
 def _diag_cycle_index(probe, release_key, deadline):
@@ -7176,19 +7280,30 @@ def _diag_lookup_matrix(release_input, session=None):
     if issue_key and focus != 'cycles':
         issue = probe('PR issue fields', f'/rest/api/2/issue/{issue_key}', {'fields': '*all'}, deadline=pr_deadline, kind='pr')
         issue_id = str((issue or {}).get('id', ''))
-        probe('PR remote links', f'/rest/api/2/issue/{issue_key}/remotelink', deadline=pr_deadline, kind='pr')
-        if issue_id.isdigit():
-            for version in ('latest', '1.0'):
-                probe(f'PR summary {version}', f'/rest/dev-status/{version}/issue/summary',
-                      {'issueId': issue_id}, deadline=pr_deadline, kind='pr')
-            for provider in ('stash', 'bitbucket', 'bitbucket-server'):
-                for data_type in ('pullrequest', 'repository', 'commit'):
-                    for version in ('latest', '1.0'):
-                        probe(f'PR detail {version}/{provider}/{data_type}', f'/rest/dev-status/{version}/issue/detail',
-                              {'issueId': issue_id, 'applicationType': provider, 'dataType': data_type},
-                              deadline=pr_deadline, kind='pr')
-        else:
-            print('[LOOKUP MATRIX] PR detail SKIP: issue id unavailable', flush=True)
+        if time.monotonic() < pr_deadline and cooldown <= time.monotonic():
+            checker = ReleaseValidator.__new__(ReleaseValidator)
+            class MatrixJiraSession:
+                def get(self, url, **kwargs):
+                    payload = probe('PR discovery', url[len(base):], kwargs.get('params'),
+                                    deadline=pr_deadline)
+                    result = requests.Response()
+                    result.status_code = 200 if payload is not None else 503
+                    result._content = json.dumps(payload).encode('utf-8')
+                    return result
+            checker.jira_http = MatrixJiraSession()
+            checker._pr_request_deadline = pr_deadline
+            try:
+                snapshot = checker._bitbucket_issue_prs(issue_key, issue_id)
+                record = {'method': 'PR Bitbucket verified',
+                          'result': 'PR_EVIDENCE' if snapshot['prs'] else
+                                    'NO_PR' if snapshot['complete'] else 'INCOMPLETE',
+                          'prs': [{'id': pr['id'], 'state': pr['state']} for _, pr in snapshot['prs']],
+                          'complete': snapshot['complete'], 'errors': snapshot['errors']}
+            except Exception as exc:
+                record = {'method': 'PR Bitbucket verified', 'result': 'EXCEPTION',
+                          'exception': type(exc).__name__}
+            records.append(record)
+            print('[LOOKUP MATRIX] ' + json.dumps(record, ensure_ascii=False), flush=True)
     elif focus != 'cycles':
         print('[LOOKUP MATRIX] PR SKIP: no linked issue; set RELEASE_CHECKER_DIAG_ISSUE', flush=True)
 

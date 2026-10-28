@@ -108,22 +108,8 @@ def test_lookup_negative_result_not_cached(validator):
     assert validator._find_issue_pull_request_only_evidence_uncached.call_count == 2
 
 
-def test_remote_link_fallback_never_loads_fields_properties_or_details(validator):
-    def fetch(url, **kwargs):
-        if url.endswith('/remotelink'):
-            return [{'object': {'url': 'https://git.example/repo/pull/42'}}]
-        return None
-    validator._pr_get_json = Mock(side_effect=fetch)
-    assert 'remote links' in validator._find_issue_pull_request_only_evidence_uncached('ABC-1', '123')
-    assert validator._pr_get_json.call_count == 3
-    assert all(call.args[0].endswith(('/summary', '/remotelink')) for call in validator._pr_get_json.call_args_list)
 
 
-def test_pr_on_subtask_does_not_count_for_story(validator):
-    validator._pr_get_json = Mock(side_effect=lambda url, **kwargs:
-        {'fields': {'subtasks': [{'fields': {'description': 'https://git.example/repo/pull/42'}}]}}
-        if url.endswith('/ABC-1') else {})
-    assert validator._find_issue_pull_request_only_evidence_uncached('ABC-1', '') is None
 
 
 def test_budget_exhaustion_prevents_request(validator):
@@ -236,18 +222,8 @@ def summary_payload(count, providers=None):
         'overall': {'count': count}, 'byInstanceType': providers or {}}}}
 
 
-def test_positive_summary_finishes_presence_check_in_one_request(validator):
-    validator.jira_http.get.return_value = response(200, summary_payload(2))
-    assert 'связанных PR — 2' in validator._find_issue_pull_request_only_evidence(NS(key='ABC-1', id='123'))
-    assert validator.jira_http.get.call_count == 1
-    assert validator.jira_http.get.call_args.args[0].endswith('/summary')
 
 
-def test_zero_count_and_empty_remote_links_is_confirmed_absence(validator):
-    validator.jira_http.get.side_effect = [response(200, summary_payload(0)), response(200, [])]
-    assert validator._find_issue_pull_request_only_evidence(NS(key='ABC-1', id='123')) is None
-    assert not validator._pr_lookup_failures
-    assert validator.jira_http.get.call_count == 2
 
 
 @pytest.mark.parametrize('payload', [{}, {'summary': {}}, summary_payload(False), summary_payload('0')])
@@ -850,51 +826,12 @@ def test_existing_bot_table_comment_is_recognized():
     other.delete.assert_not_called()
 
 
-@pytest.mark.parametrize('provider', rc.PR_LEGACY_PROVIDERS)
-def test_pr_presence_survives_missing_summary_through_legacy_detail(validator, provider):
-    def fetch(url, **kwargs):
-        if url.endswith('/summary'):
-            return response(404)
-        if url.endswith('/remotelink'):
-            return response(200, [])
-        if url.endswith('/detail') and kwargs['params']['applicationType'] == provider:
-            return response(200, {'detail': [{'pullRequests': [{'id': 42, 'status': 'OPEN'}]}]})
-        return response(200, {'detail': []})
-    validator.jira_http.get.side_effect = fetch
-    assert 'PR 42' in validator._find_issue_pull_request_only_evidence(NS(key='ABC-1', id='123'))
-    assert not validator._pr_lookup_failures
-    detail_calls = [c for c in validator.jira_http.get.call_args_list if c.args[0].endswith('/detail')]
-    assert all(c.kwargs['params']['dataType'] == 'pullrequest' for c in detail_calls)
 
 
-def test_merged_pr_details_work_when_summary_is_unavailable(validator):
-    validator._merged_pull_request_evidence_cache = {}
-    validator._pr_get_json = Mock(side_effect=lambda url, **kw:
-        None if url.endswith('/summary') else {'detail': [{'pullRequests': [{'id': 42, 'status': 'MERGED'}]}]})
-    assert '42 (merged)' in validator._find_issue_merged_pull_request_evidence(NS(key='ABC-1', id='123'))
 
 
-def test_gigacode_in_repository_survives_summary_outage(validator):
-    def fetch(url, **kwargs):
-        if url.endswith('/summary'):
-            return None
-        data_type = kwargs['params']['dataType']
-        if data_type == 'repository':
-            return {'detail': [{'repositories': [{'commits': [{'message': 'Co-authored-by: GigaCode Assistant'}]}]}]}
-        return {'detail': [{'pullRequests': [], 'commits': []}]}
-    validator._pr_get_json = Mock(side_effect=fetch)
-    assert 'GigaCode Assistant' in validator._issue_has_gigacode_pull_request(NS(key='ABC-1', id='123'))
 
 
-def test_gigacode_marker_in_pr_does_not_require_other_sources(validator):
-    def fetch(url, **kwargs):
-        if url.endswith('/summary'):
-            return summary_payload(1, {'stash': {'count': 1}})
-        assert kwargs['params']['dataType'] == 'pullrequest'
-        return {'detail': [{'pullRequests': [{'id': 42, 'description': 'Co-authored-by: GigaCode Assistant'}]}]}
-    validator._pr_get_json = Mock(side_effect=fetch)
-    assert 'GigaCode Assistant' in validator._issue_has_gigacode_pull_request(NS(key='ABC-1', id='123'))
-    assert validator._pr_get_json.call_count == 2
 
 
 def test_failed_cycle_search_does_not_poison_following_stage(zephyr):
@@ -912,44 +849,10 @@ def test_failed_cycle_search_does_not_poison_following_stage(zephyr):
     assert zephyr.get_test_cycles_for_issue.call_count == 2
 
 
-def test_properties_source_removed_today_is_restored(validator):
-    def fetch(url, **kwargs):
-        if url.endswith('/properties'):
-            return response(200, {'keys': [{'key': 'unrelated'}, {'key': 'development/pr links'}]})
-        if url.endswith('/properties/development%2Fpr%20links'):
-            return response(200, {'value': {'pullRequests': [{'id': 42, 'status': 'OPEN'}]}})
-        return response(404)
-    validator.jira_http.get.side_effect = fetch
-    evidence = validator._find_issue_pull_request_only_evidence(NS(key='ABC-1', id='123'))
-    assert 'Jira issue property' in evidence and 'PR 42' in evidence
-    assert not any(c.args[0].endswith('/properties/unrelated') for c in validator.jira_http.get.call_args_list)
 
 
-def test_property_fallback_keeps_time_after_slow_summary_and_details(validator, fake_clock):
-    def fetch(url, **kwargs):
-        if url.endswith('/properties'):
-            return response(200, {'keys': [{'key': 'dev'}]})
-        if url.endswith('/properties/dev'):
-            return response(200, {'pullRequests': [{'id': 42}]})
-        fake_clock[0] += kwargs['timeout'].total
-        raise requests.Timeout()
-    validator.jira_http.get.side_effect = fetch
-    assert 'property dev' in validator._find_issue_pull_request_only_evidence(NS(key='ABC-1', id='123'))
-    assert fake_clock[0] < rc.PR_LOOKUP_TIMEOUT_SECONDS
 
 
-def test_slow_detail_longer_than_old_three_second_limit_recovers(validator, fake_clock):
-    def fetch(url, **kwargs):
-        if url.endswith('/summary'):
-            return response(404)
-        if url.endswith('/remotelink'):
-            return response(200, [])
-        assert kwargs['timeout'].total >= 8
-        fake_clock[0] += 8
-        return response(200, {'detail': [{'pullRequests': [{'id': 42}]}]})
-    validator.jira_http.get.side_effect = fetch
-    assert validator._find_issue_pull_request_only_evidence(NS(key='ABC-1', id='123'))
-    assert fake_clock[0] == 8
 
 
 def test_transient_pr_failure_expires_within_run(validator, fake_clock):
@@ -993,31 +896,6 @@ def test_zephyr_retry_after_cannot_be_bypassed_by_search(zephyr, fake_clock):
     assert fake_clock[0] == 0
 
 
-def test_jenkins_long_retry_after_does_not_poison_unused_pr_sources(validator, fake_clock, capsys, monkeypatch):
-    monkeypatch.setenv('RELEASE_CHECKER_DEBUG_HTTP', '1')
-    validator.jira_http.get.return_value = response(429, headers={'Retry-After': '120'})
-    for number in range(24):
-        issue = NS(key=f'ABC-{number + 1}', id=str(number + 1))
-        assert validator._find_issue_pull_request_only_evidence(issue) is None
-        assert any('Retry-After' in reason for reason in validator._pr_lookup_failures)
-    assert validator.jira_http.get.call_count == 1
-    assert fake_clock[0] == 0
-    assert sum(validator._pr_endpoint_failures.values()) == 1
-    assert len(validator._pr_http_cache) == 1
-    assert len(validator._pr_endpoint_retry_at) == 1
-    validator._begin_pr_stage()
-    with pytest.raises(RuntimeError, match='Retry-After'):
-        validator._get_dev_status_payloads('25')
-    assert validator.jira_http.get.call_count == 1
-    output = capsys.readouterr().out
-    assert output.count('"result": "rate-limited"') == 1
-    assert 'circuit-open' not in output
-
-    # The pause expires naturally; no stage reset is needed to recover.
-    fake_clock[0] = 120
-    validator.jira_http.get.return_value = response(200, summary_payload(1))
-    assert validator._find_issue_pull_request_only_evidence(NS(key='ABC-2', id='2'))
-    assert validator.jira_http.get.call_count == 2
 
 
 def test_zephyr_unsent_cooldown_requests_do_not_exhaust_failure_limit(zephyr, fake_clock):
@@ -1149,67 +1027,6 @@ def test_comment_remains_red_if_success_flag_conflicts_with_errors():
     assert '#de350b' in checker._release_comment('REL-1', True)
 
 
-def test_legacy_requests_and_slow_pr_via_real_local_http(validator, monkeypatch):
-    """Transport-level replay; synthetic data, only a local HTTP server is used."""
-    import json
-    import threading
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-    from urllib.parse import urlsplit
-
-    calls = []
-    class Handler(BaseHTTPRequestHandler):
-        def log_message(self, *args):
-            pass
-
-        def do_GET(self):
-            calls.append(self.path)
-            path = urlsplit(self.path).path
-            status, payload = 200, {}
-            if path.endswith('/summary'):
-                status = 503
-            elif path.endswith('/remotelink'):
-                payload = []
-            elif path.endswith('/detail'):
-                threading.Event().wait(3.2)  # Earlier 3-second timeout loses this PR.
-                payload = {'detail': [{'pullRequests': [{'id': 42, 'status': 'MERGED'}]}]}
-            elif path.endswith('/testcases'):
-                status = 400 if 'fields=' in self.path else 200
-                payload = [{'id': 'HRPQA-T1', 'name': 'Legacy case'}]
-            elif path.endswith('/testcase/HRPQA-T1'):
-                status = 400 if 'fields=' in self.path else 200
-                payload = {k: v for k, v in case_payload().items() if k != 'key'}
-            else:
-                status = 404
-            body = json.dumps(payload).encode()
-            self.send_response(status)
-            self.send_header('Content-Type', 'application/json')
-            self.send_header('Content-Length', str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    base = f'http://127.0.0.1:{server.server_port}'
-    monkeypatch.setitem(rc.config['jira'], 'url', base)
-    validator.jira_http = rc.ReleaseHttpSession()
-    validator.jira_http.trust_env = False
-    zephyr = rc.ZephyrScaleClient(base, 'synthetic-token')
-    zephyr.session.trust_env = False
-    try:
-        assert 'PR 42' in validator._find_issue_pull_request_only_evidence(NS(key='ABC-1', id='123'))
-        checker = zephyr_checker(zephyr)
-        checker._run_check('coverage', 'Покрытие', lambda: checker._check_release_coverage('REL-1'))
-        checker._run_check('cases', 'ТК', lambda: checker._check_zephyr_test_cases('REL-1'))
-        assert [r['status'] for r in checker.check_results] == ['PASS', 'PASS']
-        assert sum('/issue/detail?' in path for path in calls) == 1
-        assert sum(path.endswith('/testcase/HRPQA-T1') for path in calls) == 1
-    finally:
-        validator.jira_http.close()
-        zephyr.session.close()
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
 
 
 @pytest.mark.parametrize('lookup', [None, requests.Timeout('unavailable')])
@@ -1281,13 +1098,6 @@ def test_zephyr_repeated_page_not_cached_as_complete(zephyr):
     assert zephyr.last_test_cycle_search_stats[-1]['status'] == 'exception'
 
 
-def test_pr_from_repository_survives_missing_summary_and_pullrequest_endpoint(validator):
-    def fetch(url, **kwargs):
-        if url.endswith('/detail') and kwargs['params']['dataType'] == 'repository':
-            return {'detail': [{'repositories': [{'pullRequests': [{'id': 42}]}]}]}
-        return None
-    validator._pr_get_json = Mock(side_effect=fetch)
-    assert 'PR 42' in validator._find_issue_pull_request_only_evidence(NS(key='ABC-1', id='123'))
 
 
 def test_direct_cycle_scan_stops_at_its_budget(zephyr, fake_clock):
@@ -1458,33 +1268,8 @@ def test_direct_scan_progress_and_new_issue_links_survive_cache(zephyr, monkeypa
     zephyr.session.get.assert_not_called()
 
 
-def test_slow_pr_endpoint_leaves_time_for_repository(validator, fake_clock):
-    def fetch(url, **kwargs):
-        if url.endswith('/summary'):
-            return response(404)
-        if url.endswith('/remotelink'):
-            return response(200, [])
-        if kwargs['params']['dataType'] == 'pullrequest':
-            fake_clock[0] += kwargs['timeout'].total
-            raise requests.ReadTimeout()
-        assert kwargs['params']['dataType'] == 'repository'
-        fake_clock[0] += 2
-        return response(200, {'detail': [{'repositories': [{'pullRequests': [{'id': 42}]}]}]})
-    validator.jira_http.get.side_effect = fetch
-    evidence = validator._find_issue_pull_request_only_evidence(NS(key='ABC-1', id='123'))
-    assert 'repository' in evidence
-    assert fake_clock[0] <= 16
 
 
-def test_four_second_summary_succeeds_within_existing_budget(validator, fake_clock):
-    def fetch(url, **kwargs):
-        assert kwargs['timeout'].total >= 4
-        fake_clock[0] += 4
-        return response(200, summary_payload(1))
-    validator.jira_http.get.side_effect = fetch
-    assert validator._find_issue_pull_request_only_evidence(NS(key='ABC-1', id='123'))
-    assert fake_clock[0] == 4
-    assert validator.jira_http.get.call_count == 1
 
 
 def test_cycle_index_and_metadata_timeouts_leave_direct_fallback_time(zephyr, fake_clock):
@@ -1860,8 +1645,9 @@ def test_lookup_matrix_compares_variants_without_writes(monkeypatch, capsys, fak
     monkeypatch.delenv('RELEASE_CHECKER_DIAG_ISSUE', raising=False)
     session = matrix_session()
     records = rc._diag_lookup_matrix('REL-1', session)
-    assert len([r for r in records if r['method'].startswith('PR detail')]) == 18
-    assert all(r['result'] == 'PR_EVIDENCE' for r in records if r['method'].startswith('PR detail'))
+    assert not any(r['method'].startswith('PR detail') for r in records)
+    verified = next(r for r in records if r['method'] == 'PR Bitbucket verified')
+    assert verified['result'] == 'INCOMPLETE'  # Jira ID-only previews are not Bitbucket proof.
     baseline = next(r for r in records if r['method'] == 'cycle index size=1000 offset=0')
     control = next(r for r in records if r['method'] == 'cycle index size=5000 offset=0')
     assert baseline['release_matches'] == 1
@@ -1927,7 +1713,7 @@ def test_matrix_short_throttle_does_not_skip_remaining_methods(monkeypatch, fake
     throttled_at = []
     def get(url, **kwargs):
         calls.append(fake_clock[0])
-        if len(calls) == 11:
+        if len(calls) == 4:
             throttled_at.append(fake_clock[0])
             return matrix_response(429, headers={'Retry-After': retry_after} if retry_after else {})
         return fetch(url, **kwargs)
@@ -1935,7 +1721,7 @@ def test_matrix_short_throttle_does_not_skip_remaining_methods(monkeypatch, fake
     records = rc._diag_lookup_matrix('REL-1', session)
     assert len(throttled_at) == 1
     assert all(b-a >= 0.5 for a, b in zip(calls, calls[1:]))
-    assert calls[11]-calls[10] >= (3 if retry_after else 2)
+    assert calls[4]-calls[3] >= (3 if retry_after else 2)
     assert all(r['result'] != 'SKIP' for r in records)
     assert any(r['method'] == 'cycle direct key' and r['http'] == 200 for r in records)
     assert fake_clock[0] < 60
@@ -2195,67 +1981,16 @@ def giga_summary(pr=0, repo=0, commit=0):
                         for kind, count in [('pullrequest', pr), ('repository', repo), ('commit', commit)]}}
 
 
-def test_gigacode_all_zero_is_known_absence_without_detail(validator):
-    validator._pr_get_json = Mock(return_value=giga_summary())
-    result = validator._lookup_gigacode(NS(key='ABC-1', id='1'))
-    assert result['state'] == 'NOT_FOUND'
-    assert validator._pr_get_json.call_count == 1
 
 
-@pytest.mark.parametrize('payload', [
-    {'detail': []}, {'detail': [{'_instance': {'name': '#GigaCode Agent'}}]},
-    {'detail': [{'pullRequests': [{'id': '1'}]}]},
-    {'detail': [{'pullRequests': [{'id': '1', 'name': 'ordinary'}], 'isLast': False}]},
-])
-def test_gigacode_empty_metadata_and_partial_data_are_unknown(validator, payload):
-    validator._pr_get_json = Mock(side_effect=lambda url, **kw: giga_summary(pr=1) if url.endswith('/summary') else payload)
-    result = validator._lookup_gigacode(NS(key='ABC-1', id='1'))
-    assert result['state'] == 'UNKNOWN'
-    assert any(r['state'] == 'INCOMPLETE' for r in result['sources'])
 
 
-def test_gigacode_visible_pr_text_without_marker_is_checked(validator):
-    validator._pr_get_json = Mock(side_effect=lambda url, **kw: giga_summary(pr=1) if url.endswith('/summary') else
-        {'detail': [{'pullRequests': [{'id': '1', 'name': 'normal PR', 'description': 'normal description'}]}]})
-    result = validator._lookup_gigacode(NS(key='ABC-1', id='1'))
-    assert result['state'] == 'NOT_FOUND'
-    checked = next(row for row in result['sources'] if row['state'] == 'CHECKED')
-    assert checked['text_fields']['description'] == 1
 
 
-def test_gigacode_marker_survives_partial_response_and_is_cached(validator):
-    validator._pr_get_json = Mock(side_effect=lambda url, **kw: giga_summary(pr=3) if url.endswith('/summary') else
-        {'detail': [{'pullRequests': [{'description': '#GigaCode Agent'}], 'isLast': False}]})
-    issue = NS(key='ABC-1', id='1')
-    assert validator._lookup_gigacode(issue)['state'] == 'FOUND'
-    validator._pr_get_json.reset_mock()
-    validator._pr_retry_state = {'until': rc.time.monotonic()+120}
-    assert validator._lookup_gigacode(issue)['state'] == 'FOUND'
-    validator._pr_get_json.assert_not_called()
 
 
-def test_gigacode_unknown_is_not_cached_as_absence(validator):
-    validator._pr_get_json = Mock(side_effect=lambda url, **kw: giga_summary(pr=1) if url.endswith('/summary') else {'detail': []})
-    issue = NS(key='ABC-1', id='1')
-    assert validator._lookup_gigacode(issue)['state'] == 'UNKNOWN'
-    validator._pr_get_json.side_effect = lambda url, **kw: giga_summary(pr=1) if url.endswith('/summary') else {
-        'detail': [{'pullRequests': [{'name': '#GigaCode Agent'}]}]}
-    assert validator._lookup_gigacode(issue)['state'] == 'FOUND'
 
 
-def test_gigacode_log_explains_unknown_but_comment_keeps_only_existing_text(validator, capsys, monkeypatch):
-    monkeypatch.setenv('RELEASE_CHECKER_DEBUG_HTTP', '1')
-    secret = 'PRIVATE_PR_CONTENT'
-    validator._pr_get_json = Mock(side_effect=lambda url, **kw: giga_summary(pr=2) if url.endswith('/summary') else {
-        'detail': [{'pullRequests': [{'title': secret, 'description': secret}]}]})
-    with pytest.raises(RuntimeError) as error:
-        validator._issue_has_gigacode_pull_request(NS(key='ABC-1', id='1'))
-    output = capsys.readouterr().out
-    assert secret not in output
-    assert 'INCOMPLETE' in output and 'expected_count' in output and 'text_fields' in output
-    comment = validator._comment_message(f'AIFIXED: не удалось определить использование GigaCode: {error.value}')
-    assert comment == 'Не удалось определить, использовался ли GigaCode при написании кода. Необходимость лейбла AIFIXED не установлена.'
-    assert 'expected_count' not in comment
 
 
 def test_api_application_error_categories_do_not_expose_messages():
@@ -2265,11 +2000,6 @@ def test_api_application_error_categories_do_not_expose_messages():
     assert 'SECRET_VALUE' not in str(error.value)
 
 
-def test_gigacode_provider_zero_does_not_override_positive_total(validator):
-    payload = giga_summary(pr=1)
-    payload['summary']['pullrequest']['byInstanceType']['stash']['count'] = 0
-    validator._pr_get_json = Mock(return_value=payload)
-    assert validator._lookup_gigacode(NS(key='ABC-1', id='1'))['state'] == 'UNKNOWN'
 
 
 def test_gigacode_timeouts_stay_within_issue_budget(validator, fake_clock):
@@ -2280,19 +2010,6 @@ def test_gigacode_timeouts_stay_within_issue_budget(validator, fake_clock):
     assert fake_clock[0] <= 12
 
 
-def test_repository_commit_objects_avoid_unsupported_commit_alias(validator):
-    summary = giga_summary(pr=0, repo=1)
-    del summary['summary']['commit']
-    def fetch(url, **kwargs):
-        if url.endswith('/summary'):
-            return summary
-        assert kwargs['params']['dataType'] == 'repository'
-        return {'detail': [{'repositories': [{'commits': [{'message': 'ordinary commit'}]}]}]}
-    validator._pr_get_json = Mock(side_effect=fetch)
-    result = validator._lookup_gigacode(NS(key='ABC-1', id='1'))
-    assert result['state'] == 'NOT_FOUND'
-    assert any(row.get('reason') == 'commits_read_from_repository' for row in result['sources'])
-    assert validator._pr_get_json.call_count == 2
 
 
 def test_gigacode_task_evidence_resolves_previous_task_failure(validator):
@@ -2614,6 +2331,7 @@ def test_packed_entrypoint_uses_same_native_sdd(monkeypatch, native_sdd):
                    and any(isinstance(t, ast.Name) and t.id == '_p' for t in n.targets))
     decoded = zlib.decompress(base64.b64decode(payload)).decode()
     assert 'SDD_GATE_SOURCE' not in decoded and 'subprocess' not in decoded
+    assert decoded == (rc.script_dir / 'release_checker.py').read_text()
     namespace = dict(vars(rc))
     parsed = ast.parse(decoded)
     helpers = [n for n in parsed.body if isinstance(n, (ast.ClassDef, ast.FunctionDef))
