@@ -242,7 +242,7 @@ def test_shared_cache_reuses_verified_pr_across_stages_and_resets_per_run(client
     assert client.checker._find_issue_merged_pull_request_evidence(ISSUE) is None
     assert client.checker._lookup_gigacode(ISSUE)['state'] == 'NOT_FOUND'
     assert sum(c.args[0] == API_PR for c in client.bb.get.call_args_list) == 1
-    assert client.checker.jira_http.get.call_count == 1
+    assert client.checker.jira_http.get.call_count == 3
     client.checker._reset_pr_run_state()
     assert client.checker._find_issue_pull_request_only_evidence(ISSUE)
     assert sum(c.args[0] == API_PR for c in client.bb.get.call_args_list) == 2
@@ -264,7 +264,7 @@ def test_confirmed_gigacode_adds_label_to_same_target_issue_only(client):
     client.checker._get_release_pr_targets = Mock(return_value=[(issue, [issue])])
     client.checker._check_gigacode_aifixed_labels('REL-1')
     assert client.checker.jira_http.put.call_args.args[0].endswith('/issue/ABC-1')
-    assert client.checker.jira_http.put.call_args.kwargs['json']['fields']['labels'] == ['AIFIXED']
+    assert client.checker.jira_http.put.call_args.kwargs['json'] == {'update': {'labels': [{'add': 'AIFIXED'}]}}
     assert 'AIFIXED' in issue.fields.labels
 
 
@@ -403,3 +403,38 @@ def test_malformed_sdd_style_commit_links_remain_unknown(client, groups):
         return fetch(url, **kwargs)
     client.checker.jira_http.get.side_effect = jira
     assert client.checker._lookup_gigacode(ISSUE)['state'] == 'UNKNOWN'
+
+
+
+def test_open_pr_does_not_hide_merged_remote_link(client):
+    client.remote.append({'object': {'url': PR_URL.replace('/42', '/43')}})
+    client.routes[urlsplit(API_PR).path.replace('/42', '/43')] = reply({**client.metadata, 'id': 43, 'state': 'MERGED'})
+    assert 'PR 43' in client.checker._find_issue_merged_pull_request_evidence(ISSUE)
+    assert any(c.args[0].endswith('/remotelink') for c in client.checker.jira_http.get.call_args_list)
+
+
+def test_open_pr_does_not_hide_merged_commit_pr(client):
+    client.routes['/rest/api/1.0/projects/APP/repos/service/commits/' + SHA + '/pull-requests'] = reply(page([{'id': 43}]))
+    client.routes[urlsplit(API_PR).path.replace('/42', '/43')] = reply({**client.metadata, 'id': 43, 'state': 'MERGED'})
+    assert 'PR 43' in client.checker._find_issue_merged_pull_request_evidence(ISSUE)
+
+
+def test_merged_discovery_does_not_claim_complete_when_commit_source_unavailable(client):
+    client.routes['/rest/jira/1.0/issues/ABC-1/commits'] = reply({}, 503)
+    client.checker._bitbucket_changesets_from_jira = Mock(side_effect=rc.SddCheckError('unavailable'))
+    with pytest.raises(RuntimeError):
+        client.checker._find_issue_merged_pull_request_evidence(ISSUE)
+
+
+def test_add_aifixed_preserves_labels_added_since_issue_snapshot(client):
+    issue = NS(key='ABC-1', fields=NS(labels=['sdd']))
+    server_labels = ['sdd', 'added-during-run']
+    def put(url, **kwargs):
+        payload = kwargs['json']
+        assert 'fields' not in payload
+        for operation in payload['update']['labels']:
+            server_labels.append(operation['add'])
+        return reply({}, 204)
+    client.checker.jira_http.put.side_effect = put
+    assert client.checker._add_label_if_missing(issue, 'AIFIXED') is True
+    assert server_labels == ['sdd', 'added-during-run', 'AIFIXED']

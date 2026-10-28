@@ -911,40 +911,49 @@ class ZephyrScaleClient:
         return result
 
     def _get_test_cycles_by_issue_link(self, issue_key: str) -> list[dict]:
-        """Быстрый поиск ТЦ, связанных с Jira-задачей, через Zephyr issue endpoints."""
+        """Read all linked cycle pages within the existing request budget."""
         result = []
         for endpoint_name, endpoint_path in self._issue_link_endpoint_paths(issue_key):
             url = f"{self.base_url}{endpoint_path}"
+            deadline = time.monotonic() + self.request_timeout_seconds
+            offset, seen, expected_total = 0, set(), None
+            stat = {'mode': 'issuelink', 'endpoint': endpoint_name,
+                    'status': 'exception', 'count': 0, 'complete': False}
             try:
-                # Retry transient failures, but spend no more than the old single GET.
-                response = self._get_with_retries(
-                    url, deadline=time.monotonic() + self.request_timeout_seconds)
-                if response.status_code != 200:
-                    self.last_test_cycle_search_stats.append({
-                        'mode': 'issuelink',
-                        'endpoint': endpoint_name,
-                        'status': response.status_code,
-                        'count': 0,
-                        'body': response.text[:200] if response.status_code not in (401, 403, 404) else '',
-                    })
-                    continue
-                items = self._extract_zephyr_collection(response.json())
-                self.last_test_cycle_search_stats.append({
-                    'mode': 'issuelink',
-                    'endpoint': endpoint_name,
-                    'status': response.status_code,
-                    'count': len(items),
-                })
-                if items:
+                for _ in range(100):
+                    kwargs = {'params': {'startAt': offset, 'maxResults': 100}} if offset else {}
+                    response = self._get_with_retries(url, deadline=deadline, **kwargs)
+                    stat['status'] = response.status_code
+                    if response.status_code != 200:
+                        break
+                    payload = response.json()
+                    items = self._extract_zephyr_collection(payload)
+                    total = payload.get('total') if isinstance(payload, dict) else None
+                    if total is not None and (type(total) is not int or total < 0):
+                        break
+                    if expected_total is not None and total != expected_total:
+                        break
+                    expected_total = total
+                    if isinstance(payload, dict) and payload.get('startAt', offset) != offset:
+                        break
+                    keys = [self.get_test_cycle_key(item) or json.dumps(item, sort_keys=True) for item in items]
+                    if len(set(keys)) != len(keys) or any(key in seen for key in keys):
+                        break
+                    seen.update(keys)
                     result.extend(items)
-            except Exception as e:
-                self.last_test_cycle_search_stats.append({
-                    'mode': 'issuelink',
-                    'endpoint': endpoint_name,
-                    'status': 'exception',
-                    'count': 0,
-                    'error': str(e),
-                })
+                    stat['count'] += len(items)
+                    offset += len(items)
+                    last = payload.get('isLast', payload.get('isLastPage')) if isinstance(payload, dict) else True
+                    if ((total is not None and offset == total and last is not False)
+                            or (total is None and last is not False)):
+                        stat['complete'] = True
+                        break
+                    if not items or (total is not None and offset >= total):
+                        break
+            except Exception as exc:
+                stat['status'] = 'exception'
+                stat['error'] = type(exc).__name__
+            self.last_test_cycle_search_stats.append(stat)
         return result
 
     def _get_test_cycles_by_issue_query_params(self, issue_key: str, project_keys: list[str]) -> list[dict]:
@@ -3413,10 +3422,39 @@ class ReleaseValidator:
                 session.headers.update({'Authorization': f"Bearer {config['jira']['token']}",
                                         'Accept': 'application/json'})
                 base_url = config['jira']['url'].rstrip('/')
-                search = sdd_get_json(session, base_url, '/rest/api/2/search', {
-                    'jql': f'issue IN linkedIssues("{release_key}") AND type = Story',
-                    'maxResults': 200, 'fields': 'key'})
-                stories = [issue['key'].upper() for issue in (search.get('issues') or [])]
+                stories, seen = [], set()
+                start, expected_total = 0, None
+                for _ in range(1000):
+                    params = {'jql': f'issue IN linkedIssues("{release_key}") AND type = Story',
+                              'maxResults': 200, 'fields': 'key'}
+                    if start:
+                        params['startAt'] = start
+                    search = sdd_get_json(session, base_url, '/rest/api/2/search', params)
+                    page = search.get('issues')
+                    total = search.get('total')
+                    if (not isinstance(page, list) or search.get('startAt', start) != start
+                            or (total is not None and (type(total) is not int or total < 0))):
+                        raise SddCheckError('Jira вернула некорректную страницу списка Story.')
+                    if expected_total is not None and total != expected_total:
+                        raise SddCheckError('Список Story изменился во время чтения. Повторите запуск.')
+                    expected_total = total
+                    for issue in page:
+                        key = issue['key'].upper()
+                        if key in seen:
+                            raise SddCheckError('Jira повторила Story при чтении страниц.')
+                        stories.append(key)
+                        seen.add(key)
+                    start += len(page)
+                    if total is None:
+                        if len(page) >= 200 or search.get('isLast') is False:
+                            raise SddCheckError('Jira не подтвердила полноту списка Story.')
+                        break
+                    if start == total:
+                        break
+                    if not page or start > total:
+                        raise SddCheckError('Jira вернула неполный список Story.')
+                else:
+                    raise SddCheckError('Достигнут лимит чтения списка Story; полнота не подтверждена.')
                 if not stories:
                     self._log_issue(release_key, 'success',
                                     'SDD: связанных Story нет; по исходным правилам гейт пройден.')
@@ -5607,10 +5645,10 @@ class ReleaseValidator:
         cache[cache_key] = payload
         return payload
 
-    def _bitbucket_jira_links(self, issue_key: str, issue_id: str) -> dict:
+    def _bitbucket_jira_links(self, issue_key: str, issue_id: str, *, all_sources: bool = False) -> dict:
         """Use Jira only for direct issue-to-PR links, never for PR text or status."""
         cache = self.__dict__.setdefault('_bitbucket_link_cache', {})
-        cache_key = issue_key or issue_id
+        cache_key = (issue_key or issue_id, all_sources)
         if cache_key in cache:
             return cache[cache_key]
         result = {'urls': [], 'complete': True, 'errors': []}
@@ -5653,7 +5691,7 @@ class ReleaseValidator:
         except SddCheckError as exc:
             result['errors'].append(str(exc))
         # Remote links are an independent, direct association with this same issue.
-        if not result['urls']:
+        if all_sources or not result['urls']:
             try:
                 links = sdd_get_json(self.jira_http, base,
                                      f'/rest/api/2/issue/{quote(issue_key, safe="")}/remotelink', {},
@@ -5694,7 +5732,8 @@ class ReleaseValidator:
         base = config['jira']['url'].rstrip('/')
         deadline = getattr(self, '_pr_request_deadline', None)
         state = self.__dict__.setdefault('_bitbucket_jira_retry_state', {})
-        links = self.__dict__.get('_bitbucket_link_cache', {}).get(issue_key, {})
+        links = (self.__dict__.get('_bitbucket_link_cache', {}).get((issue_key, True))
+                 or self.__dict__.get('_bitbucket_link_cache', {}).get((issue_key, False), {}))
         issue_id = links.get('issue_id')
         if not issue_id:
             issue = sdd_get_json(self.jira_http, base, f'/rest/api/2/issue/{quote(issue_key, safe="")}',
@@ -5751,12 +5790,12 @@ class ReleaseValidator:
         cache[issue_key] = changesets
         return changesets
 
-    def _bitbucket_issue_prs(self, issue_key: str, issue_id: str) -> dict:
+    def _bitbucket_issue_prs(self, issue_key: str, issue_id: str, *, discover_all: bool = False) -> dict:
         """Verify actual PR objects in Bitbucket, including MERGED state and full captions."""
-        links = self._bitbucket_jira_links(issue_key, issue_id)
+        links = self._bitbucket_jira_links(issue_key, issue_id, all_sources=discover_all)
         result = {'prs': [], 'complete': links['complete'], 'errors': list(links['errors'])}
         urls = list(links['urls'])
-        if not urls:
+        if discover_all or not urls:
             try:
                 for changeset in self._bitbucket_issue_changesets(issue_key):
                     commit = changeset.get('toCommit')
@@ -5820,7 +5859,7 @@ class ReleaseValidator:
         issue_key = str(getattr(issue, 'key', '') or '')
         issue_id = str(getattr(issue, 'id', '') or '')
         with self._pr_lookup_budget():
-            snapshot = self._bitbucket_issue_prs(issue_key, issue_id)
+            snapshot = self._bitbucket_issue_prs(issue_key, issue_id, discover_all=True)
         for url, pr in snapshot['prs']:
             if pr['state'] == 'MERGED':
                 return f"Bitbucket PR {pr['id']} (merged): {url}"
@@ -5989,7 +6028,7 @@ class ReleaseValidator:
             raise RuntimeError("У задачи нет key для обновления labels")
         response = self.jira_http.put(
             f"{config['jira']['url'].rstrip('/')}/rest/api/2/issue/{issue_key}",
-            json={'fields': {'labels': labels + [label]}},
+            json={'update': {'labels': [{'add': label}]}},
             timeout=12,
         )
         if response.status_code not in (200, 204):
@@ -6209,17 +6248,36 @@ class ReleaseValidator:
                         or kind in {'release', 'релиз', 'релизный объект'}):
                     keys.add(key)
             candidates[issue.key] = keys
-        all_keys = sorted(set().union(*candidates.values())) if candidates else []
+        release_types = {'release', 'релиз', 'релизный объект'}
+        known_releases = set()
+        known_non_releases = set()
+        for issue in issues:
+            for link in getattr(issue.fields, 'issuelinks', []) or []:
+                linked = getattr(link, 'outwardIssue', None) or getattr(link, 'inwardIssue', None)
+                kind = getattr(getattr(getattr(linked, 'fields', None), 'issuetype', None), 'name', '')
+                key = getattr(linked, 'key', '')
+                if kind:
+                    (known_releases if kind.casefold() in release_types else known_non_releases).add(key)
+        all_keys = set().union(*candidates.values()) if candidates else set()
+        merged_candidates = set().union(*(keys for key, keys in candidates.items()
+            if merged_issue_keys is None or key in merged_issue_keys)) if candidates else set()
+        read_keys = sorted((all_keys - known_releases - known_non_releases) | merged_candidates)
         releases = {}
-        if all_keys and (merged_issue_keys is None or merged_issue_keys):
+        if read_keys:
             try:
                 releases = {item.key: item for item in self.jira_main.search_issues(
-                    f"key in ({','.join(all_keys)})", fields='status,issuetype', maxResults=False)}
+                    f"key in ({','.join(read_keys)})", fields='status,issuetype', maxResults=False)}
+                for key, item in releases.items():
+                    kind = getattr(getattr(item.fields, 'issuetype', None), 'name', '')
+                    if kind.casefold() in release_types:
+                        known_releases.add(key)
+                    else:
+                        known_releases.discard(key)
             except Exception as exc:
                 print(f'   Unlinked release lookup failed: {type(exc).__name__}')
         accepted = set()
         for issue in issues:
-            keys = candidates[issue.key]
+            keys = candidates[issue.key] & known_releases
             installed = [key for key in sorted(keys) if key in releases and
                          normalize_field_text(getattr(getattr(releases[key].fields, 'status', None),
                                                       'name', '')).casefold() == 'установлен на пром']
@@ -6234,6 +6292,10 @@ class ReleaseValidator:
                 self._log_issue(issue, 'success',
                     'Отлинкованная задача связана с другим релизом в статусе '
                     '«Установлен на ПРОМ»: ' + ', '.join(installed) + ' ✓')
+            elif not keys and candidates[issue.key]:
+                self._log_issue(issue, 'error',
+                    'Отлинкованная задача: не удалось подтвердить тип другого релиза: '
+                    + ', '.join(sorted(candidates[issue.key])) + '.')
             elif not keys:
                 self._log_issue(issue, 'error',
                     'Отлинкованная задача: отсутствует связь с другим релизом'
@@ -6285,7 +6347,7 @@ class ReleaseValidator:
         for issue in issues_by_key.values():
             try:
                 with self._pr_lookup_budget():
-                    snapshot = self._bitbucket_issue_prs(str(issue.key), str(getattr(issue, 'id', '') or ''))
+                    snapshot = self._bitbucket_issue_prs(str(issue.key), str(getattr(issue, 'id', '') or ''), discover_all=True)
             except Exception as exc:
                 self._log_issue(issue, 'warning',
                     f'Отлинкованная задача: не удалось проверить PR: {type(exc).__name__}')

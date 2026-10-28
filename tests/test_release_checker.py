@@ -2081,7 +2081,7 @@ def test_unlinked_requires_installed_other_release(statuses, accepted):
     links.append(NS(inwardIssue=NS(key='REL-1')))
     issue = NS(key='ABC-2', fields=NS(summary='Task', assignee=None, issuelinks=links))
     checker.jira_main.search_issues.return_value = [
-        NS(key=f'REL-{i+2}', fields=NS(status=NS(name=status)))
+        NS(key=f'REL-{i+2}', fields=NS(status=NS(name=status), issuetype=NS(name='Release')))
         for i, status in enumerate(statuses) if status is not None]
     assert checker._check_unlinked_other_releases([issue], 'REL-1') == ({'ABC-2'} if accepted else set())
     assert bool(checker.report_data['ABC-2']['errors']) is not accepted
@@ -2093,11 +2093,11 @@ def test_unlinked_requires_installed_other_release(statuses, accepted):
 def test_unlinked_other_release_installation_depends_on_pr_state(pr_state, release_status, blocking):
     checker = stage_validator()
     issue = NS(key='ABC-2', fields=NS(summary='Task', assignee=None, status=NS(name='In Progress'),
-        issuetype=NS(name='Story'), labels=[], issuelinks=[NS(inwardIssue=NS(key='REL-2'))]))
+        issuetype=NS(name='Story'), labels=[], issuelinks=[NS(inwardIssue=NS(key='REL-2', fields=NS(issuetype=NS(name='Release'))))]))
     checker._get_unlinked_release_issue_keys = Mock(return_value={'ABC-2'})
     checker.jira_main = Mock()
     checker.jira_main.search_issues.side_effect = [[issue],
-        [NS(key='REL-2', fields=NS(status=NS(name=release_status)))]]
+        [NS(key='REL-2', fields=NS(status=NS(name=release_status), issuetype=NS(name='Release')))]]
     checker._bitbucket_issue_prs = Mock(return_value={'prs': [('url', {'state': pr_state})], 'complete': True})
     checker._check_unlinked_release_items_pull_requests('REL-1')
     assert bool(checker.report_data['ABC-2']['errors']) is blocking
@@ -2156,7 +2156,7 @@ def test_other_release_read_failure_blocks():
     issue = NS(key='ABC-2', fields=NS(summary='Task', assignee=None,
         issuelinks=[NS(outwardIssue=NS(key='REL-2'))]))
     assert checker._check_unlinked_other_releases([issue], 'REL-1') == set()
-    assert 'статус не удалось получить' in str(checker.report_data['ABC-2']['errors'])
+    assert 'не удалось подтвердить тип' in str(checker.report_data['ABC-2']['errors'])
 
 
 @pytest.fixture
@@ -2921,3 +2921,82 @@ def test_sdd_missing_pr_branch_is_unavailable_not_confirmed_absence(native_sdd, 
     with pytest.raises(rc.SddCheckError, match='исходную ветку'):
         REAL_SDD_RELEASE_ARTIFACTS(jira, 'https://jira.example', SDD_RELEASE, 'SEARCHCS-1831', SDD_RELEASE_PR)
     tree.get.assert_not_called()
+
+
+
+def test_sdd_gate_checks_story_after_first_page(native_sdd, monkeypatch):
+    checker, session = native_sdd
+    session.get.side_effect = [response(200, {'issues': [{'key': f'ST-{i}'} for i in range(1, 201)],
+        'startAt': 0, 'maxResults': 200, 'total': 201}),
+        response(200, {'issues': [{'key': 'ST-201'}], 'startAt': 200, 'total': 201})]
+    story = Mock(side_effect=lambda session, base, key, release: (key != 'ST-201', True))
+    monkeypatch.setattr(rc, 'sdd_story_result', story)
+    checker._run_check('sdd', 'SDD', lambda: checker._check_sdd_gate('REL-1'))
+    assert story.call_count == 201
+    assert checker.check_results[-1]['status'] == 'FAIL'
+    assert checker.report_data['ST-201']['errors']
+    assert session.get.call_args.kwargs['params']['startAt'] == 200
+
+
+@pytest.mark.parametrize('second', [
+    {'issues': [], 'startAt': 1, 'total': 2},
+    {'issues': [{'key': 'ST-1'}], 'startAt': 1, 'total': 2},
+    {'issues': [{'key': 'ST-2'}], 'startAt': 0, 'total': 2},
+    {'issues': [{'key': 'ST-2'}], 'startAt': 1, 'total': 3}])
+def test_sdd_gate_never_accepts_incomplete_story_search(native_sdd, monkeypatch, second):
+    checker, session = native_sdd
+    session.get.side_effect = [response(200, {'issues': [{'key': 'ST-1'}], 'startAt': 0, 'total': 2}),
+                              response(200, second)]
+    story = Mock()
+    monkeypatch.setattr(rc, 'sdd_story_result', story)
+    checker._run_check('sdd', 'SDD', lambda: checker._check_sdd_gate('REL-1'))
+    assert checker.check_results[-1]['status'] == 'INCOMPLETE'
+    story.assert_not_called()
+
+
+@pytest.mark.parametrize('merged', [False, True])
+def test_other_release_rejects_story_even_in_release_project(merged):
+    checker = stage_validator()
+    linked = NS(key='REL-99', fields=NS(issuetype=NS(name='Story')))
+    issue = NS(key='ABC-2', fields=NS(summary='Story', assignee=None, issuelinks=[NS(outwardIssue=linked)]))
+    checker.jira_main = Mock()
+    checker.jira_main.search_issues.return_value = [NS(key='REL-99', fields=NS(
+        issuetype=NS(name='Story'), status=NS(name='Установлен на ПРОМ')))]
+    assert checker._check_unlinked_other_releases([issue], 'REL-1', {'ABC-2'} if merged else set()) == set()
+    assert checker.report_data['ABC-2']['errors']
+
+
+def test_unknown_linked_type_is_verified_before_accepting_other_release():
+    checker = stage_validator()
+    issue = NS(key='ABC-2', fields=NS(summary='Story', assignee=None,
+        issuelinks=[NS(outwardIssue=NS(key='REL-2'))]))
+    checker.jira_main = Mock()
+    checker.jira_main.search_issues.return_value = [NS(key='REL-2', fields=NS(
+        issuetype=NS(name='Release'), status=NS(name='В работе')))]
+    assert checker._check_unlinked_other_releases([issue], 'REL-1', set()) == {'ABC-2'}
+    checker.jira_main.search_issues.assert_called_once()
+
+
+def test_linked_cycles_paging_reads_missing_required_cycle(zephyr):
+    first = {'key': 'HRPQA-C1', 'name': 'REL-1.SERVICE.api.Регресс'}
+    second = {'key': 'HRPQA-C2', 'name': 'REL-1.SERVICE.ipad/pwa/safari/sberbrowser.Регресс'}
+    zephyr.session.get.side_effect = [response(200, {'results': [first], 'total': 2, 'isLast': False, 'startAt': 0}),
+        response(200, {'results': [second], 'total': 2, 'isLast': True, 'startAt': 1})]
+    checker = zephyr_checker(zephyr)
+    checker._zephyr_release_cycles_cache = {}
+    assert checker._get_release_test_cycles('REL-1') == [(first['key'], first['name']), (second['key'], second['name'])]
+    assert zephyr.session.get.call_args.kwargs['params']['startAt'] == 1
+    assert zephyr.last_test_cycle_search_stats[0]['complete'] is True
+
+
+def test_linked_cycles_partial_page_triggers_fallback_and_is_not_cached(zephyr):
+    first = {'key': 'HRPQA-C1', 'name': 'REL-1.SERVICE.api.Регресс'}
+    # Server ignores offset: the repeated page cannot establish completeness.
+    zephyr.session.get.return_value = response(200, {'results': [first], 'total': 2, 'isLast': False, 'startAt': 0})
+    zephyr.get_test_cycles_from_frontend = Mock(return_value=([], False))
+    checker = zephyr_checker(zephyr)
+    checker._zephyr_release_cycles_cache = {}
+    assert checker._get_release_test_cycles('REL-1') == [(first['key'], first['name'])]
+    assert 'REL-1' not in checker._zephyr_release_cycles_cache
+    zephyr.get_test_cycles_from_frontend.assert_called_once_with('REL-1')
+    assert checker.report_data['REL-1']['warnings']
