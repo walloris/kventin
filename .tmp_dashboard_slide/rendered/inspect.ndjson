@@ -1,0 +1,17 @@
+{"kind":"slide","id":"sl/66041a","slide":1,"title":"Все цели выполняет 1 из 8 команд; проблема — PR ↔ задача","textShapes":12}
+{"kind":"textbox","id":"sh/kvy5ob65","slide":1,"name":"takeaway-title","text":"Все цели выполняет 1 из 8 команд; проблема — PR ↔ задача","textPreview":"Все цели выполняет 1 из 8 команд; проблема — PR ↔ задача","textChars":56,"textLines":1,"bbox":[41,34,1198,82]}
+{"kind":"textbox","id":"sh/jupov65k","slide":1,"name":"scope-line","text":"Пульс-Каркас  ·  кластер Каркас  ·  блок «Люди и культура»","textPreview":"Пульс-Каркас  ·  кластер Каркас  ·  блок «Люди и культура»","textChars":58,"textLines":1,"bbox":[42,112,1196,28]}
+{"kind":"shape","id":"sh/itgnm1oz","slide":1,"name":"chart-frame","bbox":[41,154,581,488]}
+{"kind":"textbox","id":"sh/t0r61gnm","slide":1,"name":"chart-title","text":"Доля команд, достигших цели по метрике","textPreview":"Доля команд, достигших цели по метрике","textChars":38,"textLines":1,"bbox":[65,174,525,34]}
+{"kind":"textbox","id":"sh/7ypozq5w","slide":1,"name":"chart-footnote","text":"* 7 из 7 измеренных команд; у «Продуктовой аналитики» нет релизов.","textPreview":"* 7 из 7 измеренных команд; у «Продуктовой аналитики» нет релизов.","textChars":66,"textLines":1,"bbox":[65,592,525,28]}
+{"kind":"textbox","id":"sh/6xg7qlob","slide":1,"name":"gap-eyebrow","text":"СИСТЕМНЫЙ РАЗРЫВ","textPreview":"СИСТЕМНЫЙ РАЗРЫВ","textChars":16,"textLines":1,"bbox":[676,176,270,26]}
+{"kind":"textbox","id":"sh/hor650ny","slide":1,"name":"gap-number","text":"6 из 8","textPreview":"6 из 8","textChars":6,"textLines":1,"bbox":[673,210,260,74]}
+{"kind":"textbox","id":"sh/g3ipwv6d","slide":1,"name":"gap-description","text":"команд не достигают цели 80% по связи PR с задачами. У отстающих результат — от 64,3% до 79,1%.","textPreview":"команд не достигают цели 80% по связи PR с задачами. У отстающих результат — от 64,3% до 79,1%.","textChars":95,"textLines":1,"bbox":[676,286,535,112]}
+{"kind":"shape","id":"sh/mlgn61g7","slide":1,"name":"stats-rule","bbox":[676,420,536,0]}
+{"kind":"textbox","id":"sh/nmp4f6hs","slide":1,"name":"stat-one","text":"74%","textPreview":"74%","textChars":3,"textLines":1,"bbox":[676,452,220,62]}
+{"kind":"textbox","id":"sh/8ny58byd","slide":1,"name":"stat-one-label","text":"проверок метрик\nвыполнено · 29 из 39","textPreview":"проверок метрик | выполнено · 29 из 39","textChars":36,"textLines":2,"bbox":[676,520,230,68]}
+{"kind":"textbox","id":"sh/9o7mhgzi","slide":1,"name":"stat-two","text":"5 из 8","textPreview":"5 из 8","textChars":6,"textLines":1,"bbox":[974,452,230,62]}
+{"kind":"textbox","id":"sh/u9gnalg3","slide":1,"name":"stat-two-label","text":"команд выполняют\nне менее 80% метрик","textPreview":"команд выполняют | не менее 80% метрик","textChars":36,"textLines":2,"bbox":[974,520,238,68]}
+{"kind":"textbox","id":"sh/vapoj6ho","slide":1,"name":"source-footer","text":"Источник: выгрузка дашборда · Sheet1 · 8 команд","textPreview":"Источник: выгрузка дашборда · Sheet1 · 8 команд","textChars":47,"textLines":1,"bbox":[42,674,700,20]}
+{"kind":"chart","id":"ch/cf65832h","slide":1,"name":"","chartType":"bar","bbox":[62,218,535,360]}
+{"kind":"notes","id":"nt/66041a","slide":1,"text":"[Sources]\n- /Users/walloris/Downloads/5828d199-db9f-45e6-9d2f-c8e4fe9f986f.xlsx — Sheet1, rows 2–100.\n- Calculations: 29/39 achieved metric checks; 5/8 teams at or above 80%; PR-to-task target met by 2/8 teams.\n- Documentation denominator is 7 because Product Analytics has no releases.\n[/Sources]"}
