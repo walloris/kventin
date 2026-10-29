@@ -5791,11 +5791,34 @@ class ReleaseValidator:
         return changesets
 
     def _bitbucket_issue_prs(self, issue_key: str, issue_id: str, *, discover_all: bool = False) -> dict:
-        """Verify actual PR objects in Bitbucket, including MERGED state and full captions."""
-        links = self._bitbucket_jira_links(issue_key, issue_id, all_sources=discover_all)
+        """Verify known PRs before spending the remaining budget on extra discovery."""
+        links = self._bitbucket_jira_links(issue_key, issue_id)
         result = {'prs': [], 'complete': links['complete'], 'errors': list(links['errors'])}
-        urls = list(links['urls'])
-        if discover_all or not urls:
+        seen = set()
+
+        def verify_urls(urls):
+            for url in urls:
+                if url in seen:
+                    continue
+                seen.add(url)
+                try:
+                    pr = self._bitbucket_api(url, issue_key)
+                    expected_id = int(url.rsplit('/', 1)[-1])
+                    if (str(pr.get('id')) != str(expected_id)
+                            or pr.get('state') not in {'OPEN', 'MERGED', 'DECLINED'}):
+                        raise SddCheckError('Bitbucket не подтвердил ID и состояние связанного PR.')
+                    result['prs'].append((url, pr))
+                except SddCheckError as exc:
+                    result['errors'].append(str(exc))
+                    result['complete'] = False
+
+        verify_urls(links['urls'])
+        if discover_all:
+            extra = self._bitbucket_jira_links(issue_key, issue_id, all_sources=True)
+            result['complete'] = result['complete'] and extra['complete']
+            result['errors'].extend(extra['errors'])
+            verify_urls(extra['urls'])
+        if discover_all or not links['urls']:
             try:
                 for changeset in self._bitbucket_issue_changesets(issue_key):
                     commit = changeset.get('toCommit')
@@ -5807,24 +5830,16 @@ class ReleaseValidator:
                         raise SddCheckError('Bitbucket не вернул адрес связанного коммита для поиска PR.')
                     prs = self._bitbucket_api(commit_url + '/pull-requests', issue_key, objects=True)
                     repo_api = commit_url.rsplit('/commits/', 1)[0]
+                    urls = []
                     for pr in prs:
                         if not str(pr.get('id', '')).isdigit():
                             raise SddCheckError('Bitbucket не вернул ID PR связанного коммита.')
                         urls.append(repo_api + '/pull-requests/' + str(pr['id']))
+                    verify_urls(urls)
             except SddCheckError as exc:
                 result['errors'].append(str(exc))
                 result['complete'] = False
-        for url in dict.fromkeys(urls):
-            try:
-                pr = self._bitbucket_api(url, issue_key)
-                expected_id = int(url.rsplit('/', 1)[-1])
-                if (str(pr.get('id')) != str(expected_id)
-                        or pr.get('state') not in {'OPEN', 'MERGED', 'DECLINED'}):
-                    raise SddCheckError('Bitbucket не подтвердил ID и состояние связанного PR.')
-                result['prs'].append((url, pr))
-            except SddCheckError as exc:
-                result['errors'].append(str(exc))
-                result['complete'] = False
+        result['errors'] = list(dict.fromkeys(result['errors']))
         return result
 
     def _bitbucket_commit_url(self, commit: dict, repo: dict) -> Optional[str]:

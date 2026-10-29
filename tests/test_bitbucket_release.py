@@ -438,3 +438,25 @@ def test_add_aifixed_preserves_labels_added_since_issue_snapshot(client):
     client.checker.jira_http.put.side_effect = put
     assert client.checker._add_label_if_missing(issue, 'AIFIXED') is True
     assert server_labels == ['sdd', 'added-during-run', 'AIFIXED']
+
+
+@pytest.mark.parametrize('slow_source', ['remote', 'commits'])
+def test_known_merged_pr_survives_budget_exhaustion_during_extra_discovery(client, monkeypatch, slow_source):
+    client.metadata['state'] = 'MERGED'
+    clock = [0.0]
+    monkeypatch.setattr(rc.time, 'monotonic', lambda: clock[0])
+    if slow_source == 'remote':
+        fetch = client.checker.jira_http.get.side_effect
+        def jira(url, **kwargs):
+            if url.endswith('/remotelink'):
+                clock[0] += rc.PR_LOOKUP_TIMEOUT_SECONDS + 1
+                return reply([])
+            return fetch(url, **kwargs)
+        client.checker.jira_http.get.side_effect = jira
+    else:
+        def commits(*args, **kwargs):
+            clock[0] += rc.PR_LOOKUP_TIMEOUT_SECONDS + 1
+            raise rc.SddCheckError('budget expired')
+        client.checker._bitbucket_issue_changesets = Mock(side_effect=commits)
+    assert 'PR 42' in client.checker._find_issue_merged_pull_request_evidence(ISSUE)
+    assert client.bb.get.call_args_list[0].args[0] == API_PR
