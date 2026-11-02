@@ -3114,3 +3114,38 @@ def test_sdd_mixed_error_categories_preserve_unknown_and_error_messages(capsys):
     assert row['error_causes'] == [{'number': 1, 'causes': ['upstream_timeout']},
                                     {'number': 2, 'causes': ['unclassified']}]
     assert 'SECRET' not in output
+
+
+def test_sdd_comment_explains_2484_rule_and_incomplete_files(native_sdd, monkeypatch):
+    checker, jira = native_sdd
+    key = 'NEUROUI-2484'
+    detail = sdd_linked_truncated_detail(file_count=5)
+    detail['detail'][0]['repositories'][0]['commits'][0]['files'] = [
+        {'path': 'openspec/changes/archive/remove-employee-actions/design.md'}]
+    jira.get.side_effect = sdd_responses(detail=detail, issues=[{'key': key}])
+    bb, _ = bitbucket_test_session(monkeypatch, jira)
+    bb.get.return_value = response(200, {'values': [
+        {'path': 'openspec/changes/archive/remove-employee-actions/design.md'},
+        {'path': 'openspec/changes/archive/remove-employee-actions/tasks.md'}], 'isLastPage': True})
+    assert checker.check_release('REL-1') is False
+    comment = rc.html.unescape(checker._release_comment('REL-1', False))
+    for expected in (key, 'Неполных списков файлов: 1', 'Jira заявляет 5 файлов, получено 2',
+                     f'openspec/.*{key}.*', 'Найденные пути openspec не содержат ключ',
+                     'В доступных исходных деревьях PR релиза REL-1',
+                     'Наличие openspec в непрочитанных файлах не опровергнуто',
+                     'Остальные проверки не запускались'):
+        assert expected in comment
+    assert len(checker.check_results) == 1
+    checker.jira_main.issue.assert_not_called()
+
+
+def test_sdd_comment_preserves_both_source_failures(native_sdd, monkeypatch):
+    checker, checker_session = native_sdd
+    monkeypatch.setattr(rc, 'sdd_commit_story_result', Mock(side_effect=rc.SddCheckError('Коммиты: Bitbucket HTTP 403.')))
+    monkeypatch.setattr(rc, 'sdd_release_artifacts', Mock(side_effect=rc.SddCheckError('Релизные PR: Jira HTTP 503.')))
+    # Search returns a single Story before either source fails.
+    checker_session.get.return_value = response(200, {'issues': [{'key': 'ST-1'}]})
+    assert checker.check_release('REL-1') is False
+    comment = checker._release_comment('REL-1', False)
+    assert 'Коммиты: Bitbucket HTTP 403.' in comment
+    assert 'Релизные PR: Jira HTTP 503.' in comment

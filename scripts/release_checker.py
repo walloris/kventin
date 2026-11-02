@@ -2004,9 +2004,31 @@ def sdd_commit_story_result(session: requests.Session, base_url: str, key: str) 
                     return has_sdd, True
                 if failures or any(stats[name] for name in ('missing_repositories', 'missing_commits',
                                                            'missing_files', 'invalid_paths', 'truncated_files')):
-                    reason = ' '.join(failures[:2]) or 'Источник не вернул полный список файлов.'
-                    raise SddCheckError('Jira dev-status не передал полный список путей файлов. '
-                                        + reason + ' Наличие openspec не опровергнуто.')
+                    details = [f'{label}: {stats[name]}' for name, label in (
+                        ('missing_repositories', 'Нет списка репозиториев'),
+                        ('missing_commits', 'Нет списка коммитов'),
+                        ('missing_files', 'Нет списка файлов'),
+                        ('invalid_paths', 'Некорректных путей'),
+                        ('truncated_files', 'Неполных списков файлов')) if stats[name]]
+                    discrepancies = []
+                    for group in data.get('detail') or []:
+                        for repo in group.get('repositories') or []:
+                            for commit in repo.get('commits') or []:
+                                if not isinstance(commit, dict):
+                                    continue
+                                declared, files = commit.get('fileCount'), commit.get('files')
+                                if type(declared) is int and isinstance(files, list) and declared > len(files):
+                                    discrepancies.append(f'Jira заявляет {declared} файлов, получено {len(files)}')
+                    reason = ' '.join(failures[:2])
+                    counts = '; '.join(discrepancies[:3])
+                    evidence = (f' Среди прочитанных файлов совпадений openspec/.*{key}.* пока нет.'
+                                ' Наличие openspec в непрочитанных файлах не опровергнуто.')
+                    if stats['openspec_paths_sample']:
+                        evidence += (' Найденные пути openspec не содержат ключ ' + key
+                                     + '; проверьте привязку каталога к Story.')
+                    summary = '; '.join(part for part in (', '.join(details), counts, reason) if part)
+                    raise SddCheckError('Jira dev-status не передал полный список путей файлов: '
+                        + summary + '.' + evidence)
             return has_sdd, False
         return has_sdd, None
     finally:
@@ -2147,9 +2169,20 @@ def sdd_story_result(session: requests.Session, base_url: str, key: str,
     """Use Story commits first, then the pinned source tree of the release PR."""
     try:
         has_sdd, openspec = sdd_commit_story_result(session, base_url, key)
-    except SddCheckError:
-        if not release_key or not sdd_release_artifacts(session, base_url, release_key, key, explicit_pr):
+    except SddCheckError as commit_error:
+        if not release_key:
             raise
+        try:
+            recovered = sdd_release_artifacts(session, base_url, release_key, key, explicit_pr)
+        except SddCheckError as release_error:
+            raise SddCheckError(str(commit_error) + ' Резервная проверка PR релиза: '
+                                + str(release_error)) from None
+        if not recovered:
+            raise SddCheckError(str(commit_error)
+                + f' В доступных исходных деревьях PR релиза {release_key} '
+                + f'совпадений openspec/.*{key}.* также нет. '
+                + 'Проверьте имя каталога: оно должно содержать ключ Story; '
+                + 'если файлы уже есть — восстановите полноту данных Jira/Bitbucket и повторите запуск.') from None
         labels = sdd_get_json(session, base_url, f'/rest/api/2/issue/{key}', {'fields': 'labels'})
         has_sdd = any(label.lower() == 'sdd' for label in ((labels.get('fields') or {}).get('labels') or []))
         return has_sdd, True
