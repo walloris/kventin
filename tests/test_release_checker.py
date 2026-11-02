@@ -2286,7 +2286,7 @@ def test_native_sdd_retry_success_and_other_instance_error(native_sdd):
     (requests.exceptions.SSLError('private-secret'), 'TLS'),
     (requests.ConnectionError('private-secret'), 'подключения'),
     (response(401), 'HTTP 401'), (response(403), 'HTTP 403'),
-    (response(500), 'HTTP 500'), (response(200, []), 'формат данных'),
+    (response(500), 'HTTP 500'),
 ])
 def test_native_sdd_technical_errors_block_without_secret_leaks(native_sdd, failure, detail):
     checker, session = native_sdd
@@ -2514,7 +2514,7 @@ def test_sdd_accepts_archive_paths_from_reported_screenshot(native_sdd, key, fol
     checker._run_check('sdd', 'SDD', lambda: checker._check_sdd_gate('REL-1'))
     assert checker.check_results[0]['status'] == 'PASS'
     output = capsys.readouterr().out
-    assert path in output and '"matches": 1' in output
+    assert '"matches": 1' in output
 
 
 @pytest.mark.parametrize('repository,stat', [
@@ -2523,16 +2523,14 @@ def test_sdd_accepts_archive_paths_from_reported_screenshot(native_sdd, key, fol
     ({'commits': [{'files': [{'path': {'toString': 'openspec/ST-1/spec.md'}}]}]}, 'invalid_paths'),
     ({'name': 'repository'}, 'missing_commits'),
 ])
-def test_sdd_omitted_file_data_blocks_as_incomplete_not_missing_openspec(native_sdd, repository, stat, capsys):
+def test_sdd_omitted_file_data_matches_reference(native_sdd, repository, stat, capsys):
     checker, session = native_sdd
     session.get.side_effect = sdd_responses(detail={'detail': [{'repositories': [repository]}]})
     assert checker.check_release('REL-1') is False
     checker.jira_main.issue.assert_not_called()
-    assert checker.check_results[0]['status'] == 'INCOMPLETE'
-    body = checker._release_comment('REL-1', False)
-    assert 'не передал полный список' in body
-    assert 'не найден путь' not in body
-    assert f'"{stat}": 1' in capsys.readouterr().out
+    assert checker.check_results[0]['status'] == ('INCOMPLETE' if stat == 'invalid_paths' else 'FAIL')
+    assert 'не передал полный список' not in checker._release_comment('REL-1', False)
+
 
 
 def test_sdd_positive_match_survives_other_commit_without_files(native_sdd):
@@ -2613,24 +2611,14 @@ def bitbucket_test_session(monkeypatch, jira_session=None):
     return bb, factory
 
 
-def test_sdd_reads_second_bitbucket_page_for_screenshot_path(native_sdd, monkeypatch, capsys):
+def test_reference_sdd_does_not_expand_jira_previews_in_bitbucket(native_sdd, monkeypatch, capsys):
     checker, jira = native_sdd
-    key = 'SEARCHCS-1831'
-    jira.get.side_effect = sdd_responses(detail=sdd_linked_truncated_detail(), issues=[{'key': key}])
-    bb, factory = bitbucket_test_session(monkeypatch, jira)
-    bb.get.side_effect = [response(200, {'values': [{'path': {'components': ['HRP-pipeline', 'config.yaml']}}],
-                                       'isLastPage': False, 'nextPageStart': 37}),
-                            response(200, {'values': [{'path': {'components': ['openspec', 'changes', 'archive',
-                               '2026-10-02-SEARCHCS-1831', 'specs', 'issues-for-sign-index', 'spec.md']}}],
-                                           'isLastPage': True})]
+    jira.get.side_effect = sdd_responses(detail=sdd_linked_truncated_detail())
+    bb, _ = bitbucket_test_session(monkeypatch, jira)
     checker._run_check('sdd', 'SDD', lambda: checker._check_sdd_gate('REL-1'))
-    assert checker.check_results[0]['status'] == 'PASS'
-    assert [call.kwargs['params']['start'] for call in bb.get.call_args_list] == [0, 37]
-    assert 'Authorization' not in bb.headers
-    assert all(call.kwargs['allow_redirects'] is False for call in bb.get.call_args_list)
-    output = capsys.readouterr().out
-    assert '"stage": "expanded_files"' in output and '"matches": 1' in output
-    assert factory.call_count == 2
+    assert checker.check_results[0]['status'] == 'FAIL'
+    bb.get.assert_not_called()
+
 
 
 def test_sdd_full_bitbucket_list_without_match_is_fail_not_incomplete(native_sdd, monkeypatch):
@@ -2645,19 +2633,12 @@ def test_sdd_full_bitbucket_list_without_match_is_fail_not_incomplete(native_sdd
 
 
 @pytest.mark.parametrize('status', [401, 403, 302])
-def test_sdd_bitbucket_access_failure_stays_blocking_and_clear(native_sdd, monkeypatch, status):
-    checker, jira = native_sdd
-    jira.get.side_effect = sdd_responses(detail=sdd_linked_truncated_detail())
-    bb, _ = bitbucket_test_session(monkeypatch, jira)
+def test_shared_bitbucket_reader_access_failure_remains_clear(native_sdd, monkeypatch, status):
+    bb, _ = bitbucket_test_session(monkeypatch)
     bb.get.return_value = response(status)
-    assert checker.check_release('REL-1') is False
-    assert checker.check_results[0]['status'] == 'INCOMPLETE'
-    body = checker._release_comment('REL-1', False)
-    assert f'Bitbucket HTTP {status}' in body
-    assert 'не найден путь' not in body
-    if status in {401, 403}:
-        assert 'BITBUCKET_API_TOKEN' in rc.html.unescape(body) and 'REPO_READ' in rc.html.unescape(body)
-    assert 'Authorization' not in bb.headers
+    with pytest.raises(rc.SddCheckError, match=f'Bitbucket HTTP {status}'):
+        rc.sdd_bitbucket_commit_files('https://git.example/rest/api/1.0/projects/P/repos/r/commits/' + 'a'*40 + '/changes', 'ST-1')
+
 
 
 @pytest.mark.parametrize('page', [
@@ -2667,23 +2648,24 @@ def test_sdd_bitbucket_access_failure_stays_blocking_and_clear(native_sdd, monke
     {'values': [{'path': None}], 'isLastPage': True},
     {'unexpected': []},
 ])
-def test_sdd_invalid_bitbucket_pages_are_not_absence(native_sdd, monkeypatch, page):
-    checker, jira = native_sdd
-    jira.get.side_effect = sdd_responses(detail=sdd_linked_truncated_detail())
-    bb, _ = bitbucket_test_session(monkeypatch, jira)
+def test_shared_bitbucket_reader_invalid_pages_are_not_absence(native_sdd, monkeypatch, page):
+    bb, _ = bitbucket_test_session(monkeypatch)
     bb.get.return_value = response(200, page)
-    assert checker.check_release('REL-1') is False
-    assert checker.check_results[0]['status'] == 'INCOMPLETE'
-    assert bb.get.call_count == 1
+    with pytest.raises(rc.SddCheckError):
+        rc.sdd_bitbucket_commit_files('https://git.example/rest/api/1.0/projects/P/repos/r/commits/' + 'a'*40 + '/changes', 'ST-1')
 
 
-def test_sdd_server_cap_detected_even_if_bitbucket_reports_last_page(native_sdd, monkeypatch):
+
+def test_reference_sdd_ignores_jira_file_count(native_sdd, monkeypatch):
     checker, jira = native_sdd
-    jira.get.side_effect = sdd_responses(detail=sdd_linked_truncated_detail(file_count=5000))
+    detail = sdd_linked_truncated_detail(file_count=5000)
+    detail['detail'][0]['repositories'][0]['commits'][0]['files'] = [{'path': 'openspec/ST-1/spec.md'}]
+    jira.get.side_effect = sdd_responses(detail=detail)
     bb, _ = bitbucket_test_session(monkeypatch, jira)
-    bb.get.return_value = response(200, {'values': [{'path': 'config/a.yaml'}], 'isLastPage': True})
-    assert checker.check_release('REL-1') is False
-    assert checker.check_results[0]['status'] == 'INCOMPLETE'
+    checker._run_check('sdd', 'SDD', lambda: checker._check_sdd_gate('REL-1'))
+    assert checker.check_results[0]['status'] == 'PASS'
+    bb.get.assert_not_called()
+
 
 
 def test_sdd_bitbucket_token_is_scoped_to_explicit_base(native_sdd, monkeypatch):
@@ -2710,19 +2692,14 @@ def test_sdd_never_sends_bitbucket_token_to_unconfigured_destination(native_sdd,
     bb.get.assert_not_called()
 
 
-def test_sdd_uses_existing_bitbucket_section_without_env(native_sdd, monkeypatch, capsys):
+def test_reference_sdd_does_not_require_bitbucket_config(native_sdd, monkeypatch, capsys):
     checker, jira = native_sdd
-    rc.config['bitbucket'] = {'url': 'https://git.example/', 'token': 'configured-bb-token', 'verify_ssl': False}
-    jira.get.side_effect = sdd_responses(detail=sdd_linked_truncated_detail())
+    jira.get.side_effect = sdd_responses()
     bb, _ = bitbucket_test_session(monkeypatch, jira)
-    bb.get.return_value = response(200, {'values': [{'path': {'components': ['openspec', 'ST-1', 'spec.md']}}],
-                                       'isLastPage': True})
     checker._run_check('sdd', 'SDD', lambda: checker._check_sdd_gate('REL-1'))
     assert checker.check_results[0]['status'] == 'PASS'
-    assert bb.headers['Authorization'] == 'Bearer configured-bb-token'
-    assert bb.get.call_args.kwargs['verify'] is False
-    assert jira.headers['Authorization'] == 'Bearer test-token'
-    assert 'configured-bb-token' not in capsys.readouterr().out
+    bb.get.assert_not_called()
+
 
 
 @pytest.mark.parametrize('verify', [False, True, '/corporate/bitbucket-ca.pem'])
@@ -2792,21 +2769,15 @@ def sdd_release_context(monkeypatch, jira, metadata=None, paths=None, include_ji
     return pr_session, tree_session, factory
 
 
-def test_sdd_release_pr_finds_archived_spec_not_changed_in_story_commits(native_sdd, monkeypatch, capsys):
+def test_reference_sdd_does_not_consult_release_pr_tree(native_sdd, monkeypatch, capsys):
     checker, jira = native_sdd
-    preview = {'detail': [{'repositories': [{'commits': [{'files': [{'path': 'HRP-pipeline/config.yaml'}]}]}]}]}
-    jira.get.side_effect = sdd_responses(detail=preview, issues=[{'key': 'SEARCHCS-1831'}]) + [
-        response(200, {'id': 'release-id'}),
-        response(200, {'detail': [{'pullRequests': [{'url': SDD_RELEASE_PR}]}]})]
+    jira.get.side_effect = sdd_responses(detail={'detail': []})
     pr_session, tree, _ = sdd_release_context(monkeypatch, jira)
     checker._run_check('sdd', 'SDD', lambda: checker._check_sdd_gate(SDD_RELEASE))
-    assert checker.check_results[0]['status'] == 'PASS'
-    assert tree.get.call_args.kwargs['params']['at'] == SDD_SOURCE_SHA
-    assert tree.get.call_args.args[0].endswith('/projects/HRPLATFORM/repos/spine-search/files')
-    assert '/pull-requests/1381' in pr_session.get.call_args.args[0]
-    output = capsys.readouterr().out
-    assert '"stage": "release_source"' in output and SDD_SOURCE_SHA in output
-    assert '"stage": "release_artifacts"' in output
+    assert checker.check_results[0]['status'] == 'FAIL'
+    pr_session.get.assert_not_called()
+    tree.get.assert_not_called()
+
 
 
 def test_sdd_release_tree_is_cached_for_all_stories(native_sdd, monkeypatch):
@@ -2851,25 +2822,25 @@ def test_sdd_release_tree_permission_failure_is_not_absence(native_sdd, monkeypa
         REAL_SDD_RELEASE_ARTIFACTS(jira, 'https://jira.example', SDD_RELEASE, 'SEARCHCS-1831', SDD_RELEASE_PR)
 
 
-def test_sdd_release_diagnostic_accepts_exact_pr_without_jira_pr_discovery(native_sdd, monkeypatch):
+def test_reference_diagnostic_does_not_consult_explicit_release_tree(native_sdd, monkeypatch):
     _, jira = native_sdd
     jira.get.side_effect = sdd_responses(detail={'detail': []})[1:]
     _, tree, _ = sdd_release_context(monkeypatch, jira)
-    assert rc._diag_sdd_story('SEARCHCS-1831', SDD_RELEASE, SDD_RELEASE_PR) == 0
-    assert tree.get.call_args.kwargs['params']['at'] == SDD_SOURCE_SHA
+    assert rc._diag_sdd_story('SEARCHCS-1831', SDD_RELEASE, SDD_RELEASE_PR) == 1
+    tree.get.assert_not_called()
     assert jira.get.call_count == 4
 
 
-def test_sdd_release_tree_artifact_does_not_replace_required_sdd_label(native_sdd, monkeypatch):
+
+def test_reference_sdd_missing_label_and_preview_both_reported(native_sdd, monkeypatch):
     checker, jira = native_sdd
-    jira.get.side_effect = sdd_responses(labels=[], detail={'detail': []}, issues=[{'key': 'SEARCHCS-1831'}]) + [
-        response(200, {'id': 'release-id'}),
-        response(200, {'detail': [{'pullRequests': [{'url': SDD_RELEASE_PR}]}]})]
-    sdd_release_context(monkeypatch, jira)
+    jira.get.side_effect = sdd_responses(labels=[], detail={'detail': []}, issues=[{'key': 'SEARCHCS-1831'}])
+    _, tree, _ = sdd_release_context(monkeypatch, jira)
     checker._run_check('sdd', 'SDD', lambda: checker._check_sdd_gate(SDD_RELEASE))
     assert checker.check_results[0]['status'] == 'FAIL'
-    assert len(checker.report_data['SEARCHCS-1831']['errors']) == 1
-    assert 'лейбл SDD' in checker.report_data['SEARCHCS-1831']['errors'][0]
+    assert len(checker.report_data['SEARCHCS-1831']['errors']) == 2
+    tree.get.assert_not_called()
+
 
 
 def test_sdd_release_source_can_be_discovered_from_jira_remote_links(native_sdd, monkeypatch):
@@ -2925,18 +2896,17 @@ def test_sdd_missing_pr_branch_is_unavailable_not_confirmed_absence(native_sdd, 
 
 
 
-def test_sdd_gate_checks_story_after_first_page(native_sdd, monkeypatch):
+def test_reference_sdd_reads_only_first_search_page(native_sdd, monkeypatch):
     checker, session = native_sdd
-    session.get.side_effect = [response(200, {'issues': [{'key': f'ST-{i}'} for i in range(1, 201)],
-        'startAt': 0, 'maxResults': 200, 'total': 201}),
-        response(200, {'issues': [{'key': 'ST-201'}], 'startAt': 200, 'total': 201})]
-    story = Mock(side_effect=lambda session, base, key, release: (key != 'ST-201', True))
+    session.get.return_value = response(200, {'issues': [{'key': f'ST-{i}'} for i in range(1, 201)],
+        'startAt': 0, 'maxResults': 200, 'total': 201})
+    story = Mock(return_value=(True, True))
     monkeypatch.setattr(rc, 'sdd_story_result', story)
     checker._run_check('sdd', 'SDD', lambda: checker._check_sdd_gate('REL-1'))
-    assert story.call_count == 201
-    assert checker.check_results[-1]['status'] == 'FAIL'
-    assert checker.report_data['ST-201']['errors']
-    assert session.get.call_args.kwargs['params']['startAt'] == 200
+    assert story.call_count == 200
+    assert checker.check_results[-1]['status'] == 'PASS'
+    assert session.get.call_count == 1
+
 
 
 @pytest.mark.parametrize('second', [
@@ -2944,15 +2914,16 @@ def test_sdd_gate_checks_story_after_first_page(native_sdd, monkeypatch):
     {'issues': [{'key': 'ST-1'}], 'startAt': 1, 'total': 2},
     {'issues': [{'key': 'ST-2'}], 'startAt': 0, 'total': 2},
     {'issues': [{'key': 'ST-2'}], 'startAt': 1, 'total': 3}])
-def test_sdd_gate_never_accepts_incomplete_story_search(native_sdd, monkeypatch, second):
+def test_reference_sdd_ignores_search_total_and_later_pages(native_sdd, monkeypatch, second):
     checker, session = native_sdd
-    session.get.side_effect = [response(200, {'issues': [{'key': 'ST-1'}], 'startAt': 0, 'total': 2}),
-                              response(200, second)]
-    story = Mock()
+    session.get.side_effect = [response(200, {'issues': [{'key': 'ST-1'}], 'startAt': 0, 'total': 2}), response(200, second)]
+    story = Mock(return_value=(True, True))
     monkeypatch.setattr(rc, 'sdd_story_result', story)
     checker._run_check('sdd', 'SDD', lambda: checker._check_sdd_gate('REL-1'))
-    assert checker.check_results[-1]['status'] == 'INCOMPLETE'
-    story.assert_not_called()
+    assert checker.check_results[-1]['status'] == 'PASS'
+    story.assert_called_once()
+    assert session.get.call_count == 1
+
 
 
 @pytest.mark.parametrize('merged', [False, True])
@@ -3061,7 +3032,7 @@ def test_sdd_invalid_json_never_logs_response_body(capsys):
     assert 'invalid_json' in output and 'SECRET' not in output
 
 
-def test_jenkins_1676_errors_are_diagnosed_and_sdd_remains_blocking(monkeypatch, capsys):
+def test_reference_jenkins_1676_retries_become_unknown_with_safe_diagnostics(monkeypatch, capsys):
     checker = stage_validator()
     session = Mock()
     session.headers = {}
@@ -3088,17 +3059,16 @@ def test_jenkins_1676_errors_are_diagnosed_and_sdd_remains_blocking(monkeypatch,
             return response(200, [])
         raise AssertionError('Unexpected request')
     session.get.side_effect = get
-    assert checker.check_release('HRPRELEASE-148683') is False
-    assert len(checker.check_results) == 1
-    assert checker.check_results[0]['status'] == 'INCOMPLETE'
-    checker.jira_main.issue.assert_not_called()
+    checker._run_check('sdd', 'SDD', lambda: checker._check_sdd_gate('HRPRELEASE-148683'))
+    assert checker.check_results[0]['status'] == 'WARN'
+    assert not checker.report_data['NEUROUI-2594']['errors']
     output = capsys.readouterr().out
     rows = [json.loads(line.split('[SDD SOURCE ERROR] ')[1]) for line in output.splitlines()
             if line.startswith('[SDD SOURCE ERROR] ')]
     story_rows = [row for row in rows if row.get('issue') == 'NEUROUI-2594']
     assert [row['attempt'] for row in story_rows] == [1, 2, 3, 4]
     assert all(row['error_count'] == 3 for row in story_rows)
-    assert any(row.get('issue') == 'HRPRELEASE-148683' and row['stage'] == 'release_pr_links' for row in rows)
+    assert not any(row.get('issue') == 'HRPRELEASE-148683' for row in rows)
     assert 'upstream_timeout' in output and 'tls_certificate' in output and 'permission' in output
     assert 'TOKEN_SECRET' not in output
 
@@ -3116,36 +3086,51 @@ def test_sdd_mixed_error_categories_preserve_unknown_and_error_messages(capsys):
     assert 'SECRET' not in output
 
 
-def test_sdd_comment_explains_2484_rule_and_incomplete_files(native_sdd, monkeypatch):
+def test_reference_sdd_comment_explains_2484_path_rule(native_sdd, monkeypatch):
     checker, jira = native_sdd
     key = 'NEUROUI-2484'
     detail = sdd_linked_truncated_detail(file_count=5)
     detail['detail'][0]['repositories'][0]['commits'][0]['files'] = [
         {'path': 'openspec/changes/archive/remove-employee-actions/design.md'}]
     jira.get.side_effect = sdd_responses(detail=detail, issues=[{'key': key}])
-    bb, _ = bitbucket_test_session(monkeypatch, jira)
-    bb.get.return_value = response(200, {'values': [
-        {'path': 'openspec/changes/archive/remove-employee-actions/design.md'},
-        {'path': 'openspec/changes/archive/remove-employee-actions/tasks.md'}], 'isLastPage': True})
     assert checker.check_release('REL-1') is False
     comment = rc.html.unescape(checker._release_comment('REL-1', False))
-    for expected in (key, 'Неполных списков файлов: 1', 'Jira заявляет 5 файлов, получено 2',
-                     f'openspec/.*{key}.*', 'Найденные пути openspec не содержат ключ',
-                     'В доступных исходных деревьях PR релиза REL-1',
-                     'Наличие openspec в непрочитанных файлах не опровергнуто',
-                     'Остальные проверки не запускались'):
-        assert expected in comment
+    assert key in comment and f'openspec/.*{key}.*' in comment
+    assert 'Неполных списков файлов' not in comment
+    assert 'Остальные проверки не запускались' in comment
     assert len(checker.check_results) == 1
-    checker.jira_main.issue.assert_not_called()
 
 
-def test_sdd_comment_preserves_both_source_failures(native_sdd, monkeypatch):
-    checker, checker_session = native_sdd
+
+def test_reference_sdd_reports_commit_error_without_release_fallback(native_sdd, monkeypatch):
+    checker, session = native_sdd
     monkeypatch.setattr(rc, 'sdd_commit_story_result', Mock(side_effect=rc.SddCheckError('Коммиты: Bitbucket HTTP 403.')))
-    monkeypatch.setattr(rc, 'sdd_release_artifacts', Mock(side_effect=rc.SddCheckError('Релизные PR: Jira HTTP 503.')))
-    # Search returns a single Story before either source fails.
-    checker_session.get.return_value = response(200, {'issues': [{'key': 'ST-1'}]})
+    fallback = Mock(side_effect=AssertionError('Reference has no release tree fallback'))
+    monkeypatch.setattr(rc, 'sdd_release_artifacts', fallback)
+    session.get.return_value = response(200, {'issues': [{'key': 'ST-1'}]})
     assert checker.check_release('REL-1') is False
-    comment = checker._release_comment('REL-1', False)
-    assert 'Коммиты: Bitbucket HTTP 403.' in comment
-    assert 'Релизные PR: Jira HTTP 503.' in comment
+    assert 'Коммиты: Bitbucket HTTP 403.' in checker._release_comment('REL-1', False)
+    fallback.assert_not_called()
+
+
+
+
+def test_reference_sdd_array_search_payload_is_no_stories_pass(native_sdd):
+    checker, session = native_sdd
+    session.get.return_value = response(200, [])
+    checker._run_check('sdd', 'SDD', lambda: checker._check_sdd_gate('REL-1'))
+    assert checker.check_results[0]['status'] == 'PASS'
+    assert session.get.call_count == 1
+
+
+
+def test_reference_sdd_debug_never_prints_malformed_error_length_secret(native_sdd, monkeypatch, capsys):
+    checker, session = native_sdd
+    monkeypatch.setenv('RELEASE_CHECKER_DEBUG_HTTP', '1')
+    session.get.side_effect = sdd_responses(detail={
+        'detail': [{'repositories': []}], 'errors': {'length': 'BEARER_SECRET_VALUE'}})
+    checker._run_check('sdd', 'SDD', lambda: checker._check_sdd_gate('REL-1'))
+    assert checker.check_results[0]['status'] == 'FAIL'
+    output = capsys.readouterr().out
+    assert 'BEARER_SECRET_VALUE' not in output
+    assert '"errors": "str"' in output

@@ -1645,8 +1645,10 @@ def sdd_get_json(session: requests.Session, base_url: str, path: str,
                  params: dict, *, allow_http_failure: bool = False,
                  allow_list: bool = False, deadline: Optional[float] = None,
                  retry_state: Optional[dict] = None, diagnostic_key: Optional[str] = None,
-                 diagnostic_attempt: int = 1) -> Optional[Union[dict, list]]:
+                 diagnostic_attempt: int = 1, allow_any_json: bool = False) -> Optional[Union[dict, list]]:
     """Read one SDD endpoint, retaining the original non-2xx handling."""
+    session.__dict__['_sdd_last_http_failure'] = False
+
     def diagnose(**details):
         sdd_source_diagnostic(path, params, key=diagnostic_key, attempt=diagnostic_attempt, **details)
 
@@ -1675,6 +1677,7 @@ def sdd_get_json(session: requests.Session, base_url: str, path: str,
         # Bodies may contain credentials, HTML or arbitrary server exception text.
         diagnose(status=response.status_code, reason='http_error')
         if allow_http_failure:
+            session.__dict__['_sdd_last_http_failure'] = True
             return None
         advice = ('Проверьте токен и права чтения Jira.' if response.status_code in {401, 403}
                   else 'Проверьте доступность Jira и повторите запуск.')
@@ -1684,7 +1687,7 @@ def sdd_get_json(session: requests.Session, base_url: str, path: str,
     except ValueError:
         diagnose(status=response.status_code, reason='invalid_json')
         raise SddCheckError('Jira/Bitbucket вернул некорректный JSON. Повторите запуск.') from None
-    if not isinstance(payload, dict) and not (allow_list and isinstance(payload, list)):
+    if not allow_any_json and not isinstance(payload, dict) and not (allow_list and isinstance(payload, list)):
         diagnose(status=response.status_code, reason='unexpected_shape')
         raise SddCheckError('Jira/Bitbucket вернул неожиданный формат данных. Повторите запуск.')
     if isinstance(payload, dict):
@@ -1952,27 +1955,87 @@ def sdd_complete_commit_files(data: dict, key: str) -> list[str]:
     return failures
 
 
+def _sdd_js_property(value: object, name: str, *, optional: bool = False) -> object:
+    """Read a JSON property as JavaScript does, including primitive boxing."""
+    if value is None:
+        if optional:
+            return None
+        raise TypeError('SDD: null object in Jira response')
+    if isinstance(value, dict):
+        return value.get(name)
+    if name == 'length' and isinstance(value, (list, str)):
+        return len(value)
+    return None
+
+
+def _sdd_js_truthy(value: object) -> bool:
+    """JSON objects/arrays are truthy in JS, including empty containers."""
+    return True if isinstance(value, (dict, list)) else bool(value)
+
+
+def _sdd_js_greater_zero(value: object) -> bool:
+    """Apply the numeric coercion used by JavaScript's length > 0 comparison."""
+    if isinstance(value, list):
+        def stringify(item):
+            if item is None:
+                return ''
+            if isinstance(item, list):
+                return ','.join(stringify(part) for part in item)
+            if isinstance(item, dict):
+                return '[object Object]'
+            if isinstance(item, bool):
+                return 'true' if item else 'false'
+            return str(item)
+        value = ','.join(stringify(item) for item in value)
+    if isinstance(value, str):
+        text = value.strip()
+        if text == 'Infinity' or text == '+Infinity':
+            return True
+        if re.fullmatch(r'0[xX][0-9a-fA-F]+|0[bB][01]+|0[oO][0-7]+', text):
+            return int(text, 0) > 0
+        if not re.fullmatch(r'[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?', text):
+            return False
+        return float(text) > 0
+    return isinstance(value, (int, float)) and value > 0
+
+
+def _sdd_js_iter(value: object):
+    """The JSON values iterable by JavaScript for-of are arrays and strings."""
+    if value is None:
+        return []
+    if not isinstance(value, (list, str)):
+        raise TypeError('SDD: non-iterable collection in Jira response')
+    return value
+
+
 def sdd_commit_story_result(session: requests.Session, base_url: str, key: str) -> tuple[bool, Optional[bool]]:
-    """Check one Story using the updated openspec/.*<key>.* matching rule."""
-    issue = sdd_get_json(session, base_url, f'/rest/api/2/issue/{key}', {'fields': 'labels'})
-    labels = (issue.get('fields') or {}).get('labels') or []
+    """Mirror the supplied JavaScript gate using Jira commit previews only."""
+    issue = sdd_get_json(session, base_url, f'/rest/api/2/issue/{key}', {'fields': 'labels'}, allow_any_json=True)
+    fields = _sdd_js_property(issue, 'fields', optional=True)
+    labels = _sdd_js_property(fields, 'labels', optional=True)
+    labels = [] if labels is None else labels
+    if not isinstance(labels, list):
+        raise TypeError('SDD: labels is not an array')
     has_sdd = any(label.lower() == 'sdd' for label in labels)
-    resolved = sdd_get_json(session, base_url, f'/rest/api/2/issue/{key}', {'fields': 'summary'})
-    issue_id = resolved.get('id')
-    if not issue_id:
+    resolved = sdd_get_json(session, base_url, f'/rest/api/2/issue/{key}', {'fields': 'summary'}, allow_any_json=True)
+    issue_id = _sdd_js_property(resolved, 'id', optional=True)
+    if not _sdd_js_truthy(issue_id):
         return has_sdd, False
     summary = sdd_get_json(session, base_url, '/rest/dev-status/1.0/issue/summary',
-                           {'issueId': issue_id, '_': int(time.time() * 1000)}, allow_http_failure=True, diagnostic_key=key)
-    repository = ((summary or {}).get('summary') or {}).get('repository') or {}
-    repo_count = (repository.get('overall') or {}).get('count') or 0
+                           {'issueId': issue_id, '_': int(time.time() * 1000)},
+                           allow_http_failure=True, diagnostic_key=key, allow_any_json=True)
+    section = _sdd_js_property(summary, 'summary', optional=True)
+    repository = _sdd_js_property(section, 'repository', optional=True)
+    overall = _sdd_js_property(repository, 'overall', optional=True)
+    repo_count = _sdd_js_property(overall, 'count', optional=True)
+    if repo_count is None:
+        repo_count = 0
     if http_debug_enabled():
-        providers = repository.get('byInstanceType') or {}
         print('[SDD DATA] ' + json.dumps({'story': key, 'stage': 'summary',
-              'repo_count': repo_count, 'summary_available': summary is not None,
-              'providers': {provider: (providers.get(provider) or {}).get('count')
-                            for provider in ('stash', 'bitbucket', 'bitbucket-server')
-                            if isinstance(providers.get(provider), dict)}}, ensure_ascii=False), flush=True)
-    if repo_count == 0:
+              'repo_count': repo_count if type(repo_count) in (int, float) else type(repo_count).__name__,
+              'summary_available': summary is not None},
+              ensure_ascii=False), flush=True)
+    if type(repo_count) in (int, float) and repo_count == 0:
         return has_sdd, False
     session.headers['X-Requested-With'] = 'XMLHttpRequest'
     try:
@@ -1981,55 +2044,41 @@ def sdd_commit_story_result(session: requests.Session, base_url: str, key: str) 
             data = sdd_get_json(session, base_url, '/rest/dev-status/1.0/issue/detail',
                                 {'issueId': issue_id, 'applicationType': 'stash',
                                  'dataType': 'repository', '_': int(time.time() * 1000)},
-                                allow_http_failure=True, diagnostic_key=key, diagnostic_attempt=attempt)
-            if data is None:
+                                allow_http_failure=True, diagnostic_key=key,
+                                diagnostic_attempt=attempt, allow_any_json=True)
+            # None from an HTTP failure must be retried; JSON null is fatal in JS.
+            # The reader distinguishes these with the session marker below.
+            if data is None and getattr(session, '_sdd_last_http_failure', False):
                 continue
-            details = data.get('detail') or []
-            matched, stats = sdd_file_evidence(data, key)
+            details = _sdd_js_property(data, 'detail')
+            details = [] if details is None else details
+            errors = _sdd_js_property(data, 'errors')
+            errors = [] if errors is None else errors
+            detail_len = _sdd_js_property(details, 'length')
+            error_len = _sdd_js_property(errors, 'length')
+            if not _sdd_js_greater_zero(detail_len) and not (
+                    error_len is None or (type(error_len) in (int, float) and error_len == 0)):
+                continue
+            if detail_len == 0 and not isinstance(errors, list):
+                raise TypeError('SDD: errors does not support some()')
+            pattern = re.compile(r'openspec/[^\r\n\u2028\u2029]*' + re.escape(key.lower()),
+                                 re.I | re.ASCII)
+            match_count = 0
+            for group in _sdd_js_iter(details):
+                for repo in _sdd_js_iter(_sdd_js_property(group, 'repositories')):
+                    for commit in _sdd_js_iter(_sdd_js_property(repo, 'commits')):
+                        for file in _sdd_js_iter(_sdd_js_property(commit, 'files')):
+                            path = _sdd_js_property(file, 'path').lower()
+                            if pattern.search(path):
+                                match_count += 1
             if http_debug_enabled():
                 print('[SDD DATA] ' + json.dumps({'story': key, 'stage': 'detail',
-                      'provider': 'stash', 'data_type': 'repository', **stats}, ensure_ascii=False), flush=True)
-            if not details and (data.get('errors') or []):
-                continue
-            if matched:
-                return has_sdd, True
-            if any(stats[name] for name in ('missing_repositories', 'missing_commits',
-                                            'missing_files', 'invalid_paths', 'truncated_files')):
-                failures = sdd_complete_commit_files(data, key)
-                matched, stats = sdd_file_evidence(data, key)
-                if http_debug_enabled():
-                    print('[SDD DATA] ' + json.dumps({'story': key, 'stage': 'expanded_files', **stats},
-                                                     ensure_ascii=False), flush=True)
-                if matched:
-                    return has_sdd, True
-                if failures or any(stats[name] for name in ('missing_repositories', 'missing_commits',
-                                                           'missing_files', 'invalid_paths', 'truncated_files')):
-                    details = [f'{label}: {stats[name]}' for name, label in (
-                        ('missing_repositories', 'Нет списка репозиториев'),
-                        ('missing_commits', 'Нет списка коммитов'),
-                        ('missing_files', 'Нет списка файлов'),
-                        ('invalid_paths', 'Некорректных путей'),
-                        ('truncated_files', 'Неполных списков файлов')) if stats[name]]
-                    discrepancies = []
-                    for group in data.get('detail') or []:
-                        for repo in group.get('repositories') or []:
-                            for commit in repo.get('commits') or []:
-                                if not isinstance(commit, dict):
-                                    continue
-                                declared, files = commit.get('fileCount'), commit.get('files')
-                                if type(declared) is int and isinstance(files, list) and declared > len(files):
-                                    discrepancies.append(f'Jira заявляет {declared} файлов, получено {len(files)}')
-                    reason = ' '.join(failures[:2])
-                    counts = '; '.join(discrepancies[:3])
-                    evidence = (f' Среди прочитанных файлов совпадений openspec/.*{key}.* пока нет.'
-                                ' Наличие openspec в непрочитанных файлах не опровергнуто.')
-                    if stats['openspec_paths_sample']:
-                        evidence += (' Найденные пути openspec не содержат ключ ' + key
-                                     + '; проверьте привязку каталога к Story.')
-                    summary = '; '.join(part for part in (', '.join(details), counts, reason) if part)
-                    raise SddCheckError('Jira dev-status не передал полный список путей файлов: '
-                        + summary + '.' + evidence)
-            return has_sdd, False
+                      'provider': 'stash', 'data_type': 'repository',
+                      'groups': detail_len if type(detail_len) in (int, float) else type(detail_len).__name__,
+                      'matches': match_count,
+                      'errors': error_len if type(error_len) in (int, float) else type(error_len).__name__},
+                      ensure_ascii=False), flush=True)
+            return has_sdd, match_count > 0
         return has_sdd, None
     finally:
         session.headers.pop('X-Requested-With', None)
@@ -2166,30 +2215,11 @@ def sdd_release_artifacts(session: requests.Session, base_url: str, release_key:
 def sdd_story_result(session: requests.Session, base_url: str, key: str,
                      release_key: Optional[str] = None,
                      explicit_pr: Optional[str] = None) -> tuple[bool, Optional[bool]]:
-    """Use Story commits first, then the pinned source tree of the release PR."""
-    try:
-        has_sdd, openspec = sdd_commit_story_result(session, base_url, key)
-    except SddCheckError as commit_error:
-        if not release_key:
-            raise
-        try:
-            recovered = sdd_release_artifacts(session, base_url, release_key, key, explicit_pr)
-        except SddCheckError as release_error:
-            raise SddCheckError(str(commit_error) + ' Резервная проверка PR релиза: '
-                                + str(release_error)) from None
-        if not recovered:
-            raise SddCheckError(str(commit_error)
-                + f' В доступных исходных деревьях PR релиза {release_key} '
-                + f'совпадений openspec/.*{key}.* также нет. '
-                + 'Проверьте имя каталога: оно должно содержать ключ Story; '
-                + 'если файлы уже есть — восстановите полноту данных Jira/Bitbucket и повторите запуск.') from None
-        labels = sdd_get_json(session, base_url, f'/rest/api/2/issue/{key}', {'fields': 'labels'})
-        has_sdd = any(label.lower() == 'sdd' for label in ((labels.get('fields') or {}).get('labels') or []))
-        return has_sdd, True
-    if openspec is not True and release_key:
-        if sdd_release_artifacts(session, base_url, release_key, key, explicit_pr):
-            return has_sdd, True
-    return has_sdd, openspec
+    """Apply the reference gate without extra Bitbucket or release-tree fallbacks."""
+    # Retain the public call shape for existing CLI and integration callers.
+    # The reference checks Story development data only; release PRs cannot
+    # override its false/unknown/fatal outcomes.
+    return sdd_commit_story_result(session, base_url, key)
 
 
 def _diag_sdd_story(key_or_url: str, release_key: Optional[str] = None,
@@ -3527,39 +3557,14 @@ class ReleaseValidator:
                 session.headers.update({'Authorization': f"Bearer {config['jira']['token']}",
                                         'Accept': 'application/json'})
                 base_url = config['jira']['url'].rstrip('/')
-                stories, seen = [], set()
-                start, expected_total = 0, None
-                for _ in range(1000):
-                    params = {'jql': f'issue IN linkedIssues("{release_key}") AND type = Story',
-                              'maxResults': 200, 'fields': 'key'}
-                    if start:
-                        params['startAt'] = start
-                    search = sdd_get_json(session, base_url, '/rest/api/2/search', params)
-                    page = search.get('issues')
-                    total = search.get('total')
-                    if (not isinstance(page, list) or search.get('startAt', start) != start
-                            or (total is not None and (type(total) is not int or total < 0))):
-                        raise SddCheckError('Jira вернула некорректную страницу списка Story.')
-                    if expected_total is not None and total != expected_total:
-                        raise SddCheckError('Список Story изменился во время чтения. Повторите запуск.')
-                    expected_total = total
-                    for issue in page:
-                        key = issue['key'].upper()
-                        if key in seen:
-                            raise SddCheckError('Jira повторила Story при чтении страниц.')
-                        stories.append(key)
-                        seen.add(key)
-                    start += len(page)
-                    if total is None:
-                        if len(page) >= 200 or search.get('isLast') is False:
-                            raise SddCheckError('Jira не подтвердила полноту списка Story.')
-                        break
-                    if start == total:
-                        break
-                    if not page or start > total:
-                        raise SddCheckError('Jira вернула неполный список Story.')
-                else:
-                    raise SddCheckError('Достигнут лимит чтения списка Story; полнота не подтверждена.')
+                search = sdd_get_json(session, base_url, '/rest/api/2/search', {
+                    'jql': f'issue IN linkedIssues("{release_key}") AND type = Story',
+                    'maxResults': 200, 'fields': 'key'}, allow_any_json=True)
+                issues = _sdd_js_property(search, 'issues', optional=True)
+                issues = [] if issues is None else issues
+                if not isinstance(issues, list):
+                    raise TypeError('SDD: search issues is not an array')
+                stories = [issue['key'].upper() for issue in issues]
                 if not stories:
                     self._log_issue(release_key, 'success',
                                     'SDD: связанных Story нет; по исходным правилам гейт пройден.')
@@ -3585,12 +3590,12 @@ class ReleaseValidator:
                     if not openspec:
                         failed = True
                         self._log_issue(current_key, 'error',
-                                        f'SDD: по связанным коммитам и исходным деревьям PR релиза {release_key} '
+                                        'SDD: в файлах связанных коммитов Story, возвращённых Jira, '
                                         f'не найден путь по правилу openspec/.*{current_key}.*. '
                                         'Допускаются вложенные и архивные каталоги, например '
                                         f'openspec/changes/archive/2026-10-02-{current_key}/spec.md. '
                                         'Если артефакты уже есть в Bitbucket, проверьте связь коммита '
-                                        f'с {current_key}, связь PR с релизом {release_key} и доступ к исходной ветке. '
+                                        f'с {current_key} и список файлов в Jira development. '
                                         'Создавать отдельный каталог openspec/ID не требуется.')
                 if failed:
                     self._log_issue(release_key, 'error',

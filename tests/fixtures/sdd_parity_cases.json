@@ -1,0 +1,6898 @@
+[
+  {
+    "id": "path-root",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-root-file",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-root-bare-key",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-root-bare-directory",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-nested-team",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/team/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-nested-project",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "module/openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-nested-docs",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "docs/openspec/ST-1/design.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-archive-dated",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/changes/archive/2026-10-02-ST-1/specs/feature/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-archive-lower",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/changes/archive/2026-10-02-st-1/specs/feature/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-changes-dated",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/changes/2026-10-02-ST-1-feature/tasks.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-key-in-filename",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/changes/feature/spec-ST-1.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-key-in-hidden-file",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/changes/.ST-1.yaml"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-directory-no-extension",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/changes/ST-1-feature"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-empty-after-slash",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-empty-path",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": ""
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-no-openspec",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "src/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-no-key",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/changes/feature/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-wrong-key",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-2/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-zero-key",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-0/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-key-before-openspec",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "ST-1/openspec/feature/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-key-before-and-after",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "ST-1/openspec/feature/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-openspec-hyphen",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec-ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-openspec-dot",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec.ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-openspec-backslash",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec\\ST-1\\spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-windows-entire",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "C:\\work\\openspec\\ST-1\\spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-windows-mixed",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "C:\\work\\openspec/ST-1\\spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-windows-drive-slashes",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "C:/work/openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-leading-absolute",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "/openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-relative-dot",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "./openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-relative-parent",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "../openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-duplicate-separators",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec///ST-1//spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-key-suffix-prefix-accepted",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-10/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-key-suffix-alpha-accepted",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1suffix/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-key-prefix-alpha-accepted",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/prefixST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-key-with-prefix-suffix-accepted",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/prefixST-1suffix/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-key-no-dash",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-key-underscore",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST_1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-key-spaced",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST - 1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-key-long-dash",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST\u20131/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-key-encoded-dash",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST%2D1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-key-encoded-slash",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec%2FST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-key-urlencoded-space",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/feature%20ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-key-with-space",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/feature ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-key-with-tab",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/feature\tST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-key-with-nul",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/feature\u0000ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-key-with-vtab",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/feature\u000bST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-key-with-formfeed",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/feature\fST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-key-with-nel",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/feature\u0085ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-key-with-nbsp",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/feature\u00a0ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-cyrillic-prefix",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "\u043f\u0440\u043e\u0435\u043a\u0442/openspec/\u0438\u0437\u043c\u0435\u043d\u0435\u043d\u0438\u0435-ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-emoji-prefix",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "\ud83d\udcc1/openspec/\u2705-ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-long-filename",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxST-1/yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-substring-openspec",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "notopenspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-extension-openspec",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "file.openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-only-openspec-file",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-parent-path-key",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/../ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-two-openspec-first-wrong",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-2/openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-two-openspec-second-wrong",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/openspec/ST-2/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-query-like",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/spec.md?story=ST-1"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-fragment-like",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/spec.md#ST-1"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-file-hidden",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/.openspec.yaml"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-filename-openspec-no-dir",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "ST-1-openspec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-openspec-trailing-space",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec /ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-openspec-leading-space",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": " openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-openspec-split",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "open/spec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-openspec-typo",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspecs/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "path-empty-slash",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "/"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "case-openspec-ST-1",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/changes/archive/2026-10-02-ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "case-openspec-st-1",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/changes/archive/2026-10-02-st-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "case-openspec-St-1",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/changes/archive/2026-10-02-St-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "case-OPENSPEC-ST-1",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "OPENSPEC/changes/archive/2026-10-02-ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "case-OPENSPEC-st-1",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "OPENSPEC/changes/archive/2026-10-02-st-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "case-OPENSPEC-St-1",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "OPENSPEC/changes/archive/2026-10-02-St-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "case-OpenSpec-ST-1",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "OpenSpec/changes/archive/2026-10-02-ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "case-OpenSpec-st-1",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "OpenSpec/changes/archive/2026-10-02-st-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "case-OpenSpec-St-1",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "OpenSpec/changes/archive/2026-10-02-St-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "case-oPeNsPeC-ST-1",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "oPeNsPeC/changes/archive/2026-10-02-ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "case-oPeNsPeC-st-1",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "oPeNsPeC/changes/archive/2026-10-02-st-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "case-oPeNsPeC-St-1",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "oPeNsPeC/changes/archive/2026-10-02-St-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "line-lf-before-key",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/changes\n/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "line-lf-after-key",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1\n/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "line-lf-before-openspec",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "\nopenspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "line-lf-inside-openspec",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "open\nspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "line-lf-inside-key",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/S\nT-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "line-lf-second-match",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/wrong\nopenspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "line-cr-before-key",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/changes\r/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "line-cr-after-key",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1\r/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "line-cr-before-openspec",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "\ropenspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "line-cr-inside-openspec",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "open\rspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "line-cr-inside-key",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/S\rT-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "line-cr-second-match",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/wrong\ropenspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "line-crlf-before-key",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/changes\r\n/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "line-crlf-after-key",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1\r\n/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "line-crlf-before-openspec",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "\r\nopenspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "line-crlf-inside-openspec",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "open\r\nspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "line-crlf-inside-key",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/S\r\nT-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "line-crlf-second-match",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/wrong\r\nopenspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "line-ls-before-key",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/changes\u2028/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "line-ls-after-key",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1\u2028/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "line-ls-before-openspec",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "\u2028openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "line-ls-inside-openspec",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "open\u2028spec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "line-ls-inside-key",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/S\u2028T-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "line-ls-second-match",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/wrong\u2028openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "line-ps-before-key",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/changes\u2029/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "line-ps-after-key",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1\u2029/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "line-ps-before-openspec",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "\u2029openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "line-ps-inside-openspec",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "open\u2029spec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "line-ps-inside-key",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/S\u2029T-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "line-ps-second-match",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/wrong\u2029openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "unicode-long-s-folder",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "open\u017fpec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "unicode-long-s-key",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/\u017ft-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "unicode-dotless-i-key",
+    "category": "path",
+    "key": "ISSUE-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/\u0131ssue-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "unicode-capital-dotted-i-key",
+    "category": "path",
+    "key": "ISSUE-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/\u0130SSUE-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "unicode-kelvin-key",
+    "category": "path",
+    "key": "KEY-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/\u212aEY-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "unicode-ascii-k-key",
+    "category": "path",
+    "key": "KEY-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/KEY-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "unicode-cyrillic-s-confusable",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/\u0405T-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "unicode-cyrillic-o-confusable",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "\u043epenspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "unicode-fullwidth-folder",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "\uff4f\uff50\uff45\uff4e\uff53\uff50\uff45\uff43/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "unicode-fullwidth-key",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/\uff33\uff34-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "filename-spec.md",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/changes/ST-1-feature/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "filename-design.md",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/changes/ST-1-feature/design.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "filename-proposal.md",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/changes/ST-1-feature/proposal.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "filename-tasks.md",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/changes/ST-1-feature/tasks.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "filename-.openspec.yaml",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/changes/ST-1-feature/.openspec.yaml"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "filename-README.md",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/changes/ST-1-feature/README.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "filename-requirements.txt",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/changes/ST-1-feature/requirements.txt"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "filename-arbitrary.bin",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/changes/ST-1-feature/arbitrary.bin"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "filename-file",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/changes/ST-1-feature/file"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "filename-directorydir",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/changes/ST-1-feature/directory/"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "filename-image.png",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/changes/ST-1-feature/image.png"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "filename-.gitkeep",
+    "category": "path",
+    "key": "ST-1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/changes/ST-1-feature/.gitkeep"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "shape-missing-detail",
+    "category": "shape",
+    "detail": {}
+  },
+  {
+    "id": "shape-null-detail",
+    "category": "shape",
+    "detail": {
+      "detail": null
+    }
+  },
+  {
+    "id": "shape-empty-detail",
+    "category": "shape",
+    "detail": {
+      "detail": []
+    }
+  },
+  {
+    "id": "shape-empty-group",
+    "category": "shape",
+    "detail": {
+      "detail": [
+        {}
+      ]
+    }
+  },
+  {
+    "id": "shape-null-repositories",
+    "category": "shape",
+    "detail": {
+      "detail": [
+        {
+          "repositories": null
+        }
+      ]
+    }
+  },
+  {
+    "id": "shape-empty-repositories",
+    "category": "shape",
+    "detail": {
+      "detail": [
+        {
+          "repositories": []
+        }
+      ]
+    }
+  },
+  {
+    "id": "shape-missing-commits",
+    "category": "shape",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {}
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "shape-null-commits",
+    "category": "shape",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": null
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "shape-empty-commits",
+    "category": "shape",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": []
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "shape-missing-files",
+    "category": "shape",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {}
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "shape-null-files",
+    "category": "shape",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": null
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "shape-empty-files",
+    "category": "shape",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": []
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "shape-null-file",
+    "category": "shape",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    null
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "shape-empty-file",
+    "category": "shape",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {}
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "shape-null-path",
+    "category": "shape",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": null
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "shape-numeric-path",
+    "category": "shape",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": 12
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "shape-object-path",
+    "category": "shape",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": {
+                        "toString": "openspec/ST-1/spec.md"
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "shape-components-path",
+    "category": "shape",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": {
+                        "components": [
+                          "openspec",
+                          "ST-1",
+                          "spec.md"
+                        ]
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "shape-array-path",
+    "category": "shape",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": [
+                        "openspec",
+                        "ST-1",
+                        "spec.md"
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "shape-string-file",
+    "category": "shape",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    "openspec/ST-1/spec.md"
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "shape-boolean-file",
+    "category": "shape",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    false
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "shape-null-group",
+    "category": "shape",
+    "detail": {
+      "detail": [
+        null
+      ]
+    }
+  },
+  {
+    "id": "shape-null-repo",
+    "category": "shape",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            null
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "shape-null-commit",
+    "category": "shape",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                null
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "shape-string-files",
+    "category": "shape",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": "openspec/ST-1/spec.md"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "shape-object-files",
+    "category": "shape",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": {
+                    "path": "openspec/ST-1/spec.md"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "shape-string-detail",
+    "category": "shape",
+    "detail": {
+      "detail": "str"
+    }
+  },
+  {
+    "id": "shape-object-detail",
+    "category": "shape",
+    "detail": {
+      "detail": {
+        "repositories": []
+      }
+    }
+  },
+  {
+    "id": "shape-null-payload",
+    "category": "shape",
+    "detail": null
+  },
+  {
+    "id": "shape-array-payload",
+    "category": "shape",
+    "detail": []
+  },
+  {
+    "id": "labels-161",
+    "category": "labels",
+    "labels": [],
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "labels-162",
+    "category": "labels",
+    "labels": [
+      "SDD"
+    ],
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "labels-163",
+    "category": "labels",
+    "labels": [
+      "sdd"
+    ],
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "labels-164",
+    "category": "labels",
+    "labels": [
+      "sDd"
+    ],
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "labels-165",
+    "category": "labels",
+    "labels": [
+      "#SDD"
+    ],
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "labels-166",
+    "category": "labels",
+    "labels": [
+      " SDD "
+    ],
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "labels-167",
+    "category": "labels",
+    "labels": [
+      "SDD-extra"
+    ],
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "labels-168",
+    "category": "labels",
+    "labels": [
+      ""
+    ],
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "labels-169",
+    "category": "labels",
+    "labels": [
+      "OTHER",
+      "sdd"
+    ],
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "labels-170",
+    "category": "labels",
+    "labels": [
+      null
+    ],
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "labels-171",
+    "category": "labels",
+    "labels": [
+      123
+    ],
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "labels-172",
+    "category": "labels",
+    "labels": null,
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "label-shape-missing-fields",
+    "category": "labels",
+    "labels_payload": {},
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "label-shape-null-fields",
+    "category": "labels",
+    "labels_payload": {
+      "fields": null
+    },
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "label-shape-missing-labels",
+    "category": "labels",
+    "labels_payload": {
+      "fields": {}
+    },
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "label-shape-null-labels",
+    "category": "labels",
+    "labels_payload": {
+      "fields": {
+        "labels": null
+      }
+    },
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "label-shape-object-labels",
+    "category": "labels",
+    "labels_payload": {
+      "fields": {
+        "labels": {}
+      }
+    },
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "label-shape-string-labels",
+    "category": "labels",
+    "labels_payload": {
+      "fields": {
+        "labels": "SDD"
+      }
+    },
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "label-shape-null-issue",
+    "category": "labels",
+    "labels_payload": null,
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "repo-count-180",
+    "category": "summary",
+    "repo_count": 0,
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "repo-count-181",
+    "category": "summary",
+    "repo_count": null,
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "repo-count-182",
+    "category": "summary",
+    "repo_count": 1,
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "repo-count-183",
+    "category": "summary",
+    "repo_count": 6,
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "repo-count-184",
+    "category": "summary",
+    "repo_count": -1,
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "repo-count-185",
+    "category": "summary",
+    "repo_count": "0",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "repo-count-186",
+    "category": "summary",
+    "repo_count": "1",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "repo-count-187",
+    "category": "summary",
+    "repo_count": false,
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "repo-count-188",
+    "category": "summary",
+    "repo_count": true,
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "summary-shape-missing",
+    "category": "summary",
+    "summary_payload": {},
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "summary-shape-null",
+    "category": "summary",
+    "summary_payload": null,
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "summary-shape-empty-summary",
+    "category": "summary",
+    "summary_payload": {
+      "summary": {}
+    },
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "summary-shape-null-summary",
+    "category": "summary",
+    "summary_payload": {
+      "summary": null
+    },
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "summary-shape-null-repository",
+    "category": "summary",
+    "summary_payload": {
+      "summary": {
+        "repository": null
+      }
+    },
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "summary-shape-missing-count",
+    "category": "summary",
+    "summary_payload": {
+      "summary": {
+        "repository": {
+          "overall": {}
+        }
+      }
+    },
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "summary-http-401",
+    "category": "summary",
+    "summary_status": 401,
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "summary-http-403",
+    "category": "summary",
+    "summary_status": 403,
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "summary-http-404",
+    "category": "summary",
+    "summary_status": 404,
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "summary-http-429",
+    "category": "summary",
+    "summary_status": 429,
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "summary-http-500",
+    "category": "summary",
+    "summary_status": 500,
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "summary-http-503",
+    "category": "summary",
+    "summary_status": 503,
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "issue-id-201",
+    "category": "identity",
+    "issue_id": null,
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "issue-id-202",
+    "category": "identity",
+    "issue_id": "",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "issue-id-203",
+    "category": "identity",
+    "issue_id": 0,
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "issue-id-204",
+    "category": "identity",
+    "issue_id": false,
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "issue-id-205",
+    "category": "identity",
+    "issue_id": "42",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "issue-id-206",
+    "category": "identity",
+    "issue_id": 42,
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "resolved-empty",
+    "category": "identity",
+    "resolved_payload": {},
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "resolved-null",
+    "category": "identity",
+    "resolved_payload": null,
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "resolved-missing-id",
+    "category": "identity",
+    "resolved_payload": {
+      "fields": {}
+    },
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "filecount-210",
+    "category": "file_count",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/no-key/spec.md"
+                    }
+                  ],
+                  "fileCount": 0
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "filecount-211",
+    "category": "file_count",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ],
+                  "fileCount": 0
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "filecount-212",
+    "category": "file_count",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/no-key/spec.md"
+                    }
+                  ],
+                  "fileCount": 1
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "filecount-213",
+    "category": "file_count",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ],
+                  "fileCount": 1
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "filecount-214",
+    "category": "file_count",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/no-key/spec.md"
+                    }
+                  ],
+                  "fileCount": 5
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "filecount-215",
+    "category": "file_count",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ],
+                  "fileCount": 5
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "filecount-216",
+    "category": "file_count",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/no-key/spec.md"
+                    }
+                  ],
+                  "fileCount": 5000
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "filecount-217",
+    "category": "file_count",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ],
+                  "fileCount": 5000
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "filecount-218",
+    "category": "file_count",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/no-key/spec.md"
+                    }
+                  ],
+                  "fileCount": null
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "filecount-219",
+    "category": "file_count",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ],
+                  "fileCount": null
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "filecount-220",
+    "category": "file_count",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/no-key/spec.md"
+                    }
+                  ],
+                  "fileCount": "5000"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "filecount-221",
+    "category": "file_count",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ],
+                  "fileCount": "5000"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "errors-match-other-instance-errors",
+    "category": "retry",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "errors": [
+        {
+          "error": "timeout"
+        },
+        {
+          "message": "forbidden"
+        }
+      ]
+    }
+  },
+  {
+    "id": "errors-no-match-other-instance-errors",
+    "category": "retry",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/feature/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "errors": [
+        {
+          "error": "timeout"
+        }
+      ]
+    }
+  },
+  {
+    "id": "errors-match-errors-metadata",
+    "category": "retry",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/feature/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "errors": [
+        {
+          "error": "openspec/ST-1/spec.md"
+        }
+      ]
+    }
+  },
+  {
+    "id": "errors-empty-timeout",
+    "category": "retry",
+    "detail": {
+      "detail": [],
+      "errors": [
+        {
+          "error": "timeout"
+        }
+      ]
+    }
+  },
+  {
+    "id": "errors-empty-forbidden",
+    "category": "retry",
+    "detail": {
+      "detail": [],
+      "errors": [
+        {
+          "error": "forbidden"
+        }
+      ]
+    }
+  },
+  {
+    "id": "errors-empty-errorMessages",
+    "category": "retry",
+    "detail": {
+      "detail": [],
+      "errorMessages": [
+        "timeout"
+      ]
+    }
+  },
+  {
+    "id": "errors-missing-detail-errors",
+    "category": "retry",
+    "detail": {
+      "errors": [
+        {
+          "error": "timeout"
+        }
+      ]
+    }
+  },
+  {
+    "id": "errors-null-detail-errors",
+    "category": "retry",
+    "detail": {
+      "detail": null,
+      "errors": [
+        {
+          "error": "timeout"
+        }
+      ]
+    }
+  },
+  {
+    "id": "retry-http-230",
+    "category": "retry",
+    "labels": [
+      "SDD"
+    ],
+    "detail_responses": [
+      {
+        "status": 401,
+        "payload": {
+          "errors": [
+            {
+              "error": "down"
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "id": "retry-http-231",
+    "category": "retry",
+    "labels": [
+      "SDD"
+    ],
+    "detail_responses": [
+      {
+        "status": 429,
+        "payload": {
+          "errors": [
+            {
+              "error": "down"
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "id": "retry-http-232",
+    "category": "retry",
+    "labels": [
+      "SDD"
+    ],
+    "detail_responses": [
+      {
+        "status": 500,
+        "payload": {
+          "errors": [
+            {
+              "error": "down"
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "id": "retry-http-233",
+    "category": "retry",
+    "labels": [
+      "SDD"
+    ],
+    "detail_responses": [
+      {
+        "status": 503,
+        "payload": {
+          "errors": [
+            {
+              "error": "down"
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "id": "retry-recovery-234",
+    "category": "retry",
+    "labels": [
+      "SDD"
+    ],
+    "detail_responses": [
+      {
+        "status": 503,
+        "payload": {}
+      },
+      {
+        "status": 200,
+        "payload": {
+          "detail": [
+            {
+              "repositories": [
+                {
+                  "commits": [
+                    {
+                      "files": [
+                        {
+                          "path": "openspec/ST-1/spec.md"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "id": "retry-recovery-235",
+    "category": "retry",
+    "labels": [
+      "SDD"
+    ],
+    "detail_responses": [
+      {
+        "status": 503,
+        "payload": {}
+      },
+      {
+        "status": 503,
+        "payload": {}
+      },
+      {
+        "status": 200,
+        "payload": {
+          "detail": [
+            {
+              "repositories": [
+                {
+                  "commits": [
+                    {
+                      "files": [
+                        {
+                          "path": "openspec/ST-1/spec.md"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "id": "retry-recovery-236",
+    "category": "retry",
+    "labels": [
+      "SDD"
+    ],
+    "detail_responses": [
+      {
+        "status": 503,
+        "payload": {}
+      },
+      {
+        "status": 503,
+        "payload": {}
+      },
+      {
+        "status": 503,
+        "payload": {}
+      },
+      {
+        "status": 200,
+        "payload": {
+          "detail": [
+            {
+              "repositories": [
+                {
+                  "commits": [
+                    {
+                      "files": [
+                        {
+                          "path": "openspec/ST-1/spec.md"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "id": "retry-recovery-237",
+    "category": "retry",
+    "labels": [
+      "SDD"
+    ],
+    "detail_responses": [
+      {
+        "status": 503,
+        "payload": {}
+      },
+      {
+        "status": 503,
+        "payload": {}
+      },
+      {
+        "status": 503,
+        "payload": {}
+      },
+      {
+        "status": 503,
+        "payload": {}
+      },
+      {
+        "status": 200,
+        "payload": {
+          "detail": [
+            {
+              "repositories": [
+                {
+                  "commits": [
+                    {
+                      "files": [
+                        {
+                          "path": "openspec/ST-1/spec.md"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "id": "retry-empty-recovery-238",
+    "category": "retry",
+    "labels": [
+      "SDD"
+    ],
+    "detail_responses": [
+      {
+        "status": 200,
+        "payload": {
+          "detail": [],
+          "errors": [
+            {
+              "error": "timeout"
+            }
+          ]
+        }
+      },
+      {
+        "status": 200,
+        "payload": {
+          "detail": [
+            {
+              "repositories": [
+                {
+                  "commits": [
+                    {
+                      "files": [
+                        {
+                          "path": "openspec/ST-1/spec.md"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "id": "retry-empty-recovery-239",
+    "category": "retry",
+    "labels": [
+      "SDD"
+    ],
+    "detail_responses": [
+      {
+        "status": 200,
+        "payload": {
+          "detail": [],
+          "errors": [
+            {
+              "error": "timeout"
+            }
+          ]
+        }
+      },
+      {
+        "status": 200,
+        "payload": {
+          "detail": [],
+          "errors": [
+            {
+              "error": "timeout"
+            }
+          ]
+        }
+      },
+      {
+        "status": 200,
+        "payload": {
+          "detail": [
+            {
+              "repositories": [
+                {
+                  "commits": [
+                    {
+                      "files": [
+                        {
+                          "path": "openspec/ST-1/spec.md"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "id": "retry-empty-recovery-240",
+    "category": "retry",
+    "labels": [
+      "SDD"
+    ],
+    "detail_responses": [
+      {
+        "status": 200,
+        "payload": {
+          "detail": [],
+          "errors": [
+            {
+              "error": "timeout"
+            }
+          ]
+        }
+      },
+      {
+        "status": 200,
+        "payload": {
+          "detail": [],
+          "errors": [
+            {
+              "error": "timeout"
+            }
+          ]
+        }
+      },
+      {
+        "status": 200,
+        "payload": {
+          "detail": [],
+          "errors": [
+            {
+              "error": "timeout"
+            }
+          ]
+        }
+      },
+      {
+        "status": 200,
+        "payload": {
+          "detail": [
+            {
+              "repositories": [
+                {
+                  "commits": [
+                    {
+                      "files": [
+                        {
+                          "path": "openspec/ST-1/spec.md"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "id": "retry-empty-recovery-241",
+    "category": "retry",
+    "labels": [
+      "SDD"
+    ],
+    "detail_responses": [
+      {
+        "status": 200,
+        "payload": {
+          "detail": [],
+          "errors": [
+            {
+              "error": "timeout"
+            }
+          ]
+        }
+      },
+      {
+        "status": 200,
+        "payload": {
+          "detail": [],
+          "errors": [
+            {
+              "error": "timeout"
+            }
+          ]
+        }
+      },
+      {
+        "status": 200,
+        "payload": {
+          "detail": [],
+          "errors": [
+            {
+              "error": "timeout"
+            }
+          ]
+        }
+      },
+      {
+        "status": 200,
+        "payload": {
+          "detail": [],
+          "errors": [
+            {
+              "error": "timeout"
+            }
+          ]
+        }
+      },
+      {
+        "status": 200,
+        "payload": {
+          "detail": [
+            {
+              "repositories": [
+                {
+                  "commits": [
+                    {
+                      "files": [
+                        {
+                          "path": "openspec/ST-1/spec.md"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "id": "retry-http-242",
+    "category": "retry",
+    "labels": [],
+    "detail_responses": [
+      {
+        "status": 401,
+        "payload": {
+          "errors": [
+            {
+              "error": "down"
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "id": "retry-http-243",
+    "category": "retry",
+    "labels": [],
+    "detail_responses": [
+      {
+        "status": 429,
+        "payload": {
+          "errors": [
+            {
+              "error": "down"
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "id": "retry-http-244",
+    "category": "retry",
+    "labels": [],
+    "detail_responses": [
+      {
+        "status": 500,
+        "payload": {
+          "errors": [
+            {
+              "error": "down"
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "id": "retry-http-245",
+    "category": "retry",
+    "labels": [],
+    "detail_responses": [
+      {
+        "status": 503,
+        "payload": {
+          "errors": [
+            {
+              "error": "down"
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "id": "retry-recovery-246",
+    "category": "retry",
+    "labels": [],
+    "detail_responses": [
+      {
+        "status": 503,
+        "payload": {}
+      },
+      {
+        "status": 200,
+        "payload": {
+          "detail": [
+            {
+              "repositories": [
+                {
+                  "commits": [
+                    {
+                      "files": [
+                        {
+                          "path": "openspec/ST-1/spec.md"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "id": "retry-recovery-247",
+    "category": "retry",
+    "labels": [],
+    "detail_responses": [
+      {
+        "status": 503,
+        "payload": {}
+      },
+      {
+        "status": 503,
+        "payload": {}
+      },
+      {
+        "status": 200,
+        "payload": {
+          "detail": [
+            {
+              "repositories": [
+                {
+                  "commits": [
+                    {
+                      "files": [
+                        {
+                          "path": "openspec/ST-1/spec.md"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "id": "retry-recovery-248",
+    "category": "retry",
+    "labels": [],
+    "detail_responses": [
+      {
+        "status": 503,
+        "payload": {}
+      },
+      {
+        "status": 503,
+        "payload": {}
+      },
+      {
+        "status": 503,
+        "payload": {}
+      },
+      {
+        "status": 200,
+        "payload": {
+          "detail": [
+            {
+              "repositories": [
+                {
+                  "commits": [
+                    {
+                      "files": [
+                        {
+                          "path": "openspec/ST-1/spec.md"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "id": "retry-recovery-249",
+    "category": "retry",
+    "labels": [],
+    "detail_responses": [
+      {
+        "status": 503,
+        "payload": {}
+      },
+      {
+        "status": 503,
+        "payload": {}
+      },
+      {
+        "status": 503,
+        "payload": {}
+      },
+      {
+        "status": 503,
+        "payload": {}
+      },
+      {
+        "status": 200,
+        "payload": {
+          "detail": [
+            {
+              "repositories": [
+                {
+                  "commits": [
+                    {
+                      "files": [
+                        {
+                          "path": "openspec/ST-1/spec.md"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "id": "retry-empty-recovery-250",
+    "category": "retry",
+    "labels": [],
+    "detail_responses": [
+      {
+        "status": 200,
+        "payload": {
+          "detail": [],
+          "errors": [
+            {
+              "error": "timeout"
+            }
+          ]
+        }
+      },
+      {
+        "status": 200,
+        "payload": {
+          "detail": [
+            {
+              "repositories": [
+                {
+                  "commits": [
+                    {
+                      "files": [
+                        {
+                          "path": "openspec/ST-1/spec.md"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "id": "retry-empty-recovery-251",
+    "category": "retry",
+    "labels": [],
+    "detail_responses": [
+      {
+        "status": 200,
+        "payload": {
+          "detail": [],
+          "errors": [
+            {
+              "error": "timeout"
+            }
+          ]
+        }
+      },
+      {
+        "status": 200,
+        "payload": {
+          "detail": [],
+          "errors": [
+            {
+              "error": "timeout"
+            }
+          ]
+        }
+      },
+      {
+        "status": 200,
+        "payload": {
+          "detail": [
+            {
+              "repositories": [
+                {
+                  "commits": [
+                    {
+                      "files": [
+                        {
+                          "path": "openspec/ST-1/spec.md"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "id": "retry-empty-recovery-252",
+    "category": "retry",
+    "labels": [],
+    "detail_responses": [
+      {
+        "status": 200,
+        "payload": {
+          "detail": [],
+          "errors": [
+            {
+              "error": "timeout"
+            }
+          ]
+        }
+      },
+      {
+        "status": 200,
+        "payload": {
+          "detail": [],
+          "errors": [
+            {
+              "error": "timeout"
+            }
+          ]
+        }
+      },
+      {
+        "status": 200,
+        "payload": {
+          "detail": [],
+          "errors": [
+            {
+              "error": "timeout"
+            }
+          ]
+        }
+      },
+      {
+        "status": 200,
+        "payload": {
+          "detail": [
+            {
+              "repositories": [
+                {
+                  "commits": [
+                    {
+                      "files": [
+                        {
+                          "path": "openspec/ST-1/spec.md"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "id": "retry-empty-recovery-253",
+    "category": "retry",
+    "labels": [],
+    "detail_responses": [
+      {
+        "status": 200,
+        "payload": {
+          "detail": [],
+          "errors": [
+            {
+              "error": "timeout"
+            }
+          ]
+        }
+      },
+      {
+        "status": 200,
+        "payload": {
+          "detail": [],
+          "errors": [
+            {
+              "error": "timeout"
+            }
+          ]
+        }
+      },
+      {
+        "status": 200,
+        "payload": {
+          "detail": [],
+          "errors": [
+            {
+              "error": "timeout"
+            }
+          ]
+        }
+      },
+      {
+        "status": 200,
+        "payload": {
+          "detail": [],
+          "errors": [
+            {
+              "error": "timeout"
+            }
+          ]
+        }
+      },
+      {
+        "status": 200,
+        "payload": {
+          "detail": [
+            {
+              "repositories": [
+                {
+                  "commits": [
+                    {
+                      "files": [
+                        {
+                          "path": "openspec/ST-1/spec.md"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "id": "match-file-position-0",
+    "category": "multiplicity",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    },
+                    {
+                      "path": "openspec/ST-2/spec.md"
+                    },
+                    {
+                      "path": "openspec/ST-2/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "match-file-position-1",
+    "category": "multiplicity",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-2/spec.md"
+                    },
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    },
+                    {
+                      "path": "openspec/ST-2/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "match-file-position-2",
+    "category": "multiplicity",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-2/spec.md"
+                    },
+                    {
+                      "path": "openspec/ST-2/spec.md"
+                    },
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "match-commit-position-0",
+    "category": "multiplicity",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/tasks.md"
+                    }
+                  ]
+                },
+                {
+                  "files": [
+                    {
+                      "path": "src/a.py"
+                    }
+                  ]
+                },
+                {
+                  "files": [
+                    {
+                      "path": "src/a.py"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "match-commit-position-1",
+    "category": "multiplicity",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "src/a.py"
+                    }
+                  ]
+                },
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/tasks.md"
+                    }
+                  ]
+                },
+                {
+                  "files": [
+                    {
+                      "path": "src/a.py"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "match-commit-position-2",
+    "category": "multiplicity",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "src/a.py"
+                    }
+                  ]
+                },
+                {
+                  "files": [
+                    {
+                      "path": "src/a.py"
+                    }
+                  ]
+                },
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/tasks.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "match-repo-position-0",
+    "category": "multiplicity",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/tasks.md"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "commits": [
+                {
+                  "files": []
+                }
+              ]
+            },
+            {
+              "commits": [
+                {
+                  "files": []
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "match-repo-position-1",
+    "category": "multiplicity",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": []
+                }
+              ]
+            },
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/tasks.md"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "commits": [
+                {
+                  "files": []
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "match-repo-position-2",
+    "category": "multiplicity",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": []
+                }
+              ]
+            },
+            {
+              "commits": [
+                {
+                  "files": []
+                }
+              ]
+            },
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/tasks.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "match-group-position-0",
+    "category": "multiplicity",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "repositories": []
+        },
+        {
+          "repositories": []
+        }
+      ]
+    }
+  },
+  {
+    "id": "match-group-position-1",
+    "category": "multiplicity",
+    "detail": {
+      "detail": [
+        {
+          "repositories": []
+        },
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "repositories": []
+        }
+      ]
+    }
+  },
+  {
+    "id": "match-group-position-2",
+    "category": "multiplicity",
+    "detail": {
+      "detail": [
+        {
+          "repositories": []
+        },
+        {
+          "repositories": []
+        },
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "search-no-stories",
+    "category": "search",
+    "issues": [],
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "search-two-own-key-one-missing",
+    "category": "search",
+    "issues": [
+      {
+        "key": "ST-1"
+      },
+      {
+        "key": "ST-2"
+      }
+    ],
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "search-lowercase-story",
+    "category": "search",
+    "issues": [
+      {
+        "key": "st-1"
+      }
+    ],
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "search-total-larger-page-ignored",
+    "category": "search",
+    "search_payload": {
+      "issues": [
+        {
+          "key": "ST-1"
+        }
+      ],
+      "total": 201,
+      "startAt": 0
+    },
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "search-missing-issues",
+    "category": "search",
+    "search_payload": {},
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "search-null-issues",
+    "category": "search",
+    "search_payload": {
+      "issues": null
+    },
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "search-null-payload",
+    "category": "search",
+    "search_payload": null,
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "search-duplicate-key",
+    "category": "search",
+    "issues": [
+      {
+        "key": "ST-1"
+      },
+      {
+        "key": "ST-1"
+      }
+    ],
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/ST-1/spec.md"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "reported-2484-count-5",
+    "category": "reported_log",
+    "key": "NEUROUI-2484",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/changes/archive/2026-10-26-remove-employee-actions-from-profile-drawer/design.md"
+                    },
+                    {
+                      "path": "openspec/changes/archive/2026-10-26-remove-employee-actions-from-profile-drawer/tasks.md"
+                    }
+                  ],
+                  "fileCount": 5
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "reported-2484-count-20",
+    "category": "reported_log",
+    "key": "NEUROUI-2484",
+    "detail": {
+      "detail": [
+        {
+          "repositories": [
+            {
+              "commits": [
+                {
+                  "files": [
+                    {
+                      "path": "openspec/changes/archive/2026-10-26-remove-employee-actions-from-profile-drawer/design.md"
+                    },
+                    {
+                      "path": "openspec/changes/archive/2026-10-26-remove-employee-actions-from-profile-drawer/tasks.md"
+                    }
+                  ],
+                  "fileCount": 20
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "errors-object-boolean-length",
+    "detail": {
+      "detail": [],
+      "errors": {
+        "length": false
+      }
+    }
+  },
+  {
+    "id": "errors-length-empty-string",
+    "detail": {
+      "detail": [],
+      "errors": {
+        "length": ""
+      }
+    }
+  },
+  {
+    "id": "detail-length-numeric-string",
+    "detail": {
+      "detail": {
+        "length": "0"
+      },
+      "errors": [
+        {
+          "error": "down"
+        }
+      ]
+    }
+  }
+]
