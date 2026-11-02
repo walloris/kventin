@@ -1,3 +1,4 @@
+import json
 """Release policy regressions; never connect to Jira or publish comments."""
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
@@ -3000,3 +3001,116 @@ def test_linked_cycles_partial_page_triggers_fallback_and_is_not_cached(zephyr):
     assert 'REL-1' not in checker._zephyr_release_cycles_cache
     zephyr.get_test_cycles_from_frontend.assert_called_once_with('REL-1')
     assert checker.report_data['REL-1']['warnings']
+
+
+@pytest.mark.parametrize('message,expected', [
+    ('Connection timed out token=SECRET', {'connection', 'upstream_timeout'}),
+    ('403 Forbidden Authorization: Bearer SECRET', {'permission'}),
+    ('SSLHandshakeException PKIX certificate SECRET', {'tls_certificate'}),
+    ('UnknownHostException getaddrinfo SECRET', {'dns'}),
+    ('Application link unavailable SECRET', {'application_link'}),
+    ('429 Too many requests SECRET', {'rate_limit'}),
+    ('503 Service Unavailable SECRET', {'upstream_unavailable'}),
+    ('Unrecognized private details SECRET', {'unclassified'}),
+])
+def test_sdd_application_errors_log_only_safe_categories(message, expected, capsys):
+    session = Mock()
+    payload = {'detail': [], 'errors': [{'message': message, 'url': 'https://private/SECRET',
+                                       'password': 'SECRET'}]}
+    session.get.return_value = response(200, payload)
+    assert rc.sdd_get_json(session, 'https://jira.example', '/rest/dev-status/1.0/issue/detail',
+        {'issueId': '42', 'dataType': 'repository'}, diagnostic_key='NEUROUI-2594', diagnostic_attempt=3) == payload
+    output = capsys.readouterr().out
+    row = json.loads(output.split('[SDD SOURCE ERROR] ')[1])
+    assert set(row['causes']) >= expected
+    assert row['issue'] == 'NEUROUI-2594' and row['issue_id'] == '42'
+    assert row['attempt'] == 3 and row['http_status'] == 200 and row['error_count'] == 1
+    assert 'SECRET' not in output and 'private' not in output and 'password' not in output
+
+
+@pytest.mark.parametrize('status,expected', [(401, 'permission'), (403, 'permission'),
+                                            (429, 'rate_limit'), (503, 'http_error')])
+def test_sdd_http_errors_are_logged_even_when_optional(status, expected, capsys):
+    session = Mock()
+    session.get.return_value = response(status, {'errors': ['Authorization Bearer SECRET']})
+    assert rc.sdd_get_json(session, 'https://jira.example', '/rest/dev-status/1.0/issue/summary',
+                          {}, allow_http_failure=True) is None
+    output = capsys.readouterr().out
+    assert expected in output and str(status) in output
+    assert 'SECRET' not in output and 'Bearer' not in output
+
+
+@pytest.mark.parametrize('exc,expected', [(requests.Timeout('SECRET'), 'timeout'),
+    (requests.exceptions.SSLError('SECRET'), 'tls_certificate'),
+    (requests.ConnectionError('SECRET'), 'connection')])
+def test_sdd_transport_exceptions_log_safe_causes(exc, expected, capsys):
+    session = Mock()
+    session.get.side_effect = exc
+    with pytest.raises(rc.SddCheckError):
+        rc.sdd_get_json(session, 'https://jira.example', '/rest/dev-status/1.0/issue/detail', {})
+    output = capsys.readouterr().out
+    assert expected in output and 'SECRET' not in output
+
+
+def test_sdd_invalid_json_never_logs_response_body(capsys):
+    session = Mock()
+    session.get.return_value = NS(status_code=200, json=Mock(side_effect=ValueError('SECRET HTML')))
+    with pytest.raises(rc.SddCheckError):
+        rc.sdd_get_json(session, 'https://jira.example', '/rest/dev-status/1.0/issue/detail', {})
+    output = capsys.readouterr().out
+    assert 'invalid_json' in output and 'SECRET' not in output
+
+
+def test_jenkins_1676_errors_are_diagnosed_and_sdd_remains_blocking(monkeypatch, capsys):
+    checker = stage_validator()
+    session = Mock()
+    session.headers = {}
+    monkeypatch.setattr(rc.requests, 'Session', lambda: nullcontext(session))
+    monkeypatch.setattr(rc, 'config', {'jira': {'url': 'https://jira.example', 'token': 'TOKEN_SECRET'}})
+    monkeypatch.setattr(rc.time, 'sleep', Mock())
+    checker._reset_release_run = Mock()
+    checker.jira_main = Mock()
+    def get(url, **kwargs):
+        if url.endswith('/search'):
+            return response(200, {'issues': [{'key': 'NEUROUI-2594'}], 'total': 1})
+        if url.endswith('/issue/NEUROUI-2594'):
+            return response(200, {'id': '42', 'fields': {'labels': ['SDD']}})
+        if url.endswith('/issue/HRPRELEASE-148683'):
+            return response(200, {'id': '99'})
+        if url.endswith('/summary'):
+            return response(200, {'summary': {'repository': {'overall': {'count': 6}}}})
+        if url.endswith('/detail'):
+            return response(200, {'detail': [], 'errors': [
+                {'message': 'connection timed out TOKEN_SECRET'},
+                {'message': 'SSLHandshakeException TOKEN_SECRET'},
+                {'message': 'application link forbidden TOKEN_SECRET'}]})
+        if url.endswith('/remotelink'):
+            return response(200, [])
+        raise AssertionError('Unexpected request')
+    session.get.side_effect = get
+    assert checker.check_release('HRPRELEASE-148683') is False
+    assert len(checker.check_results) == 1
+    assert checker.check_results[0]['status'] == 'INCOMPLETE'
+    checker.jira_main.issue.assert_not_called()
+    output = capsys.readouterr().out
+    rows = [json.loads(line.split('[SDD SOURCE ERROR] ')[1]) for line in output.splitlines()
+            if line.startswith('[SDD SOURCE ERROR] ')]
+    story_rows = [row for row in rows if row.get('issue') == 'NEUROUI-2594']
+    assert [row['attempt'] for row in story_rows] == [1, 2, 3, 4]
+    assert all(row['error_count'] == 3 for row in story_rows)
+    assert any(row.get('issue') == 'HRPRELEASE-148683' and row['stage'] == 'release_pr_links' for row in rows)
+    assert 'upstream_timeout' in output and 'tls_certificate' in output and 'permission' in output
+    assert 'TOKEN_SECRET' not in output
+
+
+def test_sdd_mixed_error_categories_preserve_unknown_and_error_messages(capsys):
+    session = Mock()
+    session.get.return_value = response(200, {'errors': [{'message': 'timed out SECRET'}],
+        'errorMessages': ['PRIVATE_SECRET'], 'detail': []})
+    rc.sdd_get_json(session, 'https://jira.example', '/rest/dev-status/1.0/issue/detail', {})
+    output = capsys.readouterr().out
+    row = json.loads(output.split('[SDD SOURCE ERROR] ')[1])
+    assert row['error_count'] == 2
+    assert row['error_causes'] == [{'number': 1, 'causes': ['upstream_timeout']},
+                                    {'number': 2, 'causes': ['unclassified']}]
+    assert 'SECRET' not in output

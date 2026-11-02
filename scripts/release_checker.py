@@ -1591,11 +1591,65 @@ class SddCheckError(RuntimeError):
     """An SDD request failed; messages contain no server bodies or credentials."""
 
 
+def sdd_source_diagnostic(path: str, params: dict, *, status: Optional[int] = None,
+                          errors: object = None, reason: Optional[str] = None,
+                          key: Optional[str] = None, attempt: int = 1) -> None:
+    """Emit allowlisted error categories only, never upstream text or credentials."""
+    if path.endswith('/issue/detail'):
+        stage = 'release_pr_links' if params.get('dataType') == 'pullrequest' else 'story_commits'
+    elif path.endswith('/issue/summary'):
+        stage = 'development_summary'
+    elif path.endswith('/remotelink'):
+        stage = 'remote_pr_links'
+    elif path.endswith('/search'):
+        stage = 'story_search'
+    else:
+        stage = 'jira_issue'
+    entries = (errors if isinstance(errors, list) else [errors]) if errors else []
+    categories, error_causes = set(), []
+    for index, entry in enumerate(entries):
+        causes = set(DevelopmentAPIError(entry).categories)
+        text = json.dumps(entry, ensure_ascii=False).casefold()
+        if any(word in text for word in ('ssl', 'pkix', 'certificate', 'certpath', 'handshake')):
+            causes.add('tls_certificate')
+        if any(word in text for word in ('unknownhost', 'name resolution', 'getaddrinfo')):
+            causes.add('dns')
+        if any(word in text for word in ('service unavailable', 'bad gateway', '502', '503', '504')):
+            causes.add('upstream_unavailable')
+        if causes - {'unclassified'}:
+            causes.discard('unclassified')
+        categories.update(causes)
+        if index < 20:
+            error_causes.append({'number': index + 1, 'causes': sorted(causes)})
+    # All reason values below are internal constants, never exception text.
+    if reason:
+        categories.add(reason if reason in {'tls_certificate', 'timeout', 'connection',
+            'invalid_json', 'unexpected_shape', 'http_error'} else 'unclassified')
+    if status in {401, 403}:
+        categories.add('permission')
+    elif status == 429:
+        categories.add('rate_limit')
+    row = {'stage': stage, 'http_status': status, 'attempt': attempt,
+           'error_count': len(entries), 'causes': sorted(categories) or ['unclassified']}
+    if error_causes:
+        row['error_causes'] = error_causes
+    if isinstance(key, str) and re.fullmatch(r'[A-Z][A-Z0-9_]*-\d+', key):
+        row['issue'] = key
+    issue_id = str(params.get('issueId') or '')
+    if issue_id.isdigit():
+        row['issue_id'] = issue_id
+    print('[SDD SOURCE ERROR] ' + json.dumps(row, ensure_ascii=False), flush=True)
+
+
 def sdd_get_json(session: requests.Session, base_url: str, path: str,
                  params: dict, *, allow_http_failure: bool = False,
                  allow_list: bool = False, deadline: Optional[float] = None,
-                 retry_state: Optional[dict] = None) -> Optional[Union[dict, list]]:
+                 retry_state: Optional[dict] = None, diagnostic_key: Optional[str] = None,
+                 diagnostic_attempt: int = 1) -> Optional[Union[dict, list]]:
     """Read one SDD endpoint, retaining the original non-2xx handling."""
+    def diagnose(**details):
+        sdd_source_diagnostic(path, params, key=diagnostic_key, attempt=diagnostic_attempt, **details)
+
     if retry_state and retry_state.get('until', 0) > time.monotonic():
         raise SddCheckError('Jira: сервер ограничил запросы, действует Retry-After.')
     remaining = deadline - time.monotonic() if deadline is not None else None
@@ -1607,14 +1661,19 @@ def sdd_get_json(session: requests.Session, base_url: str, path: str,
         response = session.get(base_url.rstrip('/') + path, params=params, timeout=timeout,
                                verify=release_tls_policy())
     except requests.exceptions.SSLError:
+        diagnose(reason='tls_certificate')
         raise SddCheckError('Ошибка TLS. Проверьте RELEASE_CHECKER_CA_BUNDLE и политику TLS.') from None
     except requests.Timeout:
+        diagnose(reason='timeout')
         raise SddCheckError('Истёк таймаут запроса Jira/Bitbucket. Повторите запуск.') from None
     except requests.RequestException:
+        diagnose(reason='connection')
         raise SddCheckError('Ошибка подключения к Jira/Bitbucket. Проверьте сеть и доступ.') from None
     if retry_state is not None and response.status_code in {429, 503}:
         retry_state['until'] = time.monotonic() + max(1, retry_after_seconds(response))
     if not 200 <= response.status_code < 300:
+        # Bodies may contain credentials, HTML or arbitrary server exception text.
+        diagnose(status=response.status_code, reason='http_error')
         if allow_http_failure:
             return None
         advice = ('Проверьте токен и права чтения Jira.' if response.status_code in {401, 403}
@@ -1623,9 +1682,19 @@ def sdd_get_json(session: requests.Session, base_url: str, path: str,
     try:
         payload = response.json()
     except ValueError:
+        diagnose(status=response.status_code, reason='invalid_json')
         raise SddCheckError('Jira/Bitbucket вернул некорректный JSON. Повторите запуск.') from None
     if not isinstance(payload, dict) and not (allow_list and isinstance(payload, list)):
+        diagnose(status=response.status_code, reason='unexpected_shape')
         raise SddCheckError('Jira/Bitbucket вернул неожиданный формат данных. Повторите запуск.')
+    if isinstance(payload, dict):
+        errors = []
+        for field in ('errors', 'errorMessages'):
+            value = payload.get(field)
+            if value:
+                errors.extend(value if isinstance(value, list) else [value])
+        if errors:
+            diagnose(status=response.status_code, errors=errors)
     return payload
 
 
@@ -1893,7 +1962,7 @@ def sdd_commit_story_result(session: requests.Session, base_url: str, key: str) 
     if not issue_id:
         return has_sdd, False
     summary = sdd_get_json(session, base_url, '/rest/dev-status/1.0/issue/summary',
-                           {'issueId': issue_id, '_': int(time.time() * 1000)}, allow_http_failure=True)
+                           {'issueId': issue_id, '_': int(time.time() * 1000)}, allow_http_failure=True, diagnostic_key=key)
     repository = ((summary or {}).get('summary') or {}).get('repository') or {}
     repo_count = (repository.get('overall') or {}).get('count') or 0
     if http_debug_enabled():
@@ -1907,12 +1976,12 @@ def sdd_commit_story_result(session: requests.Session, base_url: str, key: str) 
         return has_sdd, False
     session.headers['X-Requested-With'] = 'XMLHttpRequest'
     try:
-        for _ in range(4):
+        for attempt in range(1, 5):
             time.sleep(11)
             data = sdd_get_json(session, base_url, '/rest/dev-status/1.0/issue/detail',
                                 {'issueId': issue_id, 'applicationType': 'stash',
                                  'dataType': 'repository', '_': int(time.time() * 1000)},
-                                allow_http_failure=True)
+                                allow_http_failure=True, diagnostic_key=key, diagnostic_attempt=attempt)
             if data is None:
                 continue
             details = data.get('detail') or []
@@ -1979,7 +2048,8 @@ def sdd_release_artifacts(session: requests.Session, base_url: str, release_key:
             if not issue_id:
                 raise SddCheckError('Jira не вернула ID релиза для поиска исходного PR.')
             data = sdd_get_json(session, base_url, '/rest/dev-status/1.0/issue/detail', {
-                'issueId': issue_id, 'applicationType': 'stash', 'dataType': 'pullrequest'})
+                'issueId': issue_id, 'applicationType': 'stash', 'dataType': 'pullrequest'},
+                diagnostic_key=release_key)
             if not isinstance(data.get('detail'), list):
                 raise SddCheckError('Jira не вернула список релизных PR.')
             for group in data['detail']:
@@ -1989,7 +2059,7 @@ def sdd_release_artifacts(session: requests.Session, base_url: str, release_key:
                         urls.append(url)
             if not urls:
                 links = sdd_get_json(session, base_url, f'/rest/api/2/issue/{release_key}/remotelink',
-                                     {}, allow_list=True)
+                                     {}, allow_list=True, diagnostic_key=release_key)
                 if not isinstance(links, list):
                     raise SddCheckError('Jira не вернула список внешних ссылок релиза.')
                 for link in links:
@@ -1998,7 +2068,9 @@ def sdd_release_artifacts(session: requests.Session, base_url: str, release_key:
                     if url:
                         urls.append(url)
                 if not urls and (data.get('errors') or []):
-                    raise SddCheckError('Jira не смогла прочитать релизные PR. Повторите проверку SDD.')
+                    raise SddCheckError('Jira не смогла прочитать релизные PR. Причины и этапы '
+                                        'сбоя указаны в Jenkins в строках [SDD SOURCE ERROR]. '
+                                        'Это не подтверждает отсутствие openspec; повторите проверку SDD.')
         paths, failures, sources = [], [], []
         candidates = {}
         for url in dict.fromkeys(urls):
